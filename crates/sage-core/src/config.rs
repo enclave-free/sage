@@ -11,11 +11,11 @@ pub enum MessengerType {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Config {
-    pub maple_api_url: String,
-    pub maple_api_key: Option<String>,
-    pub maple_model: String,
-    pub maple_embedding_model: String,
-    pub maple_vision_model: String,
+    pub tinfoil_api_url: String,
+    pub tinfoil_api_key: Option<String>,
+    pub tinfoil_model: String,
+    pub tinfoil_embedding_model: String,
+    pub tinfoil_vision_model: String,
 
     pub database_url: String,
 
@@ -47,14 +47,15 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            maple_api_url: std::env::var("MAPLE_API_URL")
-                .unwrap_or_else(|_| "http://localhost:8080/v1".to_string()),
-            maple_api_key: std::env::var("MAPLE_API_KEY").ok(),
-            maple_model: std::env::var("MAPLE_MODEL").unwrap_or_else(|_| "kimi-k2".to_string()),
-            maple_embedding_model: std::env::var("MAPLE_EMBEDDING_MODEL")
+            tinfoil_api_url: std::env::var("TINFOIL_API_URL")
+                .unwrap_or_else(|_| "http://localhost:8089/v1".to_string()),
+            tinfoil_api_key: std::env::var("TINFOIL_API_KEY").ok(),
+            tinfoil_model: std::env::var("TINFOIL_MODEL")
+                .unwrap_or_else(|_| "kimi-k2-5".to_string()),
+            tinfoil_embedding_model: std::env::var("TINFOIL_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string()),
-            maple_vision_model: std::env::var("MAPLE_VISION_MODEL").unwrap_or_else(|_| {
-                std::env::var("MAPLE_MODEL").unwrap_or_else(|_| "kimi-k2-5".to_string())
+            tinfoil_vision_model: std::env::var("TINFOIL_VISION_MODEL").unwrap_or_else(|_| {
+                std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-5".to_string())
             }),
 
             database_url: std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?,
@@ -113,10 +114,10 @@ impl Config {
             workspace_path: std::env::var("SAGE_WORKSPACE")
                 .unwrap_or_else(|_| "/workspace".to_string()),
 
-            http_port: std::env::var("HTTP_PORT")
+            http_port: std::env::var("HEALTH_PORT")
                 .unwrap_or_else(|_| "3000".to_string())
                 .parse()
-                .context("HTTP_PORT must be a valid port number")?,
+                .context("HEALTH_PORT must be a valid port number")?,
         })
     }
 
@@ -134,6 +135,75 @@ impl Config {
         match self.messenger_type {
             MessengerType::Signal => &self.signal_allowed_users,
             MessengerType::Marmot => &self.marmot_allowed_pubkeys,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn config_reads_tinfoil_env_only() {
+        let _guard = env_lock().lock().unwrap();
+
+        let previous_database = std::env::var("DATABASE_URL").ok();
+        let previous_tinfoil_api_url = std::env::var("TINFOIL_API_URL").ok();
+        let previous_tinfoil_api_key = std::env::var("TINFOIL_API_KEY").ok();
+        let previous_tinfoil_model = std::env::var("TINFOIL_MODEL").ok();
+        let previous_tinfoil_embedding_model = std::env::var("TINFOIL_EMBEDDING_MODEL").ok();
+        let previous_tinfoil_vision_model = std::env::var("TINFOIL_VISION_MODEL").ok();
+        let previous_maple_api_url = std::env::var("MAPLE_API_URL").ok();
+        let previous_maple_api_key = std::env::var("MAPLE_API_KEY").ok();
+        let previous_maple_model = std::env::var("MAPLE_MODEL").ok();
+        let previous_maple_embedding_model = std::env::var("MAPLE_EMBEDDING_MODEL").ok();
+        let previous_maple_vision_model = std::env::var("MAPLE_VISION_MODEL").ok();
+
+        std::env::set_var("DATABASE_URL", "postgres://sage:sage@localhost:5434/sage");
+        std::env::set_var("TINFOIL_API_URL", "http://localhost:8089/v1");
+        std::env::set_var("TINFOIL_API_KEY", "test-key");
+        std::env::set_var("TINFOIL_MODEL", "kimi-k2-5");
+        std::env::set_var("TINFOIL_EMBEDDING_MODEL", "nomic-embed-text");
+        std::env::set_var("TINFOIL_VISION_MODEL", "qwen3-vl-30b");
+
+        std::env::set_var("MAPLE_API_URL", "http://legacy.invalid/v1");
+        std::env::set_var("MAPLE_API_KEY", "legacy-key");
+        std::env::set_var("MAPLE_MODEL", "legacy-model");
+        std::env::set_var("MAPLE_EMBEDDING_MODEL", "legacy-embed");
+        std::env::set_var("MAPLE_VISION_MODEL", "legacy-vision");
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.tinfoil_api_url, "http://localhost:8089/v1");
+        assert_eq!(config.tinfoil_api_key.as_deref(), Some("test-key"));
+        assert_eq!(config.tinfoil_model, "kimi-k2-5");
+        assert_eq!(config.tinfoil_embedding_model, "nomic-embed-text");
+        assert_eq!(config.tinfoil_vision_model, "qwen3-vl-30b");
+
+        restore_env("DATABASE_URL", previous_database);
+        restore_env("TINFOIL_API_URL", previous_tinfoil_api_url);
+        restore_env("TINFOIL_API_KEY", previous_tinfoil_api_key);
+        restore_env("TINFOIL_MODEL", previous_tinfoil_model);
+        restore_env("TINFOIL_EMBEDDING_MODEL", previous_tinfoil_embedding_model);
+        restore_env("TINFOIL_VISION_MODEL", previous_tinfoil_vision_model);
+        restore_env("MAPLE_API_URL", previous_maple_api_url);
+        restore_env("MAPLE_API_KEY", previous_maple_api_key);
+        restore_env("MAPLE_MODEL", previous_maple_model);
+        restore_env("MAPLE_EMBEDDING_MODEL", previous_maple_embedding_model);
+        restore_env("MAPLE_VISION_MODEL", previous_maple_vision_model);
+    }
+
+    fn restore_env(key: &str, previous: Option<String>) {
+        if let Some(value) = previous {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
         }
     }
 }

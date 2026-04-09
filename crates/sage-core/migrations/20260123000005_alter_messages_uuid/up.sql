@@ -19,6 +19,7 @@ CREATE TABLE messages (
     sequence_id BIGSERIAL,  -- Monotonic ordering within agent
     tool_calls JSONB,       -- For assistant messages with tool calls
     tool_results JSONB,     -- For tool result messages
+    attachment_text TEXT,   -- Vision preprocessing and attachment summaries
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

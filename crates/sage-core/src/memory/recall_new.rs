@@ -149,7 +149,7 @@ impl RecallManager {
             user_id,
             role,
             content,
-            &embedding,
+            Some(&embedding),
             None,
             None,
             attachment_text,
@@ -173,14 +173,12 @@ impl RecallManager {
         content: &str,
         attachment_text: Option<&str>,
     ) -> Result<Uuid> {
-        let zero_embedding = vec![0.0f32; super::embedding::EMBEDDING_DIM];
-
         let id = self.db.messages().insert_message(
             self.agent_id,
             user_id,
             role,
             content,
-            &zero_embedding,
+            None,
             None,
             None,
             attachment_text,
@@ -216,7 +214,7 @@ impl RecallManager {
             user_id,
             role,
             content,
-            &embedding,
+            Some(&embedding),
             tool_calls,
             tool_results,
             None,

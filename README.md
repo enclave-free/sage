@@ -10,10 +10,10 @@ Sage is an AI assistant that prioritizes **privacy** and **data sovereignty**. I
 
 **Key Features:**
 - **End-to-end encrypted messaging** via Signal or [Pika](https://github.com/sledtools/pika) (MLS over Nostr)
-- **Image understanding** - send photos and Sage can see and describe them
+- **Image understanding** for Signal attachments - send photos and Sage can see and describe them
 - **Long-term memory** that persists across conversations
 - **Confidential compute** - LLM inference runs in a TEE (Trusted Execution Environment)
-- **Self-hosted** - all data stays on your machine
+- **Self-hosted state** - your app state and memory stay on your machine
 - **Multi-user support** with isolated memory per conversation
 
 ## Why Build This?
@@ -21,7 +21,7 @@ Sage is an AI assistant that prioritizes **privacy** and **data sovereignty**. I
 Most AI assistants are stateless - they forget everything after each conversation. The few that have memory send your data to cloud servers you don't control. Sage takes a different approach:
 
 - Your conversations stay on **your** PostgreSQL instance
-- LLM inference happens in **confidential compute** (Maple/TEE) - the inference provider can't see your prompts
+- LLM inference happens in **confidential compute** via a local verified Tinfoil proxy - the inference provider can't see your prompts
 - Communication happens over **Signal's E2E encryption** or **MLS-encrypted Nostr** via [Pika](https://github.com/sledtools/pika)
 - The agent runs in **your container** on your infrastructure
 
@@ -54,7 +54,7 @@ Custom implementation of a 4-tier memory system (inspired by [Letta](https://git
 | **Archival Memory** | Long-term semantic storage | pgvector + TEE embeddings |
 | **Summary Memory** | Auto-compaction when context overflows | PostgreSQL |
 
-All embeddings are generated via Maple's TEE-based embedding API (nomic-embed-text), meaning your memory content stays private even during vector encoding.
+All embeddings are generated via Tinfoil's TEE-based embedding API (`nomic-embed-text`), meaning your memory content stays private even during vector encoding.
 
 ### Built for Prompt Optimization
 
@@ -247,10 +247,10 @@ DSRs parses this back into a typed `AgentResponse` struct that Sage uses to exec
 | Component | Choice | Why |
 |-----------|--------|-----|
 | Language | **Rust** | Performance, type safety, reliability |
-| LLM | **Kimi K2** (thinking variant) | Strong tool use, 128k context |
-| Inference | **Maple** | TEE-based confidential compute |
-| Embeddings | **nomic-embed-text** | Via Maple |
-| Messaging | **Signal** (signal-cli) or **Pika** (marmotd) | E2E encrypted; Signal for mobile, Pika for decentralized Nostr |
+| LLM | **Kimi K2.5** | Strong tool use, multimodal, 256k context |
+| Inference | **Tinfoil** | TEE-based confidential compute via local verified proxy |
+| Embeddings | **nomic-embed-text** | Via Tinfoil |
+| Messaging | **Signal** (signal-cli) or **Marmot** ([Pika](https://github.com/sledtools/pika) / `marmotd`) | E2E encrypted; Signal for mobile, Marmot for MLS over Nostr |
 | Database | **PostgreSQL + pgvector** | Structured data + vector search |
 | Framework | **DSRs** (dspy-rs) | Typed signatures, BAML parsing |
 
@@ -301,7 +301,7 @@ marmotd is built from source during `docker build` (included in the Dockerfile).
 
 - [Podman](https://podman.io/) or Docker
 - signal-cli registered with a phone number (if using Signal) or [Pika](https://github.com/sledtools/pika) app (if using Marmot)
-- Maple API access (or compatible OpenAI endpoint)
+- TINFOIL_API_KEY for the local verified proxy
 
 ### Option 1: Docker (Recommended)
 
@@ -319,10 +319,10 @@ cd sage
 cp .env.example .env
 # Edit .env with your settings
 
-# Initialize signal-cli data volume (requires existing signal-cli registration)
+# Initialize signal-cli data volume if using Signal
 just signal-init
 
-# Start all services (postgres, signal-cli, sage)
+# Start all services (postgres, signal-cli, tinfoil-proxy, sage)
 docker compose up -d
 ```
 
@@ -334,8 +334,8 @@ services:
     image: ghcr.io/anthonyronning/sage:latest
     environment:
       - DATABASE_URL=postgres://sage:sage@postgres:5432/sage
-      - MAPLE_API_URL=https://your-maple-endpoint
-      - MAPLE_API_KEY=your-api-key
+      - TINFOIL_API_URL=http://tinfoil-proxy:8089/v1
+      - TINFOIL_API_KEY=your-api-key
       - SIGNAL_CLI_HOST=signal-cli
       - SIGNAL_CLI_PORT=7583
       - SIGNAL_PHONE_NUMBER=+1234567890
@@ -353,7 +353,7 @@ nix develop
 cp .env.example .env
 # Edit .env with your settings
 
-just signal-init  # Copy signal-cli data to volume
+just signal-init  # Only needed when using Signal
 just build        # Build container
 just start        # Start all services
 ```
@@ -362,9 +362,15 @@ just start        # Start all services
 
 ```bash
 # Required
-MAPLE_API_URL=https://your-maple-endpoint
-MAPLE_API_KEY=your-api-key
-MAPLE_MODEL=maple/kimi-k2-5
+TINFOIL_API_URL=http://localhost:8089/v1
+TINFOIL_API_KEY=your-api-key
+TINFOIL_MODEL=kimi-k2-5
+TINFOIL_EMBEDDING_MODEL=nomic-embed-text
+
+# Local verified proxy
+TINFOIL_PROXY_PORT=8089
+TINFOIL_ROUTER_HOST=inference.tinfoil.sh
+TINFOIL_ROUTER_REPO=tinfoilsh/confidential-model-router
 
 # Messenger (choose one)
 MESSENGER=signal                      # "signal" (default) or "marmot"
@@ -380,7 +386,7 @@ MARMOT_AUTO_ACCEPT_WELCOMES=true
 
 # Optional
 BRAVE_API_KEY=your-brave-key          # For web search
-MAPLE_VISION_MODEL=maple/kimi-k2-5   # For image understanding (defaults to MAPLE_MODEL)
+TINFOIL_VISION_MODEL=kimi-k2-5        # For image understanding (defaults to TINFOIL_MODEL)
 ```
 
 ## Architecture
@@ -407,8 +413,8 @@ MAPLE_VISION_MODEL=maple/kimi-k2-5   # For image understanding (defaults to MAPL
         ┌─────────────────┼─────────────────┐
         ▼                 ▼                 ▼
 ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
-│  PostgreSQL   │ │    Maple      │ │ Brave Search  │
-│  + pgvector   │ │    (TEE)      │ │               │
+│  PostgreSQL   │ │ Tinfoil Proxy │ │ Brave Search  │
+│  + pgvector   │ │  -> TEE router│ │               │
 └───────────────┘ └───────────────┘ └───────────────┘
 ```
 
@@ -417,8 +423,8 @@ MAPLE_VISION_MODEL=maple/kimi-k2-5   # For image understanding (defaults to MAPL
 | Layer | Protection |
 |-------|------------|
 | **Transport** | Signal E2E encryption or MLS-encrypted Nostr (via Pika) |
-| **Inference** | Maple TEE (confidential compute) |
-| **Embeddings** | Maple TEE (memory vectors generated privately) |
+| **Inference** | Tinfoil TEE via local verified proxy |
+| **Embeddings** | Tinfoil TEE (memory vectors generated privately) |
 | **Storage** | Local PostgreSQL (your machine) |
 | **Search** | Brave (privacy-respecting, no tracking) |
 
@@ -436,6 +442,32 @@ MAPLE_VISION_MODEL=maple/kimi-k2-5   # For image understanding (defaults to MAPL
 - Gmail/Calendar integration
 - Group chat support
 - Voice messages
+
+## Smoke Testing
+
+Sage includes an isolated pre-push smoke gate for the direct Tinfoil path. It starts a fresh `pgvector` Postgres container and Tinfoil proxy, applies migrations, builds a dedicated smoke-runner image, and validates:
+
+- containerized `cargo check`, `cargo test`, and `cargo clippy`
+- direct chat, embeddings, and vision calls through the Tinfoil proxy
+- invalid-model preflight failure behavior
+- recall-memory `NULL -> update_embedding -> searchable` semantics
+- archival insert/search through pgvector
+
+The smoke gate does **not** start `sage`, `signal-cli`, or `marmotd`, so it avoids messenger setup while still proving the Tinfoil/data-plane migration.
+
+Run it with a transient API key:
+
+```bash
+TINFOIL_API_KEY=your-tinfoil-key just smoke-tinfoil
+```
+
+Or run the script directly if `just` is unavailable:
+
+```bash
+TINFOIL_API_KEY=your-tinfoil-key ./scripts/smoke_tinfoil.sh
+```
+
+The script uses an isolated Docker/Podman network and temporary volume, so it does not reuse the main Compose stack.
 
 ## GEPA Prompt Optimization
 
@@ -468,10 +500,10 @@ just gepa-examples
 # Required for GEPA optimization (Claude as judge)
 ANTHROPIC_API_KEY=your-anthropic-key
 
-# Program under test (Kimi via Maple)
-MAPLE_API_URL=https://your-maple-endpoint
-MAPLE_API_KEY=your-maple-key
-MAPLE_MODEL=maple/kimi-k2-5
+# Program under test (Kimi K2.5 via Tinfoil)
+TINFOIL_API_URL=http://localhost:8089/v1
+TINFOIL_API_KEY=your-tinfoil-key
+TINFOIL_MODEL=kimi-k2-5
 ```
 
 **Training Examples:**
@@ -489,7 +521,7 @@ Current categories: first-time users, casual chat, web search, memory storage, t
 - [DSRs](https://github.com/krypticmouse/DSRs) - DSPy in Rust
 - [signal-cli](https://github.com/AsamK/signal-cli) - Signal CLI interface
 - [Pika](https://github.com/sledtools/pika) - MLS-encrypted messaging over Nostr
-- [Maple](https://www.trymaple.ai/) - Confidential compute LLM inference
+- [Tinfoil](https://tinfoil.sh/) - Confidential compute LLM inference
 
 ## License
 

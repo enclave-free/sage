@@ -2,8 +2,8 @@
 # Run with: docker compose up
 #
 # Prerequisites:
-# - Maple Desktop running on host (port 8089) OR maple-proxy
 # - Signal account already registered (data in ~/.local/share/signal-cli)
+# - TINFOIL_API_KEY configured in .env
 #
 # First-time setup:
 #   1. Ensure signal-cli data exists at ~/.local/share/signal-cli
@@ -73,6 +73,26 @@ services:
       signal-cli:
         condition: service_healthy
 
+  # Verified local proxy for Tinfoil's hosted router
+  tinfoil-proxy:
+    image: ghcr.io/tinfoilsh/tinfoil-cli:latest
+    container_name: sage-tinfoil-proxy
+    command:
+      - proxy
+      - -e
+      - ${TINFOIL_ROUTER_HOST:-inference.tinfoil.sh}
+      - -r
+      - ${TINFOIL_ROUTER_REPO:-tinfoilsh/confidential-model-router}
+      - -p
+      - "${TINFOIL_PROXY_PORT:-8089}"
+      - -b
+      - 0.0.0.0
+    ports:
+      - "${TINFOIL_PROXY_PORT:-8089}:${TINFOIL_PROXY_PORT:-8089}"
+    environment:
+      - TINFOIL_API_KEY=${TINFOIL_API_KEY}
+    restart: unless-stopped
+
   # Sage V2 - Rust AI agent
   sage:
     build:
@@ -86,6 +106,8 @@ services:
         condition: service_healthy
       signal-cli-perms:
         condition: service_completed_successfully
+      tinfoil-proxy:
+        condition: service_started
     ports:
       - "8080:8080"  # Health check port
     volumes:
@@ -101,12 +123,12 @@ services:
       # Database
       - DATABASE_URL=postgres://sage:sage@postgres:5432/sage
       
-      # LLM Backend (Maple)
-      - MAPLE_API_URL=${MAPLE_API_URL:-http://host.docker.internal:8089/v1}
-      - MAPLE_API_KEY=${MAPLE_API_KEY}
-      - MAPLE_MODEL=${MAPLE_MODEL:-kimi-k2-5}
-      - MAPLE_EMBEDDING_MODEL=${MAPLE_EMBEDDING_MODEL:-maple/nomic-embed-text}
-      - MAPLE_VISION_MODEL=${MAPLE_VISION_MODEL:-${MAPLE_MODEL:-kimi-k2-5}}
+      # LLM Backend (Tinfoil via verified local proxy)
+      - TINFOIL_API_URL=http://tinfoil-proxy:${TINFOIL_PROXY_PORT:-8089}/v1
+      - TINFOIL_API_KEY=${TINFOIL_API_KEY}
+      - TINFOIL_MODEL=${TINFOIL_MODEL:-kimi-k2-5}
+      - TINFOIL_EMBEDDING_MODEL=${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}
+      - TINFOIL_VISION_MODEL=${TINFOIL_VISION_MODEL:-${TINFOIL_MODEL:-kimi-k2-5}}
       
       # Signal (TCP mode to signal-cli container)
       - SIGNAL_CLI_HOST=signal-cli
@@ -122,8 +144,6 @@ services:
       
       # Logging
       - RUST_LOG=${RUST_LOG:-info}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
 volumes:

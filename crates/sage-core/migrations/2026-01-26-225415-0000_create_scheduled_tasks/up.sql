@@ -1,7 +1,7 @@
 -- Scheduled tasks for reminders, recurring tool calls, etc.
 CREATE TABLE scheduled_tasks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    agent_id UUID NOT NULL,
     
     -- What to do: 'message' or 'tool_call'
     task_type VARCHAR(20) NOT NULL,

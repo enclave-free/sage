@@ -75,11 +75,11 @@ struct CachedAgent {
 pub struct AgentManager {
     /// Database URL for creating new memory managers
     database_url: String,
-    /// Maple API configuration
-    maple_api_url: String,
-    maple_api_key: String,
-    maple_model: String,
-    maple_embedding_model: String,
+    /// Tinfoil API configuration
+    tinfoil_api_url: String,
+    tinfoil_api_key: String,
+    tinfoil_model: String,
+    tinfoil_embedding_model: String,
     /// Brave API key for web search
     brave_api_key: Option<String>,
     /// Base workspace path
@@ -101,17 +101,17 @@ impl AgentManager {
         let workspace_base = PathBuf::from(&config.workspace_path);
         std::fs::create_dir_all(&workspace_base)?;
 
-        let maple_api_key = config
-            .maple_api_key
+        let tinfoil_api_key = config
+            .tinfoil_api_key
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("MAPLE_API_KEY not set"))?;
+            .ok_or_else(|| anyhow::anyhow!("TINFOIL_API_KEY not set"))?;
 
         Ok(Self {
             database_url: config.database_url.clone(),
-            maple_api_url: config.maple_api_url.clone(),
-            maple_api_key,
-            maple_model: config.maple_model.clone(),
-            maple_embedding_model: config.maple_embedding_model.clone(),
+            tinfoil_api_url: config.tinfoil_api_url.clone(),
+            tinfoil_api_key,
+            tinfoil_model: config.tinfoil_model.clone(),
+            tinfoil_embedding_model: config.tinfoil_embedding_model.clone(),
             brave_api_key: config.brave_api_key.clone(),
             workspace_base,
             scheduler_db,
@@ -233,9 +233,9 @@ impl AgentManager {
         let memory_manager = MemoryManager::new(
             agent_id,
             &self.database_url,
-            &self.maple_api_url,
-            &self.maple_api_key,
-            &self.maple_embedding_model,
+            &self.tinfoil_api_url,
+            &self.tinfoil_api_key,
+            &self.tinfoil_embedding_model,
         )
         .await?;
 
@@ -282,8 +282,12 @@ impl AgentManager {
         tools.register(Arc::new(crate::DoneTool));
 
         // Configure LLM
-        SageAgent::configure_lm(&self.maple_api_url, &self.maple_api_key, &self.maple_model)
-            .await?;
+        SageAgent::configure_lm(
+            &self.tinfoil_api_url,
+            &self.tinfoil_api_key,
+            &self.tinfoil_model,
+        )
+        .await?;
 
         // Create agent
         let agent = SageAgent::new(tools, memory_manager);

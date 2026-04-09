@@ -14,7 +14,7 @@ default:
 build:
     podman build -f Dockerfile -t sage:latest .
 
-# Start all containers (postgres + messenger + sage)
+# Start all containers (postgres + messenger + tinfoil-proxy + sage)
 start:
     #!/usr/bin/env bash
     set -e
@@ -23,7 +23,15 @@ start:
     set +a
     
     MESSENGER="${MESSENGER:-signal}"
+    TINFOIL_PROXY_PORT="${TINFOIL_PROXY_PORT:-8089}"
+    TINFOIL_ROUTER_HOST="${TINFOIL_ROUTER_HOST:-inference.tinfoil.sh}"
+    TINFOIL_ROUTER_REPO="${TINFOIL_ROUTER_REPO:-tinfoilsh/confidential-model-router}"
     echo "Starting Sage stack (messenger: $MESSENGER)..."
+
+    if [ -z "${TINFOIL_API_KEY:-}" ]; then
+        echo "TINFOIL_API_KEY must be set in .env"
+        exit 1
+    fi
     
     # Start PostgreSQL if not running
     if ! podman ps --format '{{{{.Names}}}}' | grep -q '^sage-postgres$'; then
@@ -80,6 +88,18 @@ start:
         echo "Unknown MESSENGER=$MESSENGER (expected 'signal' or 'marmot')"
         exit 1
     fi
+
+    # Start local verified Tinfoil proxy if not running
+    if ! podman ps --format '{{{{.Names}}}}' | grep -q '^sage-tinfoil-proxy$'; then
+        echo "Starting Tinfoil proxy..."
+        podman run -d --name sage-tinfoil-proxy --network host \
+            -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
+            ghcr.io/tinfoilsh/tinfoil-cli:latest \
+            proxy -e "$TINFOIL_ROUTER_HOST" -r "$TINFOIL_ROUTER_REPO" -p "$TINFOIL_PROXY_PORT"
+        sleep 2
+    else
+        echo "Tinfoil proxy already running"
+    fi
     
     # Create workspace directory if it doesn't exist
     mkdir -p ~/.sage/workspace
@@ -91,10 +111,11 @@ start:
         -v ~/.sage/workspace:/workspace:U,z \
         $MESSENGER_VOLUMES \
         -e DATABASE_URL=postgres://sage:sage@localhost:5434/sage \
-        -e MAPLE_API_URL="$MAPLE_API_URL" \
-        -e MAPLE_API_KEY="$MAPLE_API_KEY" \
-        -e MAPLE_MODEL="$MAPLE_MODEL" \
-        -e MAPLE_EMBEDDING_MODEL="$MAPLE_EMBEDDING_MODEL" \
+        -e TINFOIL_API_URL="${TINFOIL_API_URL:-http://localhost:${TINFOIL_PROXY_PORT}/v1}" \
+        -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
+        -e TINFOIL_MODEL="${TINFOIL_MODEL:-kimi-k2-5}" \
+        -e TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}" \
+        -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-${TINFOIL_MODEL:-kimi-k2-5}}" \
         $MESSENGER_ENV \
         -e BRAVE_API_KEY="$BRAVE_API_KEY" \
         -e SAGE_WORKSPACE=/workspace \
@@ -112,6 +133,7 @@ start:
         echo "   - PostgreSQL: localhost:5434 (data: sage-pgdata volume)"
         echo "   - Marmot state: sage-marmot-state volume"
     fi
+    echo "   - Tinfoil proxy: localhost:${TINFOIL_PROXY_PORT}"
     echo "   - Sage: running"
     echo "   - Workspace: ~/.sage/workspace"
     echo ""
@@ -123,6 +145,7 @@ stop:
     #!/usr/bin/env bash
     echo "Stopping Sage stack..."
     podman rm -f sage 2>/dev/null || true
+    podman rm -f sage-tinfoil-proxy 2>/dev/null || true
     podman rm -f sage-signal-cli 2>/dev/null || true
     podman rm -f sage-postgres 2>/dev/null || true
     echo "Containers stopped. Data preserved in volumes (sage-pgdata, signal-cli-data, sage-marmot-state)."
@@ -135,6 +158,9 @@ restart:
     set +a
     
     MESSENGER="${MESSENGER:-signal}"
+    TINFOIL_PROXY_PORT="${TINFOIL_PROXY_PORT:-8089}"
+    TINFOIL_ROUTER_HOST="${TINFOIL_ROUTER_HOST:-inference.tinfoil.sh}"
+    TINFOIL_ROUTER_REPO="${TINFOIL_ROUTER_REPO:-tinfoilsh/confidential-model-router}"
     
     MESSENGER_VOLUMES=""
     MESSENGER_ENV=""
@@ -161,6 +187,19 @@ restart:
             -e MARMOT_ALLOWED_PUBKEYS=${MARMOT_ALLOWED_PUBKEYS:-} \
             -e MARMOT_AUTO_ACCEPT_WELCOMES=${MARMOT_AUTO_ACCEPT_WELCOMES:-true}"
     fi
+
+    if [ -z "${TINFOIL_API_KEY:-}" ]; then
+        echo "TINFOIL_API_KEY must be set in .env"
+        exit 1
+    fi
+
+    if ! podman ps --format '{{{{.Names}}}}' | grep -q '^sage-tinfoil-proxy$'; then
+        podman run -d --name sage-tinfoil-proxy --network host \
+            -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
+            ghcr.io/tinfoilsh/tinfoil-cli:latest \
+            proxy -e "$TINFOIL_ROUTER_HOST" -r "$TINFOIL_ROUTER_REPO" -p "$TINFOIL_PROXY_PORT"
+        sleep 2
+    fi
     
     mkdir -p ~/.sage/workspace
     podman rm -f sage 2>/dev/null || true
@@ -168,10 +207,11 @@ restart:
         -v ~/.sage/workspace:/workspace:U,z \
         $MESSENGER_VOLUMES \
         -e DATABASE_URL=postgres://sage:sage@localhost:5434/sage \
-        -e MAPLE_API_URL="$MAPLE_API_URL" \
-        -e MAPLE_API_KEY="$MAPLE_API_KEY" \
-        -e MAPLE_MODEL="$MAPLE_MODEL" \
-        -e MAPLE_EMBEDDING_MODEL="$MAPLE_EMBEDDING_MODEL" \
+        -e TINFOIL_API_URL="${TINFOIL_API_URL:-http://localhost:${TINFOIL_PROXY_PORT}/v1}" \
+        -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
+        -e TINFOIL_MODEL="${TINFOIL_MODEL:-kimi-k2-5}" \
+        -e TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}" \
+        -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-${TINFOIL_MODEL:-kimi-k2-5}}" \
         $MESSENGER_ENV \
         -e BRAVE_API_KEY="$BRAVE_API_KEY" \
         -e SAGE_WORKSPACE=/workspace \
@@ -189,6 +229,8 @@ logs-all:
     #!/usr/bin/env bash
     echo "=== PostgreSQL ===" && podman logs --tail 10 sage-postgres
     echo ""
+    echo "=== Tinfoil Proxy ===" && podman logs --tail 10 sage-tinfoil-proxy
+    echo ""
     echo "=== signal-cli ===" && podman logs --tail 10 sage-signal-cli
     echo ""
     echo "=== Sage ===" && podman logs -f sage
@@ -204,6 +246,38 @@ psql:
 # Shell into Sage container
 shell:
     podman exec -it sage bash
+
+# Start the local verified Tinfoil proxy only
+tinfoil-proxy-start:
+    #!/usr/bin/env bash
+    set -e
+    set -a
+    source .env
+    set +a
+
+    if [ -z "${TINFOIL_API_KEY:-}" ]; then
+        echo "TINFOIL_API_KEY must be set in .env"
+        exit 1
+    fi
+
+    TINFOIL_PROXY_PORT="${TINFOIL_PROXY_PORT:-8089}"
+    TINFOIL_ROUTER_HOST="${TINFOIL_ROUTER_HOST:-inference.tinfoil.sh}"
+    TINFOIL_ROUTER_REPO="${TINFOIL_ROUTER_REPO:-tinfoilsh/confidential-model-router}"
+
+    podman rm -f sage-tinfoil-proxy 2>/dev/null || true
+    podman run -d --name sage-tinfoil-proxy --network host \
+        -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
+        ghcr.io/tinfoilsh/tinfoil-cli:latest \
+        proxy -e "$TINFOIL_ROUTER_HOST" -r "$TINFOIL_ROUTER_REPO" -p "$TINFOIL_PROXY_PORT"
+    echo "Tinfoil proxy started on localhost:${TINFOIL_PROXY_PORT}"
+
+# Stop the local verified Tinfoil proxy
+tinfoil-proxy-stop:
+    podman rm -f sage-tinfoil-proxy 2>/dev/null || true
+
+# View Tinfoil proxy logs
+tinfoil-proxy-logs:
+    podman logs -f sage-tinfoil-proxy
 
 # =============================================================================
 # First-Time Setup
@@ -294,6 +368,10 @@ ci-check:
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-features
+
+# Run the isolated Tinfoil + pgvector smoke gate without Signal or Marmot
+smoke-tinfoil:
+    ./scripts/smoke_tinfoil.sh
 
 # =============================================================================
 # GEPA Prompt Optimization

@@ -16,7 +16,7 @@ This roadmap builds incrementally. Each phase results in something testable.
 
 - [x] Architecture documentation
 - [x] NixOS flake for development
-- [x] Maple proxy connectivity (Kimi K2)
+- [x] Tinfoil proxy connectivity (Kimi K2.5)
 - [x] Basic LLM completion working
 
 ---

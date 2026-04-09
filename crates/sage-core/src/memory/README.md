@@ -52,7 +52,7 @@ This module implements a 4-tier memory architecture inspired by Letta/MemGPT, ad
 ### 3. Archival Memory (Long-term Semantic)
 - **What**: Agent-created long-term memories with embeddings
 - **Storage**: PostgreSQL `passages` table with pgvector
-- **Embedding model**: `maple/nomic-embed-text`
+- **Embedding model**: `nomic-embed-text`
 - **Agent tools**: `archival_insert`, `archival_search`
 
 ### 4. Summary Memory (Compaction)
@@ -80,7 +80,7 @@ This module implements a 4-tier memory architecture inspired by Letta/MemGPT, ad
 |----------|-------|-----------|
 | Context window | 256k tokens | Kimi K2 limit |
 | Token counting | tiktoken | Standard, accurate |
-| Embedding provider | maple/nomic-embed-text | Available via Maple proxy |
+| Embedding provider | nomic-embed-text | Available via Tinfoil proxy |
 | Vector storage | pgvector | Simpler (in PostgreSQL) |
 | LLM operations | DSRs signatures | Enables GEPA optimization |
 | No line numbers | Standard XML format | We're not Anthropic-only |

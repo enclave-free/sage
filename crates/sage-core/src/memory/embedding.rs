@@ -1,12 +1,12 @@
 //! Embedding Service
 //!
 //! Shared embedding generation for all memory tiers.
-//! Uses Maple API with nomic-embed-text model (768 dimensions).
+//! Uses a Tinfoil/OpenAI-compatible embeddings API with nomic-embed-text
+//! output (768 dimensions).
 
 #![allow(dead_code)]
 
-use anyhow::Result;
-use tracing::warn;
+use anyhow::{Context, Result};
 
 /// Embedding dimension for nomic-embed-text
 pub const EMBEDDING_DIM: usize = 768;
@@ -43,36 +43,41 @@ impl EmbeddingService {
                 "encoding_format": "float"  // Important: avoid base64 encoding issues
             }))
             .send()
-            .await;
+            .await
+            .context("Failed to call embeddings API")?;
 
-        match response {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    let json: serde_json::Value = resp.json().await?;
-                    if let Some(embedding) = json["data"][0]["embedding"].as_array() {
-                        let vec: Vec<f32> = embedding
-                            .iter()
-                            .filter_map(|v| v.as_f64().map(|f| f as f32))
-                            .collect();
-
-                        if vec.len() == EMBEDDING_DIM {
-                            return Ok(vec);
-                        }
-                        warn!(
-                            "Unexpected embedding dimension: {} (expected {})",
-                            vec.len(),
-                            EMBEDDING_DIM
-                        );
-                    }
-                }
-                warn!("Embedding API returned non-success status");
-                Ok(zero_embedding())
-            }
-            Err(e) => {
-                warn!("Failed to generate embedding: {}", e);
-                Ok(zero_embedding())
-            }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Embeddings API returned {}: {}", status, body);
         }
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse embeddings API response")?;
+        let embedding = json["data"][0]["embedding"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Embeddings API response missing data[0].embedding"))?;
+
+        let vec: Vec<f32> = embedding
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| anyhow::anyhow!("Embeddings API returned non-float value"))
+            })
+            .collect::<Result<_>>()?;
+
+        if vec.len() != EMBEDDING_DIM {
+            anyhow::bail!(
+                "Unexpected embedding dimension: {} (expected {})",
+                vec.len(),
+                EMBEDDING_DIM
+            );
+        }
+
+        Ok(vec)
     }
 
     /// Generate embeddings for multiple texts (batched)
@@ -91,43 +96,58 @@ impl EmbeddingService {
                 "encoding_format": "float"
             }))
             .send()
-            .await;
+            .await
+            .context("Failed to call batch embeddings API")?;
 
-        match response {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    let json: serde_json::Value = resp.json().await?;
-                    if let Some(data) = json["data"].as_array() {
-                        let embeddings: Vec<Vec<f32>> = data
-                            .iter()
-                            .filter_map(|item| {
-                                item["embedding"].as_array().map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_f64().map(|f| f as f32))
-                                        .collect()
-                                })
-                            })
-                            .collect();
-
-                        if embeddings.len() == texts.len() {
-                            return Ok(embeddings);
-                        }
-                    }
-                }
-                warn!("Batch embedding API call failed, using zero embeddings");
-                Ok(texts.iter().map(|_| zero_embedding()).collect())
-            }
-            Err(e) => {
-                warn!("Failed to generate batch embeddings: {}", e);
-                Ok(texts.iter().map(|_| zero_embedding()).collect())
-            }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Batch embeddings API returned {}: {}", status, body);
         }
-    }
-}
 
-/// Return a zero embedding (fallback when API fails)
-fn zero_embedding() -> Vec<f32> {
-    vec![0.0; EMBEDDING_DIM]
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse batch embeddings API response")?;
+        let data = json["data"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Batch embeddings API response missing data array"))?;
+
+        if data.len() != texts.len() {
+            anyhow::bail!(
+                "Batch embeddings API returned {} embeddings for {} texts",
+                data.len(),
+                texts.len()
+            );
+        }
+
+        data.iter()
+            .map(|item| {
+                let embedding = item["embedding"].as_array().ok_or_else(|| {
+                    anyhow::anyhow!("Batch embeddings API item missing embedding")
+                })?;
+
+                let vec: Vec<f32> = embedding
+                    .iter()
+                    .map(|v| {
+                        v.as_f64().map(|f| f as f32).ok_or_else(|| {
+                            anyhow::anyhow!("Batch embeddings API returned non-float value")
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+
+                if vec.len() != EMBEDDING_DIM {
+                    anyhow::bail!(
+                        "Unexpected embedding dimension: {} (expected {})",
+                        vec.len(),
+                        EMBEDDING_DIM
+                    );
+                }
+
+                Ok(vec)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -135,9 +155,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_zero_embedding() {
-        let emb = zero_embedding();
-        assert_eq!(emb.len(), EMBEDDING_DIM);
-        assert!(emb.iter().all(|&x| x == 0.0));
+    fn embedding_dimension_is_expected() {
+        assert_eq!(EMBEDDING_DIM, 768);
     }
 }

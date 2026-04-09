@@ -2,413 +2,422 @@
 
 ## Project Overview
 
-Sage is a privacy-first personal AI agent with persistent memory, built in Rust. It communicates via Signal (E2E encrypted), runs LLM inference in TEEs (Trusted Execution Environments) via Maple, and stores all data locally in PostgreSQL with pgvector. The agent uses a 4-tier memory architecture inspired by Letta/MemGPT and typed DSRs signatures instead of native LLM tool calling.
+Sage is a privacy-first personal AI agent built in Rust. It stores data locally in PostgreSQL with pgvector, uses a 4-tier memory architecture inspired by Letta/MemGPT, communicates over Signal or Marmot, and runs inference through a local verified Tinfoil proxy instead of provider-native tool calling.
+
+The core design constraints are:
+
+- Local-first state and memory
+- Typed DSR signatures instead of provider-native function calling
+- Multi-user isolation by `agent_id`
+- A messenger abstraction that can target Signal or Marmot
+- TEE-backed inference via Tinfoil's hosted router behind the local proxy
 
 ## Repository Structure
 
-```
+```text
 sage/
-├── Cargo.toml                  # Workspace root (resolver = "2")
+├── Cargo.toml
 ├── Cargo.lock
-├── rust-toolchain.toml         # Stable toolchain with rustfmt, clippy, rust-src
-├── Dockerfile                  # Multi-stage build (cargo-chef + debian:bookworm-slim)
-├── docker-compose.yml          # Full stack: postgres, signal-cli, sage
-├── flake.nix                   # Nix dev shell (provides podman, diesel-cli, signal-cli, etc.)
-├── flake.lock
-├── justfile                    # Task runner (all build/deploy/dev commands)
-├── .env.example                # Environment variable template
-├── .github/
-│   └── workflows/
-│       ├── ci.yml              # Check, test, fmt, clippy (on push/PR to master)
-│       ├── release.yml         # Build binaries on tag push (v*)
-│       └── docker-publish.yml  # Build + push multi-arch images to ghcr.io
+├── rust-toolchain.toml
+├── Dockerfile
+├── docker-compose.yml
+├── flake.nix
+├── justfile
+├── .env.example
 ├── .githooks/
-│   └── pre-commit              # Runs fmt, clippy, test before commit
+├── docs/
 ├── examples/
 │   └── gepa/
-│       ├── trainset.json       # GEPA training examples
-│       └── valset.json         # GEPA validation examples
-├── optimized_instructions/     # GEPA-optimized agent instructions
-├── docs/                       # Design docs, architecture notes, prompt examples
+├── optimized_instructions/
+├── scripts/
+│   └── smoke_tinfoil.sh
 └── crates/
-    ├── sage-core/              # Main application crate
-    │   ├── Cargo.toml
-    │   ├── migrations/         # Diesel PostgreSQL migrations (11 total)
-    │   ├── src/
-    │   │   ├── main.rs         # Entry point: tokio runtime, event loop, Signal listener
-    │   │   ├── lib.rs          # Public API re-exports
-    │   │   ├── config.rs       # Config struct from environment variables
-    │   │   ├── sage_agent.rs   # Core agent: DSRs signatures, tool registry, step loop
-    │   │   ├── agent_manager.rs# Multi-user agent management with isolated memory
-    │   │   ├── signal.rs       # Signal JSON-RPC client (TCP + subprocess modes)
-    │   │   ├── tools.rs        # DoneTool, WebSearchTool implementations
-    │   │   ├── shell_tool.rs   # Shell command execution with safety checks
-    │   │   ├── vision.rs       # Image description via vision LLM pre-processing
-    │   │   ├── scheduler.rs    # Cron + one-off task scheduling (PostgreSQL-backed)
-    │   │   ├── scheduler_tools.rs # schedule_task, list_schedules, cancel_schedule tools
-    │   │   ├── storage.rs      # Basic Diesel message storage
-    │   │   ├── schema.rs       # Diesel schema (agents, blocks, messages, passages, summaries, etc.)
-    │   │   ├── memory/
-    │   │   │   ├── mod.rs      # MemoryManager: coordinates all 4 memory tiers
-    │   │   │   ├── block.rs    # Core memory blocks (persona, human) - always in context
-    │   │   │   ├── recall_new.rs   # Recall memory: conversation history with embeddings
-    │   │   │   ├── archival_new.rs # Archival memory: long-term semantic storage (pgvector)
-    │   │   │   ├── compaction.rs   # Summary/compaction when context window fills
-    │   │   │   ├── context.rs  # Context window management and token estimation
-    │   │   │   ├── db.rs       # Database operations for all memory tiers
-    │   │   │   ├── embedding.rs# Embedding service (Maple TEE nomic-embed-text)
-    │   │   │   └── tools.rs    # Memory manipulation tools for the agent
-    │   │   └── bin/
-    │   │       └── gepa_optimize.rs # GEPA prompt optimization CLI (~700 lines)
-    └── sage-tools/             # External tool integrations
-        ├── Cargo.toml
+    ├── sage-core/
+    │   ├── migrations/
+    │   └── src/
+    │       ├── main.rs
+    │       ├── lib.rs
+    │       ├── config.rs
+    │       ├── agent_manager.rs
+    │       ├── sage_agent.rs
+    │       ├── messenger.rs
+    │       ├── signal.rs
+    │       ├── marmot.rs
+    │       ├── tools.rs
+    │       ├── shell_tool.rs
+    │       ├── scheduler.rs
+    │       ├── scheduler_tools.rs
+    │       ├── storage.rs
+    │       ├── schema.rs
+    │       ├── vision.rs
+    │       ├── memory/
+    │       └── bin/
+    │           └── gepa_optimize.rs
+    └── sage-tools/
         └── src/
-            ├── lib.rs          # ToolResult type, re-exports
-            ├── brave.rs        # Brave Search API client (Pro) (~740 lines)
-            └── web_search.rs   # WebSearch tool wrapper
+            ├── lib.rs
+            ├── brave.rs
+            └── web_search.rs
 ```
+
+Key directories:
+
+- `crates/sage-core/`: main application crate
+- `crates/sage-tools/`: external tool integrations
+- `crates/sage-core/migrations/`: Diesel migrations
+- `docs/`: architecture and product notes
+- `examples/gepa/`: GEPA training and validation inputs
+- `optimized_instructions/`: optimized agent prompts
+- `scripts/smoke_tinfoil.sh`: isolated pre-push Tinfoil + pgvector smoke gate
 
 ## Development Environment
 
-### Prerequisites
+### Preferred Setup
 
-- [Nix](https://nixos.org/download.html) with flakes enabled (provides the full dev environment)
-- Alternatively: Rust stable toolchain, podman/docker, diesel-cli, PostgreSQL, signal-cli
+Prefer `nix develop` when possible. The Nix shell provides the Rust toolchain, PostgreSQL helpers, container tools, `just`, and other repo dependencies in one place.
 
-### Nix Dev Shell
+If not using Nix, install at least:
 
-The project uses a Nix flake for reproducible development. The flake provides:
-- Rust stable toolchain (rustc, cargo, clippy, rustfmt, rust-analyzer)
-- Podman + container tools (Linux only: conmon, slirp4netns, fuse-overlayfs)
-- PostgreSQL with pgvector extension
-- diesel-cli for database migrations
-- signal-cli (standalone ARM64 binary on aarch64-linux, nixpkgs elsewhere)
-- jq, just, valkey
-
-```bash
-# Enter the dev shell
-nix develop
-
-# Or run a single command inside the shell
-nix develop --command just build
-```
-
-On Linux, the shell hook aliases `docker` to `podman` and configures container policy/runtime automatically.
+- Rust stable toolchain
+- Podman or Docker
+- PostgreSQL tooling / `libpq`
+- `signal-cli` for Signal work
+- `just`
 
 ### Environment Variables
 
-Copy `.env.example` to `.env` and configure:
+Copy `.env.example` to `.env` and configure the values you need.
+
+Important runtime variables:
 
 ```bash
-# Required
-MAPLE_API_URL=https://your-llm-endpoint.com
-MAPLE_API_KEY=your-api-key
-MAPLE_MODEL=maple/kimi-k2-5
-MAPLE_EMBEDDING_MODEL=maple/nomic-embed-text
+# Tinfoil / inference
+TINFOIL_API_URL=http://localhost:8089/v1
+TINFOIL_API_KEY=your-api-key
+TINFOIL_MODEL=kimi-k2-5
+TINFOIL_EMBEDDING_MODEL=nomic-embed-text
+TINFOIL_VISION_MODEL=kimi-k2-5
+TINFOIL_PROXY_PORT=8089
+TINFOIL_ROUTER_HOST=inference.tinfoil.sh
+TINFOIL_ROUTER_REPO=tinfoilsh/confidential-model-router
+
+# Messenger selection
+MESSENGER=signal   # or marmot
+
+# Signal
 SIGNAL_PHONE_NUMBER=+1234567890
+SIGNAL_ALLOWED_USERS=uuid1,uuid2
+SIGNAL_CLI_HOST=localhost
+SIGNAL_CLI_PORT=7583
+
+# Marmot
+MARMOT_RELAYS=wss://relay.example
+MARMOT_STATE_DIR=/data/marmot-state
+MARMOT_ALLOWED_PUBKEYS=npub1...,hexpubkey,...
+MARMOT_AUTO_ACCEPT_WELCOMES=true
+
+# Database
 DATABASE_URL=postgres://sage:sage@localhost:5434/sage
 
-# Optional
-MAPLE_VISION_MODEL=maple/kimi-k2-5   # Defaults to MAPLE_MODEL
-SIGNAL_ALLOWED_USERS=uuid1,uuid2     # Or * for all
-BRAVE_API_KEY=your-brave-key          # Enables web_search tool
-ANTHROPIC_API_KEY=your-key            # For GEPA optimization (Claude as judge)
-RUST_LOG=info                         # Logging level
-HEALTH_PORT=8080                      # Health check HTTP port
-SAGE_WORKSPACE=/workspace             # Shell tool working directory
+# Optional tools and tuning
+BRAVE_API_KEY=
+ANTHROPIC_API_KEY=
+RUST_LOG=info
+HEALTH_PORT=8080
+SAGE_WORKSPACE=/workspace
 ```
+
+Notes:
+
+- Local default inference target is `http://localhost:8089/v1`.
+- Compose uses `http://tinfoil-proxy:8089/v1` internally.
+- `TINFOIL_API_KEY` is still passed to Sage for now, even though the long-term trust boundary is "Sage -> local proxy -> Tinfoil router".
 
 ## Build and Run
 
-### Container Build (Primary Method)
+### Primary Workflow: `just`
 
-All container commands use `podman` and must be run inside the Nix dev shell:
+Container and dev tasks are exposed in `justfile`.
 
 ```bash
-# Enter nix shell first
-nix develop
-
-# Build the Docker image (multi-stage: cargo-chef for caching)
 just build
-# Equivalent to: podman build -f Dockerfile -t sage:latest .
-
-# Start full stack (postgres + signal-cli + sage)
 just start
-
-# Restart only the sage container (keeps postgres/signal-cli running)
 just restart
-
-# Stop all containers (data volumes preserved)
 just stop
-
-# View logs
-just logs        # Sage only
-just logs-all    # All containers
-
-# Check status
+just logs
+just logs-all
 just status
-
-# Shell into container
 just shell
-
-# Connect to PostgreSQL
 just psql
 ```
 
-The Dockerfile uses a 4-stage build:
-1. **chef** - Installs cargo-chef on rust:1.83-bookworm with nightly toolchain
-2. **planner** - Analyzes dependencies and creates recipe.json
-3. **builder** - Builds dependencies (cached layer), then builds source
-4. **runtime** - debian:bookworm-slim with comprehensive CLI toolset (python3, node, git, ripgrep, etc.)
+Useful variants:
 
-### Local Development (Without Containers)
-
-```bash
-nix develop
-
-# Start local PostgreSQL (port 5434, avoids conflicts with 5432/5433)
-sage-pg-start
-
-# Build locally
-just build-local    # cargo build --release
-just check          # cargo check
-
-# Run locally (uses signal-cli subprocess mode)
-just run            # cargo run --release
-just run-debug      # RUST_LOG=debug cargo run --release
-
-# Stop local PostgreSQL
-sage-pg-stop
-```
-
-### Database
-
-PostgreSQL with pgvector is used for all storage. Migrations are in `crates/sage-core/migrations/` and run automatically on startup via `diesel_migrations::embed_migrations!()`.
-
-For manual migration management:
-```bash
-# Inside nix develop shell
-diesel migration run --database-url postgres://sage:sage@localhost:5434/sage
-diesel migration revert --database-url postgres://sage:sage@localhost:5434/sage
-```
+- `MESSENGER=marmot just start`
+- `just tinfoil-proxy-start`
+- `just tinfoil-proxy-stop`
+- `just tinfoil-proxy-logs`
+- `just signal-init`
+- `just smoke-tinfoil`
 
 ### Docker Compose
 
-`docker-compose.yml` defines the full stack with health checks and proper service ordering:
-- `postgres` - pgvector/pgvector:pg17 on port 5434
-- `signal-cli` - JRE image with TCP JSON-RPC daemon on port 7583
-- `signal-cli-perms` - One-shot init to fix attachment permissions
-- `sage` - The agent, depends on healthy postgres + signal-cli
+`docker-compose.yml` defines the full stack:
 
-First-time setup requires `just signal-init` to copy local signal-cli registration data into a Docker volume.
+- `postgres`
+- `signal-cli`
+- `signal-cli-perms`
+- `tinfoil-proxy`
+- `sage`
 
-## Testing and CI
+Use it when you want the full compose topology rather than the host-network Podman workflow in `justfile`.
 
-### Running Tests
+### Local Rust Development
 
 ```bash
-# Run all tests
-just test           # cargo test
-cargo test --all-features
-
-# Run specific test
-cargo test test_name
-
-# CI-equivalent full check
+just build-local
+just run
+just run-debug
+just check
+just test
+just fmt
+just lint
 just ci-check
-# Runs: cargo fmt --all -- --check
-#        cargo clippy --all-targets --all-features -- -D warnings
-#        cargo test --all-features
 ```
 
-### Pre-commit Hook
+## Testing and Verification
 
-Set up with `just setup-hooks` (configures `git config core.hooksPath .githooks`). The hook runs:
-1. `cargo fmt --all -- --check`
-2. `cargo clippy --all-targets --all-features -- -D warnings`
-3. `cargo test --all-features`
+### Core Checks
 
-### CI Workflows (GitHub Actions)
-
-- **ci.yml** - Runs on push/PR to master: check, test, fmt, clippy (4 parallel jobs)
-- **docker-publish.yml** - Builds multi-arch images (linux/amd64, linux/arm64) and pushes to `ghcr.io/anthonyronning/sage`
-- **release.yml** - On tag push (v*): builds binaries for linux-x86_64, linux-aarch64, macos-aarch64 and creates GitHub release
-
-### GEPA Prompt Optimization
+Use these before pushing:
 
 ```bash
-# Evaluate current instruction (baseline score)
-just gepa-eval
-
-# Run optimization loop (requires ANTHROPIC_API_KEY)
-just gepa-optimize
-
-# View optimized instruction
-just gepa-show
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
 ```
 
-GEPA uses Claude as the judge and Kimi as the program under test. Training data is in `examples/gepa/trainset.json`.
+`just ci-check` runs the equivalent repo gate.
+
+### Smoke Testing
+
+`just smoke-tinfoil` runs the isolated messenger-free smoke gate. It validates:
+
+- containerized `cargo check`, `cargo test`, and `cargo clippy`
+- direct proxy chat completions
+- embeddings shape and connectivity
+- vision/image path
+- invalid-model rejection
+- recall-memory `NULL -> embedded -> searchable`
+- archival pgvector search
+
+This smoke test intentionally excludes Signal and Marmot delivery. It is a data-plane and inference-plane gate.
+
+### Git Hooks
+
+`just setup-hooks` configures `.githooks/pre-commit`, which runs repo checks before commit.
 
 ## Architecture and Design Patterns
 
-### No Native Tool Calling
+### No Provider-Native Tool Calling
 
-The agent does NOT use LLM provider function calling APIs. Instead it uses DSRs (dspy-rs) with BAML parsing. The LLM outputs structured text with field markers (`[[ ## field ## ]]`) that gets parsed into typed Rust structs. This works identically across all providers.
+Sage does not use provider-native function calling. The agent uses DSRs and BAML-style parsing, so structured agent output is provider-agnostic and expressed through typed Rust signatures.
 
-### DSRs Signatures
+### Tinfoil Proxy Architecture
 
-All LLM interactions are defined as typed signatures in `sage_agent.rs`:
+Sage talks to a local verified Tinfoil proxy over OpenAI-compatible HTTP:
 
-- **`AgentResponse`** - Main agent signature with 9 input fields and 2 output fields (messages, tool_calls)
-- **`CorrectionResponse`** - Self-healing: fixes malformed LLM outputs
-- **`SummarizeConversation`** - Compacts old messages when context window fills (in `memory/compaction.rs`)
+- chat: `/chat/completions`
+- embeddings: `/embeddings`
+- vision preprocessing: `/chat/completions` with image content
 
-The `AGENT_INSTRUCTION` constant contains the full system prompt (~4KB). It was optimized by GEPA (Gen 3, score 0.967).
+Current target architecture:
 
-### Agent Step Loop
+- Sage -> local Tinfoil proxy
+- proxy -> `inference.tinfoil.sh`
+- router repo -> `tinfoilsh/confidential-model-router`
 
-`SageAgent::step()` implements a multi-step agentic loop (max 10 steps per message):
-1. Build context from database (memory blocks, conversation history, summaries)
-2. Call LLM via DSRs `Predict` with retry logic (3 attempts, correction agent on parse errors)
-3. Execute tool calls, inject results for next step
-4. Return messages + done flag
+This keeps Sage simple while still benefiting from the Tinfoil verification path.
 
-The main event loop in `main.rs` orchestrates: Signal message reception -> agent processing -> Signal response sending, with async embedding updates and tool result storage.
+### Agent Loop
 
-### Memory System (4-Tier)
+`SageAgent::step()` is the core loop:
+
+1. Build context from memory blocks, recall, archival results, and summaries
+2. Run the typed DSR signature
+3. Execute requested tools
+4. Feed tool results back into the next step until done or step limit
+
+The main event loop in `main.rs` handles message intake, memory updates, tool execution, and messenger replies.
+
+### DSR Signatures
+
+Primary signatures live in `sage_agent.rs`, including the main agent response and correction/self-healing paths. If you change output structure or tool usage conventions, update both the signatures and the supporting examples/eval inputs.
+
+### Memory System
+
+Sage uses four coordinated memory tiers:
 
 | Tier | Module | Storage | Purpose |
 |------|--------|---------|---------|
-| Core | `memory/block.rs` | `blocks` table | Always-in-context persona/human info |
-| Recall | `memory/recall_new.rs` | `messages` table + embeddings | Searchable conversation history |
-| Archival | `memory/archival_new.rs` | `passages` table + pgvector | Long-term semantic storage |
-| Summary | `memory/compaction.rs` | `summaries` table | Auto-compaction at 80% of 100k token window |
+| Core | `memory/block.rs` | `blocks` | persona / human memory always in context |
+| Recall | `memory/recall_new.rs` | `messages` + embeddings | conversation history and semantic recall |
+| Archival | `memory/archival_new.rs` | `passages` + pgvector | long-term semantic storage |
+| Summary | `memory/compaction.rs` | `summaries` | compacted historical context |
 
-Embeddings are generated via Maple TEE (nomic-embed-text). Messages are stored synchronously (fast), embeddings updated asynchronously in background.
+Important current behavior:
+
+- Messages are inserted synchronously for durability.
+- Pending message embeddings start as `NULL`, not zero vectors.
+- Background embedding fill updates the row later.
+- Semantic recall only begins after real embeddings exist.
 
 ### Multi-User Isolation
 
-`AgentManager` creates isolated agents per Signal user/group:
-- Each gets a unique `agent_id` (UUID) stored in `chat_contexts` table
-- Separate memory blocks, conversation history, archival storage, preferences, scheduled tasks
-- Separate workspace directory under `SAGE_WORKSPACE/<agent_id>/`
-- Agents are cached in-memory after first creation
+`AgentManager` isolates state per agent/user:
 
-### Signal Interface
+- unique `agent_id` per chat context
+- isolated memory and preferences
+- isolated scheduled tasks
+- isolated workspace under `SAGE_WORKSPACE/<agent_id>/`
 
-`signal.rs` supports two modes:
-- **TCP mode** (production): Connects to signal-cli daemon in separate container via JSON-RPC over TCP. Includes keepalive (30s interval), auto-reconnect with exponential backoff, 24h session rotation.
-- **Subprocess mode** (development): Spawns signal-cli as a child process.
+Do not introduce shortcuts that let one agent read or mutate another agent's memory or workspace.
 
-### Tool System
+### Messenger Abstraction
 
-Tools implement the `Tool` trait (`sage_agent.rs`):
-```rust
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn name(&self) -> &str;
-    fn description(&self) -> &str;
-    fn args_schema(&self) -> &str;
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult>;
-}
-```
+Sage supports two messenger backends:
 
-Tools are registered in `ToolRegistry` (BTreeMap for deterministic ordering). The single source of truth for all tool descriptions is `ToolRegistry::all_tools_description_only()` in `sage_agent.rs`.
+- `Signal`: production-oriented JSON-RPC via `signal-cli`
+- `Marmot`: MLS-over-Nostr workflow via `marmotd`
 
-Available tools: `memory_replace`, `memory_append`, `memory_insert`, `conversation_search`, `archival_insert`, `archival_search`, `set_preference`, `schedule_task`, `list_schedules`, `cancel_schedule`, `shell`, `web_search`, `done`.
+`Config::from_env()` selects the backend with `MESSENGER`, defaulting to `signal`.
 
 ### Vision Pipeline
 
-Image attachments from Signal are pre-processed by a vision-capable LLM (`vision.rs`). The description is injected as text alongside the user's message (e.g., `[Uploaded Image: <description>]`). Recent conversation context (last 6 messages) is provided to the vision model for relevance.
+Image attachments are preprocessed by a vision-capable model in `vision.rs`, and the resulting description is injected into the text context the agent sees. Keep this path aligned with the configured `TINFOIL_VISION_MODEL`.
+
+### Scheduler
+
+Scheduled tasks live in PostgreSQL and are exposed through scheduler tools such as:
+
+- `schedule_task`
+- `list_schedules`
+- `cancel_schedule`
+
+If you change scheduling semantics, update the DB layer, tool layer, and any user-facing descriptions together.
+
+## Tooling Conventions
+
+Tools implement the shared trait in `sage_agent.rs` and are registered through the agent/tool registry flow. The descriptions shown to the model must stay aligned with the actual registered implementations.
+
+Current major tool areas include:
+
+- memory editing and search
+- archival insert/search
+- preferences
+- scheduling
+- shell execution
+- web search
+- `done`
+
+When adding a new tool:
+
+1. Implement the tool
+2. Register it in agent creation / registry wiring
+3. Update model-facing descriptions
+4. Add or update GEPA examples if the new behavior matters for prompting
+
+## Database and Migrations
+
+PostgreSQL with pgvector backs all persistent storage.
+
+Conventions:
+
+- UUID primary keys for most entities
+- pgvector for embeddings
+- raw SQL where Diesel support is awkward
+- schema and migrations must stay in sync
+
+When touching migrations:
+
+- update related schema expectations
+- verify fresh-database behavior, not just upgraded databases
+- keep docs in sync if the operational contract changes
 
 ## Coding Conventions
 
-### Rust Style
+### Rust
 
-- Edition 2021, stable toolchain
-- Workspace-level dependency management in root `Cargo.toml`
-- `#[allow(dead_code)]` used liberally on structs/methods that are public API but not yet called everywhere
-- Error handling: `anyhow::Result` for application code, `thiserror` for library errors (`sage-tools`)
-- Async runtime: Tokio with `features = ["full"]`
-- Database: Diesel 2.2 with PostgreSQL, raw SQL for pgvector operations
-- Logging: `tracing` crate with `tracing-subscriber` env filter
-- All tool args are `HashMap<String, String>` (string-typed for LLM compatibility)
+- Edition 2021
+- `anyhow::Result` in app code
+- `thiserror` where typed library errors help
+- Tokio async runtime
+- `tracing` for logging
+- string-typed tool arguments for LLM compatibility
 
-### Module Organization
+### Organization
 
-- One file per major concern (signal, vision, scheduler, shell_tool, etc.)
-- Memory system is the only subdirectory module (`memory/`)
-- `sage-tools` crate is kept minimal (only Brave Search currently)
-- `sage-core` contains everything else including binaries (`sage`, `gepa-optimize`)
+- `sage-core` contains the application and binaries
+- `sage-tools` is intentionally narrower and focused on external integrations
+- `memory/` is the main subsystem directory with multiple focused modules
 
-### Database Conventions
+### Prompt and Tool Changes
 
-- All tables use UUID primary keys (`uuid::Uuid`)
-- Timestamps are `DateTime<Utc>` (stored as `timestamptz`)
-- `sequence_id` on messages is auto-incrementing `BIGSERIAL` for ordering
-- Embeddings stored as `vector` type via pgvector, managed through raw SQL
-- Schema defined in `schema.rs` (auto-generated by Diesel CLI with manual pgvector adjustments)
+If you materially change `AGENT_INSTRUCTION`, tool semantics, or output structure:
 
-### Testing
-
-- Unit tests are in-file (`#[cfg(test)]` modules)
-- Tests that require database connections should be integration tests
-- Current test coverage is minimal (tool registry, cron parsing, datetime parsing)
-- No mocking framework in use; tests are mostly for pure functions
+1. Run `just gepa-eval`
+2. Consider `just gepa-optimize`
+3. Update examples/eval inputs if needed
 
 ## Security Considerations
 
 - Never commit `.env` files or API keys
-- The shell tool (`shell_tool.rs`) blocks dangerous patterns: `rm -rf /`, fork bombs, `mkfs`, `shutdown`, etc.
-- Shell output is capped at 100KB, timeout at 300s max
-- Signal allowed users should be configured (`SIGNAL_ALLOWED_USERS`) to prevent unauthorized access
-- All LLM inference and embedding generation happens in TEE via Maple
-- Database credentials are local-only (sage:sage for development)
+- Treat Signal allowlists and Marmot allowlists as security-sensitive
+- Treat shell tool restrictions as security-sensitive
+- Tinfoil and proxy configuration are part of the trust boundary
+- Database data is private user memory; do not casually expose or export it
 
-## Key Dependencies
-
-| Crate | Purpose |
-|-------|---------|
-| `dspy-rs` | DSPy in Rust - typed signatures, BAML parsing (git dependency) |
-| `baml-bridge` | BAML derive macros for tool call types (git dependency) |
-| `diesel` | PostgreSQL ORM with migrations |
-| `pgvector` | Vector similarity search in PostgreSQL |
-| `tokio` | Async runtime |
-| `axum` | HTTP server (health check endpoint) |
-| `reqwest` | HTTP client (LLM API, Brave Search, embeddings) |
-| `chrono` / `chrono-tz` | Time handling with timezone support |
-| `cron` | Cron expression parsing for scheduler |
-| `socket2` | TCP keepalive configuration for Signal |
-| `serde` / `serde_json` | Serialization throughout |
-| `tracing` | Structured logging |
-| `anyhow` / `thiserror` | Error handling |
-
-Note: `dspy-rs` and `baml-bridge` are git dependencies from `https://github.com/krypticmouse/DSRs.git`.
+The shell tool is explicitly sensitive and must retain its guardrails around destructive or dangerous commands.
 
 ## Common Tasks
 
-### Adding a New Tool
-
-1. Implement the `Tool` trait (in a new file or existing module)
-2. Register it in `AgentManager::create_agent()` (`agent_manager.rs`)
-3. Add a description-only entry in `ToolRegistry::all_tools_description_only()` (`sage_agent.rs`)
-4. Add training examples in `examples/gepa/trainset.json` if needed
-
-### Adding a Database Migration
+### Add a Migration
 
 ```bash
-nix develop
-diesel migration generate migration_name --database-url postgres://sage:sage@localhost:5434/sage
-# Edit the generated up.sql and down.sql
-# Update schema.rs if needed (diesel print-schema)
+diesel migration generate your_migration_name --database-url postgres://sage:sage@localhost:5434/sage
 ```
 
-### Modifying the Agent Instruction
+Then edit `up.sql` / `down.sql`, validate the schema impact, and test both fresh and incremental paths when relevant.
 
-The instruction is in `AGENT_INSTRUCTION` constant in `sage_agent.rs`. After changes:
-1. Run `just gepa-eval` to check baseline score
-2. Consider running `just gepa-optimize` to auto-improve
+### Add a Tool
 
-### Adding a New Memory Tier or Tool Category
+Implement the tool, register it, expose the correct model-facing description, and update any prompt examples that depend on the new capability.
 
-Follow the pattern in `memory/` - each tier has its own module with a manager struct, and tools are in `memory/tools.rs`. Register tools via `MemoryManager::tools()`.
+### Work on Prompts
+
+The primary agent instruction lives in `sage_agent.rs`. Prompt work should be evaluated, not just edited.
+
+### Smoke-Test Direct Tinfoil
+
+Run:
+
+```bash
+just smoke-tinfoil
+```
+
+Use this before pushing changes that affect:
+
+- Tinfoil config
+- proxy wiring
+- embeddings
+- vision
+- memory recall / archival behavior
+- migrations
+
+## Workflow
+
+- Prefer `nix develop` for a consistent environment.
+- Use the existing `just` and compose workflows instead of inventing new ad hoc startup flows.
+- Update docs when operational behavior changes.
+- Keep migration behavior, schema expectations, and runtime code aligned.
+- Unless instructed otherwise, attempt to run the CodeRabbit CLI on unstaged changes before committing and pushing.

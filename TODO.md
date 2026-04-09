@@ -83,10 +83,10 @@ just stop           # Stop containers
 
 | Variable | Purpose |
 |----------|---------|
-| `MAPLE_API_URL` | LLM endpoint |
-| `MAPLE_API_KEY` | API key |
-| `MAPLE_MODEL` | Model name (kimi-k2-5) |
-| `MAPLE_EMBEDDING_MODEL` | Embedding model |
+| `TINFOIL_API_URL` | Local verified proxy endpoint |
+| `TINFOIL_API_KEY` | API key |
+| `TINFOIL_MODEL` | Model name (`kimi-k2-5`) |
+| `TINFOIL_EMBEDDING_MODEL` | Embedding model |
 | `SIGNAL_PHONE_NUMBER` | Sage's phone number |
 | `SIGNAL_ALLOWED_USERS` | Comma-separated UUIDs (or * for all) |
 | `BRAVE_API_KEY` | For web search |

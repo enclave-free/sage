@@ -196,7 +196,7 @@ Instead of manually iterating on system prompts, we:
 │                                                                  │
 │  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐    │
 │  │   Signal     │────▶│    Agent     │────▶│     LLM      │    │
-│  │  Interface   │◀────│    Core      │◀────│   (Maple)    │    │
+│  │  Interface   │◀────│    Core      │◀────│  (Tinfoil)   │    │
 │  └──────────────┘     └──────┬───────┘     └──────────────┘    │
 │                              │                                   │
 │                              ▼                                   │
@@ -247,7 +247,7 @@ Instead of manually iterating on system prompts, we:
 
 #### LLM Integration
 - `rig-core` for provider abstraction
-- OpenAI-compatible API (Maple/Tinfoil)
+- OpenAI-compatible API (Tinfoil via local verified proxy)
 - Streaming support for real-time responses
 - Retry logic for transient failures
 
@@ -1226,8 +1226,8 @@ pub struct Passage {
 - **HTTP**: reqwest
 
 ### LLM Provider
-- **Primary**: Maple/Tinfoil (OpenAI-compatible)
-- **Embeddings**: nomic-embed-text via Maple
+- **Primary**: Tinfoil (OpenAI-compatible via local verified proxy)
+- **Embeddings**: nomic-embed-text via Tinfoil
 
 ### Observability
 - **Logging**: tracing + tracing-subscriber

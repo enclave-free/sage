@@ -182,9 +182,9 @@ async fn run_evaluation_async() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let api_url =
-        std::env::var("MAPLE_API_URL").unwrap_or_else(|_| "http://localhost:8089/v1".into());
-    let api_key = std::env::var("MAPLE_API_KEY").unwrap_or_else(|_| "test".into());
-    let model = std::env::var("MAPLE_MODEL").unwrap_or_else(|_| "gpt-4".into());
+        std::env::var("TINFOIL_API_URL").unwrap_or_else(|_| "http://localhost:8089/v1".into());
+    let api_key = std::env::var("TINFOIL_API_KEY").unwrap_or_else(|_| "test".into());
+    let model = std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-5".into());
 
     println!("Program LM: {} @ {}\n", model, api_url);
 
@@ -356,9 +356,9 @@ async fn run_optimization_async() -> Result<()> {
 
     // Configure program LM (Kimi - the model being optimized)
     let api_url =
-        std::env::var("MAPLE_API_URL").unwrap_or_else(|_| "http://localhost:8089/v1".into());
-    let api_key = std::env::var("MAPLE_API_KEY").unwrap_or_else(|_| "test".into());
-    let model = std::env::var("MAPLE_MODEL").unwrap_or_else(|_| "gpt-4".into());
+        std::env::var("TINFOIL_API_URL").unwrap_or_else(|_| "http://localhost:8089/v1".into());
+    let api_key = std::env::var("TINFOIL_API_KEY").unwrap_or_else(|_| "test".into());
+    let model = std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-5".into());
 
     println!("Program LM: {} @ {}", model, api_url);
 

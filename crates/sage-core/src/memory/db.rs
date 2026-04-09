@@ -8,7 +8,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
-use diesel::sql_types::{Array, Double, Text, Timestamptz, Uuid as DieselUuid};
+use diesel::sql_types::{Array, Double, Jsonb, Nullable, Text, Timestamptz, Uuid as DieselUuid};
 
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -516,7 +516,7 @@ impl MessageDb {
         user_id: &str,
         role: &str,
         content: &str,
-        embedding: &[f32],
+        embedding: Option<&[f32]>,
         tool_calls: Option<&serde_json::Value>,
         tool_results: Option<&serde_json::Value>,
         attachment_text: Option<&str>,
@@ -527,14 +527,18 @@ impl MessageDb {
             .map_err(|_| anyhow::anyhow!("Failed to acquire database lock"))?;
 
         let id = Uuid::new_v4();
-        let embedding_str = format!(
-            "[{}]",
-            embedding
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let embedding_str = embedding
+            .map(|embedding| {
+                format!(
+                    "'[{}]'",
+                    embedding
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
+            .unwrap_or_else(|| "NULL".to_string());
 
         let tool_calls_str = tool_calls
             .map(|v| v.to_string())
@@ -549,7 +553,7 @@ impl MessageDb {
 
         diesel::sql_query(format!(
             "INSERT INTO messages (id, agent_id, user_id, role, content, embedding, tool_calls, tool_results, attachment_text) \
-             VALUES ('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', {})",
+             VALUES ('{}', '{}', '{}', '{}', '{}', {}, '{}', '{}', {})",
             id,
             agent_id,
             user_id.replace('\'', "''"),
@@ -650,20 +654,35 @@ impl MessageDb {
         // Raw SQL for pgvector cosine distance search
         let query = format!(
             "SELECT id, agent_id, user_id, role, content, sequence_id, \
-                    tool_calls, tool_results, created_at, \
+                    tool_calls, tool_results, created_at, attachment_text, \
                     (embedding <=> '{}') as distance \
              FROM messages \
-             WHERE agent_id = '{}' AND embedding IS NOT NULL \
+             WHERE agent_id = '{}' AND embedding IS NOT NULL AND role != 'tool' \
              ORDER BY distance \
              LIMIT {}",
             embedding_str, agent_id, limit
         );
 
-        // TODO: Execute raw query and parse results
-        // For now, return empty - need custom result parsing for pgvector
-        let _ = query;
-        let _ = &mut *conn;
-        Ok(Vec::new())
+        let results: Vec<MessageSearchRow> = diesel::sql_query(&query).load(&mut *conn)?;
+
+        Ok(results
+            .into_iter()
+            .map(|row| MessageSearchResult {
+                message: MessageRow {
+                    id: row.id,
+                    agent_id: row.agent_id,
+                    user_id: row.user_id,
+                    role: row.role,
+                    content: row.content,
+                    sequence_id: row.sequence_id,
+                    tool_calls: row.tool_calls,
+                    tool_results: row.tool_results,
+                    created_at: row.created_at,
+                    attachment_text: row.attachment_text,
+                },
+                distance: row.distance,
+            })
+            .collect())
     }
 
     /// Count messages for an agent
@@ -767,6 +786,33 @@ impl MessageDb {
 
         Ok(())
     }
+}
+
+/// Helper struct for message search results with distance
+#[derive(QueryableByName, Debug)]
+struct MessageSearchRow {
+    #[diesel(sql_type = DieselUuid)]
+    id: Uuid,
+    #[diesel(sql_type = DieselUuid)]
+    agent_id: Uuid,
+    #[diesel(sql_type = Text)]
+    user_id: String,
+    #[diesel(sql_type = Text)]
+    role: String,
+    #[diesel(sql_type = Text)]
+    content: String,
+    #[diesel(sql_type = diesel::sql_types::Int8)]
+    sequence_id: i64,
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    tool_calls: Option<serde_json::Value>,
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    tool_results: Option<serde_json::Value>,
+    #[diesel(sql_type = Timestamptz)]
+    created_at: DateTime<Utc>,
+    #[diesel(sql_type = Nullable<Text>)]
+    attachment_text: Option<String>,
+    #[diesel(sql_type = Double)]
+    distance: f64,
 }
 
 // ============================================================================

@@ -48,7 +48,7 @@ WORKDIR /marmotd-src
 RUN cargo build -p marmotd --release
 
 # Stage 5: Runtime
-FROM docker.io/debian:bookworm-slim
+FROM docker.io/debian:bookworm-slim AS runtime
 
 # Install runtime dependencies and comprehensive CLI toolset
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -170,7 +170,7 @@ USER sage
 # Environment defaults (can be overridden)
 ENV RUST_LOG=info
 ENV DATABASE_URL=postgres://sage:sage@postgres:5432/sage
-ENV MAPLE_API_URL=http://host.docker.internal:8089/v1
+ENV TINFOIL_API_URL=http://localhost:8089/v1
 ENV SIGNAL_CLI_HOST=signal-cli
 ENV SIGNAL_CLI_PORT=7583
 ENV SAGE_WORKSPACE=/workspace
@@ -185,3 +185,21 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 
 # Run sage
 CMD ["/app/sage"]
+
+# Stage 6: Smoke runner
+# Adds the native development packages needed to build and lint the workspace
+# from source inside the container during pre-push smoke tests.
+FROM runtime AS smoke-runner
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+USER sage
+
+# Final stage remains the lean runtime image used by default builds.
+FROM runtime AS final

@@ -22,7 +22,7 @@ mod storage;
 mod vision;
 
 use agent_manager::{AgentManager, ContextType};
-use config::MessengerType;
+use config::{Config, MessengerType};
 use messenger::{IncomingMessage, Messenger};
 use sage_agent::SageAgent;
 use signal::{run_receive_loop, run_receive_loop_tcp, SignalClient};
@@ -60,6 +60,74 @@ fn is_user_allowed(user_id: &str, allowed_users: &[String]) -> bool {
     allowed_users.iter().any(|u| u == user_id)
 }
 
+async fn validate_tinfoil_backend(config: &Config, api_key: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+
+    let chat_response = client
+        .post(format!("{}/chat/completions", config.tinfoil_api_url))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": config.tinfoil_model,
+            "messages": [
+                { "role": "user", "content": "Reply with OK." }
+            ],
+            "max_tokens": 8,
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to reach Tinfoil chat endpoint at {}: {}",
+                config.tinfoil_api_url,
+                e
+            )
+        })?;
+
+    if !chat_response.status().is_success() {
+        let status = chat_response.status();
+        let body = chat_response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Tinfoil chat model preflight failed for model '{}': {}: {}",
+            config.tinfoil_model,
+            status,
+            body
+        );
+    }
+
+    let embedding_response = client
+        .post(format!("{}/embeddings", config.tinfoil_api_url))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": config.tinfoil_embedding_model,
+            "input": "Sage startup embedding health check",
+            "encoding_format": "float",
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to reach Tinfoil embeddings endpoint at {}: {}",
+                config.tinfoil_api_url,
+                e
+            )
+        })?;
+
+    if !embedding_response.status().is_success() {
+        let status = embedding_response.status();
+        let body = embedding_response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Tinfoil embedding model preflight failed for model '{}': {}: {}",
+            config.tinfoil_embedding_model,
+            status,
+            body
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -77,8 +145,9 @@ async fn main() -> Result<()> {
     let config = config::Config::from_env()?;
 
     info!("Configuration loaded");
-    info!("  Maple API: {}", config.maple_api_url);
-    info!("  Model: {}", config.maple_model);
+    info!("  Tinfoil API: {}", config.tinfoil_api_url);
+    info!("  Chat model: {}", config.tinfoil_model);
+    info!("  Embedding model: {}", config.tinfoil_embedding_model);
 
     // Run database migrations first
     {
@@ -93,12 +162,15 @@ async fn main() -> Result<()> {
     }
 
     let api_key = config
-        .maple_api_key
+        .tinfoil_api_key
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("MAPLE_API_KEY not set"))?;
+        .ok_or_else(|| anyhow::anyhow!("TINFOIL_API_KEY not set"))?;
+
+    validate_tinfoil_backend(&config, api_key).await?;
+    info!("Tinfoil backend preflight succeeded");
 
     // Configure DSRs LM globally (required before creating agents)
-    SageAgent::configure_lm(&config.maple_api_url, api_key, &config.maple_model).await?;
+    SageAgent::configure_lm(&config.tinfoil_api_url, api_key, &config.tinfoil_model).await?;
     info!("DSRs LM configured");
 
     // Check for Brave Search
@@ -253,10 +325,7 @@ async fn main() -> Result<()> {
     );
 
     // Start HTTP health check server
-    let health_port: u16 = std::env::var("HEALTH_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8080);
+    let health_port = config.http_port;
     let health_router = Router::new().route("/health", get(health_check));
     let health_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", health_port)).await?;
     tokio::spawn(async move {
@@ -396,9 +465,9 @@ async fn main() -> Result<()> {
                         };
 
                         match vision::describe_image(
-                            &config.maple_api_url,
-                            config.maple_api_key.as_deref().unwrap_or(""),
-                            &config.maple_vision_model,
+                            &config.tinfoil_api_url,
+                            config.tinfoil_api_key.as_deref().unwrap_or(""),
+                            &config.tinfoil_vision_model,
                             &attachment_path,
                             &attachment.content_type,
                             &msg.message,

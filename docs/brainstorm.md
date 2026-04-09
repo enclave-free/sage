@@ -4,9 +4,11 @@
 
 Build a highly private, self-hosted AI agent/companion that lives in a Docker container on a home server with full permissions to access personal data and perform actions autonomously. The agent prioritizes privacy and data sovereignty through confidential computing and self-hosted infrastructure.
 
+Historical note: the current implementation uses Tinfoil directly through a local verified proxy rather than Maple.
+
 ## Core Requirements
 
-- **Maximum Privacy**: All data stays local, LLM inference via confidential compute (Maple)
+- **Maximum Privacy**: All data stays local, LLM inference via confidential compute (Tinfoil)
 - **Full Permissions**: Agent can access personal files, services, and take actions on behalf of the user
 - **Self-Hosted**: Runs on existing home server infrastructure
 - **Open Source**: Preference for open source solutions over proprietary frameworks
@@ -27,7 +29,7 @@ Docker Container (main agent):
 
 External Services (existing infrastructure):
 ├── PostgreSQL           → Structured data, logs, Letta backend, audit trail
-└── Maple API            → Confidential compute LLM inference proxy
+└── Tinfoil proxy        → Verified local proxy to confidential compute router
 ```
 
 ### Technology Rationale
@@ -37,7 +39,7 @@ External Services (existing infrastructure):
 | Language | Rust | Developer preference, reliability, existing expertise |
 | Agent Framework | rig-core | Open source, Rust-native, flexible tool dispatch, supports custom model backends |
 | Memory | Letta | Handles memory injection/persistence, wraps LLM calls, supports Postgres backend |
-| LLM Inference | Maple | Confidential computing, privacy guarantees for personal data |
+| LLM Inference | Tinfoil | Confidential computing, privacy guarantees for personal data |
 | Chat Interface | signal-cli | Encrypted messaging, no custom client needed, works on mobile |
 | Database | PostgreSQL | Already running on server, Letta compatible |
 | Task Queue | Valkey | Simple sorted sets for scheduled tasks, pub/sub for real-time |
@@ -52,7 +54,7 @@ External Services (existing infrastructure):
 
 ### Rig-Core Integration
 
-- Implement `CompletionModel` trait pointing at Maple API proxy
+- Implement `CompletionModel` trait pointing at the local Tinfoil proxy
 - Define tools as rig-core tool structs
 - Agent loop: receive message → build context → call LLM → parse tool calls → execute → loop
 
@@ -153,9 +155,9 @@ Log everything:
 
 ## Next Steps for Coding Agent
 
-1. **Validate rig-core Maple integration**
+1. **Validate rig-core Tinfoil integration**
    - Check current `CompletionModel` trait API
-   - Prototype basic completion through Maple proxy
+   - Prototype basic completion through the local Tinfoil proxy
 
 2. **Set up Letta with Postgres backend**
    - Docker compose for local dev
@@ -181,7 +183,7 @@ Log everything:
 - [rig-core](https://github.com/0xPlaygrounds/rig) - Rust AI agent framework
 - [Letta](https://github.com/letta-ai/letta) - Memory management for LLM agents
 - [signal-cli](https://github.com/AsamK/signal-cli) - Signal messenger CLI
-- [Maple](https://maple.ai) - Confidential compute LLM inference
+- [Tinfoil](https://tinfoil.sh/) - Confidential compute LLM inference
 - [Valkey](https://valkey.io) - Redis-compatible key-value store
 
 ---

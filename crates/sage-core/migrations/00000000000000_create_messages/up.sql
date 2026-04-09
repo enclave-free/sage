@@ -1,3 +1,5 @@
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 CREATE TABLE messages (
     id BIGSERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,

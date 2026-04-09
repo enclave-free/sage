@@ -2,7 +2,7 @@
 
 ## Philosophy
 
-Sage is a privacy-first personal AI agent. You interact with Sage like a trusted friend via Signal. Sage handles everything else using confidential compute (Maple/TEE) and long-term memory (PostgreSQL/pgvector).
+Sage is a privacy-first personal AI agent. You interact with Sage like a trusted friend via Signal. Sage handles everything else using confidential compute (Tinfoil/TEE) and long-term memory (PostgreSQL/pgvector).
 
 ## Current Implementation
 
@@ -73,11 +73,11 @@ Sage is a privacy-first personal AI agent. You interact with Sage like a trusted
                                       │ OpenAI-compatible API
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                     MAPLE (Confidential Compute)                            │
+│                 TINFOIL (via local verified proxy)                          │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  Kimi K2 (thinking variant)                                          │   │
+│  │  Kimi K2.5                                                            │   │
 │  │  - Running in TEE (Trusted Execution Environment)                    │   │
-│  │  - enclave.trymaple.ai backend                                       │   │
+│  │  - Accessed through local tinfoil-cli proxy                          │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -113,7 +113,7 @@ Four-tier memory inspired by Letta/MemGPT:
 - **Archival Memory**: Long-term semantic storage (pgvector)
 - **Summary Memory**: Auto-compaction when context exceeds threshold
 
-### 4. Maple (LLM Backend)
+### 4. Tinfoil (LLM Backend)
 
 Confidential compute for privacy:
 - Kimi K2 model optimized for tool calling
@@ -148,7 +148,7 @@ Each Signal user gets:
 ## Security Model
 
 - **Signal**: End-to-end encrypted messaging
-- **Maple/TEE**: LLM inference in confidential compute
+- **Tinfoil/TEE**: LLM inference in confidential compute
 - **User Allowlist**: Only approved users can interact (or `*` for all)
 - **Brave Search**: Privacy-respecting web search (no tracking)
 - **Local PostgreSQL**: All memory stays on your machine
@@ -173,7 +173,7 @@ When running with Podman/Docker:
 - Sage runs in container with `--network host`
 - signal-cli runs in separate container on port 7583
 - PostgreSQL runs in container on port 5434
-- Maple accessed via configured API URL
+- Tinfoil accessed via a local verified proxy (`TINFOIL_API_URL`)
 
 ## Future Architecture
 

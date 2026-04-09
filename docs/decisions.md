@@ -44,25 +44,26 @@
 
 ---
 
-## ADR-003: Kimi K2 via Maple for Privacy
+## ADR-003: Kimi K2.5 via Direct Tinfoil for Privacy
 
 **Status**: Accepted
 
 **Context**: Need an LLM that excels at tool calling while maintaining privacy.
 
-**Decision**: Use Kimi K2 (thinking variant) through Maple proxy.
+**Decision**: Use Kimi K2.5 through a local verified Tinfoil proxy.
 
 **Rationale**:
 - Supports up to 200 consecutive tool calls
 - Excellent at agentic tasks
-- Maple provides confidential compute (TEE)
+- Tinfoil provides confidential compute (TEE)
 - No logs, no training on user data
 - OpenAI-compatible API
+- Local verified proxy gives Sage a stable local endpoint while preserving attestation on the proxy-to-enclave hop
 
 **Consequences**:
-- Dependent on Maple proxy / Maple Desktop
-- IPv6 addressing for container → host communication
-- Maple (enclave.trymaple.ai) as backend
+- Dependent on `tinfoil-cli` proxy or equivalent local proxy runtime
+- One extra local sidecar/process to manage
+- Tinfoil hosted router (`inference.tinfoil.sh`) as backend
 
 ---
 
