@@ -157,6 +157,7 @@ WORKDIR /app
 
 # Copy the binary from builder
 COPY --from=builder /app/target/release/sage /app/sage
+COPY --from=builder /app/target/release/enclave_web /app/enclave_web
 
 # Copy migrations for diesel
 COPY --from=builder /app/crates/sage-core/migrations /app/migrations

@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "gepa-optimize"
 path = "src/bin/gepa_optimize.rs"
 
+[[bin]]
+name = "enclave_web"
+path = "src/bin/enclave_web.rs"
+
 [dependencies]
 sage-tools = { path = "../sage-tools" }
 async-trait = "0.1"

@@ -514,6 +514,7 @@ pub struct SageAgent {
     agent_id: Uuid,
     tools: ToolRegistry,
     memory: Option<MemoryManager>,
+    instruction: String,
     /// Tool results from current request cycle only (not persisted)
     current_tool_results: Vec<Message>,
     /// Track what was sent in previous step (messages + tool names) for context
@@ -526,14 +527,29 @@ pub struct SageAgent {
 impl SageAgent {
     /// Create a new agent with tools and memory
     pub fn new(tools: ToolRegistry, memory: MemoryManager) -> Self {
+        Self::new_with_optional_memory(tools, Some(memory), AGENT_INSTRUCTION)
+    }
+
+    /// Create a new agent with optional memory and a custom instruction block.
+    pub fn new_with_optional_memory(
+        tools: ToolRegistry,
+        memory: Option<MemoryManager>,
+        instruction: impl Into<String>,
+    ) -> Self {
         Self {
             agent_id: Uuid::nil(), // Not used - single agent system
             tools,
-            memory: Some(memory),
+            memory,
+            instruction: instruction.into(),
             current_tool_results: Vec::new(),
             previous_step_summary: None,
             max_steps: 10,
         }
+    }
+
+    /// Create a stateless agent with a custom instruction block.
+    pub fn new_without_memory(tools: ToolRegistry, instruction: impl Into<String>) -> Self {
+        Self::new_with_optional_memory(tools, None, instruction)
     }
 
     /// Store a message in memory (for persistence)
@@ -639,11 +655,21 @@ impl SageAgent {
 
     /// Configure the global LM settings for DSRs
     pub async fn configure_lm(api_base: &str, api_key: &str, model: &str) -> Result<()> {
+        Self::configure_lm_with_temperature(api_base, api_key, model, 0.7).await
+    }
+
+    /// Configure the global LM settings for DSRs with a specific temperature.
+    pub async fn configure_lm_with_temperature(
+        api_base: &str,
+        api_key: &str,
+        model: &str,
+        temperature: f64,
+    ) -> Result<()> {
         let lm = LM::builder()
             .base_url(api_base.to_string())
             .api_key(api_key.to_string())
             .model(model.to_string())
-            .temperature(0.7)
+            .temperature(temperature as f32)
             .max_tokens(32768) // High limit for thinking models (Kimi K2 uses tokens for reasoning)
             .build()
             .await?;
@@ -866,7 +892,7 @@ impl SageAgent {
 
         // Create predictor with instruction
         let predictor = Predict::<AgentResponse>::builder()
-            .instruction(AGENT_INSTRUCTION)
+            .instruction(self.instruction.clone())
             .build();
 
         // Build context - separate fields for each input

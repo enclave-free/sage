@@ -16,6 +16,7 @@ pub mod signal;
 pub mod storage;
 pub mod tools;
 pub mod vision;
+pub mod web_runtime;
 
 // Re-export key types for convenience
 pub use config::Config;

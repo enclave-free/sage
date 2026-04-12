@@ -122,6 +122,31 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    ai_config (key) {
+        key -> Varchar,
+        value -> Text,
+        value_type -> Varchar,
+        category -> Varchar,
+        description -> Nullable<Text>,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    ai_config_user_type_overrides (id) {
+        id -> Uuid,
+        ai_config_key -> Varchar,
+        user_type_id -> Int4,
+        value -> Text,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     chat_contexts (id) {
         id -> Uuid,
         signal_identifier -> Text,
@@ -132,15 +157,48 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    external_identities (id) {
+        id -> Uuid,
+        identity_type -> Varchar,
+        external_id -> Varchar,
+        display_name -> Nullable<Text>,
+        user_type_id -> Nullable<Int4>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(scheduled_tasks -> agents (agent_id));
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    web_sessions (id) {
+        id -> Uuid,
+        agent_id -> Uuid,
+        owner_type -> Varchar,
+        owner_id -> Varchar,
+        user_type_id -> Nullable<Int4>,
+        last_question -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
+    ai_config,
+    ai_config_user_type_overrides,
     agents,
     blocks,
     chat_contexts,
+    external_identities,
     messages,
     passages,
     summaries,
     user_preferences,
     scheduled_tasks,
+    web_sessions,
 );
