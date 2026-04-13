@@ -25,7 +25,7 @@ baml-bridge = { git = "https://github.com/krypticmouse/DSRs.git", features = ["d
 # Web framework (for webhooks, health checks)
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

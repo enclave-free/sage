@@ -1,99 +1,52 @@
-# Sage Development TODO
+# Sage Branch Checkpoint
 
-> Last updated: 2026-01-29
-> Status: Core system complete, in production
+> Last updated: 2026-04-13
 
----
+This file tracks the current state of `enclave-web-native-auth`, the branch that moves Enclave web mode toward a dumb public gateway and native Sage auth.
 
-## Completed
+## Done
 
-### Core Implementation ✅
-- Pure Rust implementation (no Python/Letta dependency)
-- PostgreSQL with pgvector for memory storage
-- Signal integration via signal-cli JSON-RPC
-- Multi-user support with isolated memory per conversation
-- Auto-reconnect and retry logic for Signal reliability
+- Added `enclave_web` as a dedicated Enclave web runtime binary
+- Added `web_runtime.rs` with public AI routes and Enclave-specific handlers
+- Cut public `/llm/chat` and `/query` traffic over to Sage through the gateway
+- Replaced Python `auth-context` dependency with native Sage bearer/cookie verification
+- Added private Python support-route integration for retrieval, user profile context, user/admin lookups, user-type lookups, and admin DB access
+- Added Sage-owned Postgres query session persistence
+- Added Sage-owned AI config storage and user-type overrides
+- Added Enclave web tables and schema wiring
+- Adapted `SageAgent` to support custom instructions and optional/stateless memory modes for web flows
+- Verified `cargo check -p sage-core --bin enclave_web`
 
-### Memory System ✅
-- Core memory blocks (persona, human) - always in context
-- Recall memory - full conversation history with embeddings
-- Archival memory - long-term semantic storage (pgvector)
-- Summary memory - auto-compaction when context overflows
-- Conversation search with hybrid keyword + semantic
+## Intentionally Temporary On This Branch
 
-### Tools ✅
-- `web_search` - Brave Search with AI summaries
-- `shell` - Execute commands in workspace
-- `memory_replace/append/insert` - Edit memory blocks
-- `archival_insert/search` - Long-term memory
-- `conversation_search` - Search history
-- `set_preference/get_preference` - User preferences
-- `schedule_task/list_schedules/cancel_schedule` - Reminders
+- Python still issues the auth tokens and cookies Sage verifies
+- deployment/runtime config is still split between Python deployment config, Sage env, and gateway config
+- legacy Python AI route implementations still exist in-repo even though the gateway bypasses them
+- query-session delete still removes the session record, not the full memory graph
 
-### Infrastructure ✅
-- Docker/Podman containerization
-- Nix flake for development
-- Diesel ORM with migrations
-- DSRs (DSPy in Rust) for structured output
+## What To Tighten If Productizing
 
----
+- formalize and version the `/internal/agent/*` contract
+- decide whether query-session delete should remain a session-record delete or become a full Sage memory purge contract
+- reduce duplicated shared config across Python deployment config and Sage env
+- add stronger end-to-end tests around route ownership, auth forwarding, and session ownership
+- add browser-level automated tests for cookie auth + CSRF on Sage-owned routes
 
-## Next Up
-
-### Improvements 🔜
-- [ ] Streaming LLM responses (avoid Cloudflare timeouts)
-- [ ] Group chat support
-- [ ] Voice message transcription
-- [ ] Image understanding
-- [ ] Natural language time parsing ("in 2 hours")
-
-### Integrations 🔜
-- [ ] Gmail integration
-- [ ] Google Calendar integration
-- [ ] MCP (Model Context Protocol) support
-
-### Optimization 🔜
-- [ ] GEPA prompt optimization with real usage data
-- [ ] Response quality metrics and evaluation
-
----
-
-## Quick Reference
-
-### Running Sage
+## High-Value Checks
 
 ```bash
-nix develop
-just start          # Start all containers
-just logs           # View logs
-just stop           # Stop containers
+cargo check -p sage-core --bin enclave_web
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+just smoke-tinfoil
 ```
 
-### Key Files
+## Current Mental Model
 
-| File | Purpose |
-|------|---------|
-| `crates/sage-core/src/main.rs` | Entry point, message loop |
-| `crates/sage-core/src/sage_agent.rs` | Agent logic, LLM interaction |
-| `crates/sage-core/src/signal.rs` | Signal JSON-RPC client |
-| `crates/sage-core/src/memory/` | Memory system |
-| `crates/sage-core/src/agent_manager.rs` | Multi-user agent management |
+On this branch:
 
-### Environment Variables
+- Sage is the AI runtime
+- Python is the control plane
+- gateway keeps the public API stable without owning app behavior
 
-| Variable | Purpose |
-|----------|---------|
-| `TINFOIL_API_URL` | Local verified proxy endpoint |
-| `TINFOIL_API_KEY` | API key |
-| `TINFOIL_MODEL` | Model name (`kimi-k2-5`) |
-| `TINFOIL_EMBEDDING_MODEL` | Embedding model |
-| `SIGNAL_PHONE_NUMBER` | Sage's phone number |
-| `SIGNAL_ALLOWED_USERS` | Comma-separated UUIDs (or * for all) |
-| `BRAVE_API_KEY` | For web search |
-| `DATABASE_URL` | PostgreSQL connection |
-
----
-
-## Roadmap
-
-See `docs/roadmap.md` for full plan.
+If a change does not fit that model cleanly, it probably needs either a boundary clarification or a productization decision first.

@@ -3,7 +3,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use sage_core::{config::Config, sage_agent::SageAgent, web_runtime, web_runtime::EnclaveWebConfig};
+use sage_core::{
+    config::Config, sage_agent::SageAgent, web_runtime, web_runtime::EnclaveWebConfig,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {

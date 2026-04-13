@@ -1,236 +1,140 @@
-# Architecture Decision Records
+# Architecture Decisions For The Enclave Web Runtime Branch
 
-## ADR-001: Python with Letta for Agent Framework
+This file records the active decisions for the Enclave web runtime branch.
 
-**Status**: Accepted (Updated from Rust)
+The branch documented here is `enclave-web-native-auth`, which builds on the original hard-cut branch by making the public gateway boring and moving route correctness into Sage.
 
-**Context**: Originally chose Rust with rig-core, but pivoted after realizing Letta provides comprehensive agent memory management that would take months to reimplement.
-
-**Decision**: Use Python with Letta as the agent framework.
-
-**Rationale**:
-- Letta provides production-ready memory management (sliding window, summarization, archival)
-- Memory as tools concept (agent can search/update its own memory)
-- Tool sandbox for safe execution
-- Python ecosystem better for LLM/agent experimentation
-- Faster iteration than Rust for this domain
-
-**Consequences**:
-- Rust code archived in `crates/` for reference
-- UV for Python dependency management
-- Letta container dependency
-
----
-
-## ADR-002: Letta for Memory Management
+## ADR-001: Use Direct Tinfoil Through A Local Verified Proxy
 
 **Status**: Accepted
 
-**Context**: Long-term memory, context injection, and conversation state are complex problems.
+**Context**
 
-**Decision**: Use Letta as a separate service for memory.
+The Enclave web runtime needs a stable OpenAI-compatible backend for chat, embeddings, and vision while keeping the privacy posture of confidential compute.
 
-**Rationale**:
-- Purpose-built for LLM memory management
-- Core memory blocks (persona, human) for identity
-- Automatic context window management
-- PostgreSQL backend for persistence
-- Tool execution sandbox included
+**Decision**
 
-**Consequences**:
-- Additional container to manage (Podman)
-- Networking complexity with OrbStack (IPv6 for host access)
-- Letta model handle bug requires passing configs directly
+Use Tinfoil through a local verified proxy, with Sage calling the proxy directly.
 
----
+**Consequences**
 
-## ADR-003: Kimi K2.5 via Direct Tinfoil for Privacy
+- Sage owns chat, embeddings, and vision calls against `TINFOIL_API_URL`
+- model transport stays simple and OpenAI-compatible
+- the branch depends on `TINFOIL_*` runtime env
+
+## ADR-002: Add An Enclave-Specific Web Runtime Instead Of Reusing The Messenger Runtime
 
 **Status**: Accepted
 
-**Context**: Need an LLM that excels at tool calling while maintaining privacy.
+**Context**
 
-**Decision**: Use Kimi K2.5 through a local verified Tinfoil proxy.
+The upstream Sage runtime is oriented around messenger-style interaction. Enclave needs a web/backend runtime with HTTP routes, auth re-validation, session ownership, and document-grounded query flows.
 
-**Rationale**:
-- Supports up to 200 consecutive tool calls
-- Excellent at agentic tasks
-- Tinfoil provides confidential compute (TEE)
-- No logs, no training on user data
-- OpenAI-compatible API
-- Local verified proxy gives Sage a stable local endpoint while preserving attestation on the proxy-to-enclave hop
+**Decision**
 
-**Consequences**:
-- Dependent on `tinfoil-cli` proxy or equivalent local proxy runtime
-- One extra local sidecar/process to manage
-- Tinfoil hosted router (`inference.tinfoil.sh`) as backend
+Add a dedicated `enclave_web` binary and `web_runtime.rs` rather than trying to bend the messenger entrypoint into the product API shape.
 
----
+**Consequences**
 
-## ADR-004: Signal as Primary Interface
+- branch-specific entrypoint: `crates/sage-core/src/bin/enclave_web.rs`
+- branch-specific route layer: `crates/sage-core/src/web_runtime.rs`
+- clearer separation between upstream generic runtime and Enclave-specific integration logic
+
+## ADR-003: Sage Owns The Public AI Routes
 
 **Status**: Accepted
 
-**Context**: Need a communication channel that is private and works on mobile.
+**Context**
 
-**Decision**: Use Signal via signal-cli JSON-RPC mode.
+The prototype aims to move answer generation and AI orchestration out of the Python backend while keeping the same public API origin.
 
-**Rationale**:
-- End-to-end encrypted
-- Works on mobile without custom app
-- signal-cli provides programmatic access
-- Matches "text a friend" interaction model
+**Decision**
 
-**Consequences**:
-- signal-cli ARM64 binary needed for Apple Silicon
-- JSON-RPC mode for bidirectional communication
-- Typing indicators require periodic refresh (~10s)
+Sage owns:
 
----
+- `/llm/chat`
+- `/query`
+- `/query/session/*`
+- `/session-defaults`
+- `/admin/tools/execute`
+- `/admin/ai-config/*`
 
-## ADR-005: Brave Search for Web Search
+with the gateway routing those paths to Sage.
 
-**Status**: Accepted
+**Consequences**
 
-**Context**: Need web search capability without compromising privacy.
+- answer generation and tool orchestration live in Sage
+- the gateway remains the compatibility layer for the public API surface
+- legacy Python implementations of some AI routes can remain in-repo without serving public traffic
 
-**Decision**: Use Brave Search API instead of Letta's built-in Exa.
-
-**Rationale**:
-- Privacy-respecting (no tracking)
-- Good search quality
-- Simple API
-- Aligns with project's privacy-first philosophy
-
-**Consequences**:
-- Requires BRAVE_API_KEY
-- Tool executes in Letta sandbox (uses `requests` library)
-- API key passed as tool execution environment variable
-
----
-
-## ADR-006: UV for Python Dependencies
+## ADR-004: Python Remains The Control Plane
 
 **Status**: Accepted
 
-**Context**: Need reliable Python dependency management.
+**Context**
 
-**Decision**: Use UV instead of pip/poetry/conda.
+Enclave already has product logic in Python for auth, admin data, ingest, document access, and AI config assembly. Rebuilding all of that in Sage would expand the cutover far beyond prototype scope.
 
-**Rationale**:
-- Fast dependency resolution
-- Lockfile support (uv.lock)
-- Works well with Nix development environment
-- Simple pyproject.toml configuration
+**Decision**
 
-**Consequences**:
-- `uv sync` for installing dependencies
-- `uv run` for executing scripts
-- Python 3.11 pinned in .python-version
+Keep Python as the control plane and have Sage call it over private support endpoints.
 
----
+**Consequences**
 
-## ADR-007: Podman for Letta Container
+- Python remains the source of truth for auth and approval
+- Python remains the source of truth for document access and effective AI config
+- Sage depends on a stable private contract instead of duplicating control-plane logic
+
+## ADR-005: Use A Private `/internal/agent/*` Contract Between Sage And Python
 
 **Status**: Accepted
 
-**Context**: Need to run Letta server with PostgreSQL.
+**Context**
 
-**Decision**: Use Podman (not Docker) for container management.
+Sage needs a narrow, explicit way to ask Enclave for auth context, retrieval results, user profile data, and admin DB access.
 
-**Rationale**:
-- Available in NixOS packages
-- Rootless containers
-- Docker-compatible commands
-- Works with OrbStack on macOS
+**Decision**
 
-**Consequences**:
-- IPv6 addressing required for host access from container
-- `podman-compose` or direct `podman run` commands
-- Letta config file for custom LLM/embedding endpoints
+Define the Sage <-> Python boundary through private `/internal/agent/*` endpoints protected by `INTERNAL_AGENT_TOKEN`.
 
----
+**Consequences**
 
-## ADR-008: Continuous Typing Indicator
+- Sage can stay focused on AI orchestration
+- the trust boundary is explicit in code and docs
+- the private contract becomes a major integration surface that must remain versioned and consistent
+
+## ADR-006: Sage Owns Query Sessions And Memory In Postgres
 
 **Status**: Accepted
 
-**Context**: Signal typing indicators timeout after ~15 seconds, but tool calls can take 30+ seconds.
+**Context**
 
-**Decision**: Implement background thread that refreshes typing indicator every 10 seconds during long operations.
+The prototype needs durable query continuity and Sage-native memory behavior for RAG turns.
 
-**Rationale**:
-- Better UX - user knows Sage is working
-- Simple implementation with threading.Event
-- Stops immediately when response is ready
+**Decision**
 
-**Consequences**:
-- Additional thread per message processing
-- More Signal API calls during long operations
-- Cleaner code with `with_typing_indicator()` helper
+Persist query sessions and runtime memory in Sage Postgres instead of keeping session continuity in Python.
 
----
+**Consequences**
 
-## ADR-009: Per-User Agents in Letta
+- `web_sessions` and Sage memory tables become the source of truth for `/query` continuity
+- sessions survive Sage restarts if Postgres persists
+- session ownership checks happen inside Sage after auth re-validation
 
-**Status**: Accepted
+## ADR-007: Keep Admin AI Config CRUD Publicly Served By Sage But Stored/Mutated Via Python For Now
 
-**Context**: Need to support multiple users with separate conversation histories.
+**Status**: Superseded on `enclave-web-native-auth`
 
-**Decision**: Create one Letta agent per user (by UUID).
+**Context**
 
-**Rationale**:
-- Complete isolation between users
-- Each user has their own memory blocks
-- Agent name convention: `sage-{user_uuid[:8]}`
+The public AI config surface needs to appear Sage-owned because it is part of the AI runtime API, but Python already holds the current storage and mutation logic.
 
-**Consequences**:
-- Agent lookup on each message
-- Agents persist in Letta PostgreSQL
-- Tools must be re-attached when creating new agents
+**Decision**
 
----
+Serve `/admin/ai-config/*` through Sage while proxying CRUD operations to Python on the original hard-cut branch.
 
-## ADR-010: Debug Logging for Response Parsing
+**Consequences**
 
-**Status**: Accepted
-
-**Context**: Letta response format can vary (tool calls, reasoning, assistant messages).
-
-**Decision**: Add debug logging to trace response message structure.
-
-**Rationale**:
-- Helps diagnose "null" response issues
-- Shows tool call → tool return → assistant message flow
-- Can be disabled in production
-
-**Consequences**:
-- More verbose logs when DEBUG enabled
-- Easier troubleshooting of LLM/Letta issues
-
----
-
-## Historical ADRs (from Rust phase)
-
-The following ADRs were made during the Rust implementation phase. They remain for reference but the Rust code is now archived.
-
-### ADR-H1: Rust as Primary Language (Superseded)
-
-Originally chose Rust with rig-core. Pivoted to Python/Letta for faster iteration and better memory management.
-
-### ADR-H2: rig-core for Agent Orchestration (Superseded)
-
-Used rig-core 0.27 with multi-turn support. Now using Letta's agent framework instead.
-
-### ADR-H3: Diesel for PostgreSQL (Archived)
-
-Implemented message history in Rust with Diesel ORM. Now using Letta's built-in PostgreSQL storage.
-
----
-
-## Future Considerations
-
-- **Valkey Integration**: For reminders and scheduled tasks
-- **MCP Client**: For connecting to external tool servers
-- **Sub-Agent Architecture**: For complex, long-running tasks
-- **Production Deployment**: Cloudflare Tunnel, monitoring, backups
+- public route ownership stayed consistent during the initial cutover
+- storage ownership remained transitional during the first prototype pass
+- this decision was later replaced by Sage-backed AI config storage on `enclave-web-native-auth`

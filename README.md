@@ -1,528 +1,114 @@
-# Sage
+# Sage Enclave Web Runtime Branch
 
-**Privacy-first personal AI agent with persistent memory, built in Rust.**
+This repo still contains the upstream generic Sage runtime, but on the Enclave prototype branch the primary product entrypoint is the `enclave_web` binary, not the messenger runtime.
 
-> ⚠️ **Experimental** - This is a proof of concept / personal project exploring ideas around private, memory-augmented AI agents. It works, but expect rough edges.
+## Branch Note
 
-## What is Sage?
+- `master`: generic Sage messenger runtime
+- `enclave-web-prototype`: original Enclave hard-cut branch
+- `enclave-web-native-auth`: current native-auth / dumb-gateway branch in this checkout
 
-Sage is an AI assistant that prioritizes **privacy** and **data sovereignty**. It's designed to be a trusted companion that remembers your conversations, learns about you over time, and can take actions on your behalf - all while keeping your data under your control.
+If you are working on the prototype in `enclave.free-prototype`, read this branch as `enclave_web`-first.
 
-**Key Features:**
-- **End-to-end encrypted messaging** via Signal or [Pika](https://github.com/sledtools/pika) (MLS over Nostr)
-- **Image understanding** for Signal attachments - send photos and Sage can see and describe them
-- **Long-term memory** that persists across conversations
-- **Confidential compute** - LLM inference runs in a TEE (Trusted Execution Environment)
-- **Self-hosted state** - your app state and memory stay on your machine
-- **Multi-user support** with isolated memory per conversation
+## What This Branch Does
 
-## Why Build This?
+- adds `crates/sage-core/src/bin/enclave_web.rs`
+- adds `crates/sage-core/src/web_runtime.rs`
+- serves Enclave-facing AI routes over Axum
+- persists query sessions and memory in Postgres
+- calls Tinfoil directly for chat and embeddings
+- verifies Enclave bearer and cookie auth natively
+- serves CORS and enforces CSRF for Sage-owned routes
+- stores runtime AI config in Postgres
+- calls Enclave Python over private `/internal/agent/*` endpoints for retrieval and control-plane context
 
-Most AI assistants are stateless - they forget everything after each conversation. The few that have memory send your data to cloud servers you don't control. Sage takes a different approach:
+## Public Routes Owned On This Branch
 
-- Your conversations stay on **your** PostgreSQL instance
-- LLM inference happens in **confidential compute** via a local verified Tinfoil proxy - the inference provider can't see your prompts
-- Communication happens over **Signal's E2E encryption** or **MLS-encrypted Nostr** via [Pika](https://github.com/sledtools/pika)
-- The agent runs in **your container** on your infrastructure
+| Route family | Behavior |
+| --- | --- |
+| `/llm/chat` | stateless assistant-style route |
+| `/query` | retrieval-first, session-backed route |
+| `/query/session/*` | session inspection and delete |
+| `/session-defaults` | local AI defaults plus Enclave document defaults |
+| `/admin/tools/execute` | public Sage entry, execution delegated to Python |
+| `/admin/ai-config/*` | public Sage route family and Sage-backed storage |
 
-## Technical Highlights
+## What Sage Still Delegates To Enclave Python
 
-This project explores several unconventional design choices:
+Sage does not currently own:
 
-### No Native Tool Calling
+- auth issuance
+- Enclave document retrieval and access filtering
+- user/admin record lookup after token verification
+- user type lookup
+- user profile context lookup
+- admin SQLite query safety logic
 
-Instead of relying on LLM providers' function calling APIs (which are buggy and provider-specific), Sage uses **structured output parsing** via [DSRs](https://github.com/krypticmouse/DSRs) (DSPy in Rust) with BAML. The LLM outputs natural text that gets parsed into typed Rust structs. This approach:
-- Works identically across all LLM providers
-- Is immune to vLLM/provider-specific tool calling bugs
-- Is fully debuggable (just look at the text output)
+Those come through the private `/internal/agent/*` contract defined in `web_runtime.rs`.
 
-### Regenerated Context, Not Append-Only
+## What Sage Owns Directly
 
-Rather than maintaining an ever-growing message log, Sage **regenerates the full context** on each request:
-- Single system prompt with injected memory blocks
-- Recent conversation history (not the full log)
-- No KV cache dependency - works with any provider
+- public AI route handling
+- Tinfoil chat and embedding calls
+- Postgres-backed memory tables
+- `web_sessions`
+- `ai_config`
+- `ai_config_user_type_overrides`
+- session ownership checks after auth revalidation
+- server-side `web_search`
+- internal `knowledge_search`
 
-### Letta-Inspired Memory Architecture
+## Key Files
 
-Custom implementation of a 4-tier memory system (inspired by [Letta](https://github.com/letta-ai/letta)/MemGPT):
+- `crates/sage-core/src/bin/enclave_web.rs`: web runtime startup, migrations, and Axum server boot
+- `crates/sage-core/src/web_runtime.rs`: route layer, Enclave contract client, session logic, tool gating
+- `crates/sage-core/src/sage_agent.rs`: shared agent core, including custom-instruction and optional-memory support used by the web runtime
+- `crates/sage-core/src/schema.rs`: memory tables plus Enclave web tables
+- `Dockerfile`: ships both `/app/sage` and `/app/enclave_web`
 
-| Layer | Purpose | Storage |
-|-------|---------|---------|
-| **Core Memory** | Always in context (persona, user info) | PostgreSQL |
-| **Recall Memory** | Searchable conversation history | PostgreSQL + TEE embeddings |
-| **Archival Memory** | Long-term semantic storage | pgvector + TEE embeddings |
-| **Summary Memory** | Auto-compaction when context overflows | PostgreSQL |
+## Running And Verifying
 
-All embeddings are generated via Tinfoil's TEE-based embedding API (`nomic-embed-text`), meaning your memory content stays private even during vector encoding.
+Recommended full-system path:
 
-### Built for Prompt Optimization
+- run this repo through the parent `enclave.free-prototype` compose stack
 
-The codebase is structured around [DSRs](https://github.com/krypticmouse/DSRs) signatures, enabling **GEPA (Genetic-Pareto) optimization** of prompts. Sage includes a working GEPA system where Claude analyzes test failures and proposes instruction improvements, which are then evaluated against Kimi. See the [GEPA section](#gepa-prompt-optimization) below.
-
-### DSRs Signature Architecture
-
-Sage uses typed DSRs signatures to define the contract between inputs and outputs. This makes the agent's interface explicit, debuggable, and optimizable.
-
-**Main Agent Signature (`AgentResponse`):**
-
-```rust
-#[derive(dspy_rs::Signature)]
-pub struct AgentResponse {
-    // Inputs
-    #[input(desc = "The input to respond to - either a user message or tool execution result")]
-    pub input: String,
-
-    #[input(desc = "Compacted summary of very old messages (only present for long conversations)")]
-    pub previous_context_summary: String,
-
-    #[input(desc = "Recent conversation history including your messages and tool results")]
-    pub conversation_context: String,
-
-    #[input]
-    pub available_tools: String,
-
-    // Outputs
-    #[output(desc = "Your reasoning/thought process (think step by step)")]
-    pub reasoning: String,
-
-    #[output(desc = "Array of messages to send to the user (can be empty)")]
-    pub messages: Vec<String>,
-
-    #[output(desc = "Array of tool calls to execute (can be empty)")]
-    pub tool_calls: Vec<ToolCall>,
-}
-```
-
-**How it works:** DSRs compiles this signature + instruction into a single prompt with field markers (`[[ ## field ## ]]`). The LLM outputs structured text that gets parsed back into typed Rust structs via BAML.
-
-<details>
-<summary><strong>Example: Compiled Prompt → LLM Response</strong></summary>
-
-When Sage processes a message, DSRs compiles the signature into a structured prompt. Here's what gets sent to the LLM:
-
-**System Prompt (generated by DSRs):**
-
-```
-Your input fields are:
-1. `input` (string): The input to respond to - either a user message or tool execution result
-2. `previous_context_summary` (string): Compacted summary of very old messages (only present for long conversations). Ignore if empty.
-3. `conversation_context` (string): Recent conversation history including your messages and tool results
-4. `available_tools` (string)
-
-Your output fields are:
-1. `reasoning` (string): Your reasoning/thought process (think step by step)
-2. `messages` (string[]): Array of messages to send to the user (can be empty)
-3. `tool_calls` (ToolCall[]): Array of tool calls to execute (can be empty, or [{"name": "done", "args": {}}] if nothing to do)
-
-All interactions will be structured in the following way, with the appropriate values filled in.
-
-[[ ## input ## ]]
-input
-
-[[ ## previous_context_summary ## ]]
-previous_context_summary
-
-[[ ## conversation_context ## ]]
-conversation_context
-
-[[ ## available_tools ## ]]
-available_tools
-
-[[ ## reasoning ## ]]
-Output field `reasoning` should be of type: string
-
-[[ ## messages ## ]]
-Output field `messages` should be of type: string[]
-
-[[ ## tool_calls ## ]]
-Output field `tool_calls` should be of type: ToolCall[]
-
-[
-  {
-    // A tool call requested by the agent
-    name: string,
-    args: map<string, string>,
-  }
-]
-
-[[ ## completed ## ]]
-
-Respond with the corresponding output fields, starting with the field `[[ ## reasoning ## ]]`, 
-then `[[ ## messages ## ]]`, then `[[ ## tool_calls ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`.
-
-In adhering to this structure, your objective is: 
-    You are Sage, a helpful AI assistant communicating via Signal.
-    
-    MEMORY SYSTEM:
-    You have full control over your memory. Use it proactively and autonomously:
-    
-    - **Core Memory Blocks** (<persona>, <human>): Always in your context. Edit anytime.
-      - `memory_append`: Add new info to a block
-      - `memory_replace`: Update/correct existing info
-      - `memory_insert`: Insert at specific line
-      
-    - **Archival Memory**: Long-term storage for important facts, preferences, details.
-      - `archival_insert`: Store information
-      - `archival_search`: Search past memories semantically
-    
-    COMMUNICATION STYLE:
-    You communicate via Signal chat. Adapt your message format to the content:
-    
-    CASUAL - Use multiple short messages:
-    messages: ["Hey! Good question.", "The answer is pretty simple.", "It's X because Y."]
-    
-    DETAILED - Longer messages with paragraphs are fine:
-    messages: ["Here's how that works:\n\nFirst, the system does X...\n\nThen Y happens."]
-    
-    ...
-```
-
----
-
-**User Message (the actual turn):**
-
-```
-[[ ## input ## ]]
-What's the weather like in Austin today?
-
-[[ ## previous_context_summary ## ]]
-
-
-[[ ## conversation_context ## ]]
-Current time: 02/01/2026 10:30:00 (Sunday) (America/Chicago)
-
-<memory_blocks>
-<persona>
-I am Sage, a helpful AI assistant communicating via Signal.
-</persona>
-<human>
-Name: Alex
-Location: Austin, TX
-Preferences: Prefers concise responses
-</human>
-</memory_blocks>
-
-Recent conversation:
-[user @ 01/31/2026 18:45:00]: hey sage, can you help me with something tomorrow?
-[assistant @ 01/31/2026 18:45:12]: Of course! Just let me know what you need.
-...
-
-[[ ## available_tools ## ]]
-Available tools:
-web_search:
-  Description: Search the web with AI summaries
-  Args: {"query": "search query", "location": "city for local results"}
-...
-```
-
----
-
-**LLM Response:**
-
-```
-[[ ## reasoning ## ]]
-Alex is asking about weather in Austin. I should use web_search with their location
-to get current conditions. I'll keep my response concise per their preferences.
-
-[[ ## messages ## ]]
-["Let me check the current weather for you."]
-
-[[ ## tool_calls ## ]]
-[{"name": "web_search", "args": {"query": "weather Austin TX today", "location": "Austin, TX"}}]
-
-[[ ## completed ## ]]
-```
-
-DSRs parses this back into a typed `AgentResponse` struct that Sage uses to execute tools and send messages.
-
-</details>
-
-**Other signatures in the codebase:**
-- `SummarizeConversation` - Compacts old messages when context window fills
-- `CorrectionResponse` - Fixes malformed LLM outputs (self-healing)
-
-## Stack
-
-| Component | Choice | Why |
-|-----------|--------|-----|
-| Language | **Rust** | Performance, type safety, reliability |
-| LLM | **Kimi K2.5** | Strong tool use, multimodal, 256k context |
-| Inference | **Tinfoil** | TEE-based confidential compute via local verified proxy |
-| Embeddings | **nomic-embed-text** | Via Tinfoil |
-| Messaging | **Signal** (signal-cli) or **Marmot** ([Pika](https://github.com/sledtools/pika) / `marmotd`) | E2E encrypted; Signal for mobile, Marmot for MLS over Nostr |
-| Database | **PostgreSQL + pgvector** | Structured data + vector search |
-| Framework | **DSRs** (dspy-rs) | Typed signatures, BAML parsing |
-
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| `web_search` | Brave Search with AI summaries |
-| `shell` | Execute commands in workspace |
-| `memory_replace/append/insert` | Edit core memory blocks |
-| `archival_insert/search` | Long-term semantic memory |
-| `conversation_search` | Search conversation history |
-| `schedule_task` | Reminders (cron or one-off) |
-| `set_preference` | User preferences (timezone, etc.) |
-
-## Messaging Providers
-
-Sage supports two messaging backends. Set the `MESSENGER` environment variable to choose (`signal` is the default).
-
-### Signal (Default)
-
-Uses [signal-cli](https://github.com/AsamK/signal-cli) for E2E encrypted messaging over the Signal protocol. Requires a registered phone number and runs signal-cli as a sidecar container.
+Useful local checks:
 
 ```bash
-MESSENGER=signal
-SIGNAL_PHONE_NUMBER=+1234567890
-SIGNAL_ALLOWED_USERS=*  # Or comma-separated Signal UUIDs
+cargo check -p sage-core --bin enclave_web
+cargo run -p sage-core --bin enclave_web
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-### Marmot / Pika (Decentralized)
-
-Uses [marmotd](https://github.com/sledtools/pika) for MLS-encrypted messaging over Nostr relays. No phone number required — identity is a Nostr keypair. Message Sage from the [Pika](https://github.com/sledtools/pika) app.
+Useful env for the web runtime path:
 
 ```bash
-MESSENGER=marmot
-MARMOT_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net
-MARMOT_ALLOWED_PUBKEYS=npub1...  # Or * for all
-MARMOT_AUTO_ACCEPT_WELCOMES=true
-```
-
-On first startup, marmotd generates a Nostr keypair and prints its `npub` in the logs. Use this npub to start a conversation from Pika. The keypair and MLS state persist in a Docker volume (`sage-marmot-state`).
-
-marmotd is built from source during `docker build` (included in the Dockerfile).
-
-## Quick Start
-
-### Prerequisites
-
-- [Podman](https://podman.io/) or Docker
-- signal-cli registered with a phone number (if using Signal) or [Pika](https://github.com/sledtools/pika) app (if using Marmot)
-- TINFOIL_API_KEY for the local verified proxy
-
-### Option 1: Docker (Recommended)
-
-Pre-built images are available for `linux/amd64` and `linux/arm64`:
-
-```bash
-# Pull the latest image
-docker pull ghcr.io/anthonyronning/sage:latest
-
-# Clone for docker-compose and configs
-git clone https://github.com/AnthonyRonning/sage.git
-cd sage
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your settings
-
-# Initialize signal-cli data volume if using Signal
-just signal-init
-
-# Start all services (postgres, signal-cli, tinfoil-proxy, sage)
-docker compose up -d
-```
-
-Or use the image directly in your own compose setup:
-
-```yaml
-services:
-  sage:
-    image: ghcr.io/anthonyronning/sage:latest
-    environment:
-      - DATABASE_URL=postgres://sage:sage@postgres:5432/sage
-      - TINFOIL_API_URL=http://tinfoil-proxy:8089/v1
-      - TINFOIL_API_KEY=your-api-key
-      - SIGNAL_CLI_HOST=signal-cli
-      - SIGNAL_CLI_PORT=7583
-      - SIGNAL_PHONE_NUMBER=+1234567890
-```
-
-### Option 2: Build from Source
-
-Requires [Nix](https://nixos.org/download.html) with flakes enabled:
-
-```bash
-git clone https://github.com/AnthonyRonning/sage.git
-cd sage
-nix develop
-
-cp .env.example .env
-# Edit .env with your settings
-
-just signal-init  # Only needed when using Signal
-just build        # Build container
-just start        # Start all services
-```
-
-### Configuration
-
-```bash
-# Required
+DATABASE_URL=postgres://sage:sage@localhost:5432/sage
 TINFOIL_API_URL=http://localhost:8089/v1
-TINFOIL_API_KEY=your-api-key
+TINFOIL_API_KEY=your-key
 TINFOIL_MODEL=kimi-k2-5
 TINFOIL_EMBEDDING_MODEL=nomic-embed-text
-
-# Local verified proxy
-TINFOIL_PROXY_PORT=8089
-TINFOIL_ROUTER_HOST=inference.tinfoil.sh
-TINFOIL_ROUTER_REPO=tinfoilsh/confidential-model-router
-
-# Messenger (choose one)
-MESSENGER=signal                      # "signal" (default) or "marmot"
-
-# Signal config (when MESSENGER=signal)
-SIGNAL_PHONE_NUMBER=+1234567890
-SIGNAL_ALLOWED_USERS=*                # Or comma-separated UUIDs
-
-# Marmot config (when MESSENGER=marmot)
-MARMOT_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net
-MARMOT_ALLOWED_PUBKEYS=npub1...       # Or * for all
-MARMOT_AUTO_ACCEPT_WELCOMES=true
-
-# Optional
-BRAVE_API_KEY=your-brave-key          # For web search
-TINFOIL_VISION_MODEL=kimi-k2-5        # For image understanding (defaults to TINFOIL_MODEL)
+ENCLAVE_WEB_PORT=3000
+ENCLAVE_BACKEND_URL=http://core-backend:8000
+INTERNAL_AGENT_TOKEN=dev-internal-agent-token
+SEARXNG_URL=http://searxng:8080
+FRONTEND_URL=http://localhost:5173
+CORS_ORIGINS=http://localhost:5173
+USER_SESSION_COOKIE_NAME=sanctum_session
+ADMIN_SESSION_COOKIE_NAME=sanctum_admin_session
+CSRF_COOKIE_NAME=sanctum_csrf
 ```
 
-## Architecture
+## Background And Historical Docs
 
-```
-┌─────────────────┐     Signal      ┌─────────────────┐
-│   Your Phone    │◄──────────────►│   signal-cli    │
-└─────────────────┘    (encrypted)  └────────┬────────┘
-                                             │ JSON-RPC
-                                             ▼
-┌─────────────────────────────────────────────────────┐
-│                    Sage (Rust)                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │
-│  │   Agent     │  │   Memory    │  │   Tools    │  │
-│  │   Manager   │  │   System    │  │            │  │
-│  └─────────────┘  └─────────────┘  └────────────┘  │
-└─────────────────────────┬───────────────────────────┘
-                                             ▲
-                                             │ JSONL/stdio
-┌─────────────────┐   MLS/Nostr     ┌────────┴────────┐
-│   Pika App      │◄──────────────►│    marmotd      │
-└─────────────────┘    (encrypted)  └─────────────────┘
-                          │
-        ┌─────────────────┼─────────────────┐
-        ▼                 ▼                 ▼
-┌───────────────┐ ┌───────────────┐ ┌───────────────┐
-│  PostgreSQL   │ │ Tinfoil Proxy │ │ Brave Search  │
-│  + pgvector   │ │  -> TEE router│ │               │
-└───────────────┘ └───────────────┘ └───────────────┘
-```
+Messenger-specific code still exists in this repo, and `main.rs`, `signal.rs`, and `marmot.rs` still matter for upstream Sage work. They are not the primary Enclave product path on this branch.
 
-## Privacy Model
+For the current branch story, start with:
 
-| Layer | Protection |
-|-------|------------|
-| **Transport** | Signal E2E encryption or MLS-encrypted Nostr (via Pika) |
-| **Inference** | Tinfoil TEE via local verified proxy |
-| **Embeddings** | Tinfoil TEE (memory vectors generated privately) |
-| **Storage** | Local PostgreSQL (your machine) |
-| **Search** | Brave (privacy-respecting, no tracking) |
+- [`docs/architecture.md`](docs/architecture.md)
+- [`docs/decisions.md`](docs/decisions.md)
+- [`AGENTS.md`](AGENTS.md)
+- [`TODO.md`](TODO.md)
 
-## Project Status
-
-**Working:**
-- Multi-user conversations with memory isolation
-- Image understanding (send photos via Signal)
-- Web search, shell commands, scheduling
-- Auto-reconnect on Signal connection drops
-- Context compaction when approaching limits
-- GEPA prompt optimization (see below)
-
-**Future:**
-- Gmail/Calendar integration
-- Group chat support
-- Voice messages
-
-## Smoke Testing
-
-Sage includes an isolated pre-push smoke gate for the direct Tinfoil path. It starts a fresh `pgvector` Postgres container and Tinfoil proxy, applies migrations, builds a dedicated smoke-runner image, and validates:
-
-- containerized `cargo check`, `cargo test`, and `cargo clippy`
-- direct chat, embeddings, and vision calls through the Tinfoil proxy
-- invalid-model preflight failure behavior
-- recall-memory `NULL -> update_embedding -> searchable` semantics
-- archival insert/search through pgvector
-
-The smoke gate does **not** start `sage`, `signal-cli`, or `marmotd`, so it avoids messenger setup while still proving the Tinfoil/data-plane migration.
-
-Run it with a transient API key:
-
-```bash
-TINFOIL_API_KEY=your-tinfoil-key just smoke-tinfoil
-```
-
-Or run the script directly if `just` is unavailable:
-
-```bash
-TINFOIL_API_KEY=your-tinfoil-key ./scripts/smoke_tinfoil.sh
-```
-
-The script uses an isolated Docker/Podman network and temporary volume, so it does not reuse the main Compose stack.
-
-## GEPA Prompt Optimization
-
-Sage includes a GEPA (Genetic-Pareto) optimization system for automatically improving the agent instruction based on test cases and feedback.
-
-**How it works:**
-1. Define training examples in `examples/gepa/trainset.json` with expected behaviors
-2. Run evaluation to get baseline score against current instruction
-3. Run optimization - Claude (judge) analyzes failures and proposes instruction improvements
-4. Kimi (program) is re-evaluated with the improved instruction
-5. Repeat until convergence or perfect score
-
-**Commands:**
-```bash
-# Evaluate current instruction (baseline score)
-just gepa-eval
-
-# Run optimization loop (requires ANTHROPIC_API_KEY)
-just gepa-optimize
-
-# View optimized instruction
-just gepa-show
-
-# See training example categories
-just gepa-examples
-```
-
-**Environment:**
-```bash
-# Required for GEPA optimization (Claude as judge)
-ANTHROPIC_API_KEY=your-anthropic-key
-
-# Program under test (Kimi K2.5 via Tinfoil)
-TINFOIL_API_URL=http://localhost:8089/v1
-TINFOIL_API_KEY=your-tinfoil-key
-TINFOIL_MODEL=kimi-k2-5
-```
-
-**Training Examples:**
-Training data is in `examples/gepa/trainset.json`. Each example includes:
-- Input scenario (user message or tool result)
-- Context (persona, human block, conversation history)
-- Expected behavior description
-- Good/bad response examples
-
-Current categories: first-time users, casual chat, web search, memory storage, tool result processing, corrections.
-
-## Related Projects
-
-- [Letta](https://github.com/letta-ai/letta) - Memory management inspiration
-- [DSRs](https://github.com/krypticmouse/DSRs) - DSPy in Rust
-- [signal-cli](https://github.com/AsamK/signal-cli) - Signal CLI interface
-- [Pika](https://github.com/sledtools/pika) - MLS-encrypted messaging over Nostr
-- [Tinfoil](https://tinfoil.sh/) - Confidential compute LLM inference
-
-## License
-
-MIT
+Older design docs such as `docs/brainstorm.md`, `docs/roadmap.md`, and `docs/SAGE_V2_DESIGN.md` are now historical background only.

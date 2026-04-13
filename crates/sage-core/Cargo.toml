@@ -35,6 +35,7 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 base64.workspace = true
+flate2 = "1"
 diesel.workspace = true
 diesel_migrations.workspace = true
 pgvector.workspace = true
@@ -48,6 +49,7 @@ chrono-tz.workspace = true
 cron.workspace = true
 uuid.workspace = true
 dotenvy.workspace = true
+itsdangerous = { version = "0.4.1", features = ["serializer"] }
 socket2 = "0.5"
 libc = "0.2"
 

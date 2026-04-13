@@ -1,26 +1,46 @@
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
+use base64::{
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use diesel::prelude::*;
+use diesel::sql_types::{Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid, Varchar};
+use flate2::read::ZlibDecoder;
+use itsdangerous::{
+    default_builder, timed_serializer_with_signer, Encoding, IntoTimestampSigner,
+    TimedSerializer,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::sage_agent::{SageAgent, Tool, ToolRegistry, ToolResult};
-use crate::schema::{messages, web_sessions};
+use crate::schema::{ai_config, ai_config_user_type_overrides, messages, web_sessions};
 
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
+const USER_SESSION_SALT: &str = "session";
+const USER_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const ADMIN_SESSION_SALT: &str = "admin-session";
+const ADMIN_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const ENCLAVE_WEB_BASE_INSTRUCTION: &str = r#"You are Sage operating enclave.free's web application.
 
 This is not Signal, not a companion chat, and not a friendship simulator.
@@ -41,6 +61,45 @@ Output style:
 - Use tools and then continue until you have the answer.
 - Use done only when there is nothing else to do this turn.
 "#;
+
+#[derive(Clone, Copy)]
+struct PythonURLSafeEncoding;
+
+impl Encoding for PythonURLSafeEncoding {
+    fn encode<'a>(&self, serialized_input: String) -> String {
+        URL_SAFE_NO_PAD.encode(serialized_input.as_bytes())
+    }
+
+    fn decode<'a>(&self, encoded_input: String) -> Result<String, itsdangerous::PayloadError> {
+        let is_compressed = encoded_input.starts_with('.');
+        let payload = encoded_input.strip_prefix('.').unwrap_or(&encoded_input);
+        let decoded = decode_urlsafe_nopad(payload)
+            .map_err(|_| serde_json::from_str::<Value>("").expect_err("invalid json"))?;
+
+        if is_compressed {
+            let mut decoder = ZlibDecoder::new(decoded.as_slice());
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .map_err(|_| {
+                    std::str::from_utf8(&decoded)
+                        .expect_err("compressed payload should not be valid utf8")
+                })?;
+            return Ok(String::from_utf8(decompressed).map_err(|error| error.utf8_error())?);
+        }
+
+        Ok(String::from_utf8(decoded).map_err(|error| error.utf8_error())?)
+    }
+}
+
+fn decode_urlsafe_nopad(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    let mut normalized = value.to_string();
+    let remainder = normalized.len() % 4;
+    if remainder != 0 {
+        normalized.push_str(&"=".repeat(4 - remainder));
+    }
+    URL_SAFE.decode(normalized.as_bytes())
+}
 
 #[derive(Debug)]
 pub struct AppError {
@@ -74,6 +133,7 @@ pub struct EnclaveWebConfig {
     pub http_port: u16,
     pub backend_url: String,
     pub internal_agent_token: String,
+    pub secret_key: String,
     pub allowed_origins: Vec<String>,
     pub frontend_url: Option<String>,
     pub user_session_cookie_name: String,
@@ -112,6 +172,7 @@ impl EnclaveWebConfig {
                 .unwrap_or_else(|_| "http://core-backend:8000".to_string()),
             internal_agent_token: std::env::var("INTERNAL_AGENT_TOKEN")
                 .context("INTERNAL_AGENT_TOKEN must be set")?,
+            secret_key: std::env::var("SECRET_KEY").context("SECRET_KEY must be set")?,
             allowed_origins,
             frontend_url,
             user_session_cookie_name: std::env::var("USER_SESSION_COOKIE_NAME")
@@ -144,21 +205,29 @@ pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Rout
 
     let state = WebAppState {
         config,
-        web_config,
+        web_config: web_config.clone(),
         http,
         db: Arc::new(Mutex::new(db_conn)),
         internal,
     };
+    seed_default_ai_config(&state).map_err(|error| anyhow!(error.message.clone()))?;
+    let cors = build_cors_layer(&web_config)?;
 
     Ok(Router::new()
         .route("/health", get(health))
         .route("/llm/chat", post(chat))
         .route("/query", post(query))
-        .route("/query/session/{session_id}", get(get_query_session).delete(delete_query_session))
+        .route(
+            "/query/session/{session_id}",
+            get(get_query_session).delete(delete_query_session),
+        )
         .route("/session-defaults", get(session_defaults))
         .route("/admin/tools/execute", post(admin_tools_execute))
         .route("/admin/ai-config", get(admin_ai_config))
-        .route("/admin/ai-config/{key}", get(admin_ai_config_key).put(admin_ai_config_key_update))
+        .route(
+            "/admin/ai-config/{key}",
+            get(admin_ai_config_key).put(admin_ai_config_key_update),
+        )
         .route(
             "/admin/ai-config/user-type/{user_type_id}",
             get(admin_ai_config_user_type),
@@ -167,11 +236,15 @@ pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Rout
             "/admin/ai-config/user-type/{user_type_id}/{key}",
             put(admin_ai_config_user_type_update).delete(admin_ai_config_user_type_delete),
         )
-        .route("/admin/ai-config/prompts/preview", post(admin_ai_config_preview))
+        .route(
+            "/admin/ai-config/prompts/preview",
+            post(admin_ai_config_preview),
+        )
         .route(
             "/admin/ai-config/user-type/{user_type_id}/prompts/preview",
             post(admin_ai_config_preview_user_type),
         )
+        .layer(cors)
         .with_state(state))
 }
 
@@ -269,12 +342,61 @@ struct PromptPreviewResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct AIConfigItemResponse {
+    key: String,
+    value: String,
+    value_type: String,
+    category: String,
+    description: Option<String>,
+    updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AIConfigResponseBody {
+    prompt_sections: Vec<AIConfigItemResponse>,
+    parameters: Vec<AIConfigItemResponse>,
+    defaults: Vec<AIConfigItemResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AIConfigUpdateRequest {
+    value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AIConfigWithInheritanceResponse {
+    key: String,
+    value: String,
+    value_type: String,
+    category: String,
+    description: Option<String>,
+    updated_at: Option<String>,
+    is_override: bool,
+    override_user_type_id: Option<i32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AIConfigUserTypeResponseBody {
+    user_type_id: i32,
+    user_type_name: Option<String>,
+    prompt_sections: Vec<AIConfigWithInheritanceResponse>,
+    parameters: Vec<AIConfigWithInheritanceResponse>,
+    defaults: Vec<AIConfigWithInheritanceResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SuccessResponse {
+    success: bool,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SessionDefaultsQuery {
     user_type_id: Option<i32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct InternalSessionDefaultsResponse {
+struct SessionDefaultsResponse {
     web_search_enabled: bool,
     default_document_ids: Vec<String>,
 }
@@ -323,6 +445,96 @@ struct InternalUserProfileResponse {
     profile: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InternalUserRecordResponse {
+    id: i32,
+    approved: bool,
+    email: Option<String>,
+    name: Option<String>,
+    user_type_id: Option<i32>,
+    dev_mode: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InternalAdminRecordResponse {
+    id: i32,
+    pubkey: String,
+    session_nonce: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InternalUserTypeResponse {
+    id: i32,
+    name: String,
+    description: Option<String>,
+    icon: Option<String>,
+    display_order: i32,
+    created_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InternalDocumentAccessResponse {
+    user_type_id: Option<i32>,
+    available_document_ids: Vec<String>,
+    default_document_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct UserSessionTokenPayload {
+    user_id: i32,
+    email: String,
+    #[serde(default)]
+    dev_mode: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AdminSessionTokenPayload {
+    admin_id: i32,
+    pubkey: String,
+    #[serde(rename = "type", default)]
+    r#type: String,
+    #[serde(default)]
+    session_nonce: i32,
+}
+
+#[derive(Clone, Debug, QueryableByName)]
+struct AiConfigRow {
+    #[diesel(sql_type = Varchar)]
+    key: String,
+    #[diesel(sql_type = Text)]
+    value: String,
+    #[diesel(sql_type = Varchar)]
+    value_type: String,
+    #[diesel(sql_type = Varchar)]
+    category: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    description: Option<String>,
+    #[diesel(sql_type = Timestamptz)]
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug, QueryableByName)]
+struct AiConfigOverrideRow {
+    #[diesel(sql_type = Varchar)]
+    ai_config_key: String,
+    #[diesel(sql_type = Text)]
+    value: String,
+    #[diesel(sql_type = Timestamptz)]
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveAiConfigRow {
+    key: String,
+    value: String,
+    value_type: String,
+    category: String,
+    description: Option<String>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    is_override: bool,
+    override_user_type_id: Option<i32>,
+}
+
 #[allow(dead_code)]
 #[derive(Queryable, Selectable, Clone, Debug)]
 #[diesel(table_name = web_sessions)]
@@ -367,37 +579,6 @@ struct StoredMessageRow {
 }
 
 #[derive(Clone)]
-struct ForwardedAuthHeaders {
-    authorization: Option<String>,
-    cookie: Option<String>,
-    csrf: Option<String>,
-}
-
-impl ForwardedAuthHeaders {
-    fn from_headers(headers: &HeaderMap) -> Self {
-        Self {
-            authorization: header_to_string(headers.get("authorization")),
-            cookie: header_to_string(headers.get("cookie")),
-            csrf: header_to_string(headers.get("x-csrf-token")),
-        }
-    }
-
-    fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let mut builder = builder;
-        if let Some(value) = &self.authorization {
-            builder = builder.header("Authorization", value);
-        }
-        if let Some(value) = &self.cookie {
-            builder = builder.header("Cookie", value);
-        }
-        if let Some(value) = &self.csrf {
-            builder = builder.header("X-CSRF-Token", value);
-        }
-        builder
-    }
-}
-
-#[derive(Clone)]
 pub struct InternalAgentClient {
     http: Client,
     backend_url: String,
@@ -413,31 +594,49 @@ impl InternalAgentClient {
         }
     }
 
-    async fn resolve_auth(&self, auth: &ForwardedAuthHeaders) -> Result<InternalAuthContext> {
-        let request = auth.apply(
-            self.http
-                .post(format!("{}/internal/agent/auth-context", self.backend_url))
-                .header("X-Internal-Agent-Token", &self.internal_agent_token),
-        );
+    async fn user_record(&self, user_id: i32) -> Result<InternalUserRecordResponse> {
+        let request = self
+            .http
+            .get(format!(
+                "{}/internal/agent/users/{}",
+                self.backend_url, user_id
+            ))
+            .header("X-Internal-Agent-Token", &self.internal_agent_token);
         self.send_json(request).await
     }
 
-    async fn session_defaults(
+    async fn admin_record(&self, pubkey: &str) -> Result<InternalAdminRecordResponse> {
+        let request = self
+            .http
+            .get(format!(
+                "{}/internal/agent/admins/by-pubkey/{}",
+                self.backend_url, pubkey
+            ))
+            .header("X-Internal-Agent-Token", &self.internal_agent_token);
+        self.send_json(request).await
+    }
+
+    async fn user_type(&self, user_type_id: i32) -> Result<InternalUserTypeResponse> {
+        let request = self
+            .http
+            .get(format!(
+                "{}/internal/agent/user-types/{}",
+                self.backend_url, user_type_id
+            ))
+            .header("X-Internal-Agent-Token", &self.internal_agent_token);
+        self.send_json(request).await
+    }
+
+    async fn document_access(
         &self,
         user_type_id: Option<i32>,
-    ) -> Result<InternalSessionDefaultsResponse> {
+    ) -> Result<InternalDocumentAccessResponse> {
         let request = self
             .http
-            .get(format!("{}/internal/agent/session-defaults", self.backend_url))
-            .header("X-Internal-Agent-Token", &self.internal_agent_token)
-            .query(&[("user_type_id", user_type_id)]);
-        self.send_json(request).await
-    }
-
-    async fn effective_ai_config(&self, user_type_id: Option<i32>) -> Result<InternalEffectiveAiConfig> {
-        let request = self
-            .http
-            .get(format!("{}/internal/agent/ai-config/effective", self.backend_url))
+            .get(format!(
+                "{}/internal/agent/document-access",
+                self.backend_url
+            ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .query(&[("user_type_id", user_type_id)]);
         self.send_json(request).await
@@ -465,7 +664,10 @@ impl InternalAgentClient {
     ) -> Result<InternalDocumentSearchResponse> {
         let request = self
             .http
-            .post(format!("{}/internal/agent/document-search", self.backend_url))
+            .post(format!(
+                "{}/internal/agent/document-search",
+                self.backend_url
+            ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(payload);
         self.send_json(request).await
@@ -474,27 +676,13 @@ impl InternalAgentClient {
     async fn admin_db_query(&self, sql: &str) -> Result<Value> {
         let request = self
             .http
-            .post(format!("{}/internal/agent/admin-db-query", self.backend_url))
+            .post(format!(
+                "{}/internal/agent/admin-db-query",
+                self.backend_url
+            ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(&json!({ "sql": sql }));
         self.send_value(request).await
-    }
-
-    async fn proxy_json(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        auth: &ForwardedAuthHeaders,
-        body: Option<Value>,
-    ) -> Result<(StatusCode, Value)> {
-        let mut request = auth.apply(
-            self.http
-                .request(method, format!("{}{}", self.backend_url, path)),
-        );
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        self.send_value_with_status(request).await
     }
 
     async fn send_json<T: for<'de> Deserialize<'de>>(
@@ -742,13 +930,18 @@ async fn health() -> Json<Value> {
 async fn session_defaults(
     State(state): State<WebAppState>,
     Query(query): Query<SessionDefaultsQuery>,
-) -> AppResult<Json<InternalSessionDefaultsResponse>> {
-    let defaults = state
+) -> AppResult<Json<SessionDefaultsResponse>> {
+    let ai_config = load_effective_ai_config(&state, query.user_type_id)?;
+    let document_access = state
         .internal
-        .session_defaults(query.user_type_id)
+        .document_access(query.user_type_id)
         .await
         .map_err(internal_error)?;
-    Ok(Json(defaults))
+
+    Ok(Json(SessionDefaultsResponse {
+        web_search_enabled: value_as_bool(ai_config.defaults.get("web_search_default"), false),
+        default_document_ids: document_access.default_document_ids,
+    }))
 }
 
 async fn chat(
@@ -757,13 +950,7 @@ async fn chat(
     Json(request): Json<ChatRequest>,
 ) -> AppResult<Json<ChatResponse>> {
     enforce_csrf(&state.web_config, &Method::POST, &headers)?;
-
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_public_actor(&state, &headers).await?;
 
     if request.tool_context.is_some() && auth.kind != "admin" {
         return Err(AppError::new(
@@ -772,11 +959,7 @@ async fn chat(
         ));
     }
 
-    let ai_config = state
-        .internal
-        .effective_ai_config(auth.user_type_id)
-        .await
-        .map_err(internal_error)?;
+    let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     configure_request_lm(&state.config, temperature).await?;
 
@@ -803,7 +986,8 @@ async fn chat(
     }
 
     let mut registry = ToolRegistry::new();
-    if request.tools.iter().any(|tool| tool == "web-search") && !client_executed_set.contains("web-search")
+    if request.tools.iter().any(|tool| tool == "web-search")
+        && !client_executed_set.contains("web-search")
     {
         registry.register(Arc::new(SearxWebSearchTool {
             http: state.http.clone(),
@@ -856,19 +1040,8 @@ async fn query(
     Json(request): Json<QueryRequest>,
 ) -> AppResult<Json<QueryResponse>> {
     enforce_csrf(&state.web_config, &Method::POST, &headers)?;
-
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
-
-    let ai_config = state
-        .internal
-        .effective_ai_config(auth.user_type_id)
-        .await
-        .map_err(internal_error)?;
+    let auth = resolve_public_actor(&state, &headers).await?;
+    let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     let top_k = request
         .top_k
@@ -980,7 +1153,10 @@ async fn query(
         .store_message(&assistant_user_id, "assistant", &answer)
         .await
     {
-        warn!("failed to persist assistant message for session {}: {}", session.id, err);
+        warn!(
+            "failed to persist assistant message for session {}: {}",
+            session.id, err
+        );
     }
 
     let sources = dedupe_sources(
@@ -1013,12 +1189,7 @@ async fn get_query_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_public_actor(&state, &headers).await?;
     let session = load_web_session(&state, &session_id)?;
     ensure_session_access(&auth, &session)?;
 
@@ -1053,12 +1224,7 @@ async fn delete_query_session(
     Path(session_id): Path<String>,
 ) -> AppResult<Json<Value>> {
     enforce_csrf(&state.web_config, &Method::DELETE, &headers)?;
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_public_actor(&state, &headers).await?;
     let session = load_web_session(&state, &session_id)?;
     ensure_session_access(&auth, &session)?;
 
@@ -1079,46 +1245,47 @@ async fn admin_tools_execute(
     Json(request): Json<ToolExecuteRequest>,
 ) -> AppResult<impl IntoResponse> {
     enforce_csrf(&state.web_config, &Method::POST, &headers)?;
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_admin_actor(&state, &headers).await?;
     ensure_admin(&auth)?;
-
-    let (status, value) = state
+    if request.tool_id != "db-query" {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            format!(
+                "Tool '{}' is not admin-only or not allowed",
+                request.tool_id
+            ),
+        ));
+    }
+    let data = state
         .internal
-        .proxy_json(
-            reqwest::Method::POST,
-            "/admin/tools/execute",
-            &forwarded,
-            Some(serde_json::to_value(request).map_err(internal_error)?),
-        )
+        .admin_db_query(&request.query)
         .await
         .map_err(internal_error)?;
-
-    Ok((status, Json(value)))
+    Ok((
+        StatusCode::OK,
+        Json(json!(ToolExecuteResponse {
+            success: data
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            tool_id: request.tool_id.clone(),
+            tool_name: "Database Query".to_string(),
+            data: Some(data.clone()),
+            error: data
+                .get("error")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string()),
+        })),
+    ))
 }
 
 async fn admin_ai_config(
     State(state): State<WebAppState>,
     headers: HeaderMap,
 ) -> AppResult<impl IntoResponse> {
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_admin_actor(&state, &headers).await?;
     ensure_admin(&auth)?;
-
-    let (status, value) = state
-        .internal
-        .proxy_json(reqwest::Method::GET, "/admin/ai-config", &forwarded, None)
-        .await
-        .map_err(internal_error)?;
-    Ok((status, Json(value)))
+    Ok((StatusCode::OK, Json(load_ai_config_response(&state)?)))
 }
 
 async fn admin_ai_config_key(
@@ -1126,53 +1293,28 @@ async fn admin_ai_config_key(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> AppResult<impl IntoResponse> {
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_admin_actor(&state, &headers).await?;
     ensure_admin(&auth)?;
-
-    let (status, value) = state
-        .internal
-        .proxy_json(
-            reqwest::Method::GET,
-            &format!("/admin/ai-config/{}", key),
-            &forwarded,
-            None,
-        )
-        .await
-        .map_err(internal_error)?;
-    Ok((status, Json(value)))
+    Ok((
+        StatusCode::OK,
+        Json(load_ai_config_item_response(&state, &key)?),
+    ))
 }
 
 async fn admin_ai_config_key_update(
     State(state): State<WebAppState>,
     headers: HeaderMap,
     Path(key): Path<String>,
-    Json(body): Json<Value>,
+    Json(body): Json<AIConfigUpdateRequest>,
 ) -> AppResult<impl IntoResponse> {
     enforce_csrf(&state.web_config, &Method::PUT, &headers)?;
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_admin_actor(&state, &headers).await?;
     ensure_admin(&auth)?;
-
-    let (status, value) = state
-        .internal
-        .proxy_json(
-            reqwest::Method::PUT,
-            &format!("/admin/ai-config/{}", key),
-            &forwarded,
-            Some(body),
-        )
-        .await
-        .map_err(internal_error)?;
-    Ok((status, Json(value)))
+    update_ai_config_value(&state, &key, &body.value)?;
+    Ok((
+        StatusCode::OK,
+        Json(load_ai_config_item_response(&state, &key)?),
+    ))
 }
 
 async fn admin_ai_config_user_type(
@@ -1180,53 +1322,43 @@ async fn admin_ai_config_user_type(
     headers: HeaderMap,
     Path(user_type_id): Path<i32>,
 ) -> AppResult<impl IntoResponse> {
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_admin_actor(&state, &headers).await?;
     ensure_admin(&auth)?;
-
-    let (status, value) = state
+    let user_type = state
         .internal
-        .proxy_json(
-            reqwest::Method::GET,
-            &format!("/admin/ai-config/user-type/{}", user_type_id),
-            &forwarded,
-            None,
-        )
+        .user_type(user_type_id)
         .await
         .map_err(internal_error)?;
-    Ok((status, Json(value)))
+    Ok((
+        StatusCode::OK,
+        Json(load_ai_config_user_type_response(&state, &user_type)?),
+    ))
 }
 
 async fn admin_ai_config_user_type_update(
     State(state): State<WebAppState>,
     headers: HeaderMap,
     Path((user_type_id, key)): Path<(i32, String)>,
-    Json(body): Json<Value>,
+    Json(body): Json<AIConfigUpdateRequest>,
 ) -> AppResult<impl IntoResponse> {
     enforce_csrf(&state.web_config, &Method::PUT, &headers)?;
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_admin_actor(&state, &headers).await?;
     ensure_admin(&auth)?;
-
-    let (status, value) = state
+    let user_type = state
         .internal
-        .proxy_json(
-            reqwest::Method::PUT,
-            &format!("/admin/ai-config/user-type/{}/{}", user_type_id, key),
-            &forwarded,
-            Some(body),
-        )
+        .user_type(user_type_id)
         .await
         .map_err(internal_error)?;
-    Ok((status, Json(value)))
+    upsert_ai_config_override(&state, &key, user_type.id, &body.value)?;
+    Ok((
+        StatusCode::OK,
+        Json(load_ai_config_user_type_item(
+            &state,
+            user_type.id,
+            &user_type.name,
+            &key,
+        )?),
+    ))
 }
 
 async fn admin_ai_config_user_type_delete(
@@ -1235,25 +1367,21 @@ async fn admin_ai_config_user_type_delete(
     Path((user_type_id, key)): Path<(i32, String)>,
 ) -> AppResult<impl IntoResponse> {
     enforce_csrf(&state.web_config, &Method::DELETE, &headers)?;
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_admin_actor(&state, &headers).await?;
     ensure_admin(&auth)?;
-
-    let (status, value) = state
+    let _ = state
         .internal
-        .proxy_json(
-            reqwest::Method::DELETE,
-            &format!("/admin/ai-config/user-type/{}/{}", user_type_id, key),
-            &forwarded,
-            None,
-        )
+        .user_type(user_type_id)
         .await
         .map_err(internal_error)?;
-    Ok((status, Json(value)))
+    delete_ai_config_override(&state, &key, user_type_id)?;
+    Ok((
+        StatusCode::OK,
+        Json(json!(SuccessResponse {
+            success: true,
+            message: format!("Override for '{}' reverted to global default", key),
+        })),
+    ))
 }
 
 async fn admin_ai_config_preview(
@@ -1261,19 +1389,9 @@ async fn admin_ai_config_preview(
     headers: HeaderMap,
     Json(request): Json<PromptPreviewRequest>,
 ) -> AppResult<Json<PromptPreviewResponse>> {
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_admin_actor(&state, &headers).await?;
     ensure_admin(&auth)?;
-
-    let config = state
-        .internal
-        .effective_ai_config(None)
-        .await
-        .map_err(internal_error)?;
+    let config = load_effective_ai_config(&state, None)?;
     Ok(Json(build_prompt_preview(&config, request)))
 }
 
@@ -1283,19 +1401,14 @@ async fn admin_ai_config_preview_user_type(
     Path(user_type_id): Path<i32>,
     Json(request): Json<PromptPreviewRequest>,
 ) -> AppResult<Json<PromptPreviewResponse>> {
-    let forwarded = ForwardedAuthHeaders::from_headers(&headers);
-    let auth = state
-        .internal
-        .resolve_auth(&forwarded)
-        .await
-        .map_err(auth_error)?;
+    let auth = resolve_admin_actor(&state, &headers).await?;
     ensure_admin(&auth)?;
-
-    let config = state
+    let _ = state
         .internal
-        .effective_ai_config(Some(user_type_id))
+        .user_type(user_type_id)
         .await
         .map_err(internal_error)?;
+    let config = load_effective_ai_config(&state, Some(user_type_id))?;
     Ok(Json(build_prompt_preview(&config, request)))
 }
 
@@ -1307,7 +1420,11 @@ fn build_prompt_preview(
 
     if !request.sample_facts.is_empty() {
         parts.push("=== CONFIRMED FACTS ===".to_string());
-        for (key, value) in request.sample_facts.iter().filter(|(_, value)| !value.is_empty()) {
+        for (key, value) in request
+            .sample_facts
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+        {
             parts.push(format!("- {}: {}", key, value));
         }
         parts.push(String::new());
@@ -1344,7 +1461,11 @@ fn get_or_create_web_session(
         .unwrap_or_else(Uuid::new_v4);
     let agent_id = Uuid::new_v4();
     let owner_id = auth.id.to_string();
-    let owner_type = if auth.kind == "admin" { "admin" } else { "user" };
+    let owner_type = if auth.kind == "admin" {
+        "admin"
+    } else {
+        "user"
+    };
 
     let new_session = NewWebSession {
         id: session_id,
@@ -1386,7 +1507,10 @@ fn get_or_create_web_session(
         .map_err(internal_error)
 }
 
-fn maybe_load_web_session(state: &WebAppState, session_id: &str) -> AppResult<Option<WebSessionRow>> {
+fn maybe_load_web_session(
+    state: &WebAppState,
+    session_id: &str,
+) -> AppResult<Option<WebSessionRow>> {
     let parsed = match Uuid::parse_str(session_id) {
         Ok(value) => value,
         Err(_) => return Ok(None),
@@ -1442,7 +1566,10 @@ fn load_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<Vec<S
 
 fn ensure_admin(auth: &InternalAuthContext) -> AppResult<()> {
     if auth.kind != "admin" {
-        return Err(AppError::new(StatusCode::FORBIDDEN, "Admin access required"));
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "Admin access required",
+        ));
     }
     Ok(())
 }
@@ -1453,9 +1580,791 @@ fn ensure_session_access(auth: &InternalAuthContext, session: &WebSessionRow) ->
     }
 
     if session.owner_type != "user" || session.owner_id != auth.id.to_string() {
-        return Err(AppError::new(StatusCode::FORBIDDEN, "Session access denied"));
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "Session access denied",
+        ));
     }
     Ok(())
+}
+
+fn build_cors_layer(config: &EnclaveWebConfig) -> Result<CorsLayer> {
+    let origins = config
+        .allowed_origins
+        .iter()
+        .map(|origin| HeaderValue::from_str(origin))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("invalid CORS origin")?;
+
+    Ok(CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_credentials(true)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            "x-csrf-token".parse().expect("static header is valid"),
+        ]))
+}
+
+fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
+    let defaults = [
+        (
+            "prompt_tone",
+            "Be helpful, concise, and professional. Acknowledge the user's question before answering.",
+            "string",
+            "prompt_section",
+            Some("Voice and personality instructions"),
+        ),
+        (
+            "prompt_rules",
+            "[\"ONE action per response when providing step-by-step guidance\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
+            "json",
+            "prompt_section",
+            Some("Array of behavioral rules"),
+        ),
+        (
+            "prompt_forbidden",
+            "[]",
+            "json",
+            "prompt_section",
+            Some("Topics to avoid or redirect"),
+        ),
+        (
+            "prompt_greeting",
+            "greeting_style",
+            "string",
+            "prompt_section",
+            Some("Initial response style"),
+        ),
+        (
+            "temperature",
+            "0.1",
+            "number",
+            "parameter",
+            Some("LLM temperature (0.0-1.0)"),
+        ),
+        (
+            "top_k",
+            "8",
+            "number",
+            "parameter",
+            Some("RAG retrieval count"),
+        ),
+        (
+            "web_search_default",
+            "false",
+            "boolean",
+            "default",
+            Some("Web search active by default for new sessions"),
+        ),
+    ];
+
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    for (key, value, value_type, category, description) in defaults {
+        diesel::sql_query(
+            "INSERT INTO ai_config (key, value, value_type, category, description, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, NOW()) \
+             ON CONFLICT (key) DO NOTHING",
+        )
+        .bind::<Varchar, _>(key)
+        .bind::<Text, _>(value)
+        .bind::<Varchar, _>(value_type)
+        .bind::<Varchar, _>(category)
+        .bind::<Nullable<Text>, _>(description)
+        .execute(&mut *conn)
+        .map_err(internal_error)?;
+    }
+    Ok(())
+}
+
+fn load_all_ai_config_rows(state: &WebAppState) -> AppResult<Vec<AiConfigRow>> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    diesel::sql_query(
+        "SELECT key, value, value_type, category, description, updated_at \
+         FROM ai_config ORDER BY category, key",
+    )
+    .load::<AiConfigRow>(&mut *conn)
+    .map_err(internal_error)
+}
+
+fn load_ai_config_row(state: &WebAppState, key: &str) -> AppResult<AiConfigRow> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    let mut rows = diesel::sql_query(
+        "SELECT key, value, value_type, category, description, updated_at \
+         FROM ai_config WHERE key = $1",
+    )
+    .bind::<Varchar, _>(key)
+    .load::<AiConfigRow>(&mut *conn)
+    .map_err(internal_error)?;
+    rows.pop().ok_or_else(|| {
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("Config key not found: {}", key),
+        )
+    })
+}
+
+fn load_ai_config_override_rows(
+    state: &WebAppState,
+    user_type_id: i32,
+) -> AppResult<Vec<AiConfigOverrideRow>> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    diesel::sql_query(
+        "SELECT ai_config_key, value, updated_at \
+         FROM ai_config_user_type_overrides \
+         WHERE user_type_id = $1 ORDER BY ai_config_key",
+    )
+    .bind::<Integer, _>(user_type_id)
+    .load::<AiConfigOverrideRow>(&mut *conn)
+    .map_err(internal_error)
+}
+
+fn load_effective_ai_config(
+    state: &WebAppState,
+    user_type_id: Option<i32>,
+) -> AppResult<InternalEffectiveAiConfig> {
+    let mut effective_rows = load_all_ai_config_rows(state)?
+        .into_iter()
+        .map(|row| EffectiveAiConfigRow {
+            key: row.key,
+            value: row.value,
+            value_type: row.value_type,
+            category: row.category,
+            description: row.description,
+            updated_at: row.updated_at,
+            is_override: false,
+            override_user_type_id: None,
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(user_type_id) = user_type_id {
+        let overrides = load_ai_config_override_rows(state, user_type_id)?;
+        let overrides_by_key = overrides
+            .into_iter()
+            .map(|row| (row.ai_config_key.clone(), row))
+            .collect::<HashMap<_, _>>();
+
+        for row in &mut effective_rows {
+            if let Some(override_row) = overrides_by_key.get(&row.key) {
+                row.value = override_row.value.clone();
+                row.updated_at = override_row.updated_at;
+                row.is_override = true;
+                row.override_user_type_id = Some(user_type_id);
+            }
+        }
+    }
+
+    let mut prompt_sections = HashMap::new();
+    let mut parameters = HashMap::new();
+    let mut defaults = HashMap::new();
+
+    for row in &effective_rows {
+        let parsed = parse_ai_config_value(&row.value_type, &row.value);
+        match row.category.as_str() {
+            "prompt_section" => {
+                prompt_sections.insert(row.key.clone(), parsed);
+            }
+            "parameter" => {
+                parameters.insert(row.key.clone(), parsed);
+            }
+            "default" => {
+                defaults.insert(row.key.clone(), parsed);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(InternalEffectiveAiConfig {
+        prompt_sections,
+        parameters,
+        defaults,
+        compiled_prompt: build_compiled_prompt(&effective_rows),
+    })
+}
+
+fn load_ai_config_response(state: &WebAppState) -> AppResult<AIConfigResponseBody> {
+    let rows = load_all_ai_config_rows(state)?;
+    let mut response = AIConfigResponseBody {
+        prompt_sections: Vec::new(),
+        parameters: Vec::new(),
+        defaults: Vec::new(),
+    };
+    for row in rows {
+        let item = ai_config_item_from_row(&row);
+        match row.category.as_str() {
+            "prompt_section" => response.prompt_sections.push(item),
+            "parameter" => response.parameters.push(item),
+            "default" => response.defaults.push(item),
+            _ => {}
+        }
+    }
+    Ok(response)
+}
+
+fn load_ai_config_item_response(state: &WebAppState, key: &str) -> AppResult<AIConfigItemResponse> {
+    Ok(ai_config_item_from_row(&load_ai_config_row(state, key)?))
+}
+
+fn load_ai_config_user_type_response(
+    state: &WebAppState,
+    user_type: &InternalUserTypeResponse,
+) -> AppResult<AIConfigUserTypeResponseBody> {
+    let rows = load_effective_ai_config_rows(state, user_type.id)?;
+    let mut response = AIConfigUserTypeResponseBody {
+        user_type_id: user_type.id,
+        user_type_name: Some(user_type.name.clone()),
+        prompt_sections: Vec::new(),
+        parameters: Vec::new(),
+        defaults: Vec::new(),
+    };
+    for row in rows {
+        let item = ai_config_with_inheritance_from_row(&row);
+        match row.category.as_str() {
+            "prompt_section" => response.prompt_sections.push(item),
+            "parameter" => response.parameters.push(item),
+            "default" => response.defaults.push(item),
+            _ => {}
+        }
+    }
+    Ok(response)
+}
+
+fn load_effective_ai_config_rows(
+    state: &WebAppState,
+    user_type_id: i32,
+) -> AppResult<Vec<EffectiveAiConfigRow>> {
+    let globals = load_all_ai_config_rows(state)?;
+    let overrides = load_ai_config_override_rows(state, user_type_id)?
+        .into_iter()
+        .map(|row| (row.ai_config_key.clone(), row))
+        .collect::<HashMap<_, _>>();
+
+    Ok(globals
+        .into_iter()
+        .map(|row| {
+            if let Some(override_row) = overrides.get(&row.key) {
+                EffectiveAiConfigRow {
+                    key: row.key,
+                    value: override_row.value.clone(),
+                    value_type: row.value_type,
+                    category: row.category,
+                    description: row.description,
+                    updated_at: override_row.updated_at,
+                    is_override: true,
+                    override_user_type_id: Some(user_type_id),
+                }
+            } else {
+                EffectiveAiConfigRow {
+                    key: row.key,
+                    value: row.value,
+                    value_type: row.value_type,
+                    category: row.category,
+                    description: row.description,
+                    updated_at: row.updated_at,
+                    is_override: false,
+                    override_user_type_id: None,
+                }
+            }
+        })
+        .collect())
+}
+
+fn load_ai_config_user_type_item(
+    state: &WebAppState,
+    user_type_id: i32,
+    user_type_name: &str,
+    key: &str,
+) -> AppResult<AIConfigWithInheritanceResponse> {
+    let _ = user_type_name;
+    let row = load_effective_ai_config_rows(state, user_type_id)?
+        .into_iter()
+        .find(|row| row.key == key)
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_FOUND,
+                format!("Config key not found: {}", key),
+            )
+        })?;
+    Ok(ai_config_with_inheritance_from_row(&row))
+}
+
+fn update_ai_config_value(state: &WebAppState, key: &str, value: &str) -> AppResult<()> {
+    let existing = load_ai_config_row(state, key)?;
+    validate_ai_config_value(key, &existing.value_type, &existing.category, value)?;
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    let updated = diesel::update(ai_config::table.filter(ai_config::key.eq(key)))
+        .set((
+            ai_config::value.eq(value),
+            ai_config::updated_at.eq(chrono::Utc::now()),
+        ))
+        .execute(&mut *conn)
+        .map_err(internal_error)?;
+    if updated == 0 {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("Config key not found: {}", key),
+        ));
+    }
+    Ok(())
+}
+
+fn upsert_ai_config_override(
+    state: &WebAppState,
+    key: &str,
+    user_type_id: i32,
+    value: &str,
+) -> AppResult<()> {
+    let existing = load_ai_config_row(state, key)?;
+    validate_ai_config_value(key, &existing.value_type, &existing.category, value)?;
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    diesel::sql_query(
+        "INSERT INTO ai_config_user_type_overrides (id, ai_config_key, user_type_id, value, updated_at) \
+         VALUES ($1, $2, $3, $4, NOW()) \
+         ON CONFLICT (ai_config_key, user_type_id) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+    )
+    .bind::<SqlUuid, _>(Uuid::new_v4())
+    .bind::<Varchar, _>(key)
+    .bind::<Integer, _>(user_type_id)
+    .bind::<Text, _>(value)
+    .execute(&mut *conn)
+    .map_err(internal_error)?;
+    Ok(())
+}
+
+fn delete_ai_config_override(state: &WebAppState, key: &str, user_type_id: i32) -> AppResult<()> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    let deleted = diesel::delete(
+        ai_config_user_type_overrides::table
+            .filter(ai_config_user_type_overrides::ai_config_key.eq(key))
+            .filter(ai_config_user_type_overrides::user_type_id.eq(user_type_id)),
+    )
+    .execute(&mut *conn)
+    .map_err(internal_error)?;
+    if deleted == 0 {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            format!(
+                "No override found for key '{}' and user type {}",
+                key, user_type_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ai_config_value(
+    key: &str,
+    value_type: &str,
+    category: &str,
+    value: &str,
+) -> AppResult<()> {
+    if value.is_empty() && value_type != "string" {
+        // Empty string is a valid string override but typically invalid for typed config.
+    }
+
+    match value_type {
+        "number" => {
+            let parsed = value.parse::<f64>().map_err(|_| {
+                AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid value for type '{}'", value_type),
+                )
+            })?;
+            if key == "temperature" && !(0.0..=1.0).contains(&parsed) {
+                return Err(AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Temperature must be between 0.0 and 1.0",
+                ));
+            }
+            if key == "top_k" {
+                if parsed.fract() != 0.0 {
+                    return Err(AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        "Top-K must be a whole number",
+                    ));
+                }
+                if !(1.0..=100.0).contains(&parsed) {
+                    return Err(AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        "Top-K must be between 1 and 100",
+                    ));
+                }
+            }
+        }
+        "boolean" => {
+            let normalized = value.trim().to_ascii_lowercase();
+            if normalized != "true" && normalized != "false" {
+                return Err(AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid value for type '{}'", value_type),
+                ));
+            }
+        }
+        "json" => {
+            let parsed: Value = serde_json::from_str(value).map_err(|error| {
+                AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid value for type '{}': {}", value_type, error),
+                )
+            })?;
+            if matches!(key, "prompt_rules" | "prompt_forbidden") {
+                let items = parsed.as_array().ok_or_else(|| {
+                    AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        format!("{} must be a JSON array", key),
+                    )
+                })?;
+                if !items.iter().all(|item| item.is_string()) {
+                    return Err(AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        format!("{} must be an array of strings", key),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if category == "prompt_section" && value.len() > 5000 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "Prompt section must be 5000 characters or less",
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_ai_config_value(value_type: &str, value: &str) -> Value {
+    match value_type {
+        "number" => value
+            .parse::<f64>()
+            .map(|parsed| {
+                if parsed.fract() == 0.0 {
+                    Value::from(parsed as i64)
+                } else {
+                    Value::from(parsed)
+                }
+            })
+            .unwrap_or_else(|_| Value::String(value.to_string())),
+        "boolean" => Value::Bool(value.trim().eq_ignore_ascii_case("true")),
+        "json" => serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string())),
+        _ => Value::String(value.to_string()),
+    }
+}
+
+fn build_compiled_prompt(rows: &[EffectiveAiConfigRow]) -> String {
+    let mut by_key = HashMap::new();
+    for row in rows {
+        by_key.insert(
+            row.key.clone(),
+            parse_ai_config_value(&row.value_type, &row.value),
+        );
+    }
+
+    let rules = by_key
+        .get("prompt_rules")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let forbidden = by_key
+        .get("prompt_forbidden")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut lines = vec![
+        "PROFILE: enclave_web_v1".to_string(),
+        String::new(),
+        "=== TONE ===".to_string(),
+        by_key
+            .get("prompt_tone")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        String::new(),
+        "=== RULES ===".to_string(),
+    ];
+
+    if rules.is_empty() {
+        lines.push("1. Be accurate, concise, and operationally useful.".to_string());
+    } else {
+        for (idx, rule) in rules.iter().filter_map(|value| value.as_str()).enumerate() {
+            lines.push(format!("{}. {}", idx + 1, rule));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("=== FORBIDDEN ===".to_string());
+    if forbidden.is_empty() {
+        lines.push("- None configured".to_string());
+    } else {
+        for rule in forbidden.iter().filter_map(|value| value.as_str()) {
+            lines.push(format!("- {}", rule));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("=== DEFAULTS ===".to_string());
+    lines.push(format!(
+        "temperature={}",
+        value_as_f64(by_key.get("temperature"), 0.1)
+    ));
+    lines.push(format!("top_k={}", value_as_i32(by_key.get("top_k"), 8)));
+    lines.push(format!(
+        "web_search_default={}",
+        value_as_bool(by_key.get("web_search_default"), false)
+    ));
+
+    lines.join("\n")
+}
+
+fn ai_config_item_from_row(row: &AiConfigRow) -> AIConfigItemResponse {
+    AIConfigItemResponse {
+        key: row.key.clone(),
+        value: row.value.clone(),
+        value_type: row.value_type.clone(),
+        category: row.category.clone(),
+        description: row.description.clone(),
+        updated_at: Some(row.updated_at.to_rfc3339()),
+    }
+}
+
+fn ai_config_with_inheritance_from_row(
+    row: &EffectiveAiConfigRow,
+) -> AIConfigWithInheritanceResponse {
+    AIConfigWithInheritanceResponse {
+        key: row.key.clone(),
+        value: row.value.clone(),
+        value_type: row.value_type.clone(),
+        category: row.category.clone(),
+        description: row.description.clone(),
+        updated_at: Some(row.updated_at.to_rfc3339()),
+        is_override: row.is_override,
+        override_user_type_id: row.override_user_type_id,
+    }
+}
+
+async fn resolve_public_actor(
+    state: &WebAppState,
+    headers: &HeaderMap,
+) -> AppResult<InternalAuthContext> {
+    let bearer_token = extract_bearer_token(headers.get("authorization"));
+    let cookies = parse_cookie_header(
+        header_to_string(headers.get("cookie"))
+            .as_deref()
+            .unwrap_or(""),
+    );
+
+    let admin_token = bearer_token.clone().or_else(|| {
+        cookies
+            .get(&state.web_config.admin_session_cookie_name)
+            .cloned()
+    });
+    if let Some(token) = admin_token {
+        if let Some(payload) = verify_admin_session_token(&state.web_config.secret_key, &token) {
+            let admin = state
+                .internal
+                .admin_record(&payload.pubkey)
+                .await
+                .map_err(auth_error)?;
+            if admin.session_nonce == payload.session_nonce {
+                return Ok(InternalAuthContext {
+                    id: admin.id,
+                    kind: "admin".to_string(),
+                    approved: true,
+                    pubkey: Some(admin.pubkey),
+                    email: None,
+                    name: None,
+                    user_type_id: None,
+                    dev_mode: false,
+                });
+            }
+        }
+    }
+
+    let user_token = bearer_token.or_else(|| {
+        cookies
+            .get(&state.web_config.user_session_cookie_name)
+            .cloned()
+    });
+    if let Some(token) = user_token {
+        if let Some(payload) = verify_user_session_token(&state.web_config.secret_key, &token) {
+            if payload.dev_mode {
+                return Ok(InternalAuthContext {
+                    id: -1,
+                    kind: "user".to_string(),
+                    approved: true,
+                    pubkey: None,
+                    email: Some("dev@localhost".to_string()),
+                    name: Some("Dev User".to_string()),
+                    user_type_id: None,
+                    dev_mode: true,
+                });
+            }
+
+            let user = state
+                .internal
+                .user_record(payload.user_id)
+                .await
+                .map_err(auth_error)?;
+            if !user.approved {
+                return Err(AppError::new(StatusCode::FORBIDDEN, "User not approved"));
+            }
+
+            return Ok(InternalAuthContext {
+                id: user.id,
+                kind: "user".to_string(),
+                approved: user.approved,
+                pubkey: None,
+                email: user.email.or_else(|| Some(payload.email)),
+                name: user.name,
+                user_type_id: user.user_type_id,
+                dev_mode: user.dev_mode,
+            });
+        }
+    }
+
+    Err(AppError::new(
+        StatusCode::UNAUTHORIZED,
+        "Invalid or expired token",
+    ))
+}
+
+async fn resolve_admin_actor(
+    state: &WebAppState,
+    headers: &HeaderMap,
+) -> AppResult<InternalAuthContext> {
+    let token = extract_bearer_token(headers.get("authorization")).or_else(|| {
+        parse_cookie_header(
+            header_to_string(headers.get("cookie"))
+                .as_deref()
+                .unwrap_or(""),
+        )
+        .get(&state.web_config.admin_session_cookie_name)
+        .cloned()
+    });
+
+    let token = token.ok_or_else(|| {
+        AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "Missing or invalid authentication token",
+        )
+    })?;
+    let payload = verify_admin_session_token(&state.web_config.secret_key, &token)
+        .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, "Invalid or expired admin token"))?;
+    let admin = state
+        .internal
+        .admin_record(&payload.pubkey)
+        .await
+        .map_err(auth_error)?;
+    if admin.session_nonce != payload.session_nonce {
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "Admin session revoked or expired",
+        ));
+    }
+    Ok(InternalAuthContext {
+        id: admin.id,
+        kind: "admin".to_string(),
+        approved: true,
+        pubkey: Some(admin.pubkey),
+        email: None,
+        name: None,
+        user_type_id: None,
+        dev_mode: false,
+    })
+}
+
+fn verify_user_session_token(secret_key: &str, token: &str) -> Option<UserSessionTokenPayload> {
+    if token == "dev-mode-mock-token" {
+        return Some(UserSessionTokenPayload {
+            user_id: -1,
+            email: "dev-mode".to_string(),
+            dev_mode: true,
+        });
+    }
+    let serializer = timed_serializer_with_signer(
+        default_builder(secret_key.to_string())
+            .with_salt(USER_SESSION_SALT)
+            .build()
+            .into_timestamp_signer(),
+        PythonURLSafeEncoding,
+    );
+    serializer
+        .unsign::<UserSessionTokenPayload>(token)
+        .ok()?
+        .value_if_not_expired(Duration::from_secs(USER_SESSION_MAX_AGE_SECS))
+        .ok()
+}
+
+fn verify_admin_session_token(secret_key: &str, token: &str) -> Option<AdminSessionTokenPayload> {
+    let serializer = timed_serializer_with_signer(
+        default_builder(secret_key.to_string())
+            .with_salt(ADMIN_SESSION_SALT)
+            .build()
+            .into_timestamp_signer(),
+        PythonURLSafeEncoding,
+    );
+    let payload = match serializer.unsign::<AdminSessionTokenPayload>(token) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!("admin token unsign failed: {}", error);
+            return None;
+        }
+    };
+    let payload = match payload.value_if_not_expired(Duration::from_secs(ADMIN_SESSION_MAX_AGE_SECS))
+    {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!("admin token expired or invalid timestamp: {}", error);
+            return None;
+        }
+    };
+    if payload.r#type != "admin" {
+        warn!("admin token type mismatch: {:?}", payload.r#type);
+        return None;
+    }
+    Some(payload)
+}
+
+fn extract_bearer_token(value: Option<&HeaderValue>) -> Option<String> {
+    let value = value?.to_str().ok()?;
+    let token = value.strip_prefix("Bearer ")?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 fn build_persona_block(compiled_prompt: &str) -> String {
@@ -1616,7 +2525,11 @@ fn dedupe_sources(sources: Vec<QuerySource>) -> Vec<QuerySource> {
         let key = if !source.chunk_id.is_empty() {
             source.chunk_id.clone()
         } else {
-            format!("{}::{}", source.source_file, truncate_chars(&source.text, 120))
+            format!(
+                "{}::{}",
+                source.source_file,
+                truncate_chars(&source.text, 120)
+            )
         };
         if seen.insert(key) {
             deduped.push(source);
@@ -1640,14 +2553,32 @@ fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
 
 fn value_as_f64(value: Option<&Value>, default: f64) -> f64 {
     value
-        .and_then(|value| value.as_f64().or_else(|| value.as_str().and_then(|raw| raw.parse().ok())))
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
+        })
         .unwrap_or(default)
 }
 
 fn value_as_i32(value: Option<&Value>, default: i32) -> i32 {
     value
-        .and_then(|value| value.as_i64().or_else(|| value.as_str().and_then(|raw| raw.parse().ok())))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
+        })
         .map(|value| value as i32)
+        .unwrap_or(default)
+}
+
+fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
+    value
+        .and_then(|value| {
+            value
+                .as_bool()
+                .or_else(|| value.as_str().map(|raw| raw.eq_ignore_ascii_case("true")))
+        })
         .unwrap_or(default)
 }
 
@@ -1666,11 +2597,7 @@ async fn configure_request_lm(config: &Config, temperature: f64) -> AppResult<()
     .map_err(internal_error)
 }
 
-fn enforce_csrf(
-    config: &EnclaveWebConfig,
-    method: &Method,
-    headers: &HeaderMap,
-) -> AppResult<()> {
+fn enforce_csrf(config: &EnclaveWebConfig, method: &Method, headers: &HeaderMap) -> AppResult<()> {
     if matches!(
         method,
         &Method::GET | &Method::HEAD | &Method::OPTIONS | &Method::TRACE
@@ -1702,7 +2629,11 @@ fn enforce_csrf(
         });
 
     match origin {
-        Some(origin) if config.allowed_origins.iter().any(|allowed| allowed == &origin) => {}
+        Some(origin)
+            if config
+                .allowed_origins
+                .iter()
+                .any(|allowed| allowed == &origin) => {}
         _ => {
             return Err(AppError::new(
                 StatusCode::FORBIDDEN,
@@ -1758,7 +2689,9 @@ fn parse_cookie_header(raw: &str) -> HashMap<String, String> {
 }
 
 fn header_to_string(value: Option<&HeaderValue>) -> Option<String> {
-    value.and_then(|value| value.to_str().ok()).map(|value| value.to_string())
+    value
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -1790,5 +2723,67 @@ fn auth_error(error: anyhow::Error) -> AppError {
         AppError::new(StatusCode::UNAUTHORIZED, "Invalid or expired token")
     } else {
         AppError::new(StatusCode::UNAUTHORIZED, "Authentication failed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::ZlibEncoder, Compression};
+    use itsdangerous::{default_builder, timed_serializer_with_signer, Signer};
+    use serde_json::json;
+    use std::io::Write;
+
+    #[test]
+    fn admin_session_tokens_deserialize_python_type_field() {
+        let serializer = timed_serializer_with_signer(
+            default_builder("test-secret".to_string())
+                .with_salt(ADMIN_SESSION_SALT)
+                .build()
+                .into_timestamp_signer(),
+            PythonURLSafeEncoding,
+        );
+        let token = serializer
+            .sign(&json!({
+                "admin_id": 1,
+                "pubkey": "abc123",
+                "type": "admin",
+                "session_nonce": 7
+            }))
+            .expect("token should serialize");
+
+        let payload = verify_admin_session_token("test-secret", &token)
+            .expect("admin token should deserialize");
+
+        assert_eq!(payload.admin_id, 1);
+        assert_eq!(payload.pubkey, "abc123");
+        assert_eq!(payload.r#type, "admin");
+        assert_eq!(payload.session_nonce, 7);
+    }
+
+    #[test]
+    fn admin_session_tokens_deserialize_python_compressed_payloads() {
+        let json = serde_json::to_vec(&json!({
+            "admin_id": 1,
+            "pubkey": "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+            "type": "admin",
+            "session_nonce": 7
+        }))
+        .expect("json should serialize");
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&json).expect("zlib write should succeed");
+        let compressed = encoder.finish().expect("zlib finish should succeed");
+        let encoded = format!(".{}", URL_SAFE_NO_PAD.encode(compressed));
+        let signer = default_builder("test-secret".to_string())
+            .with_salt(ADMIN_SESSION_SALT)
+            .build()
+            .into_timestamp_signer();
+        let token = signer.sign(&encoded);
+
+        let payload = verify_admin_session_token("test-secret", &token)
+            .expect("compressed admin token should deserialize");
+
+        assert_eq!(payload.r#type, "admin");
+        assert_eq!(payload.session_nonce, 7);
     }
 }

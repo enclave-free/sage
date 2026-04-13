@@ -1,6 +1,7 @@
 DO $$
 BEGIN
-    IF NOT EXISTS (
+    IF to_regclass('public.user_preferences') IS NOT NULL
+       AND NOT EXISTS (
         SELECT 1
         FROM pg_constraint
         WHERE conname = 'user_preferences_agent_id_fkey'
@@ -14,7 +15,8 @@ $$;
 
 DO $$
 BEGIN
-    IF NOT EXISTS (
+    IF to_regclass('public.scheduled_tasks') IS NOT NULL
+       AND NOT EXISTS (
         SELECT 1
         FROM pg_constraint
         WHERE conname = 'scheduled_tasks_agent_id_fkey'
