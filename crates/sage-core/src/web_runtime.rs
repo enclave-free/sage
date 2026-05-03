@@ -2730,7 +2730,7 @@ fn auth_error(error: anyhow::Error) -> AppError {
 mod tests {
     use super::*;
     use flate2::{write::ZlibEncoder, Compression};
-    use itsdangerous::{default_builder, timed_serializer_with_signer, Signer};
+    use itsdangerous::{default_builder, timed_serializer_with_signer, Signer, TimestampSigner};
     use serde_json::json;
     use std::io::Write;
 
