@@ -184,7 +184,7 @@ async fn run_evaluation_async() -> Result<()> {
     let api_url =
         std::env::var("TINFOIL_API_URL").unwrap_or_else(|_| "http://localhost:8089/v1".into());
     let api_key = std::env::var("TINFOIL_API_KEY").unwrap_or_else(|_| "test".into());
-    let model = std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-5".into());
+    let model = std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-6".into());
 
     println!("Program LM: {} @ {}\n", model, api_url);
 
@@ -358,7 +358,7 @@ async fn run_optimization_async() -> Result<()> {
     let api_url =
         std::env::var("TINFOIL_API_URL").unwrap_or_else(|_| "http://localhost:8089/v1".into());
     let api_key = std::env::var("TINFOIL_API_KEY").unwrap_or_else(|_| "test".into());
-    let model = std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-5".into());
+    let model = std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-6".into());
 
     println!("Program LM: {} @ {}", model, api_url);
 

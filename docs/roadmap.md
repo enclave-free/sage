@@ -1,5 +1,13 @@
 # Sage Implementation Roadmap
 
+> Historical background only.
+> This file does not describe the current `enclave_web` architecture used by the Enclave prototype branch.
+> Start with [../README.md](../README.md), [architecture.md](architecture.md), and [decisions.md](decisions.md).
+
+> Historical background only.
+>
+> This roadmap reflects older planning phases and is not the current implementation contract for the `enclave-web-prototype` branch. Use `README.md`, `docs/architecture.md`, and `TODO.md` for the active branch state.
+
 ## Overview
 
 This roadmap builds incrementally. Each phase results in something testable.

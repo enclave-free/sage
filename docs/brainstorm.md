@@ -1,5 +1,13 @@
 # Personal AI Agent Project: Brainstorm Document
 
+> Historical background only.
+> This file does not describe the current `enclave_web` architecture used by the Enclave prototype branch.
+> Start with [../README.md](../README.md), [architecture.md](architecture.md), and [decisions.md](decisions.md).
+
+> Historical background only.
+>
+> This file reflects earlier planning and exploratory architecture notes. It is not the current source of truth for the `enclave-web-prototype` branch. Use `README.md`, `docs/architecture.md`, and `docs/decisions.md` for the active branch architecture.
+
 ## Project Vision
 
 Build a highly private, self-hosted AI agent/companion that lives in a Docker container on a home server with full permissions to access personal data and perform actions autonomously. The agent prioritizes privacy and data sovereignty through confidential computing and self-hosted infrastructure.

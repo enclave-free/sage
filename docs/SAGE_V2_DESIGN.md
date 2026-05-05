@@ -1,5 +1,13 @@
 # Sage V2: A Memory-Augmented AI Agent in Rust
 
+> Historical background only.
+> This file does not describe the current `enclave_web` architecture used by the Enclave prototype branch.
+> Start with [../README.md](../README.md), [architecture.md](architecture.md), and [decisions.md](decisions.md).
+
+> Historical background only.
+>
+> This document captures the earlier generic Sage design work. It is not the current branch architecture for `enclave-web-prototype`. Use `README.md`, `docs/architecture.md`, and `docs/decisions.md` for the active Enclave web runtime design.
+
 ## Design Document
 
 **Version:** 1.0.0  

@@ -126,9 +126,9 @@ services:
       # LLM Backend (Tinfoil via verified local proxy)
       - TINFOIL_API_URL=http://tinfoil-proxy:${TINFOIL_PROXY_PORT:-8089}/v1
       - TINFOIL_API_KEY=${TINFOIL_API_KEY}
-      - TINFOIL_MODEL=${TINFOIL_MODEL:-kimi-k2-5}
+      - TINFOIL_MODEL=${TINFOIL_MODEL:-kimi-k2-6}
       - TINFOIL_EMBEDDING_MODEL=${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}
-      - TINFOIL_VISION_MODEL=${TINFOIL_VISION_MODEL:-${TINFOIL_MODEL:-kimi-k2-5}}
+      - TINFOIL_VISION_MODEL=${TINFOIL_VISION_MODEL:-${TINFOIL_MODEL:-kimi-k2-6}}
       
       # Signal (TCP mode to signal-cli container)
       - SIGNAL_CLI_HOST=signal-cli

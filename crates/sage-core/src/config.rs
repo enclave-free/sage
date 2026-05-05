@@ -51,11 +51,11 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:8089/v1".to_string()),
             tinfoil_api_key: std::env::var("TINFOIL_API_KEY").ok(),
             tinfoil_model: std::env::var("TINFOIL_MODEL")
-                .unwrap_or_else(|_| "kimi-k2-5".to_string()),
+                .unwrap_or_else(|_| "kimi-k2-6".to_string()),
             tinfoil_embedding_model: std::env::var("TINFOIL_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string()),
             tinfoil_vision_model: std::env::var("TINFOIL_VISION_MODEL").unwrap_or_else(|_| {
-                std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-5".to_string())
+                std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-6".to_string())
             }),
 
             database_url: std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?,
@@ -168,7 +168,7 @@ mod tests {
         std::env::set_var("DATABASE_URL", "postgres://sage:sage@localhost:5434/sage");
         std::env::set_var("TINFOIL_API_URL", "http://localhost:8089/v1");
         std::env::set_var("TINFOIL_API_KEY", "test-key");
-        std::env::set_var("TINFOIL_MODEL", "kimi-k2-5");
+        std::env::set_var("TINFOIL_MODEL", "kimi-k2-6");
         std::env::set_var("TINFOIL_EMBEDDING_MODEL", "nomic-embed-text");
         std::env::set_var("TINFOIL_VISION_MODEL", "qwen3-vl-30b");
 
@@ -182,7 +182,7 @@ mod tests {
 
         assert_eq!(config.tinfoil_api_url, "http://localhost:8089/v1");
         assert_eq!(config.tinfoil_api_key.as_deref(), Some("test-key"));
-        assert_eq!(config.tinfoil_model, "kimi-k2-5");
+        assert_eq!(config.tinfoil_model, "kimi-k2-6");
         assert_eq!(config.tinfoil_embedding_model, "nomic-embed-text");
         assert_eq!(config.tinfoil_vision_model, "qwen3-vl-30b");
 

@@ -258,6 +258,7 @@ pub struct ToolCallInfoResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
+    pub session_id: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
     pub tool_context: Option<String>,
@@ -267,6 +268,7 @@ pub struct ChatRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatResponse {
     pub message: String,
+    pub session_id: Option<String>,
     pub model: String,
     pub provider: String,
     #[serde(default)]
@@ -963,6 +965,19 @@ async fn chat(
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     configure_request_lm(&state.config, temperature).await?;
 
+    let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
+    update_session_last_question(&state, session.id, &request.message)?;
+
+    let mut profile = HashMap::new();
+    if auth.kind != "admin" && auth.id != -1 {
+        profile = state
+            .internal
+            .user_profile_context(auth.id, auth.user_type_id)
+            .await
+            .map_err(internal_error)?
+            .profile;
+    }
+
     let tool_traces = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
     let mut tools_used = Vec::<ToolCallInfoResponse>::new();
 
@@ -1007,9 +1022,16 @@ async fn chat(
     }
     registry.register(Arc::new(crate::tools::DoneTool));
 
-    let mut agent = SageAgent::new_without_memory(
+    let memory = build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id).await?;
+    let memory_user_id = memory_user_id(&auth);
+    memory
+        .store_message_sync(&memory_user_id, "user", &request.message)
+        .map_err(internal_error)?;
+
+    let mut agent = SageAgent::new_with_optional_memory(
         registry,
-        build_agent_instruction(&ai_config.compiled_prompt, false),
+        Some(memory),
+        build_agent_instruction(&ai_config.compiled_prompt, true),
     );
 
     let mut input = String::new();
@@ -1022,12 +1044,19 @@ async fn chat(
     input.push_str(&request.message);
 
     let response_text = run_agent_turn(&mut agent, &input).await?;
+    if let Err(err) = agent.store_message_sync(&memory_user_id, "assistant", &response_text) {
+        warn!(
+            "failed to persist assistant message for session {}: {}",
+            session.id, err
+        );
+    }
     if let Ok(mut trace_lock) = tool_traces.lock() {
         tools_used.extend(trace_lock.drain(..));
     }
 
     Ok(Json(ChatResponse {
         message: response_text,
+        session_id: Some(session.id.to_string()),
         model: state.config.tinfoil_model.clone(),
         provider: "sage".to_string(),
         tools_used: dedupe_tool_calls(tools_used),
@@ -1505,6 +1534,45 @@ fn get_or_create_web_session(
         .select(WebSessionRow::as_select())
         .first(&mut *conn)
         .map_err(internal_error)
+}
+
+async fn build_session_memory(
+    state: &WebAppState,
+    ai_config: &InternalEffectiveAiConfig,
+    auth: &InternalAuthContext,
+    profile: &HashMap<String, String>,
+    agent_id: Uuid,
+) -> AppResult<MemoryManager> {
+    let tinfoil_key = state
+        .config
+        .tinfoil_api_key
+        .clone()
+        .ok_or_else(|| AppError::internal("TINFOIL_API_KEY not configured"))?;
+
+    let memory = MemoryManager::new(
+        agent_id,
+        &state.config.database_url,
+        &state.config.tinfoil_api_url,
+        &tinfoil_key,
+        &state.config.tinfoil_embedding_model,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    memory
+        .blocks()
+        .update("persona", build_persona_block(&ai_config.compiled_prompt))
+        .map_err(internal_error)?;
+    memory
+        .blocks()
+        .update("human", build_human_block(auth, profile))
+        .map_err(internal_error)?;
+
+    Ok(memory)
+}
+
+fn memory_user_id(auth: &InternalAuthContext) -> String {
+    format!("{}:{}", auth.kind, auth.id)
 }
 
 fn maybe_load_web_session(
@@ -2473,7 +2541,7 @@ fn build_query_debug_context(
 async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String> {
     let mut messages = Vec::new();
     for step in 0..8 {
-        let result = agent.step(input, step == 0).await.map_err(internal_error)?;
+        let result = agent.step(input, step == 0).await.map_err(model_provider_error)?;
         messages.extend(result.messages);
         if result.done {
             break;
@@ -2713,6 +2781,18 @@ fn fallback_text<'a>(value: &'a str, fallback: &'a str) -> &'a str {
 
 fn internal_error(error: impl std::fmt::Display) -> AppError {
     AppError::internal(error.to_string())
+}
+
+fn model_provider_error(error: impl std::fmt::Display) -> AppError {
+    let message = error.to_string();
+    if message.contains("The model does not exist") {
+        AppError::new(
+            StatusCode::BAD_GATEWAY,
+            "Configured Tinfoil model is unavailable. Check TINFOIL_MODEL and restart Sage.",
+        )
+    } else {
+        AppError::internal(message)
+    }
 }
 
 fn auth_error(error: anyhow::Error) -> AppError {
