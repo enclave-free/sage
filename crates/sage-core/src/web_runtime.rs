@@ -17,8 +17,7 @@ use diesel::prelude::*;
 use diesel::sql_types::{Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid, Varchar};
 use flate2::read::ZlibDecoder;
 use itsdangerous::{
-    default_builder, timed_serializer_with_signer, Encoding, IntoTimestampSigner,
-    TimedSerializer,
+    default_builder, timed_serializer_with_signer, Encoding, IntoTimestampSigner, TimedSerializer,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -34,7 +33,10 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::sage_agent::{SageAgent, Tool, ToolRegistry, ToolResult};
-use crate::schema::{ai_config, ai_config_user_type_overrides, messages, web_sessions};
+use crate::schema::{
+    agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
+    summaries, user_preferences, web_sessions,
+};
 
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
 const USER_SESSION_SALT: &str = "session";
@@ -79,12 +81,10 @@ impl Encoding for PythonURLSafeEncoding {
         if is_compressed {
             let mut decoder = ZlibDecoder::new(decoded.as_slice());
             let mut decompressed = Vec::new();
-            decoder
-                .read_to_end(&mut decompressed)
-                .map_err(|_| {
-                    std::str::from_utf8(&decoded)
-                        .expect_err("compressed payload should not be valid utf8")
-                })?;
+            decoder.read_to_end(&mut decompressed).map_err(|_| {
+                std::str::from_utf8(&decoded)
+                    .expect_err("compressed payload should not be valid utf8")
+            })?;
             return Ok(String::from_utf8(decompressed).map_err(|error| error.utf8_error())?);
         }
 
@@ -580,6 +580,17 @@ struct StoredMessageRow {
     attachment_text: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SessionMemoryDeletionCounts {
+    messages: usize,
+    summaries: usize,
+    passages: usize,
+    blocks: usize,
+    user_preferences: usize,
+    scheduled_tasks: usize,
+    agent: usize,
+}
+
 #[derive(Clone)]
 pub struct InternalAgentClient {
     http: Client,
@@ -1022,7 +1033,8 @@ async fn chat(
     }
     registry.register(Arc::new(crate::tools::DoneTool));
 
-    let memory = build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id).await?;
+    let memory =
+        build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id).await?;
     let memory_user_id = memory_user_id(&auth);
     memory
         .store_message_sync(&memory_user_id, "user", &request.message)
@@ -1254,18 +1266,27 @@ async fn delete_query_session(
 ) -> AppResult<Json<Value>> {
     enforce_csrf(&state.web_config, &Method::DELETE, &headers)?;
     let auth = resolve_public_actor(&state, &headers).await?;
-    let session = load_web_session(&state, &session_id)?;
+    let session = match maybe_load_web_session(&state, &session_id)? {
+        Some(session) => session,
+        None => {
+            return Ok(Json(summarize_missing_query_session_deletion()));
+        }
+    };
     ensure_session_access(&auth, &session)?;
 
     let mut conn = state
         .db
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    let memory_deletion = delete_session_memory_for_agent(&mut conn, session.agent_id)?;
     diesel::delete(web_sessions::table.filter(web_sessions::id.eq(session.id)))
         .execute(&mut *conn)
         .map_err(internal_error)?;
 
-    Ok(Json(json!({ "status": "deleted" })))
+    Ok(Json(json!({
+        "status": "deleted",
+        "deletion": summarize_query_session_deletion(1, memory_deletion),
+    })))
 }
 
 async fn admin_tools_execute(
@@ -1630,6 +1651,132 @@ fn load_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<Vec<S
         .select(StoredMessageRow::as_select())
         .load(&mut *conn)
         .map_err(internal_error)
+}
+
+fn delete_session_memory_for_agent(
+    conn: &mut PgConnection,
+    agent_id: Uuid,
+) -> AppResult<SessionMemoryDeletionCounts> {
+    let agent_id_text = agent_id.to_string();
+
+    let messages_deleted = diesel::delete(messages::table.filter(messages::agent_id.eq(agent_id)))
+        .execute(conn)
+        .map_err(internal_error)?;
+    let summaries_deleted =
+        diesel::delete(summaries::table.filter(summaries::agent_id.eq(agent_id)))
+            .execute(conn)
+            .map_err(internal_error)?;
+    let passages_deleted =
+        diesel::delete(passages::table.filter(passages::agent_id.eq(agent_id_text.clone())))
+            .execute(conn)
+            .map_err(internal_error)?;
+    let blocks_deleted = diesel::delete(blocks::table.filter(blocks::agent_id.eq(agent_id_text)))
+        .execute(conn)
+        .map_err(internal_error)?;
+    let preferences_deleted =
+        diesel::delete(user_preferences::table.filter(user_preferences::agent_id.eq(agent_id)))
+            .execute(conn)
+            .map_err(internal_error)?;
+    let scheduled_tasks_deleted =
+        diesel::delete(scheduled_tasks::table.filter(scheduled_tasks::agent_id.eq(agent_id)))
+            .execute(conn)
+            .map_err(internal_error)?;
+    let agents_deleted = diesel::delete(agents::table.filter(agents::id.eq(agent_id)))
+        .execute(conn)
+        .map_err(internal_error)?;
+
+    Ok(SessionMemoryDeletionCounts {
+        messages: messages_deleted,
+        summaries: summaries_deleted,
+        passages: passages_deleted,
+        blocks: blocks_deleted,
+        user_preferences: preferences_deleted,
+        scheduled_tasks: scheduled_tasks_deleted,
+        agent: agents_deleted,
+    })
+}
+
+fn summarize_session_memory_deletion(counts: SessionMemoryDeletionCounts) -> Value {
+    let targets = [
+        ("delete_messages", counts.messages),
+        ("delete_summaries", counts.summaries),
+        ("delete_passages", counts.passages),
+        ("delete_blocks", counts.blocks),
+        ("delete_user_preferences", counts.user_preferences),
+        ("delete_scheduled_tasks", counts.scheduled_tasks),
+        ("delete_agent_record", counts.agent),
+    ];
+    let succeeded: usize = targets.iter().map(|(_, count)| *count).sum();
+    let results: Vec<Value> = targets
+        .iter()
+        .map(|(action, count)| {
+            json!({
+                "target_kind": "session_memory",
+                "action": action,
+                "status": "succeeded",
+                "retryable": false,
+                "count": count,
+            })
+        })
+        .collect();
+
+    json!({
+        "status": "succeeded",
+        "retryable": false,
+        "counts": {
+            "succeeded": succeeded,
+            "skipped": 0,
+            "failed": 0,
+        },
+        "results": results,
+    })
+}
+
+fn summarize_query_session_deletion(
+    session_records_deleted: usize,
+    counts: SessionMemoryDeletionCounts,
+) -> Value {
+    let mut summary = summarize_session_memory_deletion(counts);
+    if let Some(results) = summary["results"].as_array_mut() {
+        results.insert(
+            0,
+            json!({
+                "target_kind": "conversation",
+                "action": "delete_session_record",
+                "status": "succeeded",
+                "retryable": false,
+                "count": session_records_deleted,
+            }),
+        );
+    }
+    if let Some(succeeded) = summary["counts"]["succeeded"].as_u64() {
+        summary["counts"]["succeeded"] = json!(succeeded + session_records_deleted as u64);
+    }
+    summary
+}
+
+fn summarize_missing_query_session_deletion() -> Value {
+    json!({
+        "status": "deleted",
+        "deletion": {
+            "status": "succeeded",
+            "retryable": false,
+            "counts": {
+                "succeeded": 0,
+                "skipped": 1,
+                "failed": 0,
+            },
+            "results": [
+                {
+                    "target_kind": "conversation",
+                    "action": "delete_session_record",
+                    "status": "skipped",
+                    "retryable": false,
+                    "count": 0,
+                }
+            ],
+        },
+    })
 }
 
 fn ensure_admin(auth: &InternalAuthContext) -> AppResult<()> {
@@ -2409,14 +2556,14 @@ fn verify_admin_session_token(secret_key: &str, token: &str) -> Option<AdminSess
             return None;
         }
     };
-    let payload = match payload.value_if_not_expired(Duration::from_secs(ADMIN_SESSION_MAX_AGE_SECS))
-    {
-        Ok(payload) => payload,
-        Err(error) => {
-            warn!("admin token expired or invalid timestamp: {}", error);
-            return None;
-        }
-    };
+    let payload =
+        match payload.value_if_not_expired(Duration::from_secs(ADMIN_SESSION_MAX_AGE_SECS)) {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!("admin token expired or invalid timestamp: {}", error);
+                return None;
+            }
+        };
     if payload.r#type != "admin" {
         warn!("admin token type mismatch: {:?}", payload.r#type);
         return None;
@@ -2541,7 +2688,10 @@ fn build_query_debug_context(
 async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String> {
     let mut messages = Vec::new();
     for step in 0..8 {
-        let result = agent.step(input, step == 0).await.map_err(model_provider_error)?;
+        let result = agent
+            .step(input, step == 0)
+            .await
+            .map_err(model_provider_error)?;
         messages.extend(result.messages);
         if result.done {
             break;
@@ -2810,7 +2960,7 @@ fn auth_error(error: anyhow::Error) -> AppError {
 mod tests {
     use super::*;
     use flate2::{write::ZlibEncoder, Compression};
-    use itsdangerous::{default_builder, timed_serializer_with_signer, Signer, TimestampSigner};
+    use itsdangerous::{default_builder, timed_serializer_with_signer, TimestampSigner};
     use serde_json::json;
     use std::io::Write;
 
@@ -2865,5 +3015,25 @@ mod tests {
 
         assert_eq!(payload.r#type, "admin");
         assert_eq!(payload.session_nonce, 7);
+    }
+
+    #[test]
+    fn session_memory_deletion_summary_reports_deleted_targets() {
+        let summary = summarize_session_memory_deletion(SessionMemoryDeletionCounts {
+            messages: 2,
+            summaries: 1,
+            passages: 0,
+            blocks: 2,
+            user_preferences: 0,
+            scheduled_tasks: 0,
+            agent: 1,
+        });
+
+        assert_eq!(summary["status"], "succeeded");
+        assert_eq!(summary["counts"]["succeeded"], 6);
+        assert_eq!(summary["counts"]["failed"], 0);
+        assert_eq!(summary["results"][0]["target_kind"], "session_memory");
+        assert_eq!(summary["results"][0]["action"], "delete_messages");
+        assert_eq!(summary["results"][0]["status"], "succeeded");
     }
 }
