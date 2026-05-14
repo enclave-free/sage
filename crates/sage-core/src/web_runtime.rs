@@ -221,6 +221,10 @@ pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Rout
             "/query/session/{session_id}",
             get(get_query_session).delete(delete_query_session),
         )
+        .route(
+            "/internal/lifecycle/session-memory/delete",
+            post(delete_session_memory_internal),
+        )
         .route("/session-defaults", get(session_defaults))
         .route("/admin/tools/execute", post(admin_tools_execute))
         .route("/admin/ai-config", get(admin_ai_config))
@@ -589,6 +593,11 @@ struct SessionMemoryDeletionCounts {
     user_preferences: usize,
     scheduled_tasks: usize,
     agent: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InternalSessionMemoryDeleteRequest {
+    conversation_id: String,
 }
 
 #[derive(Clone)]
@@ -1289,6 +1298,52 @@ async fn delete_query_session(
     })))
 }
 
+async fn delete_session_memory_internal(
+    State(state): State<WebAppState>,
+    headers: HeaderMap,
+    Json(request): Json<InternalSessionMemoryDeleteRequest>,
+) -> AppResult<Json<Value>> {
+    ensure_internal_lifecycle_token(&state, &headers)?;
+    let session = match maybe_load_web_session(&state, &request.conversation_id)? {
+        Some(session) => session,
+        None => {
+            return Ok(Json(json!({
+                "status": "deleted",
+                "deletion": {
+                    "status": "succeeded",
+                    "retryable": false,
+                    "counts": {
+                        "succeeded": 0,
+                        "skipped": 1,
+                        "failed": 0,
+                    },
+                    "results": [
+                        {
+                            "target_kind": "session_memory",
+                            "target_id": request.conversation_id,
+                            "action": "delete_session_memory",
+                            "status": "skipped",
+                            "retryable": false,
+                            "detail": "already_deleted",
+                        }
+                    ],
+                },
+            })));
+        }
+    };
+
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    let memory_deletion = delete_session_memory_for_agent(&mut conn, session.agent_id)?;
+
+    Ok(Json(json!({
+        "status": "deleted",
+        "deletion": summarize_session_memory_deletion(memory_deletion),
+    })))
+}
+
 async fn admin_tools_execute(
     State(state): State<WebAppState>,
     headers: HeaderMap,
@@ -1777,6 +1832,17 @@ fn summarize_missing_query_session_deletion() -> Value {
             ],
         },
     })
+}
+
+fn ensure_internal_lifecycle_token(state: &WebAppState, headers: &HeaderMap) -> AppResult<()> {
+    let supplied = header_to_string(headers.get("x-internal-agent-token"));
+    if supplied.as_deref() != Some(state.web_config.internal_agent_token.as_str()) {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "Invalid internal agent token",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_admin(auth: &InternalAuthContext) -> AppResult<()> {
