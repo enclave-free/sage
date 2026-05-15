@@ -95,9 +95,9 @@ INTERNAL_AGENT_TOKEN=dev-internal-agent-token
 SEARXNG_URL=http://searxng:8080
 FRONTEND_URL=http://localhost:5173
 CORS_ORIGINS=http://localhost:5173
-USER_SESSION_COOKIE_NAME=sanctum_session
-ADMIN_SESSION_COOKIE_NAME=sanctum_admin_session
-CSRF_COOKIE_NAME=sanctum_csrf
+USER_SESSION_COOKIE_NAME=enclave_session
+ADMIN_SESSION_COOKIE_NAME=enclave_admin_session
+CSRF_COOKIE_NAME=enclave_csrf
 ```
 
 ## Background And Historical Docs

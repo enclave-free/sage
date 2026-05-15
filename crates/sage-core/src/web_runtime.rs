@@ -176,11 +176,11 @@ impl EnclaveWebConfig {
             allowed_origins,
             frontend_url,
             user_session_cookie_name: std::env::var("USER_SESSION_COOKIE_NAME")
-                .unwrap_or_else(|_| "sanctum_session".to_string()),
+                .unwrap_or_else(|_| "enclave_session".to_string()),
             admin_session_cookie_name: std::env::var("ADMIN_SESSION_COOKIE_NAME")
-                .unwrap_or_else(|_| "sanctum_admin_session".to_string()),
+                .unwrap_or_else(|_| "enclave_admin_session".to_string()),
             csrf_cookie_name: std::env::var("CSRF_COOKIE_NAME")
-                .unwrap_or_else(|_| "sanctum_csrf".to_string()),
+                .unwrap_or_else(|_| "enclave_csrf".to_string()),
         })
     }
 }
