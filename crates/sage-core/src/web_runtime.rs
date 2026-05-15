@@ -260,6 +260,44 @@ pub struct ToolCallInfoResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReasoningTraceResponse {
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolTraceResponse {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub execution: String,
+    pub input_summary: Option<String>,
+    pub output_summary: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetrievalTraceResponse {
+    pub source_type: String,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub score: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversationTraceResponse {
+    pub visibility: String,
+    pub reasoning: ReasoningTraceResponse,
+    #[serde(default)]
+    pub tools: Vec<ToolTraceResponse>,
+    #[serde(default)]
+    pub retrieval: Vec<RetrievalTraceResponse>,
+    pub suppressed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
     pub session_id: Option<String>,
@@ -277,6 +315,7 @@ pub struct ChatResponse {
     pub provider: String,
     #[serde(default)]
     pub tools_used: Vec<ToolCallInfoResponse>,
+    pub trace: Option<ConversationTraceResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,6 +351,7 @@ pub struct QueryResponse {
     pub search_term: Option<String>,
     pub context_used: String,
     pub temperature: f64,
+    pub trace: Option<ConversationTraceResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1074,13 +1114,16 @@ async fn chat(
     if let Ok(mut trace_lock) = tool_traces.lock() {
         tools_used.extend(trace_lock.drain(..));
     }
+    let tools_used = dedupe_tool_calls(tools_used);
+    let trace = build_conversation_trace(&ai_config, &auth, tools_used.clone(), Vec::new());
 
     Ok(Json(ChatResponse {
         message: response_text,
         session_id: Some(session.id.to_string()),
         model: state.config.tinfoil_model.clone(),
         provider: "sage".to_string(),
-        tools_used: dedupe_tool_calls(tools_used),
+        tools_used,
+        trace,
     }))
 }
 
@@ -1219,8 +1262,7 @@ async fn query(
         .lock()
         .map(|traces| dedupe_tool_calls(traces.clone()))
         .unwrap_or_default();
-
-    let _ = tools_used;
+    let trace = build_conversation_trace(&ai_config, &auth, tools_used, sources.clone());
 
     Ok(Json(QueryResponse {
         answer: answer.clone(),
@@ -1231,6 +1273,7 @@ async fn query(
         search_term: None,
         context_used: debug_context,
         temperature,
+        trace,
     }))
 }
 
@@ -1945,6 +1988,20 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
             "default",
             Some("Web search active by default for new sessions"),
         ),
+        (
+            "admin_trace_visibility",
+            "detailed",
+            "string",
+            "default",
+            Some("Conversation Trace visibility for Admin Conversations"),
+        ),
+        (
+            "user_trace_visibility",
+            "minimal",
+            "string",
+            "default",
+            Some("Conversation Trace visibility for User Conversations"),
+        ),
     ];
 
     let mut conn = state
@@ -2334,6 +2391,10 @@ fn validate_ai_config_value(
         _ => {}
     }
 
+    if matches!(key, "admin_trace_visibility" | "user_trace_visibility") {
+        validate_trace_visibility_value(key, value)?;
+    }
+
     if category == "prompt_section" && value.len() > 5000 {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
@@ -2342,6 +2403,35 @@ fn validate_ai_config_value(
     }
 
     Ok(())
+}
+
+fn validate_trace_visibility_value(key: &str, value: &str) -> AppResult<()> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let allowed: &[&str] = if key == "user_trace_visibility" {
+        &["off", "minimal", "summary", "detailed"]
+    } else {
+        &["off", "minimal", "summary", "detailed"]
+    };
+
+    if allowed
+        .iter()
+        .any(|allowed_value| *allowed_value == normalized)
+    {
+        return Ok(());
+    }
+
+    Err(AppError::new(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "Trace visibility for {} must be one of: {}",
+            if key == "admin_trace_visibility" {
+                "admin"
+            } else {
+                "user"
+            },
+            allowed.join(", ")
+        ),
+    ))
 }
 
 fn parse_ai_config_value(value_type: &str, value: &str) -> Value {
@@ -2822,6 +2912,128 @@ fn dedupe_sources(sources: Vec<QuerySource>) -> Vec<QuerySource> {
     deduped
 }
 
+fn build_conversation_trace(
+    ai_config: &InternalEffectiveAiConfig,
+    auth: &InternalAuthContext,
+    tools: Vec<ToolCallInfoResponse>,
+    retrieval_sources: Vec<QuerySource>,
+) -> Option<ConversationTraceResponse> {
+    let actor_type = if auth.kind == "admin" {
+        "admin"
+    } else {
+        "user"
+    };
+    let key = if actor_type == "admin" {
+        "admin_trace_visibility"
+    } else {
+        "user_trace_visibility"
+    };
+    let default_visibility = if actor_type == "admin" {
+        "detailed"
+    } else {
+        "minimal"
+    };
+    let visibility = value_as_string(ai_config.defaults.get(key), default_visibility)
+        .trim()
+        .to_ascii_lowercase();
+
+    if visibility == "off" {
+        return None;
+    }
+
+    let detailed_tools = tools
+        .into_iter()
+        .map(|tool| {
+            let is_db_query = tool.tool_id == "db-query";
+            ToolTraceResponse {
+                id: tool.tool_id,
+                name: tool.tool_name,
+                status: "completed".to_string(),
+                execution: "server".to_string(),
+                input_summary: tool.query.map(|query| truncate_chars(&query, 160)),
+                output_summary: if is_db_query {
+                    Some("Database results were redacted from the trace.".to_string())
+                } else {
+                    None
+                },
+                warnings: if is_db_query {
+                    vec!["raw_results_redacted".to_string()]
+                } else {
+                    Vec::new()
+                },
+                metadata: if is_db_query {
+                    json!({ "redacted": true })
+                } else {
+                    json!({})
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let detailed_retrieval = retrieval_sources
+        .into_iter()
+        .map(|source| RetrievalTraceResponse {
+            source_type: source.source_type,
+            title: if source.source_file.is_empty() {
+                None
+            } else {
+                Some(source.source_file)
+            },
+            summary: if source.text.is_empty() {
+                None
+            } else {
+                Some(truncate_chars(&source.text, 160))
+            },
+            score: Some(source.score),
+        })
+        .collect::<Vec<_>>();
+
+    let summary = if !detailed_retrieval.is_empty() && !detailed_tools.is_empty() {
+        "Sage used retrieval and enabled tools before answering."
+    } else if !detailed_retrieval.is_empty() {
+        "Sage searched available documents before answering."
+    } else if !detailed_tools.is_empty() {
+        "Sage used enabled tools before answering."
+    } else {
+        "Sage answered from the conversation context and configured instructions."
+    };
+
+    let (tools, retrieval) = match visibility.as_str() {
+        "minimal" => (
+            detailed_tools
+                .into_iter()
+                .map(|tool| ToolTraceResponse {
+                    input_summary: None,
+                    output_summary: None,
+                    warnings: Vec::new(),
+                    metadata: json!({}),
+                    ..tool
+                })
+                .collect(),
+            detailed_retrieval
+                .into_iter()
+                .map(|item| RetrievalTraceResponse {
+                    summary: None,
+                    score: None,
+                    ..item
+                })
+                .collect(),
+        ),
+        "summary" => (Vec::new(), Vec::new()),
+        _ => (detailed_tools, detailed_retrieval),
+    };
+
+    Some(ConversationTraceResponse {
+        visibility,
+        reasoning: ReasoningTraceResponse {
+            summary: summary.to_string(),
+        },
+        tools,
+        retrieval,
+        suppressed: false,
+    })
+}
+
 fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
     let tool_name = match tool_id {
         "web-search" => "Web Search",
@@ -2833,6 +3045,12 @@ fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
         tool_name: tool_name.to_string(),
         query: Some(query),
     }
+}
+
+fn value_as_string(value: Option<&Value>, default: &str) -> String {
+    value
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn value_as_f64(value: Option<&Value>, default: f64) -> f64 {
