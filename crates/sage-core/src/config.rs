@@ -71,7 +71,12 @@ impl Config {
 
             signal_phone_number: std::env::var("SIGNAL_PHONE_NUMBER").ok(),
             signal_allowed_users: std::env::var("SIGNAL_ALLOWED_USERS")
-                .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
+                .map(|s| {
+                    s.split(',')
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default(),
             signal_cli_host: std::env::var("SIGNAL_CLI_HOST").ok(),
             signal_cli_port: std::env::var("SIGNAL_CLI_PORT")
