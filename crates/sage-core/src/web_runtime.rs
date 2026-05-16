@@ -309,8 +309,16 @@ pub struct ChatRequest {
     pub session_id: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
+    #[serde(default)]
+    pub conversation_history: Vec<ChatHistoryMessage>,
     pub tool_context: Option<String>,
     pub client_executed_tools: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatHistoryMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1326,6 +1334,33 @@ fn build_final_answer_prompt(
         prompt.push_str("\n=== PREPARED TOOL CONTEXT ===\n");
         prompt.push_str(&prepared.context);
         prompt.push('\n');
+    }
+    let history: Vec<&ChatHistoryMessage> = request
+        .conversation_history
+        .iter()
+        .filter(|message| {
+            matches!(message.role.as_str(), "user" | "assistant")
+                && !message.content.trim().is_empty()
+        })
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if !history.is_empty() {
+        prompt.push_str("\n=== RECENT CONVERSATION ===\n");
+        for message in history {
+            let role = if message.role == "user" {
+                "User"
+            } else {
+                "Assistant"
+            };
+            prompt.push_str(role);
+            prompt.push_str(": ");
+            prompt.push_str(&truncate_chars(message.content.trim(), 2000));
+            prompt.push('\n');
+        }
     }
     prompt.push_str("\n=== USER MESSAGE ===\n");
     prompt.push_str(&request.message);
@@ -3966,5 +4001,56 @@ mod tests {
         assert!(rendered.contains("raw_results_redacted"));
         assert!(!rendered.contains("decrypted secret"));
         assert!(!rendered.contains("encrypted_value"));
+    }
+
+    #[test]
+    fn final_answer_prompt_includes_recent_conversation_before_current_message() {
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "your suggestions above".to_string(),
+            session_id: Some("session-123".to_string()),
+            tools: vec!["admin-config".to_string()],
+            conversation_history: vec![
+                ChatHistoryMessage {
+                    role: "user".to_string(),
+                    content: "Change more of the copy.".to_string(),
+                },
+                ChatHistoryMessage {
+                    role: "assistant".to_string(),
+                    content: "I recommend updating Instance Name and Assistant Name.".to_string(),
+                },
+            ],
+            tool_context: None,
+            client_executed_tools: None,
+        };
+        let prepared = PreparedChatContext {
+            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
+            tools_used: Vec::new(),
+        };
+        let profile = HashMap::new();
+
+        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
+
+        assert!(prompt.contains("=== RECENT CONVERSATION ==="));
+        assert!(prompt.contains("User: Change more of the copy."));
+        assert!(
+            prompt.contains("Assistant: I recommend updating Instance Name and Assistant Name.")
+        );
+        assert!(prompt.contains("=== USER MESSAGE ===\nyour suggestions above"));
     }
 }
