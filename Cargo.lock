@@ -3440,6 +3440,7 @@ name = "sage-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "baml-bridge",
@@ -3452,6 +3453,7 @@ dependencies = [
  "dotenvy",
  "dspy-rs",
  "flate2",
+ "futures-util",
  "itsdangerous",
  "libc",
  "pgvector",

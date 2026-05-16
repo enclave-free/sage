@@ -5,7 +5,10 @@ use axum::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         HeaderMap, HeaderValue, Method, StatusCode,
     },
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post, put},
     Json, Router,
 };
@@ -16,6 +19,7 @@ use base64::{
 use diesel::prelude::*;
 use diesel::sql_types::{Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid, Varchar};
 use flate2::read::ZlibDecoder;
+use futures_util::{Stream, StreamExt};
 use itsdangerous::{
     default_builder, timed_serializer_with_signer, Encoding, IntoTimestampSigner, TimedSerializer,
 };
@@ -23,6 +27,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -216,6 +221,7 @@ pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Rout
     Ok(Router::new()
         .route("/health", get(health))
         .route("/llm/chat", post(chat))
+        .route("/llm/chat/stream", post(chat_stream))
         .route("/query", post(query))
         .route(
             "/query/session/{session_id}",
@@ -316,6 +322,54 @@ pub struct ChatResponse {
     #[serde(default)]
     pub tools_used: Vec<ToolCallInfoResponse>,
     pub trace: Option<ConversationTraceResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatStreamEventPayload {
+    pub message_id: String,
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<ConversationTraceResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tools_used: Vec<ToolCallInfoResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PreparedChatContext {
+    context: String,
+    tools_used: Vec<ToolCallInfoResponse>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FinalAnswerChunk {
+    delta: Option<String>,
+    done: bool,
+}
+
+impl ChatStreamEventPayload {
+    fn new(message_id: impl Into<String>, session_id: Option<String>) -> Self {
+        Self {
+            message_id: message_id.into(),
+            session_id,
+            status: None,
+            delta: None,
+            trace: None,
+            model: None,
+            provider: None,
+            tools_used: Vec::new(),
+            detail: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -989,6 +1043,25 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "healthy", "service": "enclave_web" }))
 }
 
+fn chat_stream_sse_event(event: &str, payload: &ChatStreamEventPayload) -> Event {
+    Event::default()
+        .event(event)
+        .json_data(payload)
+        .unwrap_or_else(|_| {
+            Event::default().event("error").data(
+                r#"{"message_id":"unknown","session_id":null,"detail":"failed to serialize stream event"}"#,
+            )
+        })
+}
+
+#[cfg(test)]
+fn chat_stream_event_payload_json(payload: &ChatStreamEventPayload) -> String {
+    serde_json::to_string(payload).unwrap_or_else(|_| {
+        r#"{"message_id":"unknown","session_id":null,"detail":"failed to serialize stream event"}"#
+            .to_string()
+    })
+}
+
 async fn session_defaults(
     State(state): State<WebAppState>,
     Query(query): Query<SessionDefaultsQuery>,
@@ -1125,6 +1198,263 @@ async fn chat(
         tools_used,
         trace,
     }))
+}
+
+async fn prepare_explicit_chat_context(
+    state: &WebAppState,
+    request: &ChatRequest,
+    auth: &InternalAuthContext,
+) -> AppResult<PreparedChatContext> {
+    let mut context_parts = Vec::new();
+    let mut tools_used = Vec::<ToolCallInfoResponse>::new();
+
+    if let Some(tool_context) = request.tool_context.as_deref() {
+        context_parts.push(format!("CLIENT TOOL CONTEXT\n{}", tool_context));
+    }
+
+    let client_executed_tools = if request.tool_context.is_some() {
+        request.client_executed_tools.clone().unwrap_or_else(|| {
+            if request.tools.iter().any(|tool| tool == "db-query") {
+                vec!["db-query".to_string()]
+            } else {
+                Vec::new()
+            }
+        })
+    } else {
+        Vec::new()
+    };
+    let client_executed_set: HashSet<String> = client_executed_tools.iter().cloned().collect();
+    for tool_id in client_executed_tools {
+        if request.tools.iter().any(|enabled| enabled == &tool_id) {
+            tools_used.push(tool_call_info_for_id(&tool_id, request.message.clone()));
+        }
+    }
+
+    if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "admin-config") {
+        tools_used.push(tool_call_info_for_id(
+            "admin-config",
+            request.message.clone(),
+        ));
+        let ai_config = load_ai_config_response(state)?;
+        context_parts.push(format!(
+            "SCOPED CONFIG CONTEXT\n{}",
+            serde_json::to_string_pretty(&ai_config).map_err(internal_error)?
+        ));
+    }
+
+    if request.tools.iter().any(|tool| tool == "web-search")
+        && !client_executed_set.contains("web-search")
+    {
+        let trace_sink = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
+        let tool = SearxWebSearchTool {
+            http: state.http.clone(),
+            searxng_url: std::env::var("SEARXNG_URL")
+                .unwrap_or_else(|_| "http://searxng:8080".to_string()),
+            traces: trace_sink.clone(),
+        };
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), request.message.clone());
+        let result = tool.execute(&args).await.map_err(internal_error)?;
+        if result.success {
+            context_parts.push(format!("WEB SEARCH CONTEXT\n{}", result.output));
+        } else if let Some(error) = result.error {
+            context_parts.push(format!("WEB SEARCH ERROR\n{}", error));
+        }
+        if let Ok(mut traces) = trace_sink.lock() {
+            tools_used.extend(traces.drain(..));
+        };
+    }
+
+    if auth.kind == "admin"
+        && request.tools.iter().any(|tool| tool == "db-query")
+        && !client_executed_set.contains("db-query")
+    {
+        let trimmed = request.message.trim();
+        if trimmed.to_ascii_uppercase().starts_with("SELECT ") {
+            let trace_sink = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
+            let tool = AdminDbQueryTool {
+                internal: state.internal.clone(),
+                traces: trace_sink.clone(),
+            };
+            let mut args = HashMap::new();
+            args.insert("sql".to_string(), trimmed.to_string());
+            let result = tool.execute(&args).await.map_err(internal_error)?;
+            if result.success {
+                context_parts.push(format!("DATABASE CONTEXT\n{}", result.output));
+            } else if let Some(error) = result.error {
+                context_parts.push(format!("DATABASE ERROR\n{}", error));
+            }
+            if let Ok(mut traces) = trace_sink.lock() {
+                tools_used.extend(traces.drain(..));
+            };
+        } else {
+            tools_used.push(tool_call_info_for_id("db-query", request.message.clone()));
+            context_parts.push(
+                "DATABASE CONTEXT\nDatabase Query was selected, but server-side streaming currently requires client-executed decrypted context or a direct SELECT query."
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(PreparedChatContext {
+        context: context_parts.join("\n\n"),
+        tools_used: dedupe_tool_calls(tools_used),
+    })
+}
+
+fn build_final_answer_prompt(
+    ai_config: &InternalEffectiveAiConfig,
+    auth: &InternalAuthContext,
+    profile: &HashMap<String, String>,
+    request: &ChatRequest,
+    prepared: &PreparedChatContext,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(&build_agent_instruction(&ai_config.compiled_prompt, false));
+    prompt.push_str("\n\n=== REQUEST CONTEXT ===\n");
+    prompt.push_str(&format!("auth_type: {}\n", auth.kind));
+    if let Some(user_type_id) = auth.user_type_id {
+        prompt.push_str(&format!("user_type_id: {}\n", user_type_id));
+    }
+    if !profile.is_empty() {
+        prompt.push_str("\nUSER PROFILE\n");
+        for (key, value) in profile {
+            prompt.push_str(&format!("{}: {}\n", key, value));
+        }
+    }
+    if !prepared.context.trim().is_empty() {
+        prompt.push_str("\n=== PREPARED TOOL CONTEXT ===\n");
+        prompt.push_str(&prepared.context);
+        prompt.push('\n');
+    }
+    prompt.push_str("\n=== USER MESSAGE ===\n");
+    prompt.push_str(&request.message);
+    prompt.push_str("\n\nAnswer in normal user-visible prose. Do not emit JSON, tool calls, hidden reasoning, raw prompts, raw provider traces, secrets, or unredacted database rows.");
+    prompt
+}
+
+async fn chat_stream(
+    State(state): State<WebAppState>,
+    headers: HeaderMap,
+    Json(request): Json<ChatRequest>,
+) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    enforce_csrf(&state.web_config, &Method::POST, &headers)?;
+    let auth = resolve_public_actor(&state, &headers).await?;
+    if request.tool_context.is_some() && auth.kind != "admin" {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "Tool context override is admin-only",
+        ));
+    }
+    let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
+    let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
+    let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
+    update_session_last_question(&state, session.id, &request.message)?;
+    let message_id = format!("msg_{}", Uuid::new_v4().simple());
+    let session_id = Some(session.id.to_string());
+
+    let stream = async_stream::stream! {
+        yield Ok(chat_stream_sse_event(
+            "assistant_message_started",
+            &ChatStreamEventPayload::new(message_id.clone(), session_id.clone()),
+        ));
+
+        let mut status = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+        status.status = Some("Preparing selected tools...".to_string());
+        yield Ok(chat_stream_sse_event("trace_status", &status));
+
+        let mut profile = HashMap::new();
+        if auth.kind != "admin" && auth.id != -1 {
+            match state.internal.user_profile_context(auth.id, auth.user_type_id).await {
+                Ok(response) => profile = response.profile,
+                Err(error) => {
+                    let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+                    payload.detail = Some(format!("Failed to load user profile context: {}", error));
+                    yield Ok(chat_stream_sse_event("error", &payload));
+                    return;
+                }
+            }
+        }
+
+        let prepared = match prepare_explicit_chat_context(&state, &request, &auth).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+                payload.detail = Some(error.message);
+                yield Ok(chat_stream_sse_event("error", &payload));
+                return;
+            }
+        };
+
+        let mut status = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+        status.status = Some("Writing answer...".to_string());
+        yield Ok(chat_stream_sse_event("trace_status", &status));
+
+        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
+        let mut answer = String::new();
+        let stream_result = stream_final_answer_from_model(&state, &prompt, temperature).await;
+        let answer_stream = match stream_result {
+            Ok(stream) => stream,
+            Err(error) => {
+                let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+                payload.detail = Some(error.message);
+                yield Ok(chat_stream_sse_event("error", &payload));
+                return;
+            }
+        };
+        futures_util::pin_mut!(answer_stream);
+
+        while let Some(chunk_result) = answer_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    if let Some(delta) = chunk.delta {
+                        answer.push_str(&delta);
+                        let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+                        payload.delta = Some(delta);
+                        yield Ok(chat_stream_sse_event("answer_delta", &payload));
+                    }
+                    if chunk.done {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+                    payload.detail = Some(error.message);
+                    yield Ok(chat_stream_sse_event("error", &payload));
+                    return;
+                }
+            }
+        }
+
+        if !answer.trim().is_empty() {
+            match build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id).await {
+                Ok(memory) => {
+                    let memory_user_id = memory_user_id(&auth);
+                    if let Err(error) = memory.store_message_sync(&memory_user_id, "user", &request.message) {
+                        warn!("failed to persist streamed user message for session {}: {}", session.id, error);
+                    }
+                    if let Err(error) = memory.store_message_sync(&memory_user_id, "assistant", &answer) {
+                        warn!("failed to persist streamed assistant message for session {}: {}", session.id, error);
+                    }
+                }
+                Err(error) => warn!("failed to build memory for streamed chat session {}: {}", session.id, error.message),
+            }
+        }
+
+        let trace = build_conversation_trace(&ai_config, &auth, prepared.tools_used.clone(), Vec::new());
+        if trace.is_some() {
+            let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+            payload.trace = trace;
+            yield Ok(chat_stream_sse_event("trace_final", &payload));
+        }
+
+        let mut done = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+        done.model = Some(state.config.tinfoil_model.clone());
+        done.provider = Some("sage".to_string());
+        done.tools_used = prepared.tools_used;
+        yield Ok(chat_stream_sse_event("done", &done));
+    };
+    Ok(Sse::new(stream))
 }
 
 async fn query(
@@ -2912,6 +3242,203 @@ fn dedupe_sources(sources: Vec<QuerySource>) -> Vec<QuerySource> {
     deduped
 }
 
+async fn stream_final_answer_from_model(
+    state: &WebAppState,
+    prompt: &str,
+    temperature: f64,
+) -> AppResult<impl Stream<Item = AppResult<FinalAnswerChunk>>> {
+    let api_key = state
+        .config
+        .tinfoil_api_key
+        .as_deref()
+        .ok_or_else(|| AppError::internal("TINFOIL_API_KEY not configured"))?;
+    let response = state
+        .http
+        .post(format!(
+            "{}/chat/completions",
+            state.config.tinfoil_api_url.trim_end_matches('/')
+        ))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header(CONTENT_TYPE, "application/json")
+        .json(&json!({
+            "model": state.config.tinfoil_model.clone(),
+            "messages": [
+                { "role": "user", "content": prompt }
+            ],
+            "stream": true,
+            "temperature": temperature,
+        }))
+        .send()
+        .await
+        .map_err(model_provider_error)?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Model Provider stream failed with {}: {}", status, body),
+        ));
+    }
+
+    let mut bytes = response.bytes_stream();
+    let stream = async_stream::stream! {
+        let mut buffer = String::new();
+        let mut pending_utf8 = Vec::new();
+        loop {
+            let item = match tokio::time::timeout(Duration::from_secs(30), bytes.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    yield Err(model_provider_error("Model Provider stream timed out waiting for data"));
+                    return;
+                }
+            };
+            let chunk = match item {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    yield Err(model_provider_error(error));
+                    return;
+                }
+            };
+            if let Err(error) = append_utf8_chunk(&mut buffer, &mut pending_utf8, &chunk) {
+                yield Err(error);
+                return;
+            }
+            let frames = drain_sse_data_frames(&mut buffer);
+            for frame in frames {
+                match parse_openai_chat_stream_frame(&frame) {
+                    Ok(Some(parsed)) => {
+                        let done = parsed.done;
+                        yield Ok(parsed);
+                        if done {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+        }
+        if !pending_utf8.is_empty() {
+            yield Err(AppError::new(
+                StatusCode::BAD_GATEWAY,
+                "Model Provider stream ended with incomplete UTF-8 data",
+            ));
+            return;
+        }
+        for frame in drain_remaining_sse_data_frames(&mut buffer) {
+            match parse_openai_chat_stream_frame(&frame) {
+                Ok(Some(parsed)) => yield Ok(parsed),
+                Ok(None) => {}
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+    };
+
+    Ok(stream)
+}
+
+fn append_utf8_chunk(buffer: &mut String, pending: &mut Vec<u8>, chunk: &[u8]) -> AppResult<()> {
+    pending.extend_from_slice(chunk);
+
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                buffer.push_str(text);
+                pending.clear();
+                return Ok(());
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid =
+                        std::str::from_utf8(&pending[..valid_up_to]).map_err(internal_error)?;
+                    buffer.push_str(valid);
+                    pending.drain(..valid_up_to);
+                    continue;
+                }
+                if error.error_len().is_none() {
+                    return Ok(());
+                }
+                return Err(AppError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "Model Provider stream returned invalid UTF-8 data",
+                ));
+            }
+        }
+    }
+}
+
+fn drain_sse_data_frames(buffer: &mut String) -> Vec<String> {
+    let normalized = buffer.replace("\r\n", "\n").replace('\r', "\n");
+    *buffer = normalized;
+    let mut frames = Vec::new();
+    while let Some(boundary) = buffer.find("\n\n") {
+        let raw = buffer[..boundary].to_string();
+        *buffer = buffer[boundary + 2..].to_string();
+        if let Some(data) = sse_data_from_raw_event(&raw) {
+            frames.push(data);
+        }
+    }
+    frames
+}
+
+fn drain_remaining_sse_data_frames(buffer: &mut String) -> Vec<String> {
+    if buffer.trim().is_empty() {
+        return Vec::new();
+    }
+    let raw = std::mem::take(buffer);
+    sse_data_from_raw_event(&raw).into_iter().collect()
+}
+
+fn sse_data_from_raw_event(raw: &str) -> Option<String> {
+    let lines = raw
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn parse_openai_chat_stream_frame(data: &str) -> AppResult<Option<FinalAnswerChunk>> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed == "[DONE]" {
+        return Ok(Some(FinalAnswerChunk {
+            delta: None,
+            done: true,
+        }));
+    }
+    let value = serde_json::from_str::<Value>(trimmed).map_err(model_provider_error)?;
+    let choice = value
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first());
+    let delta = choice
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|content| content.as_str())
+        .map(ToOwned::to_owned);
+    let done = choice
+        .and_then(|choice| choice.get("finish_reason"))
+        .map(|reason| !reason.is_null())
+        .unwrap_or(false);
+    Ok(Some(FinalAnswerChunk { delta, done }))
+}
+
 fn build_conversation_trace(
     ai_config: &InternalEffectiveAiConfig,
     auth: &InternalAuthContext,
@@ -2950,7 +3477,11 @@ fn build_conversation_trace(
                 name: tool.tool_name,
                 status: "completed".to_string(),
                 execution: "server".to_string(),
-                input_summary: tool.query.map(|query| truncate_chars(&query, 160)),
+                input_summary: if is_db_query {
+                    Some("Read-only database query.".to_string())
+                } else {
+                    tool.query.map(|query| truncate_chars(&query, 160))
+                },
                 output_summary: if is_db_query {
                     Some("Database results were redacted from the trace.".to_string())
                 } else {
@@ -3036,6 +3567,7 @@ fn build_conversation_trace(
 
 fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
     let tool_name = match tool_id {
+        "admin-config" => "Admin Config",
         "web-search" => "Web Search",
         "db-query" => "Database Query",
         other => other,
@@ -3319,5 +3851,120 @@ mod tests {
         assert_eq!(summary["results"][0]["target_kind"], "session_memory");
         assert_eq!(summary["results"][0]["action"], "delete_messages");
         assert_eq!(summary["results"][0]["status"], "succeeded");
+    }
+
+    #[test]
+    fn chat_stream_events_use_stable_message_and_session_ids() {
+        let mut payload = ChatStreamEventPayload::new(
+            "msg_test",
+            Some("11111111-1111-1111-1111-111111111111".to_string()),
+        );
+        payload.status = Some("Writing answer...".to_string());
+
+        let rendered = chat_stream_event_payload_json(&payload);
+
+        assert!(rendered.contains(r#""message_id":"msg_test""#));
+        assert!(rendered.contains(r#""session_id":"11111111-1111-1111-1111-111111111111""#));
+        assert!(rendered.contains(r#""status":"Writing answer...""#));
+    }
+
+    #[test]
+    fn model_provider_stream_frames_become_answer_chunks() {
+        let chunk = parse_openai_chat_stream_frame(
+            r#"{"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}"#,
+        )
+        .expect("frame should parse")
+        .expect("frame should produce a chunk");
+        assert_eq!(
+            chunk,
+            FinalAnswerChunk {
+                delta: Some("hel".to_string()),
+                done: false,
+            }
+        );
+
+        let done = parse_openai_chat_stream_frame("[DONE]")
+            .expect("done frame should parse")
+            .expect("done frame should produce a chunk");
+        assert_eq!(
+            done,
+            FinalAnswerChunk {
+                delta: None,
+                done: true,
+            }
+        );
+    }
+
+    #[test]
+    fn sse_data_frames_are_drained_incrementally() {
+        let mut buffer = "data: {\"a\":1}\n\n:data ignored\n\ndata: [DONE]\n\npartial".to_string();
+
+        let frames = drain_sse_data_frames(&mut buffer);
+
+        assert_eq!(frames, vec![r#"{"a":1}"#.to_string(), "[DONE]".to_string()]);
+        assert_eq!(buffer, "partial");
+    }
+
+    #[test]
+    fn stream_utf8_decoder_preserves_split_multibyte_characters() {
+        let mut buffer = String::new();
+        let mut pending = Vec::new();
+        let bytes = "data: {\"choices\":[{\"delta\":{\"content\":\"€\"}}]}\n\n".as_bytes();
+
+        append_utf8_chunk(&mut buffer, &mut pending, &bytes[..44]).expect("prefix should decode");
+        append_utf8_chunk(&mut buffer, &mut pending, &bytes[44..45])
+            .expect("partial character should wait");
+        append_utf8_chunk(&mut buffer, &mut pending, &bytes[45..]).expect("suffix should decode");
+
+        assert!(pending.is_empty());
+        assert!(buffer.contains("€"));
+        assert!(!buffer.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn admin_streaming_trace_reports_tools_without_raw_context() {
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "admin_trace_visibility".to_string(),
+            Value::String("detailed".to_string()),
+        );
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults,
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let trace = build_conversation_trace(
+            &ai_config,
+            &auth,
+            vec![
+                tool_call_info_for_id("admin-config", "review config".to_string()),
+                ToolCallInfoResponse {
+                    tool_id: "db-query".to_string(),
+                    tool_name: "Database Query".to_string(),
+                    query: Some("SELECT encrypted_value FROM settings".to_string()),
+                },
+            ],
+            Vec::new(),
+        )
+        .expect("admin trace should be visible");
+
+        let rendered = serde_json::to_string(&trace).expect("trace should serialize");
+
+        assert!(rendered.contains("Admin Config"));
+        assert!(rendered.contains("Database results were redacted from the trace."));
+        assert!(rendered.contains("raw_results_redacted"));
+        assert!(!rendered.contains("decrypted secret"));
+        assert!(!rendered.contains("encrypted_value"));
     }
 }
