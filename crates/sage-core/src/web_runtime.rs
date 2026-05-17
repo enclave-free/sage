@@ -290,6 +290,8 @@ pub struct RetrievalTraceResponse {
     pub title: Option<String>,
     pub summary: Option<String>,
     pub score: Option<f32>,
+    #[serde(default)]
+    pub metadata: Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3551,7 +3553,7 @@ fn build_conversation_trace(
             title: if source.source_file.is_empty() {
                 None
             } else {
-                Some(source.source_file)
+                Some(source.source_file.clone())
             },
             summary: if source.text.is_empty() {
                 None
@@ -3559,6 +3561,14 @@ fn build_conversation_trace(
                 Some(truncate_chars(&source.text, 160))
             },
             score: Some(source.score),
+            metadata: json!({
+                "job_id": source.job_id,
+                "chunk_id": source.chunk_id,
+                "source_file": source.source_file,
+                "content_ref": source.content_ref,
+                "hydrated": source.hydrated,
+                "hydration_status": source.hydration_status,
+            }),
         })
         .collect::<Vec<_>>();
 
@@ -4009,6 +4019,63 @@ mod tests {
         assert!(rendered.contains("raw_results_redacted"));
         assert!(!rendered.contains("decrypted secret"));
         assert!(!rendered.contains("encrypted_value"));
+    }
+
+    #[test]
+    fn retrieval_trace_preserves_source_metadata_without_raw_reasoning() {
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "admin_trace_visibility".to_string(),
+            Value::String("detailed".to_string()),
+        );
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults,
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+
+        let trace = build_conversation_trace(
+            &ai_config,
+            &auth,
+            Vec::new(),
+            vec![QuerySource {
+                score: 0.91,
+                source_type: "chunk".to_string(),
+                text: "Benefits include two preventive dental visits each year.".to_string(),
+                chunk_id: "benefits-guide_chunk_0000".to_string(),
+                job_id: "benefits-guide".to_string(),
+                source_file: "Benefits Guide.md".to_string(),
+                content_ref: "retrieval_chunk:benefits-guide_chunk_0000".to_string(),
+                hydrated: true,
+                hydration_status: "hydrated".to_string(),
+            }],
+        )
+        .expect("admin trace should be visible");
+
+        assert_eq!(trace.retrieval.len(), 1);
+        assert_eq!(trace.retrieval[0].title.as_deref(), Some("Benefits Guide.md"));
+        assert_eq!(trace.retrieval[0].metadata["job_id"], "benefits-guide");
+        assert_eq!(
+            trace.retrieval[0].metadata["chunk_id"],
+            "benefits-guide_chunk_0000"
+        );
+        assert_eq!(trace.retrieval[0].metadata["hydrated"], true);
+        assert_eq!(trace.retrieval[0].metadata["hydration_status"], "hydrated");
+        assert_eq!(
+            trace.retrieval[0].metadata["content_ref"],
+            "retrieval_chunk:benefits-guide_chunk_0000"
+        );
     }
 
     #[test]
