@@ -400,7 +400,15 @@ pub struct QuerySource {
     pub source_type: String,
     pub text: String,
     pub chunk_id: String,
+    #[serde(default)]
+    pub job_id: String,
     pub source_file: String,
+    #[serde(default)]
+    pub content_ref: String,
+    #[serde(default)]
+    pub hydrated: bool,
+    #[serde(default)]
+    pub hydration_status: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
