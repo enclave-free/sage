@@ -26,6 +26,7 @@ use itsdangerous::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::Read;
@@ -220,6 +221,10 @@ pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Rout
 
     Ok(Router::new()
         .route("/health", get(health))
+        .route(
+            "/internal/runtime-config/fingerprint",
+            get(runtime_config_fingerprint),
+        )
         .route("/llm/chat", post(chat))
         .route("/llm/chat/stream", post(chat_stream))
         .route("/query", post(query))
@@ -1059,6 +1064,39 @@ impl Tool for AdminDbQueryTool {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "healthy", "service": "enclave_web" }))
+}
+
+fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{:x}", digest)
+}
+
+async fn runtime_config_fingerprint(
+    State(state): State<WebAppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Value>> {
+    ensure_internal_lifecycle_token(&state, &headers)?;
+    let api_key_fingerprint = state
+        .config
+        .tinfoil_api_key
+        .as_ref()
+        .map(|value| sha256_hex(value));
+    let payload = json!({
+        "service": "sage",
+        "runtime_config": {
+            "TINFOIL_API_URL": state.config.tinfoil_api_url,
+            "TINFOIL_API_KEY": {
+                "configured": state.config.tinfoil_api_key.as_ref().map(|value| !value.is_empty()).unwrap_or(false),
+                "fingerprint": api_key_fingerprint,
+            },
+            "TINFOIL_MODEL": state.config.tinfoil_model,
+            "TINFOIL_EMBEDDING_MODEL": state.config.tinfoil_embedding_model,
+            "FRONTEND_URL": state.web_config.frontend_url,
+            "CORS_ORIGINS": state.web_config.allowed_origins,
+            "SEARXNG_URL": std::env::var("SEARXNG_URL").unwrap_or_default(),
+        },
+    });
+    Ok(Json(payload))
 }
 
 fn chat_stream_sse_event(event: &str, payload: &ChatStreamEventPayload) -> Event {
@@ -4064,7 +4102,10 @@ mod tests {
         .expect("admin trace should be visible");
 
         assert_eq!(trace.retrieval.len(), 1);
-        assert_eq!(trace.retrieval[0].title.as_deref(), Some("Benefits Guide.md"));
+        assert_eq!(
+            trace.retrieval[0].title.as_deref(),
+            Some("Benefits Guide.md")
+        );
         assert_eq!(trace.retrieval[0].metadata["job_id"], "benefits-guide");
         assert_eq!(
             trace.retrieval[0].metadata["chunk_id"],
