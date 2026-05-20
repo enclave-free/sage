@@ -1075,28 +1075,34 @@ async fn runtime_config_fingerprint(
     State(state): State<WebAppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    ensure_internal_lifecycle_token(&state, &headers)?;
-    let api_key_fingerprint = state
-        .config
+    runtime_config_fingerprint_response(&state.config, &state.web_config, &headers).map(Json)
+}
+
+fn runtime_config_fingerprint_response(
+    config: &Config,
+    web_config: &EnclaveWebConfig,
+    headers: &HeaderMap,
+) -> AppResult<Value> {
+    ensure_internal_agent_token(web_config, headers)?;
+    let api_key_fingerprint = config
         .tinfoil_api_key
         .as_ref()
         .map(|value| sha256_hex(value));
-    let payload = json!({
+    Ok(json!({
         "service": "sage",
         "runtime_config": {
-            "TINFOIL_API_URL": state.config.tinfoil_api_url,
+            "TINFOIL_API_URL": config.tinfoil_api_url,
             "TINFOIL_API_KEY": {
-                "configured": state.config.tinfoil_api_key.as_ref().map(|value| !value.is_empty()).unwrap_or(false),
+                "configured": config.tinfoil_api_key.as_ref().map(|value| !value.is_empty()).unwrap_or(false),
                 "fingerprint": api_key_fingerprint,
             },
-            "TINFOIL_MODEL": state.config.tinfoil_model,
-            "TINFOIL_EMBEDDING_MODEL": state.config.tinfoil_embedding_model,
-            "FRONTEND_URL": state.web_config.frontend_url,
-            "CORS_ORIGINS": state.web_config.allowed_origins,
+            "TINFOIL_MODEL": config.tinfoil_model,
+            "TINFOIL_EMBEDDING_MODEL": config.tinfoil_embedding_model,
+            "FRONTEND_URL": web_config.frontend_url,
+            "CORS_ORIGINS": web_config.allowed_origins,
             "SEARXNG_URL": std::env::var("SEARXNG_URL").unwrap_or_default(),
         },
-    });
-    Ok(Json(payload))
+    }))
 }
 
 fn chat_stream_sse_event(event: &str, payload: &ChatStreamEventPayload) -> Event {
@@ -2291,8 +2297,15 @@ fn summarize_missing_query_session_deletion() -> Value {
 }
 
 fn ensure_internal_lifecycle_token(state: &WebAppState, headers: &HeaderMap) -> AppResult<()> {
+    ensure_internal_agent_token(&state.web_config, headers)
+}
+
+fn ensure_internal_agent_token(
+    web_config: &EnclaveWebConfig,
+    headers: &HeaderMap,
+) -> AppResult<()> {
     let supplied = header_to_string(headers.get("x-internal-agent-token"));
-    if supplied.as_deref() != Some(state.web_config.internal_agent_token.as_str()) {
+    if supplied.as_deref() != Some(web_config.internal_agent_token.as_str()) {
         return Err(AppError::new(
             StatusCode::FORBIDDEN,
             "Invalid internal agent token",
@@ -4168,5 +4181,96 @@ mod tests {
             prompt.contains("Assistant: I recommend updating Instance Name and Assistant Name.")
         );
         assert!(prompt.contains("=== USER MESSAGE ===\nyour suggestions above"));
+    }
+
+    #[test]
+    fn runtime_config_fingerprint_requires_internal_token_and_never_returns_raw_secret() {
+        let config = test_config_with_tinfoil_key("super-secret-tinfoil-key");
+        let web_config = test_web_config();
+        let mut headers = HeaderMap::new();
+
+        let missing = runtime_config_fingerprint_response(&config, &web_config, &headers)
+            .expect_err("missing internal token should be rejected");
+        assert_eq!(missing.status, StatusCode::FORBIDDEN);
+
+        headers.insert("x-internal-agent-token", "wrong-token".parse().unwrap());
+        let wrong = runtime_config_fingerprint_response(&config, &web_config, &headers)
+            .expect_err("wrong internal token should be rejected");
+        assert_eq!(wrong.status, StatusCode::FORBIDDEN);
+
+        headers.insert(
+            "x-internal-agent-token",
+            "internal-test-token".parse().unwrap(),
+        );
+        let payload = runtime_config_fingerprint_response(&config, &web_config, &headers)
+            .expect("correct internal token should return runtime fingerprint");
+
+        assert_eq!(payload["service"], "sage");
+        assert_eq!(
+            payload["runtime_config"]["TINFOIL_API_URL"],
+            "http://tinfoil-proxy:8089/v1"
+        );
+        assert_eq!(payload["runtime_config"]["TINFOIL_MODEL"], "kimi-k2-6");
+        assert_eq!(
+            payload["runtime_config"]["TINFOIL_EMBEDDING_MODEL"],
+            "nomic-embed-text"
+        );
+        assert_eq!(
+            payload["runtime_config"]["FRONTEND_URL"],
+            "https://app.example.test"
+        );
+        assert_eq!(
+            payload["runtime_config"]["CORS_ORIGINS"][0],
+            "https://app.example.test"
+        );
+        assert_eq!(
+            payload["runtime_config"]["TINFOIL_API_KEY"]["configured"],
+            true
+        );
+        assert_eq!(
+            payload["runtime_config"]["TINFOIL_API_KEY"]["fingerprint"],
+            sha256_hex("super-secret-tinfoil-key")
+        );
+
+        let rendered = serde_json::to_string(&payload).expect("payload should serialize");
+        assert!(!rendered.contains("super-secret-tinfoil-key"));
+    }
+
+    fn test_config_with_tinfoil_key(secret: &str) -> Config {
+        Config {
+            tinfoil_api_url: "http://tinfoil-proxy:8089/v1".to_string(),
+            tinfoil_api_key: Some(secret.to_string()),
+            tinfoil_model: "kimi-k2-6".to_string(),
+            tinfoil_embedding_model: "nomic-embed-text".to_string(),
+            tinfoil_vision_model: "qwen3-vl-30b".to_string(),
+            database_url: "postgres://sage:sage@localhost:5434/sage".to_string(),
+            messenger_type: crate::config::MessengerType::Signal,
+            signal_phone_number: None,
+            signal_allowed_users: Vec::new(),
+            signal_cli_host: None,
+            signal_cli_port: 7583,
+            marmot_binary: "marmotd".to_string(),
+            marmot_relays: Vec::new(),
+            marmot_state_dir: "/tmp/marmot".to_string(),
+            marmot_allowed_pubkeys: Vec::new(),
+            marmot_auto_accept_welcomes: true,
+            brave_api_key: None,
+            workspace_path: "/workspace".to_string(),
+            http_port: 3000,
+        }
+    }
+
+    fn test_web_config() -> EnclaveWebConfig {
+        EnclaveWebConfig {
+            http_port: 3000,
+            backend_url: "http://core-backend:8000".to_string(),
+            internal_agent_token: "internal-test-token".to_string(),
+            secret_key: "test-secret".to_string(),
+            allowed_origins: vec!["https://app.example.test".to_string()],
+            frontend_url: Some("https://app.example.test".to_string()),
+            user_session_cookie_name: "enclave_session".to_string(),
+            admin_session_cookie_name: "enclave_admin_session".to_string(),
+            csrf_cookie_name: "enclave_csrf".to_string(),
+        }
     }
 }
