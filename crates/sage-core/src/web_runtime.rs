@@ -1304,6 +1304,31 @@ async fn prepare_explicit_chat_context(
         ));
     }
 
+    if should_auto_retrieve_admin_config_context(request, auth) {
+        let response = state
+            .internal
+            .document_search(&InternalDocumentSearchRequest {
+                query: request.message.clone(),
+                user: auth.clone(),
+                top_k: 4,
+                job_ids: None,
+                jurisdiction: None,
+                situation_details: None,
+            })
+            .await
+            .map_err(internal_error)?;
+        tools_used.push(tool_call_info_for_id(
+            "knowledge-search",
+            request.message.clone(),
+        ));
+        if !response.context.trim().is_empty() {
+            context_parts.push(format!(
+                "UPLOADED DOCUMENT CONTEXT\n{}",
+                response.context.trim()
+            ));
+        }
+    }
+
     if request.tools.iter().any(|tool| tool == "web-search")
         && !client_executed_set.contains("web-search")
     {
@@ -1362,6 +1387,46 @@ async fn prepare_explicit_chat_context(
         context: context_parts.join("\n\n"),
         tools_used: dedupe_tool_calls(tools_used),
     })
+}
+
+fn should_auto_retrieve_admin_config_context(
+    request: &ChatRequest,
+    auth: &InternalAuthContext,
+) -> bool {
+    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "admin-config") {
+        return false;
+    }
+    let message = request.message.to_ascii_lowercase();
+    let refers_to_uploaded_materials = [
+        "uploaded",
+        "document",
+        "documents",
+        "pdf",
+        "guide",
+        "book",
+        "materials",
+        "resource",
+        "archive",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle));
+    let config_intent = [
+        "theme",
+        "configure",
+        "configuration",
+        "copy",
+        "style",
+        "branding",
+        "brand",
+        "colors",
+        "icons",
+        "tagline",
+        "instance",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle));
+
+    refers_to_uploaded_materials && config_intent
 }
 
 fn build_final_answer_prompt(
@@ -2374,7 +2439,7 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
         ),
         (
             "prompt_rules",
-            "[\"ONE action per response when providing step-by-step guidance\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
+            "[\"For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one reviewable Change Confirmation.\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
             "json",
             "prompt_section",
             Some("Array of behavioral rules"),
@@ -4181,6 +4246,117 @@ mod tests {
             prompt.contains("Assistant: I recommend updating Instance Name and Assistant Name.")
         );
         assert!(prompt.contains("=== USER MESSAGE ===\nyour suggestions above"));
+    }
+
+    #[test]
+    fn admin_config_requests_for_uploaded_materials_trigger_document_retrieval() {
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "Based on the uploaded WLC PDF, configure the theme and copy.".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+        };
+
+        assert!(should_auto_retrieve_admin_config_context(&request, &auth));
+    }
+
+    #[test]
+    fn user_and_non_material_admin_requests_do_not_trigger_admin_document_retrieval() {
+        let admin_auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let user_auth = InternalAuthContext {
+            id: 2,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: None,
+            email: Some("user@example.test".to_string()),
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let admin_request = ChatRequest {
+            message: "What is the current instance name?".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+        };
+        let user_request = ChatRequest {
+            message: "Based on the uploaded PDF, configure the theme.".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+        };
+
+        assert!(!should_auto_retrieve_admin_config_context(
+            &admin_request,
+            &admin_auth
+        ));
+        assert!(!should_auto_retrieve_admin_config_context(
+            &user_request,
+            &user_auth
+        ));
+    }
+
+    #[test]
+    fn final_answer_prompt_includes_uploaded_document_context_for_admin_config_turns() {
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Help the admin configure the Instance.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "Configure the theme from the uploaded guide.".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+        };
+        let prepared = PreparedChatContext {
+            context: "SCOPED CONFIG CONTEXT\n{}\n\nUPLOADED DOCUMENT CONTEXT\nThe guide uses deep blue headings and a shield mark.".to_string(),
+            tools_used: Vec::new(),
+        };
+        let profile = HashMap::new();
+
+        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
+
+        assert!(prompt.contains("UPLOADED DOCUMENT CONTEXT"));
+        assert!(prompt.contains("deep blue headings"));
     }
 
     #[test]
