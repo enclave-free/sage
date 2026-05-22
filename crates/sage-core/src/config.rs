@@ -51,11 +51,11 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:8089/v1".to_string()),
             tinfoil_api_key: std::env::var("TINFOIL_API_KEY").ok(),
             tinfoil_model: std::env::var("TINFOIL_MODEL")
-                .unwrap_or_else(|_| "gpt-oss:120b".to_string()),
+                .unwrap_or_else(|_| "kimi-k2-6".to_string()),
             tinfoil_embedding_model: std::env::var("TINFOIL_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string()),
             tinfoil_vision_model: std::env::var("TINFOIL_VISION_MODEL").unwrap_or_else(|_| {
-                std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "gpt-oss:120b".to_string())
+                std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "kimi-k2-6".to_string())
             }),
 
             database_url: std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?,

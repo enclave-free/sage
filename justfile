@@ -113,9 +113,9 @@ start:
         -e DATABASE_URL=postgres://sage:sage@localhost:5434/sage \
         -e TINFOIL_API_URL="${TINFOIL_API_URL:-http://localhost:${TINFOIL_PROXY_PORT}/v1}" \
         -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
-        -e TINFOIL_MODEL="${TINFOIL_MODEL:-gpt-oss:120b}" \
+        -e TINFOIL_MODEL="${TINFOIL_MODEL:-kimi-k2-6}" \
         -e TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}" \
-        -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-${TINFOIL_MODEL:-gpt-oss:120b}}" \
+        -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-${TINFOIL_MODEL:-kimi-k2-6}}" \
         $MESSENGER_ENV \
         -e BRAVE_API_KEY="$BRAVE_API_KEY" \
         -e SAGE_WORKSPACE=/workspace \
@@ -209,9 +209,9 @@ restart:
         -e DATABASE_URL=postgres://sage:sage@localhost:5434/sage \
         -e TINFOIL_API_URL="${TINFOIL_API_URL:-http://localhost:${TINFOIL_PROXY_PORT}/v1}" \
         -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
-        -e TINFOIL_MODEL="${TINFOIL_MODEL:-gpt-oss:120b}" \
+        -e TINFOIL_MODEL="${TINFOIL_MODEL:-kimi-k2-6}" \
         -e TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}" \
-        -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-${TINFOIL_MODEL:-gpt-oss:120b}}" \
+        -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-${TINFOIL_MODEL:-kimi-k2-6}}" \
         $MESSENGER_ENV \
         -e BRAVE_API_KEY="$BRAVE_API_KEY" \
         -e SAGE_WORKSPACE=/workspace \
