@@ -307,7 +307,21 @@ pub struct ConversationTraceResponse {
     pub tools: Vec<ToolTraceResponse>,
     #[serde(default)]
     pub retrieval: Vec<RetrievalTraceResponse>,
+    #[serde(default)]
+    pub activity_steps: Vec<ConversationActivityStepResponse>,
     pub suppressed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversationActivityStepResponse {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -350,6 +364,8 @@ pub struct ChatStreamEventPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<ConversationTraceResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_step: Option<ConversationActivityStepResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -363,6 +379,7 @@ pub struct ChatStreamEventPayload {
 struct PreparedChatContext {
     context: String,
     tools_used: Vec<ToolCallInfoResponse>,
+    activity_steps: Vec<ConversationActivityStepResponse>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -379,6 +396,7 @@ impl ChatStreamEventPayload {
             status: None,
             delta: None,
             trace: None,
+            activity_step: None,
             model: None,
             provider: None,
             tools_used: Vec::new(),
@@ -1358,9 +1376,13 @@ async fn prepare_explicit_chat_context(
         }
     }
 
+    let tools_used = dedupe_tool_calls(tools_used);
+    let activity_steps = conversation_activity_steps_from_tools(&tools_used);
+
     Ok(PreparedChatContext {
         context: context_parts.join("\n\n"),
-        tools_used: dedupe_tool_calls(tools_used),
+        tools_used,
+        activity_steps,
     })
 }
 
@@ -1474,6 +1496,11 @@ async fn chat_stream(
                 return;
             }
         };
+        for activity_step in prepared.activity_steps.iter().cloned() {
+            let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+            payload.activity_step = Some(activity_step);
+            yield Ok(chat_stream_sse_event("activity_step", &payload));
+        }
 
         let mut status = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
         status.status = Some("Writing answer...".to_string());
@@ -3658,6 +3685,8 @@ fn build_conversation_trace(
         _ => (detailed_tools, detailed_retrieval),
     };
 
+    let activity_steps = conversation_activity_steps_from_tool_traces(&tools);
+
     Some(ConversationTraceResponse {
         visibility,
         reasoning: ReasoningTraceResponse {
@@ -3665,8 +3694,71 @@ fn build_conversation_trace(
         },
         tools,
         retrieval,
+        activity_steps,
         suppressed: false,
     })
+}
+
+fn conversation_activity_steps_from_tools(
+    tools: &[ToolCallInfoResponse],
+) -> Vec<ConversationActivityStepResponse> {
+    tools
+        .iter()
+        .map(|tool| conversation_activity_step_from_tool(tool, None, Vec::new()))
+        .collect()
+}
+
+fn conversation_activity_steps_from_tool_traces(
+    tools: &[ToolTraceResponse],
+) -> Vec<ConversationActivityStepResponse> {
+    tools
+        .iter()
+        .map(|tool| {
+            conversation_activity_step_from_tool_trace(tool)
+        })
+        .collect()
+}
+
+fn conversation_activity_step_from_tool(
+    tool: &ToolCallInfoResponse,
+    summary: Option<String>,
+    warnings: Vec<String>,
+) -> ConversationActivityStepResponse {
+    let is_db_query = tool.tool_id == "db-query";
+    ConversationActivityStepResponse {
+        id: format!("tool-{}", tool.tool_id),
+        kind: "tool".to_string(),
+        title: tool.tool_name.clone(),
+        status: "succeeded".to_string(),
+        summary: summary.or_else(|| {
+            if is_db_query {
+                Some("Database results were redacted from the trace.".to_string())
+            } else {
+                Some("Tool completed.".to_string())
+            }
+        }),
+        warnings,
+    }
+}
+
+fn conversation_activity_step_from_tool_trace(
+    tool: &ToolTraceResponse,
+) -> ConversationActivityStepResponse {
+    ConversationActivityStepResponse {
+        id: format!("tool-{}", tool.id),
+        kind: "tool".to_string(),
+        title: tool.name.clone(),
+        status: if tool.status == "completed" {
+            "succeeded".to_string()
+        } else {
+            tool.status.clone()
+        },
+        summary: tool
+            .output_summary
+            .clone()
+            .or_else(|| Some("Tool completed.".to_string())),
+        warnings: tool.warnings.clone(),
+    }
 }
 
 fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
@@ -3970,6 +4062,31 @@ mod tests {
         assert!(rendered.contains(r#""message_id":"msg_test""#));
         assert!(rendered.contains(r#""session_id":"11111111-1111-1111-1111-111111111111""#));
         assert!(rendered.contains(r#""status":"Writing answer...""#));
+    }
+
+    #[test]
+    fn chat_stream_activity_step_payloads_expose_sanitized_tool_progress() {
+        let mut payload = ChatStreamEventPayload::new(
+            "msg_test",
+            Some("11111111-1111-1111-1111-111111111111".to_string()),
+        );
+        payload.activity_step = Some(ConversationActivityStepResponse {
+            id: "tool-db-query".to_string(),
+            kind: "tool".to_string(),
+            title: "Database Query".to_string(),
+            status: "succeeded".to_string(),
+            summary: Some("Database results were redacted from the trace.".to_string()),
+            warnings: vec!["raw_results_redacted".to_string()],
+        });
+
+        let rendered = chat_stream_event_payload_json(&payload);
+
+        assert!(rendered.contains(r#""activity_step""#));
+        assert!(rendered.contains(r#""kind":"tool""#));
+        assert!(rendered.contains(r#""title":"Database Query""#));
+        assert!(rendered.contains(r#""summary":"Database results were redacted from the trace.""#));
+        assert!(!rendered.contains("SELECT encrypted_value"));
+        assert!(!rendered.contains("decrypted secret"));
     }
 
     #[test]
