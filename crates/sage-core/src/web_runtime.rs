@@ -70,6 +70,13 @@ Output style:
 - Use done only when there is nothing else to do this turn.
 "#;
 
+const ADMIN_TOOL_CAPABILITY_CONTEXT: &str = r#"ADMIN-VISIBLE TOOL CAPABILITIES
+- web-search (Web Search): Looks up current or external information through the configured SearXNG service.
+- admin-config (Config): Reads admin configuration context and supports confirmed configuration changes.
+- db-query (Database): Runs safe read-only admin database queries for troubleshooting and inspection.
+- knowledge-search (Uploaded Documents): Internal retrieval over default-active uploaded documents. It is not a visible toggle in admin chat, but Config-enabled admin turns can use it automatically when the admin asks about uploaded PDFs, books, documents, files, or materials.
+"#;
+
 #[derive(Clone, Copy)]
 struct PythonURLSafeEncoding;
 
@@ -1316,6 +1323,7 @@ async fn prepare_explicit_chat_context(
             request.message.clone(),
         ));
         let ai_config = load_ai_config_response(state)?;
+        context_parts.push(ADMIN_TOOL_CAPABILITY_CONTEXT.to_string());
         context_parts.push(format!(
             "SCOPED CONFIG CONTEXT\n{}",
             serde_json::to_string_pretty(&ai_config).map_err(internal_error)?
@@ -1423,32 +1431,21 @@ fn should_auto_retrieve_admin_config_context(
         "uploaded",
         "document",
         "documents",
+        "file",
+        "files",
         "pdf",
         "guide",
         "book",
         "materials",
         "resource",
         "archive",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle));
-    let config_intent = [
-        "theme",
-        "configure",
-        "configuration",
-        "copy",
-        "style",
-        "branding",
-        "brand",
-        "colors",
-        "icons",
-        "tagline",
-        "instance",
+        "attached",
+        "attachment",
     ]
     .iter()
     .any(|needle| message.contains(needle));
 
-    refers_to_uploaded_materials && config_intent
+    refers_to_uploaded_materials
 }
 
 fn build_final_answer_prompt(
@@ -3778,9 +3775,7 @@ fn conversation_activity_steps_from_tool_traces(
 ) -> Vec<ConversationActivityStepResponse> {
     tools
         .iter()
-        .map(|tool| {
-            conversation_activity_step_from_tool_trace(tool)
-        })
+        .map(|tool| conversation_activity_step_from_tool_trace(tool))
         .collect()
 }
 
@@ -4352,6 +4347,7 @@ mod tests {
         let prepared = PreparedChatContext {
             context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
             tools_used: Vec::new(),
+            activity_steps: Vec::new(),
         };
         let profile = HashMap::new();
 
@@ -4378,7 +4374,7 @@ mod tests {
             dev_mode: false,
         };
         let request = ChatRequest {
-            message: "Based on the uploaded WLC PDF, configure the theme and copy.".to_string(),
+            message: "Can you see the book I uploaded? Get a basic overview.".to_string(),
             session_id: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: Vec::new(),
@@ -4439,6 +4435,49 @@ mod tests {
     }
 
     #[test]
+    fn admin_config_context_describes_admin_tool_capabilities() {
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "What tools do you have?".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+        };
+        let prepared = PreparedChatContext {
+            context: format!(
+                "{}\n\nSCOPED CONFIG CONTEXT\n{{}}",
+                ADMIN_TOOL_CAPABILITY_CONTEXT
+            ),
+            tools_used: Vec::new(),
+            activity_steps: Vec::new(),
+        };
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Help the admin operate the Instance.".to_string(),
+        };
+        let profile = HashMap::new();
+
+        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
+
+        assert!(prompt.contains("ADMIN-VISIBLE TOOL CAPABILITIES"));
+        assert!(prompt.contains("knowledge-search (Uploaded Documents)"));
+        assert!(prompt.contains("not a visible toggle in admin chat"));
+    }
+
+    #[test]
     fn final_answer_prompt_includes_uploaded_document_context_for_admin_config_turns() {
         let ai_config = InternalEffectiveAiConfig {
             prompt_sections: HashMap::new(),
@@ -4467,6 +4506,7 @@ mod tests {
         let prepared = PreparedChatContext {
             context: "SCOPED CONFIG CONTEXT\n{}\n\nUPLOADED DOCUMENT CONTEXT\nThe guide uses deep blue headings and a shield mark.".to_string(),
             tools_used: Vec::new(),
+            activity_steps: Vec::new(),
         };
         let profile = HashMap::new();
 
