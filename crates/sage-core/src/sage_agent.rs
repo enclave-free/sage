@@ -571,6 +571,22 @@ impl SageAgent {
         }
     }
 
+    /// Store a message and check whether Session Memory compaction should run.
+    pub async fn store_message_with_compaction_check(
+        &self,
+        user_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<(Uuid, bool)> {
+        if let Some(memory) = &self.memory {
+            memory
+                .store_message_with_compaction_check(user_id, role, content)
+                .await
+        } else {
+            Err(anyhow::anyhow!("No memory system configured"))
+        }
+    }
+
     /// Store a message with optional attachment description (fast, synchronous)
     pub fn store_message_sync_with_attachment(
         &self,

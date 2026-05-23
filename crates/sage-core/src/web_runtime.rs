@@ -349,6 +349,12 @@ pub struct ChatHistoryMessage {
     pub content: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PersistedConversationContext {
+    summary: Option<String>,
+    messages: Vec<ChatHistoryMessage>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatResponse {
     pub message: String,
@@ -1448,12 +1454,26 @@ fn should_auto_retrieve_admin_config_context(
     refers_to_uploaded_materials
 }
 
+#[cfg(test)]
 fn build_final_answer_prompt(
     ai_config: &InternalEffectiveAiConfig,
     auth: &InternalAuthContext,
     profile: &HashMap<String, String>,
     request: &ChatRequest,
     prepared: &PreparedChatContext,
+) -> String {
+    build_final_answer_prompt_with_persisted_context(
+        ai_config, auth, profile, request, prepared, None,
+    )
+}
+
+fn build_final_answer_prompt_with_persisted_context(
+    ai_config: &InternalEffectiveAiConfig,
+    auth: &InternalAuthContext,
+    profile: &HashMap<String, String>,
+    request: &ChatRequest,
+    prepared: &PreparedChatContext,
+    persisted_context: Option<&PersistedConversationContext>,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str(&build_agent_instruction(&ai_config.compiled_prompt, false));
@@ -1473,8 +1493,25 @@ fn build_final_answer_prompt(
         prompt.push_str(&prepared.context);
         prompt.push('\n');
     }
-    let history: Vec<&ChatHistoryMessage> = request
-        .conversation_history
+    let persisted_summary = persisted_context
+        .and_then(|context| context.summary.as_deref())
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty());
+    if let Some(summary) = persisted_summary {
+        prompt.push_str("\n=== SESSION MEMORY SUMMARY ===\n");
+        prompt.push_str(&truncate_chars(summary, 4000));
+        prompt.push('\n');
+    }
+
+    let persisted_messages = persisted_context
+        .map(|context| context.messages.as_slice())
+        .unwrap_or(&[]);
+    let history_source = if persisted_context.is_some() && !persisted_messages.is_empty() {
+        persisted_messages
+    } else {
+        request.conversation_history.as_slice()
+    };
+    let history: Vec<&ChatHistoryMessage> = history_source
         .iter()
         .filter(|message| {
             matches!(message.role.as_str(), "user" | "assistant")
@@ -1504,6 +1541,23 @@ fn build_final_answer_prompt(
     prompt.push_str(&request.message);
     prompt.push_str("\n\nAnswer in normal user-visible prose. Do not emit JSON, tool calls, hidden reasoning, raw prompts, raw provider traces, secrets, or unredacted database rows.");
     prompt
+}
+
+fn persisted_conversation_context_from_memory(
+    memory: &MemoryManager,
+) -> anyhow::Result<PersistedConversationContext> {
+    let (summary, messages) = memory.get_context_messages()?;
+    Ok(PersistedConversationContext {
+        summary: summary.map(|summary| summary.content),
+        messages: messages
+            .into_iter()
+            .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+            .map(|message| ChatHistoryMessage {
+                role: message.role,
+                content: message.content,
+            })
+            .collect(),
+    })
 }
 
 async fn chat_stream(
@@ -1568,7 +1622,30 @@ async fn chat_stream(
         status.status = Some("Writing answer...".to_string());
         yield Ok(chat_stream_sse_event("trace_status", &status));
 
-        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
+        let memory_result =
+            build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id).await;
+        let persisted_context = match memory_result.as_ref() {
+            Ok(memory) => match persisted_conversation_context_from_memory(memory) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    warn!("failed to load persisted conversation context for streamed chat session {}: {}", session.id, error);
+                    None
+                }
+            },
+            Err(error) => {
+                warn!("failed to build memory for streamed chat session {}: {}", session.id, error.message);
+                None
+            }
+        };
+
+        let prompt = build_final_answer_prompt_with_persisted_context(
+            &ai_config,
+            &auth,
+            &profile,
+            &request,
+            &prepared,
+            persisted_context.as_ref(),
+        );
         let mut answer = String::new();
         let stream_result = stream_final_answer_from_model(&state, &prompt, temperature).await;
         let answer_stream = match stream_result {
@@ -1605,13 +1682,13 @@ async fn chat_stream(
         }
 
         if !answer.trim().is_empty() {
-            match build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id).await {
+            match memory_result {
                 Ok(memory) => {
                     let memory_user_id = memory_user_id(&auth);
-                    if let Err(error) = memory.store_message_sync(&memory_user_id, "user", &request.message) {
+                    if let Err(error) = memory.store_message_with_compaction_check(&memory_user_id, "user", &request.message).await {
                         warn!("failed to persist streamed user message for session {}: {}", session.id, error);
                     }
-                    if let Err(error) = memory.store_message_sync(&memory_user_id, "assistant", &answer) {
+                    if let Err(error) = memory.store_message_with_compaction_check(&memory_user_id, "assistant", &answer).await {
                         warn!("failed to persist streamed assistant message for session {}: {}", session.id, error);
                     }
                 }
@@ -4359,6 +4436,72 @@ mod tests {
             prompt.contains("Assistant: I recommend updating Instance Name and Assistant Name.")
         );
         assert!(prompt.contains("=== USER MESSAGE ===\nyour suggestions above"));
+    }
+
+    #[test]
+    fn final_answer_prompt_prefers_persisted_session_memory_over_client_history() {
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "continue from memory".to_string(),
+            session_id: Some("session-123".to_string()),
+            tools: vec!["admin-config".to_string()],
+            conversation_history: vec![ChatHistoryMessage {
+                role: "user".to_string(),
+                content: "stale client-only turn".to_string(),
+            }],
+            tool_context: None,
+            client_executed_tools: None,
+        };
+        let prepared = PreparedChatContext {
+            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
+            tools_used: Vec::new(),
+            activity_steps: Vec::new(),
+        };
+        let persisted = PersistedConversationContext {
+            summary: Some("Persisted summary from Sage Session Memory.".to_string()),
+            messages: vec![
+                ChatHistoryMessage {
+                    role: "user".to_string(),
+                    content: "persisted user turn".to_string(),
+                },
+                ChatHistoryMessage {
+                    role: "assistant".to_string(),
+                    content: "persisted assistant turn".to_string(),
+                },
+            ],
+        };
+        let profile = HashMap::new();
+
+        let prompt = build_final_answer_prompt_with_persisted_context(
+            &ai_config,
+            &auth,
+            &profile,
+            &request,
+            &prepared,
+            Some(&persisted),
+        );
+
+        assert!(prompt.contains("=== SESSION MEMORY SUMMARY ==="));
+        assert!(prompt.contains("Persisted summary from Sage Session Memory."));
+        assert!(prompt.contains("User: persisted user turn"));
+        assert!(prompt.contains("Assistant: persisted assistant turn"));
+        assert!(!prompt.contains("stale client-only turn"));
+        assert!(prompt.contains("=== USER MESSAGE ===\ncontinue from memory"));
     }
 
     #[test]
