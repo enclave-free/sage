@@ -341,6 +341,15 @@ pub struct ChatRequest {
     pub conversation_history: Vec<ChatHistoryMessage>,
     pub tool_context: Option<String>,
     pub client_executed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub conversation_channel: Option<ConversationChannelRequest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversationChannelRequest {
+    pub kind: String,
+    #[serde(default)]
+    pub delivery: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1481,6 +1490,12 @@ fn build_final_answer_prompt_with_persisted_context(
     prompt.push_str(&format!("auth_type: {}\n", auth.kind));
     if let Some(user_type_id) = auth.user_type_id {
         prompt.push_str(&format!("user_type_id: {}\n", user_type_id));
+    }
+    if let Some(channel) = &request.conversation_channel {
+        prompt.push_str(&format!("conversation_channel: {}\n", channel.kind));
+        if let Some(delivery) = channel.delivery.as_deref() {
+            prompt.push_str(&format!("channel_delivery: {}\n", delivery));
+        }
     }
     if !profile.is_empty() {
         prompt.push_str("\nUSER PROFILE\n");
@@ -3357,16 +3372,32 @@ fn build_human_block(auth: &InternalAuthContext, profile: &HashMap<String, Strin
     lines.join("\n")
 }
 
-fn build_agent_instruction(compiled_prompt: &str, include_knowledge_tool: bool) -> String {
-    let mut instruction = String::from(ENCLAVE_WEB_BASE_INSTRUCTION);
-    if include_knowledge_tool {
-        instruction.push_str(
-            "\nTool preference:\n- Use knowledge_search first for uploaded-document questions.\n",
-        );
+struct EnclaveWebRuntimeProfile<'a> {
+    compiled_prompt: &'a str,
+    include_knowledge_tool: bool,
+}
+
+impl<'a> EnclaveWebRuntimeProfile<'a> {
+    fn build_instruction(&self) -> String {
+        let mut instruction = String::from(ENCLAVE_WEB_BASE_INSTRUCTION);
+        instruction.push_str("\nRuntime profile: enclave_web\n");
+        if self.include_knowledge_tool {
+            instruction.push_str(
+                "\nTool preference:\n- Use knowledge_search first for uploaded-document questions.\n",
+            );
+        }
+        instruction.push_str("\nAgent Settings profile:\n");
+        instruction.push_str(self.compiled_prompt);
+        instruction
     }
-    instruction.push_str("\nCompiled enclave profile:\n");
-    instruction.push_str(compiled_prompt);
-    instruction
+}
+
+fn build_agent_instruction(compiled_prompt: &str, include_knowledge_tool: bool) -> String {
+    EnclaveWebRuntimeProfile {
+        compiled_prompt,
+        include_knowledge_tool,
+    }
+    .build_instruction()
 }
 
 fn build_query_input(
@@ -4202,6 +4233,17 @@ mod tests {
     }
 
     #[test]
+    fn enclave_web_instruction_uses_runtime_profile_boundary() {
+        let instruction = build_agent_instruction("PROFILE: custom instance", false);
+
+        assert!(instruction.contains("Runtime profile: enclave_web"));
+        assert!(instruction.contains("Agent Settings profile:"));
+        assert!(instruction.contains("PROFILE: custom instance"));
+        assert!(!instruction.contains("communicating via Signal"));
+        assert!(!instruction.contains("building genuine friendships"));
+    }
+
+    #[test]
     fn chat_stream_activity_step_payloads_expose_sanitized_tool_progress() {
         let mut payload = ChatStreamEventPayload::new(
             "msg_test",
@@ -4420,6 +4462,7 @@ mod tests {
             ],
             tool_context: None,
             client_executed_tools: None,
+            conversation_channel: None,
         };
         let prepared = PreparedChatContext {
             context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
@@ -4466,6 +4509,7 @@ mod tests {
             }],
             tool_context: None,
             client_executed_tools: None,
+            conversation_channel: None,
         };
         let prepared = PreparedChatContext {
             context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
@@ -4505,6 +4549,91 @@ mod tests {
     }
 
     #[test]
+    fn chat_requests_accept_channel_metadata_without_requiring_it() {
+        let web_request: ChatRequest = serde_json::from_value(json!({
+            "message": "hello",
+            "session_id": "session-123"
+        }))
+        .expect("existing web requests should still deserialize");
+
+        assert!(web_request.conversation_channel.is_none());
+
+        let signal_request: ChatRequest = serde_json::from_value(json!({
+            "message": "hello from signal",
+            "conversation_channel": {
+                "kind": "signal",
+                "delivery": "short_messages"
+            }
+        }))
+        .expect("channel metadata should deserialize");
+
+        let channel = signal_request
+            .conversation_channel
+            .expect("channel metadata should be present");
+        assert_eq!(channel.kind, "signal");
+        assert_eq!(channel.delivery.as_deref(), Some("short_messages"));
+    }
+
+    #[test]
+    fn channel_metadata_is_request_context_not_session_memory_identity() {
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "continue from the same conversation".to_string(),
+            session_id: Some("session-123".to_string()),
+            tools: vec!["admin-config".to_string()],
+            conversation_history: vec![ChatHistoryMessage {
+                role: "user".to_string(),
+                content: "stale signal client turn".to_string(),
+            }],
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: Some(ConversationChannelRequest {
+                kind: "signal".to_string(),
+                delivery: Some("short_messages".to_string()),
+            }),
+        };
+        let prepared = PreparedChatContext::default();
+        let persisted = PersistedConversationContext {
+            summary: None,
+            messages: vec![ChatHistoryMessage {
+                role: "user".to_string(),
+                content: "persisted shared session turn".to_string(),
+            }],
+        };
+        let profile = HashMap::new();
+
+        let prompt = build_final_answer_prompt_with_persisted_context(
+            &ai_config,
+            &auth,
+            &profile,
+            &request,
+            &prepared,
+            Some(&persisted),
+        );
+
+        assert!(prompt.contains("conversation_channel: signal"));
+        assert!(prompt.contains("channel_delivery: short_messages"));
+        assert!(prompt.contains("User: persisted shared session turn"));
+        assert!(!prompt.contains("stale signal client turn"));
+        assert_eq!(memory_user_id(&auth), "admin:1");
+    }
+
+    #[test]
     fn admin_config_requests_for_uploaded_materials_trigger_document_retrieval() {
         let auth = InternalAuthContext {
             id: 1,
@@ -4523,6 +4652,7 @@ mod tests {
             conversation_history: Vec::new(),
             tool_context: None,
             client_executed_tools: None,
+            conversation_channel: None,
         };
 
         assert!(should_auto_retrieve_admin_config_context(&request, &auth));
@@ -4557,6 +4687,7 @@ mod tests {
             conversation_history: Vec::new(),
             tool_context: None,
             client_executed_tools: None,
+            conversation_channel: None,
         };
         let user_request = ChatRequest {
             message: "Based on the uploaded PDF, configure the theme.".to_string(),
@@ -4565,6 +4696,7 @@ mod tests {
             conversation_history: Vec::new(),
             tool_context: None,
             client_executed_tools: None,
+            conversation_channel: None,
         };
 
         assert!(!should_auto_retrieve_admin_config_context(
@@ -4596,6 +4728,7 @@ mod tests {
             conversation_history: Vec::new(),
             tool_context: None,
             client_executed_tools: None,
+            conversation_channel: None,
         };
         let prepared = PreparedChatContext {
             context: format!(
@@ -4645,6 +4778,7 @@ mod tests {
             conversation_history: Vec::new(),
             tool_context: None,
             client_executed_tools: None,
+            conversation_channel: None,
         };
         let prepared = PreparedChatContext {
             context: "SCOPED CONFIG CONTEXT\n{}\n\nUPLOADED DOCUMENT CONTEXT\nThe guide uses deep blue headings and a shield mark.".to_string(),
