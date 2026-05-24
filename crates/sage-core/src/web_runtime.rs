@@ -275,6 +275,8 @@ pub struct ToolCallInfoResponse {
     pub tool_id: String,
     pub tool_name: String,
     pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guarded: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -410,6 +412,12 @@ struct PreparedChatContext {
     context: String,
     tools_used: Vec<ToolCallInfoResponse>,
     activity_steps: Vec<ConversationActivityStepResponse>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedToolActivity {
+    tool: ToolCallInfoResponse,
+    activity_step: Option<ConversationActivityStepResponse>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1048,6 +1056,7 @@ impl Tool for SearxWebSearchTool {
                 tool_id: "web-search".to_string(),
                 tool_name: "Web Search".to_string(),
                 query: Some(query.clone()),
+                guarded: false,
             });
         }
 
@@ -1104,6 +1113,7 @@ impl Tool for AdminDbQueryTool {
                 tool_id: "db-query".to_string(),
                 tool_name: "Database Query".to_string(),
                 query: Some(sql.clone()),
+                guarded: false,
             });
         }
 
@@ -1337,6 +1347,7 @@ async fn prepare_explicit_chat_context(
 ) -> AppResult<PreparedChatContext> {
     let mut context_parts = Vec::new();
     let mut tools_used = Vec::<ToolCallInfoResponse>::new();
+    let mut prepared_tool_activity = Vec::<PreparedToolActivity>::new();
 
     if let Some(tool_context) = request.tool_context.as_deref() {
         context_parts.push(format!("CLIENT TOOL CONTEXT\n{}", tool_context));
@@ -1426,7 +1437,7 @@ async fn prepare_explicit_chat_context(
         && !client_executed_set.contains("db-query")
     {
         let trimmed = request.message.trim();
-        if trimmed.to_ascii_uppercase().starts_with("SELECT ") {
+        if is_direct_readonly_select_message(trimmed) {
             let trace_sink = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
             let tool = AdminDbQueryTool {
                 internal: state.internal.clone(),
@@ -1444,7 +1455,16 @@ async fn prepare_explicit_chat_context(
                 tools_used.extend(traces.drain(..));
             };
         } else {
-            tools_used.push(tool_call_info_for_id("db-query", request.message.clone()));
+            let tool = tool_call_info_for_id("db-query", request.message.clone());
+            let tool = ToolCallInfoResponse {
+                guarded: true,
+                ..tool
+            };
+            let activity_step = guarded_database_activity_step(&tool);
+            prepared_tool_activity.push(PreparedToolActivity {
+                tool,
+                activity_step: Some(activity_step),
+            });
             context_parts.push(
                 "DATABASE CONTEXT\nDatabase Query was selected, but server-side streaming currently requires client-executed decrypted context or a direct SELECT query."
                     .to_string(),
@@ -1452,8 +1472,25 @@ async fn prepare_explicit_chat_context(
         }
     }
 
+    tools_used.extend(
+        prepared_tool_activity
+            .iter()
+            .map(|activity| activity.tool.clone()),
+    );
     let tools_used = dedupe_tool_calls(tools_used);
-    let activity_steps = conversation_activity_steps_from_tools(&tools_used);
+    let mut activity_steps = conversation_activity_steps_from_tools(&tools_used);
+    for activity in prepared_tool_activity {
+        if let Some(step) = activity.activity_step {
+            if let Some(existing) = activity_steps
+                .iter_mut()
+                .find(|existing| existing.id == step.id)
+            {
+                *existing = step;
+            } else {
+                activity_steps.push(step);
+            }
+        }
+    }
 
     Ok(PreparedChatContext {
         context: context_parts.join("\n\n"),
@@ -1489,6 +1526,13 @@ fn should_auto_retrieve_admin_config_context(
     .any(|needle| message.contains(needle));
 
     refers_to_uploaded_materials
+}
+
+fn is_direct_readonly_select_message(message: &str) -> bool {
+    message
+        .trim_start()
+        .to_ascii_uppercase()
+        .starts_with("SELECT ")
 }
 
 #[cfg(test)]
@@ -3822,27 +3866,43 @@ fn build_conversation_trace(
         .into_iter()
         .map(|tool| {
             let is_db_query = tool.tool_id == "db-query";
+            let is_guarded_db_query = is_db_query && tool.guarded;
             ToolTraceResponse {
                 id: tool.tool_id,
                 name: tool.tool_name,
-                status: "completed".to_string(),
+                status: if is_guarded_db_query {
+                    "guarded".to_string()
+                } else {
+                    "completed".to_string()
+                },
                 execution: "server".to_string(),
-                input_summary: if is_db_query {
+                input_summary: if is_guarded_db_query {
+                    Some("Database selected for a natural-language question.".to_string())
+                } else if is_db_query {
                     Some("Read-only database query.".to_string())
                 } else {
                     tool.query.map(|query| truncate_chars(&query, 160))
                 },
-                output_summary: if is_db_query {
+                output_summary: if is_guarded_db_query {
+                    Some(
+                        "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
+                            .to_string(),
+                    )
+                } else if is_db_query {
                     Some("Database results were redacted from the trace.".to_string())
                 } else {
                     None
                 },
-                warnings: if is_db_query {
+                warnings: if is_guarded_db_query {
+                    vec!["direct_select_required".to_string()]
+                } else if is_db_query {
                     vec!["raw_results_redacted".to_string()]
                 } else {
                     Vec::new()
                 },
-                metadata: if is_db_query {
+                metadata: if is_guarded_db_query {
+                    json!({ "guarded": true, "executed": false })
+                } else if is_db_query {
                     json!({ "redacted": true })
                 } else {
                     json!({})
@@ -3954,7 +4014,11 @@ fn conversation_activity_step_from_tool(
         id: format!("tool-{}", tool.tool_id),
         kind: "tool".to_string(),
         title: tool.tool_name.clone(),
-        status: "succeeded".to_string(),
+        status: if tool.guarded {
+            "guarded".to_string()
+        } else {
+            "succeeded".to_string()
+        },
         summary: summary.or_else(|| {
             if is_db_query {
                 Some("Database results were redacted from the trace.".to_string())
@@ -3964,6 +4028,17 @@ fn conversation_activity_step_from_tool(
         }),
         warnings,
     }
+}
+
+fn guarded_database_activity_step(tool: &ToolCallInfoResponse) -> ConversationActivityStepResponse {
+    conversation_activity_step_from_tool(
+        tool,
+        Some(
+            "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
+                .to_string(),
+        ),
+        vec!["direct_select_required".to_string()],
+    )
 }
 
 fn conversation_activity_step_from_tool_trace(
@@ -3997,6 +4072,7 @@ fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
         tool_id: tool_id.to_string(),
         tool_name: tool_name.to_string(),
         query: Some(query),
+        guarded: false,
     }
 }
 
@@ -4415,6 +4491,7 @@ mod tests {
                     tool_id: "db-query".to_string(),
                     tool_name: "Database Query".to_string(),
                     query: Some("SELECT encrypted_value FROM settings".to_string()),
+                    guarded: false,
                 },
             ],
             Vec::new(),
@@ -4428,6 +4505,79 @@ mod tests {
         assert!(rendered.contains("raw_results_redacted"));
         assert!(!rendered.contains("decrypted secret"));
         assert!(!rendered.contains("encrypted_value"));
+    }
+
+    #[test]
+    fn guarded_database_activity_warns_when_natural_language_does_not_execute() {
+        let tool = ToolCallInfoResponse {
+            guarded: true,
+            ..tool_call_info_for_id("db-query", "Which users are active?".to_string())
+        };
+
+        let step = guarded_database_activity_step(&tool);
+
+        assert_eq!(step.title, "Database Query");
+        assert_eq!(step.status, "guarded");
+        assert_eq!(
+            step.summary,
+            Some("Database Query was selected but not executed. Submit a direct read-only SELECT to run it.".to_string())
+        );
+        assert_eq!(step.warnings, vec!["direct_select_required".to_string()]);
+    }
+
+    #[test]
+    fn guarded_database_trace_does_not_claim_results_were_redacted() {
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "admin_trace_visibility".to_string(),
+            Value::String("detailed".to_string()),
+        );
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults,
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let trace = build_conversation_trace(
+            &ai_config,
+            &auth,
+            vec![ToolCallInfoResponse {
+                guarded: true,
+                ..tool_call_info_for_id("db-query", "Which users are active?".to_string())
+            }],
+            Vec::new(),
+        )
+        .expect("admin trace should be visible");
+        let rendered = serde_json::to_string(&trace).expect("trace should serialize");
+
+        assert!(rendered.contains("direct_select_required"));
+        assert!(rendered.contains(r#""executed":false"#));
+        assert!(rendered.contains("Database Query was selected but not executed"));
+        assert!(!rendered.contains("Database results were redacted from the trace."));
+        assert!(!rendered.contains("raw_results_redacted"));
+    }
+
+    #[test]
+    fn database_streaming_guard_distinguishes_direct_select_from_natural_language() {
+        assert!(is_direct_readonly_select_message(
+            "SELECT id, email FROM users LIMIT 10"
+        ));
+        assert!(!is_direct_readonly_select_message(
+            "Which users are active?"
+        ));
+        assert!(!is_direct_readonly_select_message(
+            "Please write a SELECT query for active users"
+        ));
     }
 
     #[test]
