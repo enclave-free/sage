@@ -2,11 +2,7 @@
 # Multi-stage build with cargo-chef for optimal layer caching
 
 # Stage 1: Chef - Install cargo-chef
-FROM docker.io/rust:1.83-bookworm AS chef
-
-# Use the stable toolchain pinned by rust-toolchain.toml.
-RUN rustup toolchain install stable \
-    && rustup default stable
+FROM docker.io/rust:1.95.0-bookworm AS chef
 
 RUN cargo install cargo-chef
 
