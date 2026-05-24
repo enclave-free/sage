@@ -70,6 +70,19 @@ Output style:
 - Use done only when there is nothing else to do this turn.
 "#;
 
+const ENCLAVE_WEB_FINAL_ANSWER_INSTRUCTION: &str = r#"You are Sage operating enclave.free's web application.
+
+Tool and retrieval preparation for this turn is already complete. You are now writing the final user-visible answer.
+
+Final-answer rules:
+- Answer from the prepared context, session memory, and current user message.
+- Do not say you will search, look up, check, inspect, query, use a tool, or do anything in the background.
+- If prepared uploaded-document context is present, synthesize it directly.
+- If prepared context says no relevant uploaded-document passages were found, say that plainly and ask for the missing document or a narrower question.
+- Never fabricate facts, sources, organizations, contacts, database results, or background work.
+- Do not emit JSON, tool calls, hidden reasoning, raw prompts, raw provider traces, secrets, or unredacted database rows.
+"#;
+
 const ADMIN_TOOL_CAPABILITY_CONTEXT: &str = r#"ADMIN-VISIBLE TOOL CAPABILITIES
 - web-search (Web Search): Looks up current or external information through the configured SearXNG service.
 - admin-config (Config): Reads admin configuration context and supports confirmed configuration changes.
@@ -275,6 +288,10 @@ pub struct ToolCallInfoResponse {
     pub tool_id: String,
     pub tool_name: String,
     pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guarded: bool,
 }
@@ -411,6 +428,7 @@ pub struct ConversationTurnTimingResponse {
 struct PreparedChatContext {
     context: String,
     tools_used: Vec<ToolCallInfoResponse>,
+    retrieval_sources: Vec<QuerySource>,
     activity_steps: Vec<ConversationActivityStepResponse>,
 }
 
@@ -1056,6 +1074,10 @@ impl Tool for SearxWebSearchTool {
                 tool_id: "web-search".to_string(),
                 tool_name: "Web Search".to_string(),
                 query: Some(query.clone()),
+                output_summary: Some(
+                    "Web search results were prepared for the answer.".to_string(),
+                ),
+                warnings: Vec::new(),
                 guarded: false,
             });
         }
@@ -1113,6 +1135,8 @@ impl Tool for AdminDbQueryTool {
                 tool_id: "db-query".to_string(),
                 tool_name: "Database Query".to_string(),
                 query: Some(sql.clone()),
+                output_summary: None,
+                warnings: Vec::new(),
                 guarded: false,
             });
         }
@@ -1384,93 +1408,40 @@ async fn prepare_explicit_chat_context(
         ));
     }
 
-    if should_auto_retrieve_admin_config_context(request, auth) {
-        let response = state
-            .internal
-            .document_search(&InternalDocumentSearchRequest {
-                query: request.message.clone(),
-                user: auth.clone(),
-                top_k: 4,
-                job_ids: None,
-                jurisdiction: None,
-                situation_details: None,
-            })
-            .await
-            .map_err(internal_error)?;
-        tools_used.push(tool_call_info_for_id(
-            "knowledge-search",
-            request.message.clone(),
-        ));
-        if !response.context.trim().is_empty() {
-            context_parts.push(format!(
-                "UPLOADED DOCUMENT CONTEXT\n{}",
-                response.context.trim()
-            ));
-        }
-    }
+    let document_context = prepare_uploaded_document_context(state, request, auth);
+    let web_context =
+        prepare_web_search_context(state, request, client_executed_set.contains("web-search"));
+    let database_context = prepare_database_context(
+        state,
+        request,
+        auth,
+        client_executed_set.contains("db-query"),
+    );
+    let (document_context, web_context, database_context) =
+        overlap_streamed_tool_context_work(document_context, web_context, database_context).await;
+    let mut retrieval_sources = Vec::new();
 
-    if request.tools.iter().any(|tool| tool == "web-search")
-        && !client_executed_set.contains("web-search")
-    {
-        let trace_sink = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
-        let tool = SearxWebSearchTool {
-            http: state.http.clone(),
-            searxng_url: std::env::var("SEARXNG_URL")
-                .unwrap_or_else(|_| "http://searxng:8080".to_string()),
-            traces: trace_sink.clone(),
-        };
-        let mut args = HashMap::new();
-        args.insert("query".to_string(), request.message.clone());
-        let result = tool.execute(&args).await.map_err(internal_error)?;
-        if result.success {
-            context_parts.push(format!("WEB SEARCH CONTEXT\n{}", result.output));
-        } else if let Some(error) = result.error {
-            context_parts.push(format!("WEB SEARCH ERROR\n{}", error));
-        }
-        if let Ok(mut traces) = trace_sink.lock() {
-            tools_used.extend(traces.drain(..));
-        };
-    }
-
-    if auth.kind == "admin"
-        && request.tools.iter().any(|tool| tool == "db-query")
-        && !client_executed_set.contains("db-query")
-    {
-        let trimmed = request.message.trim();
-        if is_direct_readonly_select_message(trimmed) {
-            let trace_sink = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
-            let tool = AdminDbQueryTool {
-                internal: state.internal.clone(),
-                traces: trace_sink.clone(),
-            };
-            let mut args = HashMap::new();
-            args.insert("sql".to_string(), trimmed.to_string());
-            let result = tool.execute(&args).await.map_err(internal_error)?;
-            if result.success {
-                context_parts.push(format!("DATABASE CONTEXT\n{}", result.output));
-            } else if let Some(error) = result.error {
-                context_parts.push(format!("DATABASE ERROR\n{}", error));
-            }
-            if let Ok(mut traces) = trace_sink.lock() {
-                tools_used.extend(traces.drain(..));
-            };
-        } else {
-            let tool = tool_call_info_for_id("db-query", request.message.clone());
-            let tool = ToolCallInfoResponse {
-                guarded: true,
-                ..tool
-            };
-            let activity_step = guarded_database_activity_step(&tool);
-            prepared_tool_activity.push(PreparedToolActivity {
-                tool,
-                activity_step: Some(activity_step),
-            });
-            context_parts.push(
-                "DATABASE CONTEXT\nDatabase Query was selected, but server-side streaming currently requires client-executed decrypted context or a direct SELECT query."
-                    .to_string(),
-            );
-        }
-    }
+    merge_prepared_tool_context(
+        document_context?,
+        &mut context_parts,
+        &mut tools_used,
+        &mut retrieval_sources,
+        &mut prepared_tool_activity,
+    );
+    merge_prepared_tool_context(
+        web_context?,
+        &mut context_parts,
+        &mut tools_used,
+        &mut retrieval_sources,
+        &mut prepared_tool_activity,
+    );
+    merge_prepared_tool_context(
+        database_context?,
+        &mut context_parts,
+        &mut tools_used,
+        &mut retrieval_sources,
+        &mut prepared_tool_activity,
+    );
 
     tools_used.extend(
         prepared_tool_activity
@@ -1495,8 +1466,195 @@ async fn prepare_explicit_chat_context(
     Ok(PreparedChatContext {
         context: context_parts.join("\n\n"),
         tools_used,
+        retrieval_sources,
         activity_steps,
     })
+}
+
+async fn prepare_uploaded_document_context(
+    state: &WebAppState,
+    request: &ChatRequest,
+    auth: &InternalAuthContext,
+) -> AppResult<PreparedChatContext> {
+    if !should_auto_retrieve_admin_config_context(request, auth) {
+        return Ok(PreparedChatContext::default());
+    }
+
+    let response = state
+        .internal
+        .document_search(&InternalDocumentSearchRequest {
+            query: request.message.clone(),
+            user: auth.clone(),
+            top_k: 4,
+            job_ids: None,
+            jurisdiction: None,
+            situation_details: None,
+        })
+        .await
+        .map_err(internal_error)?;
+
+    Ok(prepared_uploaded_document_context_from_response(
+        request, response,
+    ))
+}
+
+fn prepared_uploaded_document_context_from_response(
+    request: &ChatRequest,
+    response: InternalDocumentSearchResponse,
+) -> PreparedChatContext {
+    let mut tool = tool_call_info_for_id("knowledge-search", request.message.clone());
+    let has_context = !response.context.trim().is_empty();
+    if has_context {
+        tool.output_summary =
+            Some("Retrieved uploaded-document passages for the answer.".to_string());
+    } else {
+        tool.output_summary =
+            Some("No relevant uploaded-document passages were found for this message.".to_string());
+        tool.warnings
+            .push("no_relevant_uploaded_document_context".to_string());
+    }
+
+    let mut prepared = PreparedChatContext {
+        tools_used: vec![tool],
+        retrieval_sources: response.sources,
+        ..PreparedChatContext::default()
+    };
+    if has_context {
+        prepared.context = format!("UPLOADED DOCUMENT CONTEXT\n{}", response.context.trim());
+    } else {
+        prepared.context =
+            "UPLOADED DOCUMENT CONTEXT\nNo relevant uploaded-document passages were found for this message."
+                .to_string();
+    }
+    prepared
+}
+
+async fn overlap_streamed_tool_context_work<
+    DocumentFuture,
+    WebFuture,
+    DatabaseFuture,
+    Document,
+    Web,
+    Database,
+>(
+    document_context: DocumentFuture,
+    web_context: WebFuture,
+    database_context: DatabaseFuture,
+) -> (Document, Web, Database)
+where
+    DocumentFuture: std::future::Future<Output = Document>,
+    WebFuture: std::future::Future<Output = Web>,
+    DatabaseFuture: std::future::Future<Output = Database>,
+{
+    tokio::join!(document_context, web_context, database_context)
+}
+
+async fn prepare_web_search_context(
+    state: &WebAppState,
+    request: &ChatRequest,
+    client_executed: bool,
+) -> AppResult<PreparedChatContext> {
+    if client_executed || !request.tools.iter().any(|tool| tool == "web-search") {
+        return Ok(PreparedChatContext::default());
+    }
+
+    let trace_sink = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
+    let tool = SearxWebSearchTool {
+        http: state.http.clone(),
+        searxng_url: std::env::var("SEARXNG_URL")
+            .unwrap_or_else(|_| "http://searxng:8080".to_string()),
+        traces: trace_sink.clone(),
+    };
+    let mut args = HashMap::new();
+    args.insert("query".to_string(), request.message.clone());
+    let result = tool.execute(&args).await.map_err(internal_error)?;
+    let mut prepared = PreparedChatContext::default();
+    if result.success {
+        prepared.context = format!("WEB SEARCH CONTEXT\n{}", result.output);
+    } else if let Some(error) = result.error {
+        prepared.context = format!("WEB SEARCH ERROR\n{}", error);
+    }
+    if let Ok(mut traces) = trace_sink.lock() {
+        prepared.tools_used.extend(traces.drain(..));
+    };
+    Ok(prepared)
+}
+
+async fn prepare_database_context(
+    state: &WebAppState,
+    request: &ChatRequest,
+    auth: &InternalAuthContext,
+    client_executed: bool,
+) -> AppResult<PreparedChatContext> {
+    if client_executed
+        || auth.kind != "admin"
+        || !request.tools.iter().any(|tool| tool == "db-query")
+    {
+        return Ok(PreparedChatContext::default());
+    }
+
+    let trimmed = request.message.trim();
+    if !is_direct_readonly_select_message(trimmed) {
+        let tool = ToolCallInfoResponse {
+            guarded: true,
+            ..tool_call_info_for_id("db-query", request.message.clone())
+        };
+        return Ok(PreparedChatContext {
+            context: "DATABASE CONTEXT\nDatabase Query was selected, but server-side streaming currently requires client-executed decrypted context or a direct SELECT query."
+                .to_string(),
+            tools_used: vec![tool.clone()],
+            retrieval_sources: Vec::new(),
+            activity_steps: vec![guarded_database_activity_step(&tool)],
+        });
+    }
+
+    let trace_sink = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
+    let tool = AdminDbQueryTool {
+        internal: state.internal.clone(),
+        traces: trace_sink.clone(),
+    };
+    let mut args = HashMap::new();
+    args.insert("sql".to_string(), trimmed.to_string());
+    let result = tool.execute(&args).await.map_err(internal_error)?;
+    let mut prepared = PreparedChatContext::default();
+    if result.success {
+        prepared.context = format!("DATABASE CONTEXT\n{}", result.output);
+    } else if let Some(error) = result.error {
+        prepared.context = format!("DATABASE ERROR\n{}", error);
+    }
+    if let Ok(mut traces) = trace_sink.lock() {
+        prepared.tools_used.extend(traces.drain(..));
+    };
+    Ok(prepared)
+}
+
+fn merge_prepared_tool_context(
+    prepared: PreparedChatContext,
+    context_parts: &mut Vec<String>,
+    tools_used: &mut Vec<ToolCallInfoResponse>,
+    retrieval_sources: &mut Vec<QuerySource>,
+    prepared_tool_activity: &mut Vec<PreparedToolActivity>,
+) {
+    if !prepared.context.trim().is_empty() {
+        context_parts.push(prepared.context);
+    }
+    retrieval_sources.extend(prepared.retrieval_sources);
+    if prepared.activity_steps.is_empty() {
+        tools_used.extend(prepared.tools_used);
+        return;
+    }
+
+    prepared_tool_activity.extend(prepared.tools_used.into_iter().map(|tool| {
+        let activity_step = prepared
+            .activity_steps
+            .iter()
+            .find(|step| step.id == format!("tool-{}", tool.tool_id))
+            .cloned();
+        PreparedToolActivity {
+            tool,
+            activity_step,
+        }
+    }));
 }
 
 fn should_auto_retrieve_admin_config_context(
@@ -1557,7 +1715,7 @@ fn build_final_answer_prompt_with_persisted_context(
     persisted_context: Option<&PersistedConversationContext>,
 ) -> String {
     let mut prompt = String::new();
-    prompt.push_str(&build_agent_instruction(&ai_config.compiled_prompt, false));
+    prompt.push_str(&build_final_answer_instruction(&ai_config.compiled_prompt));
     prompt.push_str("\n\n=== REQUEST CONTEXT ===\n");
     prompt.push_str(&format!("auth_type: {}\n", auth.kind));
     if let Some(user_type_id) = auth.user_type_id {
@@ -1626,7 +1784,7 @@ fn build_final_answer_prompt_with_persisted_context(
     }
     prompt.push_str("\n=== USER MESSAGE ===\n");
     prompt.push_str(&request.message);
-    prompt.push_str("\n\nAnswer in normal user-visible prose. Do not emit JSON, tool calls, hidden reasoning, raw prompts, raw provider traces, secrets, or unredacted database rows.");
+    prompt.push_str("\n\nAnswer in normal user-visible prose.");
     prompt
 }
 
@@ -1812,7 +1970,12 @@ async fn chat_stream(
             }
         }
 
-        let trace = build_conversation_trace(&ai_config, &auth, prepared.tools_used.clone(), Vec::new());
+        let trace = build_conversation_trace(
+            &ai_config,
+            &auth,
+            prepared.tools_used.clone(),
+            prepared.retrieval_sources.clone(),
+        );
         if trace.is_some() {
             let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
             payload.trace = trace;
@@ -3501,6 +3664,13 @@ fn build_agent_instruction(compiled_prompt: &str, include_knowledge_tool: bool) 
     .build_instruction()
 }
 
+fn build_final_answer_instruction(compiled_prompt: &str) -> String {
+    let mut instruction = String::from(ENCLAVE_WEB_FINAL_ANSWER_INSTRUCTION);
+    instruction.push_str("\nAgent Settings profile:\n");
+    instruction.push_str(compiled_prompt);
+    instruction
+}
+
 fn build_query_input(
     auth: &InternalAuthContext,
     profile: &HashMap<String, String>,
@@ -3867,6 +4037,8 @@ fn build_conversation_trace(
         .map(|tool| {
             let is_db_query = tool.tool_id == "db-query";
             let is_guarded_db_query = is_db_query && tool.guarded;
+            let tool_output_summary = tool.output_summary.clone();
+            let tool_warnings = tool.warnings.clone();
             ToolTraceResponse {
                 id: tool.tool_id,
                 name: tool.tool_name,
@@ -3891,14 +4063,14 @@ fn build_conversation_trace(
                 } else if is_db_query {
                     Some("Database results were redacted from the trace.".to_string())
                 } else {
-                    None
+                    tool_output_summary
                 },
                 warnings: if is_guarded_db_query {
                     vec!["direct_select_required".to_string()]
                 } else if is_db_query {
                     vec!["raw_results_redacted".to_string()]
                 } else {
-                    Vec::new()
+                    tool_warnings
                 },
                 metadata: if is_guarded_db_query {
                     json!({ "guarded": true, "executed": false })
@@ -4019,14 +4191,18 @@ fn conversation_activity_step_from_tool(
         } else {
             "succeeded".to_string()
         },
-        summary: summary.or_else(|| {
+        summary: summary.or_else(|| tool.output_summary.clone()).or_else(|| {
             if is_db_query {
                 Some("Database results were redacted from the trace.".to_string())
             } else {
                 Some("Tool completed.".to_string())
             }
         }),
-        warnings,
+        warnings: if warnings.is_empty() {
+            tool.warnings.clone()
+        } else {
+            warnings
+        },
     }
 }
 
@@ -4072,6 +4248,8 @@ fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
         tool_id: tool_id.to_string(),
         tool_name: tool_name.to_string(),
         query: Some(query),
+        output_summary: None,
+        warnings: Vec::new(),
         guarded: false,
     }
 }
@@ -4491,6 +4669,8 @@ mod tests {
                     tool_id: "db-query".to_string(),
                     tool_name: "Database Query".to_string(),
                     query: Some("SELECT encrypted_value FROM settings".to_string()),
+                    output_summary: None,
+                    warnings: Vec::new(),
                     guarded: false,
                 },
             ],
@@ -4679,6 +4859,7 @@ mod tests {
         let prepared = PreparedChatContext {
             context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
             tools_used: Vec::new(),
+            retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
         };
         let profile = HashMap::new();
@@ -4726,6 +4907,7 @@ mod tests {
         let prepared = PreparedChatContext {
             context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
             tools_used: Vec::new(),
+            retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
         };
         let persisted = PersistedConversationContext {
@@ -4948,6 +5130,7 @@ mod tests {
                 ADMIN_TOOL_CAPABILITY_CONTEXT
             ),
             tools_used: Vec::new(),
+            retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
         };
         let ai_config = InternalEffectiveAiConfig {
@@ -4995,6 +5178,7 @@ mod tests {
         let prepared = PreparedChatContext {
             context: "SCOPED CONFIG CONTEXT\n{}\n\nUPLOADED DOCUMENT CONTEXT\nThe guide uses deep blue headings and a shield mark.".to_string(),
             tools_used: Vec::new(),
+            retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
         };
         let profile = HashMap::new();
@@ -5003,6 +5187,185 @@ mod tests {
 
         assert!(prompt.contains("UPLOADED DOCUMENT CONTEXT"));
         assert!(prompt.contains("deep blue headings"));
+    }
+
+    #[test]
+    fn final_answer_prompt_is_synthesis_only_after_tool_preparation() {
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Help the admin operate the Instance.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "Learn about my org PPST from my uploaded resource.".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+        let prepared = PreparedChatContext {
+            context: "UPLOADED DOCUMENT CONTEXT\nNo relevant uploaded-document passages were found for this message.".to_string(),
+            tools_used: Vec::new(),
+            retrieval_sources: Vec::new(),
+            activity_steps: Vec::new(),
+        };
+        let profile = HashMap::new();
+
+        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
+
+        assert!(
+            prompt.contains("Tool and retrieval preparation for this turn is already complete.")
+        );
+        assert!(prompt.contains("Do not say you will search"));
+        assert!(!prompt.contains("- Use tools when they materially improve the answer."));
+        assert!(!prompt.contains("- Use tools and then continue until you have the answer."));
+    }
+
+    #[test]
+    fn empty_uploaded_document_context_is_explicit_in_prompt_and_activity() {
+        let request = ChatRequest {
+            message: "Learn about PPST from my uploaded PDF.".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+        let prepared = prepared_uploaded_document_context_from_response(
+            &request,
+            InternalDocumentSearchResponse {
+                sources: Vec::new(),
+                context: String::new(),
+                search_query: request.message.clone(),
+                top_k: 4,
+            },
+        );
+
+        assert!(prepared
+            .context
+            .contains("No relevant uploaded-document passages were found for this message."));
+        assert_eq!(
+            prepared.tools_used[0].output_summary.as_deref(),
+            Some("No relevant uploaded-document passages were found for this message.")
+        );
+        assert_eq!(
+            prepared.tools_used[0].warnings,
+            vec!["no_relevant_uploaded_document_context".to_string()]
+        );
+
+        let steps = conversation_activity_steps_from_tools(&prepared.tools_used);
+        assert_eq!(
+            steps[0].summary.as_deref(),
+            Some("No relevant uploaded-document passages were found for this message.")
+        );
+        assert_eq!(
+            steps[0].warnings,
+            vec!["no_relevant_uploaded_document_context".to_string()]
+        );
+    }
+
+    #[test]
+    fn uploaded_document_context_carries_retrieval_sources_to_trace() {
+        let request = ChatRequest {
+            message: "Learn about PPST from my uploaded PDF.".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+        let prepared = prepared_uploaded_document_context_from_response(
+            &request,
+            InternalDocumentSearchResponse {
+                sources: vec![QuerySource {
+                    score: 0.87,
+                    source_type: "chunk".to_string(),
+                    text: "PPST organizes support for political prisoners.".to_string(),
+                    chunk_id: "wlc_chunk_0001".to_string(),
+                    job_id: "wlc-political-prisoners".to_string(),
+                    source_file: "WLC_Political-Prisoners_EN.pdf".to_string(),
+                    content_ref: "retrieval_chunk:wlc_chunk_0001".to_string(),
+                    hydrated: true,
+                    hydration_status: "hydrated".to_string(),
+                }],
+                context:
+                    "=== RELEVANT PASSAGES ===\n[1] PPST organizes support for political prisoners."
+                        .to_string(),
+                search_query: request.message.clone(),
+                top_k: 4,
+            },
+        );
+
+        assert_eq!(prepared.retrieval_sources.len(), 1);
+        assert!(prepared.context.contains("PPST organizes support"));
+        assert_eq!(
+            prepared.tools_used[0].output_summary.as_deref(),
+            Some("Retrieved uploaded-document passages for the answer.")
+        );
+    }
+
+    #[test]
+    fn knowledge_search_trace_preserves_prepared_tool_summary() {
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "admin_trace_visibility".to_string(),
+            Value::String("detailed".to_string()),
+        );
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults,
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let mut tool = tool_call_info_for_id(
+            "knowledge-search",
+            "Learn about PPST from my uploaded PDF.".to_string(),
+        );
+        tool.output_summary =
+            Some("No relevant uploaded-document passages were found for this message.".to_string());
+        tool.warnings
+            .push("no_relevant_uploaded_document_context".to_string());
+
+        let trace = build_conversation_trace(&ai_config, &auth, vec![tool], Vec::new())
+            .expect("admin trace should be visible");
+
+        assert_eq!(
+            trace.tools[0].output_summary.as_deref(),
+            Some("No relevant uploaded-document passages were found for this message.")
+        );
+        assert_eq!(
+            trace.activity_steps[0].summary.as_deref(),
+            Some("No relevant uploaded-document passages were found for this message.")
+        );
+        assert_eq!(
+            trace.activity_steps[0].warnings,
+            vec!["no_relevant_uploaded_document_context".to_string()]
+        );
     }
 
     #[test]
@@ -5079,6 +5442,35 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "pre-answer work should overlap instead of running serially"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_context_work_overlaps_independent_tools() {
+        let started = Instant::now();
+
+        let (documents, web, database) = overlap_streamed_tool_context_work(
+            async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                "documents"
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                "web"
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                "database"
+            },
+        )
+        .await;
+
+        assert_eq!(documents, "documents");
+        assert_eq!(web, "web");
+        assert_eq!(database, "database");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "independent streamed tool context work should overlap instead of running serially"
         );
     }
 
