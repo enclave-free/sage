@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::warn;
 use uuid::Uuid;
@@ -382,6 +382,8 @@ pub struct ChatStreamEventPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<ConversationTurnTimingResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<ConversationTraceResponse>,
@@ -395,6 +397,12 @@ pub struct ChatStreamEventPayload {
     pub tools_used: Vec<ToolCallInfoResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversationTurnTimingResponse {
+    pub phase: String,
+    pub elapsed_ms: u128,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -416,6 +424,7 @@ impl ChatStreamEventPayload {
             message_id: message_id.into(),
             session_id,
             status: None,
+            timing: None,
             delta: None,
             trace: None,
             activity_step: None,
@@ -1164,6 +1173,25 @@ fn chat_stream_event_payload_json(payload: &ChatStreamEventPayload) -> String {
     })
 }
 
+fn chat_stream_status_payload(
+    message_id: String,
+    session_id: Option<String>,
+    status: impl Into<String>,
+    phase: impl Into<String>,
+    turn_started_at: Instant,
+    include_timing: bool,
+) -> ChatStreamEventPayload {
+    let mut payload = ChatStreamEventPayload::new(message_id, session_id);
+    payload.status = Some(status.into());
+    if include_timing {
+        payload.timing = Some(ConversationTurnTimingResponse {
+            phase: phase.into(),
+            elapsed_ms: turn_started_at.elapsed().as_millis(),
+        });
+    }
+    payload
+}
+
 async fn session_defaults(
     State(state): State<WebAppState>,
     Query(query): Query<SessionDefaultsQuery>,
@@ -1596,13 +1624,22 @@ async fn chat_stream(
     let session_id = Some(session.id.to_string());
 
     let stream = async_stream::stream! {
+        let turn_started_at = Instant::now();
+        let include_timing = auth.kind == "admin";
+
         yield Ok(chat_stream_sse_event(
             "assistant_message_started",
             &ChatStreamEventPayload::new(message_id.clone(), session_id.clone()),
         ));
 
-        let mut status = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-        status.status = Some("Preparing selected tools...".to_string());
+        let status = chat_stream_status_payload(
+            message_id.clone(),
+            session_id.clone(),
+            "Preparing selected tools...",
+            "preparing_tools",
+            turn_started_at,
+            include_timing,
+        );
         yield Ok(chat_stream_sse_event("trace_status", &status));
 
         let mut profile = HashMap::new();
@@ -1633,8 +1670,14 @@ async fn chat_stream(
             yield Ok(chat_stream_sse_event("activity_step", &payload));
         }
 
-        let mut status = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-        status.status = Some("Writing answer...".to_string());
+        let status = chat_stream_status_payload(
+            message_id.clone(),
+            session_id.clone(),
+            "Writing answer...",
+            "writing_answer",
+            turn_started_at,
+            include_timing,
+        );
         yield Ok(chat_stream_sse_event("trace_status", &status));
 
         let memory_result =
@@ -4224,12 +4267,17 @@ mod tests {
             Some("11111111-1111-1111-1111-111111111111".to_string()),
         );
         payload.status = Some("Writing answer...".to_string());
+        payload.timing = Some(ConversationTurnTimingResponse {
+            phase: "writing_answer".to_string(),
+            elapsed_ms: 1250,
+        });
 
         let rendered = chat_stream_event_payload_json(&payload);
 
         assert!(rendered.contains(r#""message_id":"msg_test""#));
         assert!(rendered.contains(r#""session_id":"11111111-1111-1111-1111-111111111111""#));
         assert!(rendered.contains(r#""status":"Writing answer...""#));
+        assert!(rendered.contains(r#""timing":{"phase":"writing_answer","elapsed_ms":1250}"#));
     }
 
     #[test]
