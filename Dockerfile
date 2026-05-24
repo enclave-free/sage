@@ -4,9 +4,9 @@
 # Stage 1: Chef - Install cargo-chef
 FROM docker.io/rust:1.83-bookworm AS chef
 
-# Install Rust nightly first (required for edition2024 in cargo-chef deps)
-RUN rustup toolchain install nightly \
-    && rustup default nightly
+# Use the stable toolchain pinned by rust-toolchain.toml.
+RUN rustup toolchain install stable \
+    && rustup default stable
 
 RUN cargo install cargo-chef
 

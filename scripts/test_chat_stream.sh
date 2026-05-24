@@ -12,7 +12,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
         echo "  brew install libpq" >&2
         exit 1
     fi
-    export LIBRARY_PATH="$(brew --prefix libpq)/lib:${LIBRARY_PATH:-}"
+    export LIBRARY_PATH
+    LIBRARY_PATH="$(brew --prefix libpq)/lib:${LIBRARY_PATH:-}"
 fi
 
 cargo test -p sage-core chat_stream

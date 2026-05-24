@@ -681,6 +681,17 @@ impl SageAgent {
         model: &str,
         temperature: f64,
     ) -> Result<()> {
+        if !temperature.is_finite() {
+            return Err(anyhow::anyhow!(
+                "configure_lm_with_temperature requires a finite temperature"
+            ));
+        }
+        if !(0.0..=1.0).contains(&temperature) {
+            return Err(anyhow::anyhow!(
+                "configure_lm_with_temperature temperature must be between 0.0 and 1.0"
+            ));
+        }
+
         let lm = LM::builder()
             .base_url(api_base.to_string())
             .api_key(api_key.to_string())
@@ -1224,5 +1235,24 @@ mod tests {
         let registry = ToolRegistry::new();
         let desc = registry.generate_description();
         assert_eq!(desc, "No tools available.");
+    }
+
+    #[tokio::test]
+    async fn configure_lm_with_temperature_rejects_invalid_values() {
+        for temperature in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            let error = SageAgent::configure_lm_with_temperature(
+                "http://example.test/v1",
+                "test-key",
+                "test-model",
+                temperature,
+            )
+            .await
+            .expect_err("invalid temperature should fail before configuring the LM");
+
+            assert!(
+                error.to_string().contains("configure_lm_with_temperature"),
+                "error should name the failing function: {error}"
+            );
+        }
     }
 }

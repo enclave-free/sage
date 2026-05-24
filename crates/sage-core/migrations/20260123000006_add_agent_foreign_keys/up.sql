@@ -1,6 +1,7 @@
 DO $$
 BEGIN
     IF to_regclass('public.user_preferences') IS NOT NULL
+       AND to_regclass('public.agents') IS NOT NULL
        AND NOT EXISTS (
         SELECT 1
         FROM pg_constraint
@@ -16,6 +17,7 @@ $$;
 DO $$
 BEGIN
     IF to_regclass('public.scheduled_tasks') IS NOT NULL
+       AND to_regclass('public.agents') IS NOT NULL
        AND NOT EXISTS (
         SELECT 1
         FROM pg_constraint
