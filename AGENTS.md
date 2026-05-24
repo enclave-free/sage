@@ -107,11 +107,23 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+On macOS, Diesel/Postgres tests need Homebrew `libpq` on the linker search path. Use the helper task for streamed chat checks:
+
+```bash
+./scripts/test_chat_stream.sh
+# or, when just is installed:
+just test-chat-stream
+```
+
+This runs `cargo test -p sage-core chat_stream` after exporting `LIBRARY_PATH="$(brew --prefix libpq)/lib:${LIBRARY_PATH:-}"` on macOS.
+
 ### Useful `just` tasks
 
 ```bash
 just build-local
 just test
+./scripts/test_chat_stream.sh
+just test-chat-stream
 just lint
 just ci-check
 just smoke-tinfoil

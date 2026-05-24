@@ -81,6 +81,17 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+On macOS, local Diesel/Postgres test binaries link against `libpq`. If `cargo test -p sage-core chat_stream` fails with `ld: library 'pq' not found`, install Homebrew `libpq` and run the helper:
+
+```bash
+brew install libpq
+./scripts/test_chat_stream.sh
+# or, when just is installed:
+just test-chat-stream
+```
+
+The helper exports `LIBRARY_PATH="$(brew --prefix libpq)/lib:${LIBRARY_PATH:-}"` before running `cargo test -p sage-core chat_stream` on macOS.
+
 Useful env for the web runtime path:
 
 ```bash

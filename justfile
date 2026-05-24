@@ -321,6 +321,10 @@ check:
 test:
     cargo test
 
+# Run streamed chat tests with macOS Homebrew libpq linked for Diesel
+test-chat-stream:
+    ./scripts/test_chat_stream.sh
+
 # Format code
 fmt:
     cargo fmt
