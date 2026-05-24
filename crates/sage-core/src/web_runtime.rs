@@ -2540,7 +2540,7 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
         ),
         (
             "prompt_rules",
-            "[\"For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one reviewable Change Confirmation.\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
+            "[\"For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.\", \"Never call prose-only bullets or recommendations a Change Confirmation; include exactly one valid JSON change set when proposing writes.\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
             "json",
             "prompt_section",
             Some("Array of behavioral rules"),
