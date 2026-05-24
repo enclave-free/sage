@@ -1603,6 +1603,17 @@ fn persisted_conversation_context_from_memory(
     })
 }
 
+async fn overlap_streamed_pre_answer_work<PrepareFuture, MemoryFuture, Prepared, Memory>(
+    prepare_context: PrepareFuture,
+    hydrate_memory: MemoryFuture,
+) -> (Prepared, Memory)
+where
+    PrepareFuture: std::future::Future<Output = Prepared>,
+    MemoryFuture: std::future::Future<Output = Memory>,
+{
+    tokio::join!(prepare_context, hydrate_memory)
+}
+
 async fn chat_stream(
     State(state): State<WebAppState>,
     headers: HeaderMap,
@@ -1655,7 +1666,12 @@ async fn chat_stream(
             }
         }
 
-        let prepared = match prepare_explicit_chat_context(&state, &request, &auth).await {
+        let (prepared_result, memory_result) = overlap_streamed_pre_answer_work(
+            prepare_explicit_chat_context(&state, &request, &auth),
+            build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id),
+        ).await;
+
+        let prepared = match prepared_result {
             Ok(prepared) => prepared,
             Err(error) => {
                 let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
@@ -1680,8 +1696,6 @@ async fn chat_stream(
         );
         yield Ok(chat_stream_sse_event("trace_status", &status));
 
-        let memory_result =
-            build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id).await;
         let persisted_context = match memory_result.as_ref() {
             Ok(memory) => match persisted_conversation_context_from_memory(memory) {
                 Ok(context) => Some(context),
@@ -4892,6 +4906,30 @@ mod tests {
 
         let rendered = serde_json::to_string(&payload).expect("payload should serialize");
         assert!(!rendered.contains("super-secret-tinfoil-key"));
+    }
+
+    #[tokio::test]
+    async fn streamed_pre_answer_work_overlaps_context_and_memory_hydration() {
+        let started = Instant::now();
+
+        let (prepared, memory) = overlap_streamed_pre_answer_work(
+            async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                "prepared_context"
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                "session_memory"
+            },
+        )
+        .await;
+
+        assert_eq!(prepared, "prepared_context");
+        assert_eq!(memory, "session_memory");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "pre-answer work should overlap instead of running serially"
+        );
     }
 
     fn test_config_with_tinfoil_key(secret: &str) -> Config {
