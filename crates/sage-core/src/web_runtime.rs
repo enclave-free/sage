@@ -83,13 +83,6 @@ Final-answer rules:
 - Do not emit JSON, tool calls, hidden reasoning, raw prompts, raw provider traces, secrets, or unredacted database rows.
 "#;
 
-const ADMIN_TOOL_CAPABILITY_CONTEXT: &str = r#"ADMIN-VISIBLE TOOL CAPABILITIES
-- web-search (Web Search): Looks up current or external information through the configured SearXNG service.
-- admin-config (Config): Reads admin configuration context and supports confirmed configuration changes.
-- db-query (Database): Runs safe read-only admin database queries for troubleshooting and inspection.
-- knowledge-search (Uploaded Documents): Internal retrieval over default-active uploaded documents. It is not a visible toggle in admin chat, but Config-enabled admin turns can use it automatically when the admin asks about uploaded PDFs, books, documents, files, or materials.
-"#;
-
 #[derive(Clone, Copy)]
 struct PythonURLSafeEncoding;
 
@@ -654,6 +647,32 @@ struct InternalDocumentSearchResponse {
     top_k: i32,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct InternalScopedConfigContextRequest {
+    query: String,
+    actor: InternalAuthContext,
+    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_scopes: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct InternalScopedConfigContextResponse {
+    version: i32,
+    primary_scope: String,
+    included_scopes: Vec<String>,
+    context_text: String,
+    warnings: Vec<String>,
+    generated_at: String,
+    secret_policy: Value,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScopedConfigContextError {
+    Unauthorized,
+    Failed(String),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct InternalEffectiveAiConfig {
     prompt_sections: HashMap<String, Value>,
@@ -923,6 +942,37 @@ impl InternalAgentClient {
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(&json!({ "sql": sql }));
         self.send_value(request).await
+    }
+
+    async fn scoped_config_context(
+        &self,
+        payload: &InternalScopedConfigContextRequest,
+    ) -> std::result::Result<InternalScopedConfigContextResponse, ScopedConfigContextError> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/internal/agent/scoped-config-context",
+                self.backend_url
+            ))
+            .header("X-Internal-Agent-Token", &self.internal_agent_token)
+            .json(payload);
+        let (status, value) = self
+            .send_value_with_status(request)
+            .await
+            .map_err(|error| ScopedConfigContextError::Failed(error.to_string()))?;
+        if status == StatusCode::FORBIDDEN {
+            return Err(ScopedConfigContextError::Unauthorized);
+        }
+        if !status.is_success() {
+            let detail = value
+                .get("detail")
+                .and_then(|detail| detail.as_str())
+                .unwrap_or("Control plane scoped config request failed.");
+            return Err(ScopedConfigContextError::Failed(detail.to_string()));
+        }
+        serde_json::from_value(value).map_err(|error| {
+            ScopedConfigContextError::Failed(format!("Invalid scoped config response: {}", error))
+        })
     }
 
     async fn send_json<T: for<'de> Deserialize<'de>>(
@@ -1426,14 +1476,9 @@ async fn prepare_explicit_chat_context(
             "admin-config",
             request.message.clone(),
         ));
-        let ai_config = load_ai_config_response(state)?;
-        context_parts.push(ADMIN_TOOL_CAPABILITY_CONTEXT.to_string());
-        context_parts.push(format!(
-            "SCOPED CONFIG CONTEXT\n{}",
-            serde_json::to_string_pretty(&ai_config).map_err(internal_error)?
-        ));
     }
 
+    let admin_config_context = prepare_admin_config_context(state, request, auth);
     let document_context = prepare_uploaded_document_context(state, request, auth);
     let web_context =
         prepare_web_search_context(state, request, client_executed_set.contains("web-search"));
@@ -1443,10 +1488,21 @@ async fn prepare_explicit_chat_context(
         auth,
         client_executed_set.contains("db-query"),
     );
-    let (document_context, web_context, database_context) =
-        overlap_streamed_tool_context_work(document_context, web_context, database_context).await;
+    let (admin_config_context, document_context, web_context, database_context) = tokio::join!(
+        admin_config_context,
+        document_context,
+        web_context,
+        database_context
+    );
     let mut retrieval_sources = Vec::new();
 
+    merge_prepared_tool_context(
+        admin_config_context?,
+        &mut context_parts,
+        &mut tools_used,
+        &mut retrieval_sources,
+        &mut prepared_tool_activity,
+    );
     merge_prepared_tool_context(
         document_context?,
         &mut context_parts,
@@ -1495,6 +1551,152 @@ async fn prepare_explicit_chat_context(
         retrieval_sources,
         activity_steps,
     })
+}
+
+async fn prepare_admin_config_context(
+    state: &WebAppState,
+    request: &ChatRequest,
+    auth: &InternalAuthContext,
+) -> AppResult<PreparedChatContext> {
+    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "admin-config") {
+        return Ok(PreparedChatContext::default());
+    }
+
+    match state
+        .internal
+        .scoped_config_context(&InternalScopedConfigContextRequest {
+            query: request.message.clone(),
+            actor: auth.clone(),
+            mode: "auto".to_string(),
+            requested_scopes: None,
+        })
+        .await
+    {
+        Ok(response) => Ok(prepared_admin_config_context_from_response(
+            request, response,
+        )),
+        Err(ScopedConfigContextError::Unauthorized) => Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "Admin scoped config context is not authorized for this actor.",
+        )),
+        Err(ScopedConfigContextError::Failed(detail)) => {
+            Ok(prepared_admin_config_context_failure(request, &detail))
+        }
+    }
+}
+
+fn prepared_admin_config_context_from_response(
+    request: &ChatRequest,
+    response: InternalScopedConfigContextResponse,
+) -> PreparedChatContext {
+    let mut tool = tool_call_info_for_id("admin-config", request.message.clone());
+    tool.output_summary = Some(build_admin_config_output_summary(
+        &response.primary_scope,
+        &response.included_scopes,
+        &response.warnings,
+    ));
+    tool.warnings =
+        sanitize_admin_config_activity_warnings(&response.included_scopes, &response.warnings);
+    let activity_step = admin_config_activity_step(&tool, &response);
+
+    PreparedChatContext {
+        context: response.context_text,
+        tools_used: vec![tool],
+        activity_steps: vec![activity_step],
+        retrieval_sources: Vec::new(),
+    }
+}
+
+fn prepared_admin_config_context_failure(
+    request: &ChatRequest,
+    detail: &str,
+) -> PreparedChatContext {
+    let mut tool = tool_call_info_for_id("admin-config", request.message.clone());
+    tool.output_summary = Some("Scoped config context could not be prepared.".to_string());
+    tool.warnings
+        .push("scoped_config_context_failed".to_string());
+    let activity_step = conversation_activity_step_from_tool(
+        &tool,
+        Some("Scoped config context could not be prepared.".to_string()),
+        vec!["scoped_config_context_failed".to_string()],
+    );
+
+    PreparedChatContext {
+        context: format!(
+            "SCOPED CONFIG CONTEXT\nScoped config context could not be prepared safely. {}",
+            sanitize_scoped_config_failure_detail(detail)
+        ),
+        tools_used: vec![tool],
+        activity_steps: vec![activity_step],
+        retrieval_sources: Vec::new(),
+    }
+}
+
+fn build_admin_config_output_summary(
+    primary_scope: &str,
+    included_scopes: &[String],
+    warnings: &[String],
+) -> String {
+    let mut summary = if included_scopes.len() <= 1 {
+        format!("Prepared scoped config context for {}.", primary_scope)
+    } else {
+        format!(
+            "Prepared scoped config context for {} ({} included scopes).",
+            primary_scope,
+            included_scopes.len()
+        )
+    };
+    if !warnings.is_empty() {
+        summary.push_str(&format!(
+            " {} scoped-read warning(s) reported.",
+            warnings.len()
+        ));
+    }
+    summary
+}
+
+fn sanitize_admin_config_activity_warnings(
+    included_scopes: &[String],
+    warnings: &[String],
+) -> Vec<String> {
+    let mut activity_warnings = Vec::new();
+    if warnings.is_empty() {
+        if included_scopes
+            .iter()
+            .any(|scope| scope == "deployment-settings")
+        {
+            activity_warnings.push("deployment_secrets_redacted".to_string());
+        }
+        return activity_warnings;
+    }
+
+    activity_warnings.push(format!("scoped_read_warnings:{}", warnings.len()));
+    activity_warnings
+}
+
+fn admin_config_activity_step(
+    tool: &ToolCallInfoResponse,
+    response: &InternalScopedConfigContextResponse,
+) -> ConversationActivityStepResponse {
+    conversation_activity_step_from_tool(
+        tool,
+        Some(build_admin_config_output_summary(
+            &response.primary_scope,
+            &response.included_scopes,
+            &response.warnings,
+        )),
+        sanitize_admin_config_activity_warnings(&response.included_scopes, &response.warnings),
+    )
+}
+
+fn sanitize_scoped_config_failure_detail(detail: &str) -> String {
+    detail
+        .lines()
+        .next()
+        .unwrap_or("Control plane request failed.")
+        .chars()
+        .take(160)
+        .collect()
 }
 
 async fn prepare_uploaded_document_context(
@@ -1555,6 +1757,7 @@ fn prepared_uploaded_document_context_from_response(
     prepared
 }
 
+#[cfg(test)]
 async fn overlap_streamed_tool_context_work<
     DocumentFuture,
     WebFuture,
@@ -1950,7 +2153,7 @@ async fn chat_stream(
         let status = chat_stream_status_payload(
             message_id.clone(),
             session_id.clone(),
-            "Writing answer...",
+            "Finalizing response...",
             "writing_answer",
             turn_started_at,
             include_timing,
@@ -4761,7 +4964,7 @@ mod tests {
             "msg_test",
             Some("11111111-1111-1111-1111-111111111111".to_string()),
         );
-        payload.status = Some("Writing answer...".to_string());
+        payload.status = Some("Finalizing response...".to_string());
         payload.timing = Some(ConversationTurnTimingResponse {
             phase: "writing_answer".to_string(),
             elapsed_ms: 1250,
@@ -4771,7 +4974,7 @@ mod tests {
 
         assert!(rendered.contains(r#""message_id":"msg_test""#));
         assert!(rendered.contains(r#""session_id":"11111111-1111-1111-1111-111111111111""#));
-        assert!(rendered.contains(r#""status":"Writing answer...""#));
+        assert!(rendered.contains(r#""status":"Finalizing response...""#));
         assert!(rendered.contains(r#""timing":{"phase":"writing_answer","elapsed_ms":1250}"#));
     }
 
@@ -5352,6 +5555,143 @@ mod tests {
     }
 
     #[test]
+    fn prepared_admin_config_context_uses_control_plane_context_text() {
+        let request = ChatRequest {
+            message: "update the theme and primary color".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+        let response = InternalScopedConfigContextResponse {
+            version: 1,
+            primary_scope: "instance-settings".to_string(),
+            included_scopes: vec!["instance-settings".to_string()],
+            context_text: "SCOPED CONFIG CONTEXT\nscope: instance-settings\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- admin-config (Admin Config): Reads scoped admin configuration context.".to_string(),
+            warnings: Vec::new(),
+            generated_at: "2026-05-25T12:00:00+00:00".to_string(),
+            secret_policy: json!({ "mode": "masked" }),
+        };
+
+        let prepared = prepared_admin_config_context_from_response(&request, response);
+
+        assert!(prepared.context.starts_with("SCOPED CONFIG CONTEXT"));
+        assert!(prepared.context.contains("ADMIN-VISIBLE TOOL CAPABILITIES"));
+        assert!(!prepared.context.contains("prompt_sections"));
+        assert!(!prepared.context.contains("compiled_prompt"));
+        assert_eq!(prepared.tools_used.len(), 1);
+        assert_eq!(prepared.tools_used[0].tool_id, "admin-config");
+    }
+
+    #[test]
+    fn prepared_admin_config_context_surfaces_warnings_in_activity() {
+        let request = ChatRequest {
+            message: "review onboarding fields for user types".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+        let response = InternalScopedConfigContextResponse {
+            version: 1,
+            primary_scope: "user-types".to_string(),
+            included_scopes: vec!["user-types".to_string()],
+            context_text: "SCOPED CONFIG CONTEXT\nscope: user-types".to_string(),
+            warnings: vec!["user-fields user_type_id=2 failed".to_string()],
+            generated_at: "2026-05-25T12:00:00+00:00".to_string(),
+            secret_policy: json!({ "mode": "masked" }),
+        };
+
+        let prepared = prepared_admin_config_context_from_response(&request, response);
+
+        assert_eq!(
+            prepared.tools_used[0].output_summary.as_deref(),
+            Some(
+                "Prepared scoped config context for user-types. 1 scoped-read warning(s) reported."
+            )
+        );
+        assert_eq!(
+            prepared.tools_used[0].warnings,
+            vec!["scoped_read_warnings:1".to_string()]
+        );
+        assert_eq!(
+            prepared.activity_steps[0].summary.as_deref(),
+            Some(
+                "Prepared scoped config context for user-types. 1 scoped-read warning(s) reported."
+            )
+        );
+        assert_eq!(
+            prepared.activity_steps[0].warnings,
+            vec!["scoped_read_warnings:1".to_string()]
+        );
+    }
+
+    #[test]
+    fn prepared_admin_config_context_does_not_echo_raw_secrets() {
+        let request = ChatRequest {
+            message: "change smtp settings".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+        let response = InternalScopedConfigContextResponse {
+            version: 1,
+            primary_scope: "deployment-settings".to_string(),
+            included_scopes: vec!["deployment-settings".to_string()],
+            context_text:
+                "SCOPED CONFIG CONTEXT\nscope: deployment-settings\nSMTP_PASSWORD = [REDACTED]"
+                    .to_string(),
+            warnings: Vec::new(),
+            generated_at: "2026-05-25T12:00:00+00:00".to_string(),
+            secret_policy: json!({ "mode": "masked" }),
+        };
+
+        let prepared = prepared_admin_config_context_from_response(&request, response);
+
+        assert!(prepared.context.contains("[REDACTED]"));
+        assert!(!prepared.context.contains("super-secret-smtp-password"));
+        assert_eq!(
+            prepared.tools_used[0].warnings,
+            vec!["deployment_secrets_redacted".to_string()]
+        );
+    }
+
+    #[test]
+    fn prepared_admin_config_context_failure_is_safe() {
+        let request = ChatRequest {
+            message: "what tools do you have?".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+
+        let prepared = prepared_admin_config_context_failure(
+            &request,
+            "backend returned 503: upstream unavailable\nsecret=should-not-leak",
+        );
+
+        assert!(prepared
+            .context
+            .contains("Scoped config context could not be prepared safely."));
+        assert!(prepared.context.contains("backend returned 503"));
+        assert!(!prepared.context.contains("secret=should-not-leak"));
+        assert_eq!(
+            prepared.tools_used[0].warnings,
+            vec!["scoped_config_context_failed".to_string()]
+        );
+    }
+
+    #[test]
     fn admin_config_context_describes_admin_tool_capabilities() {
         let auth = InternalAuthContext {
             id: 1,
@@ -5373,10 +5713,7 @@ mod tests {
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
-            context: format!(
-                "{}\n\nSCOPED CONFIG CONTEXT\n{{}}",
-                ADMIN_TOOL_CAPABILITY_CONTEXT
-            ),
+            context: "SCOPED CONFIG CONTEXT\nscope: overview\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- web-search (Web Search): Looks up current or external information through the configured SearXNG service.\n- admin-config (Admin Config): Reads scoped admin configuration context and supports confirmed configuration changes.\n- db-query (Database): Runs safe read-only admin database queries for troubleshooting and inspection.".to_string(),
             tools_used: Vec::new(),
             retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
@@ -5392,8 +5729,8 @@ mod tests {
         let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
 
         assert!(prompt.contains("ADMIN-VISIBLE TOOL CAPABILITIES"));
-        assert!(prompt.contains("knowledge-search (Uploaded Documents)"));
-        assert!(prompt.contains("not a visible toggle in admin chat"));
+        assert!(prompt.contains("admin-config (Admin Config)"));
+        assert!(!prompt.contains("not a visible toggle in admin chat"));
     }
 
     #[test]
