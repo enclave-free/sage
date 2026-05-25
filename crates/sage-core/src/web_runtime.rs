@@ -1687,10 +1687,40 @@ fn should_auto_retrieve_admin_config_context(
 }
 
 fn is_direct_readonly_select_message(message: &str) -> bool {
-    message
-        .trim_start()
-        .to_ascii_uppercase()
-        .starts_with("SELECT ")
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.contains(';') {
+        return false;
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.starts_with("SELECT")
+        || upper
+            .get(6..)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|ch| !ch.is_whitespace())
+    {
+        return false;
+    }
+
+    const FORBIDDEN_KEYWORDS: &[&str] = &[
+        "ALTER", "ATTACH", "CREATE", "DELETE", "DETACH", "DROP", "INSERT", "PRAGMA", "REPLACE",
+        "TRUNCATE", "UPDATE", "VACUUM",
+    ];
+    !FORBIDDEN_KEYWORDS
+        .iter()
+        .any(|keyword| contains_sql_keyword(&upper, keyword))
+}
+
+fn contains_sql_keyword(sql: &str, keyword: &str) -> bool {
+    sql.match_indices(keyword).any(|(index, _)| {
+        let before = sql[..index].chars().next_back();
+        let after = sql[index + keyword.len()..].chars().next();
+        !before.is_some_and(is_sql_identifier_char) && !after.is_some_and(is_sql_identifier_char)
+    })
+}
+
+fn is_sql_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 #[cfg(test)]
@@ -1715,7 +1745,10 @@ fn build_final_answer_prompt_with_persisted_context(
     persisted_context: Option<&PersistedConversationContext>,
 ) -> String {
     let mut prompt = String::new();
-    prompt.push_str(&build_final_answer_instruction(&ai_config.compiled_prompt));
+    prompt.push_str("Agent Settings profile:\n");
+    prompt.push_str(&ai_config.compiled_prompt);
+    prompt.push_str("\n\n");
+    prompt.push_str(&build_final_answer_instruction());
     prompt.push_str("\n\n=== REQUEST CONTEXT ===\n");
     prompt.push_str(&format!("auth_type: {}\n", auth.kind));
     if let Some(user_type_id) = auth.user_type_id {
@@ -3664,11 +3697,8 @@ fn build_agent_instruction(compiled_prompt: &str, include_knowledge_tool: bool) 
     .build_instruction()
 }
 
-fn build_final_answer_instruction(compiled_prompt: &str) -> String {
-    let mut instruction = String::from(ENCLAVE_WEB_FINAL_ANSWER_INSTRUCTION);
-    instruction.push_str("\nAgent Settings profile:\n");
-    instruction.push_str(compiled_prompt);
-    instruction
+fn build_final_answer_instruction() -> String {
+    ENCLAVE_WEB_FINAL_ANSWER_INSTRUCTION.to_string()
 }
 
 fn build_query_input(
@@ -4752,11 +4782,32 @@ mod tests {
         assert!(is_direct_readonly_select_message(
             "SELECT id, email FROM users LIMIT 10"
         ));
+        assert!(is_direct_readonly_select_message(
+            "SELECT\nid, email FROM users LIMIT 10"
+        ));
+        assert!(is_direct_readonly_select_message(
+            "SELECT\tid, email FROM users LIMIT 10"
+        ));
+        assert!(!is_direct_readonly_select_message(
+            "SELECTED id, email FROM users LIMIT 10"
+        ));
         assert!(!is_direct_readonly_select_message(
             "Which users are active?"
         ));
         assert!(!is_direct_readonly_select_message(
             "Please write a SELECT query for active users"
+        ));
+        assert!(!is_direct_readonly_select_message(
+            "SELECT id, email FROM users; DROP TABLE users"
+        ));
+        assert!(!is_direct_readonly_select_message(
+            "SELECT id, email FROM users;"
+        ));
+        assert!(!is_direct_readonly_select_message(
+            "SELECT id, email FROM users UPDATE users"
+        ));
+        assert!(is_direct_readonly_select_message(
+            "SELECT id, updated_at FROM users LIMIT 10"
         ));
     }
 
@@ -5232,6 +5283,13 @@ mod tests {
         assert!(prompt.contains("Do not say you will search"));
         assert!(!prompt.contains("- Use tools when they materially improve the answer."));
         assert!(!prompt.contains("- Use tools and then continue until you have the answer."));
+        let compiled_profile_index = prompt
+            .find("Help the admin operate the Instance.")
+            .expect("compiled profile should be present");
+        let final_answer_index = prompt
+            .find("Tool and retrieval preparation for this turn is already complete.")
+            .expect("final-answer constraints should be present");
+        assert!(compiled_profile_index < final_answer_index);
     }
 
     #[test]
