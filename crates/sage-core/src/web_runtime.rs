@@ -248,9 +248,12 @@ pub fn build_router(config: Config, web_config: EnclaveWebConfig) -> Result<Rout
         .route("/llm/chat", post(chat))
         .route("/llm/chat/stream", post(chat_stream))
         .route("/query", post(query))
+        .route("/query/sessions", get(list_query_sessions))
         .route(
             "/query/session/{session_id}",
-            get(get_query_session).delete(delete_query_session),
+            get(get_query_session)
+                .patch(rename_query_session)
+                .delete(delete_query_session),
         )
         .route(
             "/internal/lifecycle/session-memory/delete",
@@ -599,6 +602,27 @@ struct SessionDefaultsResponse {
     default_document_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ConversationHistorySummaryResponse {
+    id: String,
+    title: String,
+    owner_type: String,
+    owner_id: String,
+    message_count: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ConversationHistoryResponse {
+    conversations: Vec<ConversationHistorySummaryResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct RenameConversationRequest {
+    title: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct InternalAuthContext {
     id: i32,
@@ -743,6 +767,7 @@ struct WebSessionRow {
     owner_id: String,
     user_type_id: Option<i32>,
     last_question: Option<String>,
+    title: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -756,6 +781,7 @@ struct NewWebSession<'a> {
     owner_id: &'a str,
     user_type_id: Option<i32>,
     last_question: Option<&'a str>,
+    title: Option<&'a str>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2190,22 +2216,83 @@ async fn get_query_session(
             json!({
                 "role": message.role,
                 "content": message.content,
+                "id": message.id.to_string(),
                 "timestamp": message.created_at.to_rfc3339(),
             })
         })
         .collect();
 
+    let title = conversation_title(&session);
     Ok(Json(json!({
         "id": session.id,
+        "title": title,
         "owner_type": session.owner_type,
         "owner_id": session.owner_id,
         "created_at": session.created_at.to_rfc3339(),
+        "updated_at": session.updated_at.to_rfc3339(),
         "messages": serialized_messages,
         "jurisdiction": Value::Null,
         "situation_details": Value::Null,
         "facts_gathered": {},
         "pending_questions": [],
     })))
+}
+
+async fn rename_query_session(
+    State(state): State<WebAppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(request): Json<RenameConversationRequest>,
+) -> AppResult<Json<ConversationHistorySummaryResponse>> {
+    enforce_csrf(&state.web_config, &Method::PATCH, &headers)?;
+    let auth = resolve_public_actor(&state, &headers).await?;
+    let session = load_web_session(&state, &session_id)?;
+    ensure_session_access(&auth, &session)?;
+    let title = sanitize_conversation_title(&request.title)
+        .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "Conversation title is required"))?;
+    let session = update_session_title(&state, session.id, &title)?;
+    let message_count = count_session_messages(&state, session.agent_id)?;
+
+    Ok(Json(conversation_history_summary_response(
+        session,
+        message_count,
+    )))
+}
+
+async fn list_query_sessions(
+    State(state): State<WebAppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<ConversationHistoryResponse>> {
+    let auth = resolve_public_actor(&state, &headers).await?;
+    let owner_type = if auth.kind == "admin" {
+        "admin"
+    } else {
+        "user"
+    };
+    let owner_id = auth.id.to_string();
+
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    let sessions: Vec<WebSessionRow> = web_sessions::table
+        .filter(web_sessions::owner_type.eq(owner_type))
+        .filter(web_sessions::owner_id.eq(&owner_id))
+        .order(web_sessions::updated_at.desc())
+        .select(WebSessionRow::as_select())
+        .load(&mut *conn)
+        .map_err(internal_error)?;
+
+    let mut conversations = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let message_count = count_session_messages_with_conn(&mut *conn, session.agent_id)?;
+        conversations.push(conversation_history_summary_response(
+            session,
+            message_count,
+        ));
+    }
+
+    Ok(Json(ConversationHistoryResponse { conversations }))
 }
 
 async fn delete_query_session(
@@ -2519,6 +2606,7 @@ fn get_or_create_web_session(
         owner_id: &owner_id,
         user_type_id: auth.user_type_id,
         last_question: None,
+        title: None,
         created_at: now,
         updated_at: now,
     };
@@ -2635,6 +2723,29 @@ fn update_session_last_question(
     Ok(())
 }
 
+fn update_session_title(
+    state: &WebAppState,
+    session_id: Uuid,
+    title: &str,
+) -> AppResult<WebSessionRow> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    diesel::update(web_sessions::table.filter(web_sessions::id.eq(session_id)))
+        .set((
+            web_sessions::title.eq(Some(title.to_string())),
+            web_sessions::updated_at.eq(chrono::Utc::now()),
+        ))
+        .execute(&mut *conn)
+        .map_err(internal_error)?;
+    web_sessions::table
+        .find(session_id)
+        .select(WebSessionRow::as_select())
+        .first(&mut *conn)
+        .map_err(internal_error)
+}
+
 fn load_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<Vec<StoredMessageRow>> {
     let mut conn = state
         .db
@@ -2646,6 +2757,64 @@ fn load_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<Vec<S
         .select(StoredMessageRow::as_select())
         .load(&mut *conn)
         .map_err(internal_error)
+}
+
+fn count_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<i64> {
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    count_session_messages_with_conn(&mut *conn, agent_id)
+}
+
+fn count_session_messages_with_conn(conn: &mut PgConnection, agent_id: Uuid) -> AppResult<i64> {
+    messages::table
+        .filter(messages::agent_id.eq(agent_id))
+        .count()
+        .get_result::<i64>(conn)
+        .map_err(internal_error)
+}
+
+fn conversation_history_summary_response(
+    session: WebSessionRow,
+    message_count: i64,
+) -> ConversationHistorySummaryResponse {
+    let title = conversation_title(&session);
+
+    ConversationHistorySummaryResponse {
+        id: session.id.to_string(),
+        title,
+        owner_type: session.owner_type,
+        owner_id: session.owner_id,
+        message_count,
+        created_at: session.created_at.to_rfc3339(),
+        updated_at: session.updated_at.to_rfc3339(),
+    }
+}
+
+fn conversation_title(session: &WebSessionRow) -> String {
+    [session.title.as_deref(), session.last_question.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(sanitize_conversation_title)
+        .unwrap_or_else(|| "Untitled chat".to_string())
+}
+
+fn sanitize_conversation_title(value: &str) -> Option<String> {
+    let trimmed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_conversation_history_title(&trimmed))
+}
+
+fn truncate_conversation_history_title(value: &str) -> String {
+    const MAX_TITLE_CHARS: usize = 80;
+    let mut title: String = value.chars().take(MAX_TITLE_CHARS).collect();
+    if value.chars().count() > MAX_TITLE_CHARS {
+        title.push_str("...");
+    }
+    title
 }
 
 fn delete_session_memory_for_agent(
@@ -4556,6 +4725,34 @@ mod tests {
         assert_eq!(summary["results"][0]["target_kind"], "session_memory");
         assert_eq!(summary["results"][0]["action"], "delete_messages");
         assert_eq!(summary["results"][0]["status"], "succeeded");
+    }
+
+    #[test]
+    fn conversation_history_summary_uses_safe_title_and_message_count() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-24T20:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let session = WebSessionRow {
+            id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid should parse"),
+            agent_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222")
+                .expect("uuid should parse"),
+            owner_type: "user".to_string(),
+            owner_id: "7".to_string(),
+            user_type_id: None,
+            last_question: Some("Draft membership policy".to_string()),
+            title: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let summary = conversation_history_summary_response(session, 4);
+
+        assert_eq!(summary.id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(summary.title, "Draft membership policy");
+        assert_eq!(summary.owner_type, "user");
+        assert_eq!(summary.owner_id, "7");
+        assert_eq!(summary.message_count, 4);
+        assert_eq!(summary.updated_at, "2026-05-24T20:00:00+00:00");
     }
 
     #[test]

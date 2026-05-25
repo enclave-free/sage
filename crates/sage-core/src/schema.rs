@@ -183,6 +183,7 @@ diesel::table! {
         owner_id -> Varchar,
         user_type_id -> Nullable<Int4>,
         last_question -> Nullable<Text>,
+        title -> Nullable<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
