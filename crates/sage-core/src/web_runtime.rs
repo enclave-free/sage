@@ -1579,8 +1579,8 @@ async fn prepare_admin_config_context(
             StatusCode::FORBIDDEN,
             "Admin scoped config context is not authorized for this actor.",
         )),
-        Err(ScopedConfigContextError::Failed(detail)) => {
-            Ok(prepared_admin_config_context_failure(request, &detail))
+        Err(ScopedConfigContextError::Failed(_)) => {
+            Ok(prepared_admin_config_context_failure(request))
         }
     }
 }
@@ -1607,10 +1607,7 @@ fn prepared_admin_config_context_from_response(
     }
 }
 
-fn prepared_admin_config_context_failure(
-    request: &ChatRequest,
-    detail: &str,
-) -> PreparedChatContext {
+fn prepared_admin_config_context_failure(request: &ChatRequest) -> PreparedChatContext {
     let mut tool = tool_call_info_for_id("admin-config", request.message.clone());
     tool.output_summary = Some("Scoped config context could not be prepared.".to_string());
     tool.warnings
@@ -1622,10 +1619,8 @@ fn prepared_admin_config_context_failure(
     );
 
     PreparedChatContext {
-        context: format!(
-            "SCOPED CONFIG CONTEXT\nScoped config context could not be prepared safely. {}",
-            sanitize_scoped_config_failure_detail(detail)
-        ),
+        context: "SCOPED CONFIG CONTEXT\nScoped config context could not be prepared safely."
+            .to_string(),
         tools_used: vec![tool],
         activity_steps: vec![activity_step],
         retrieval_sources: Vec::new(),
@@ -1687,16 +1682,6 @@ fn admin_config_activity_step(
         )),
         sanitize_admin_config_activity_warnings(&response.included_scopes, &response.warnings),
     )
-}
-
-fn sanitize_scoped_config_failure_detail(detail: &str) -> String {
-    detail
-        .lines()
-        .next()
-        .unwrap_or("Control plane request failed.")
-        .chars()
-        .take(160)
-        .collect()
 }
 
 async fn prepare_uploaded_document_context(
@@ -3203,6 +3188,7 @@ fn build_cors_layer(config: &EnclaveWebConfig) -> Result<CorsLayer> {
             Method::GET,
             Method::POST,
             Method::PUT,
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])
@@ -5675,15 +5661,12 @@ mod tests {
             conversation_channel: None,
         };
 
-        let prepared = prepared_admin_config_context_failure(
-            &request,
-            "backend returned 503: upstream unavailable\nsecret=should-not-leak",
-        );
+        let prepared = prepared_admin_config_context_failure(&request);
 
         assert!(prepared
             .context
             .contains("Scoped config context could not be prepared safely."));
-        assert!(prepared.context.contains("backend returned 503"));
+        assert!(!prepared.context.contains("backend returned 503"));
         assert!(!prepared.context.contains("secret=should-not-leak"));
         assert_eq!(
             prepared.tools_used[0].warnings,
