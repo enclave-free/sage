@@ -1693,7 +1693,12 @@ fn is_direct_readonly_select_message(message: &str) -> bool {
     }
 
     let upper = trimmed.to_ascii_uppercase();
-    if !upper.starts_with("SELECT ") {
+    if !upper.starts_with("SELECT")
+        || upper
+            .get(6..)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|ch| !ch.is_whitespace())
+    {
         return false;
     }
 
@@ -4776,6 +4781,15 @@ mod tests {
     fn database_streaming_guard_distinguishes_direct_select_from_natural_language() {
         assert!(is_direct_readonly_select_message(
             "SELECT id, email FROM users LIMIT 10"
+        ));
+        assert!(is_direct_readonly_select_message(
+            "SELECT\nid, email FROM users LIMIT 10"
+        ));
+        assert!(is_direct_readonly_select_message(
+            "SELECT\tid, email FROM users LIMIT 10"
+        ));
+        assert!(!is_direct_readonly_select_message(
+            "SELECTED id, email FROM users LIMIT 10"
         ));
         assert!(!is_direct_readonly_select_message(
             "Which users are active?"
