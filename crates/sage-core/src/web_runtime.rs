@@ -5555,7 +5555,7 @@ mod tests {
             version: 1,
             primary_scope: "instance-settings".to_string(),
             included_scopes: vec!["instance-settings".to_string()],
-            context_text: "SCOPED CONFIG CONTEXT\nscope: instance-settings\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- admin-config (Admin Config): Reads scoped admin configuration context.".to_string(),
+            context_text: "SCOPED CONFIG CONTEXT\nscope: instance-settings\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- admin-config (Admin Config): Read instance configuration including settings, deployment configuration, user types, onboarding structure, document access policies, and agent behavior. Ask about what you need to inspect or change, and the tool returns the relevant context with actionable schema for configuration changes. Access: admins only.".to_string(),
             warnings: Vec::new(),
             generated_at: "2026-05-25T12:00:00+00:00".to_string(),
             secret_policy: json!({ "mode": "masked" }),
@@ -5696,7 +5696,7 @@ mod tests {
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\nscope: overview\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- web-search (Web Search): Looks up current or external information through the configured SearXNG service.\n- admin-config (Admin Config): Reads scoped admin configuration context and supports confirmed configuration changes.\n- db-query (Database): Runs safe read-only admin database queries for troubleshooting and inspection.".to_string(),
+            context: "SCOPED CONFIG CONTEXT\nscope: overview\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- web-search (Web Search): Looks up current or external information through the configured SearXNG service. Use this to find best practices, current documentation, or external reference material that may inform configuration decisions. Access: all users when enabled.\n- admin-config (Admin Config): Read instance configuration including settings, deployment configuration, user types, onboarding structure, document access policies, and agent behavior. Ask about what you need to inspect or change, and the tool returns the relevant context with actionable schema for configuration changes. Access: admins only.\n- db-query (Database): Runs safe read-only admin database queries using natural language for analytics, user inspection, troubleshooting, or data analysis. Use this for questions about existing data, patterns, or inventory. Access: admins only.".to_string(),
             tools_used: Vec::new(),
             retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
