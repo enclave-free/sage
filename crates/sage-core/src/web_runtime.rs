@@ -1418,7 +1418,11 @@ async fn chat(
     input.push_str(&request.message);
 
     let response_text = run_agent_turn(&mut agent, &input).await?;
-    if let Err(err) = agent.store_message_sync(&memory_user_id, "assistant", &response_text) {
+    let assistant_memory_content =
+        sanitize_admin_config_message_for_memory(&auth, &request, &response_text);
+    if let Err(err) =
+        agent.store_message_sync(&memory_user_id, "assistant", &assistant_memory_content)
+    {
         warn!(
             "failed to persist assistant message for session {}: {}",
             session.id, err
@@ -1560,8 +1564,7 @@ async fn prepare_explicit_chat_context(
 }
 
 fn client_tool_context_includes_scoped_config(tool_context: Option<&str>) -> bool {
-    tool_context
-        .is_some_and(|context| context.contains("SCOPED CONFIG CONTEXT"))
+    tool_context.is_some_and(|context| context.contains("SCOPED CONFIG CONTEXT"))
 }
 
 async fn prepare_admin_config_context(
@@ -2014,7 +2017,8 @@ fn build_final_answer_prompt_with_persisted_context(
     } else {
         request.conversation_history.as_slice()
     };
-    let history: Vec<&ChatHistoryMessage> = history_source
+    let sanitize_history = should_sanitize_admin_config_history(auth, request);
+    let history: Vec<ChatHistoryMessage> = history_source
         .iter()
         .filter(|message| {
             matches!(message.role.as_str(), "user" | "assistant")
@@ -2022,6 +2026,14 @@ fn build_final_answer_prompt_with_persisted_context(
         })
         .rev()
         .take(8)
+        .map(|message| {
+            let mut message = message.clone();
+            if sanitize_history {
+                message.content = sanitize_admin_config_history_content(&message.content);
+            }
+            message
+        })
+        .filter(|message| !message.content.trim().is_empty())
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -2044,6 +2056,154 @@ fn build_final_answer_prompt_with_persisted_context(
     prompt.push_str(&request.message);
     prompt.push_str("\n\nAnswer in normal user-visible prose.");
     prompt
+}
+
+fn should_sanitize_admin_config_history(auth: &InternalAuthContext, request: &ChatRequest) -> bool {
+    auth.kind == "admin" && request.tools.iter().any(|tool| tool == "admin-config")
+}
+
+fn sanitize_admin_config_message_for_memory(
+    auth: &InternalAuthContext,
+    request: &ChatRequest,
+    content: &str,
+) -> String {
+    if should_sanitize_admin_config_history(auth, request) {
+        sanitize_admin_config_history_content(content)
+    } else {
+        content.to_string()
+    }
+}
+
+fn sanitize_admin_config_history_content(content: &str) -> String {
+    if !content.contains("\"requests\"") {
+        return content.to_string();
+    }
+
+    let mut output = String::new();
+    let mut rest = content;
+    let mut replaced = false;
+
+    while let Some(start) = rest.find("```") {
+        output.push_str(&rest[..start]);
+        let after_open = &rest[start + 3..];
+        let Some(end) = after_open.find("```") else {
+            output.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+
+        let block = &after_open[..end];
+        let candidate = strip_json_fence_language(block);
+        if let Some(summary) = summarize_admin_change_set_json(candidate) {
+            output.push_str(&summary);
+            replaced = true;
+        } else {
+            output.push_str("```");
+            output.push_str(block);
+            output.push_str("```");
+        }
+        rest = &after_open[end + 3..];
+    }
+    output.push_str(rest);
+
+    let rendered = if replaced {
+        output
+    } else if let Some(summary) = summarize_admin_change_set_json(content.trim()) {
+        summary
+    } else if let Some((start, end, summary)) = summarize_embedded_admin_change_set_json(content) {
+        format!("{}{}{}", &content[..start], summary, &content[end..])
+    } else {
+        content.to_string()
+    };
+
+    rendered
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn strip_json_fence_language(block: &str) -> &str {
+    let trimmed = block.trim_start();
+    let Some(after_json) = trimmed.strip_prefix("json") else {
+        return block.trim();
+    };
+    if after_json
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_whitespace())
+    {
+        after_json.trim()
+    } else {
+        block.trim()
+    }
+}
+
+fn summarize_embedded_admin_change_set_json(content: &str) -> Option<(usize, usize, String)> {
+    let start = content.find('{')?;
+    let end = content.rfind('}')? + 1;
+    if start >= end {
+        return None;
+    }
+    let summary = summarize_admin_change_set_json(&content[start..end])?;
+    Some((start, end, summary))
+}
+
+fn summarize_admin_change_set_json(candidate: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(candidate).ok()?;
+    let object = value.as_object()?;
+    if object.get("version").and_then(Value::as_i64) != Some(1) {
+        return None;
+    }
+    let requests = object.get("requests").and_then(Value::as_array)?;
+    if requests.is_empty() {
+        return None;
+    }
+
+    let summary = object
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .unwrap_or("Admin configuration change set");
+
+    let mut lines = vec![
+        format!(
+            "Admin Change Confirmation summary: {}",
+            truncate_chars(summary, 240)
+        ),
+        format!("Requests proposed: {}", requests.len()),
+    ];
+
+    for request in requests.iter().take(8) {
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|method| !method.is_empty())
+            .unwrap_or("UNKNOWN");
+        let path = request
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .unwrap_or("/admin/config");
+        lines.push(format!("- {} {}", method, path));
+    }
+    if requests.len() > 8 {
+        lines.push(format!(
+            "- ...{} more request(s) omitted",
+            requests.len() - 8
+        ));
+    }
+    lines.push(
+        "Full request bodies were omitted from model context; use the UI Change Confirmation state for review and apply."
+            .to_string(),
+    );
+
+    Some(lines.join("\n"))
 }
 
 fn persisted_conversation_context_from_memory(
@@ -2220,7 +2380,9 @@ async fn chat_stream(
                     if let Err(error) = memory.store_message_with_compaction_check(&memory_user_id, "user", &request.message).await {
                         warn!("failed to persist streamed user message for session {}: {}", session.id, error);
                     }
-                    if let Err(error) = memory.store_message_with_compaction_check(&memory_user_id, "assistant", &answer).await {
+                    let assistant_memory_content =
+                        sanitize_admin_config_message_for_memory(&auth, &request, &answer);
+                    if let Err(error) = memory.store_message_with_compaction_check(&memory_user_id, "assistant", &assistant_memory_content).await {
                         warn!("failed to persist streamed assistant message for session {}: {}", session.id, error);
                     }
                 }
@@ -5388,6 +5550,199 @@ mod tests {
         assert!(prompt.contains("Assistant: persisted assistant turn"));
         assert!(!prompt.contains("stale client-only turn"));
         assert!(prompt.contains("=== USER MESSAGE ===\ncontinue from memory"));
+    }
+
+    #[test]
+    fn admin_config_prompt_history_summarizes_change_set_json() {
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let secret_padding = "sk-live-secret-value".repeat(200);
+        let change_set = json!({
+            "version": 1,
+            "summary": "Update instance theme",
+            "requests": [
+                {
+                    "method": "PUT",
+                    "path": "/admin/settings",
+                    "body": {
+                        "primary_color": "#1E3A8A",
+                        "api_key": secret_padding
+                    }
+                },
+                {
+                    "method": "PUT",
+                    "path": "/admin/deployment/config/LLM_API_KEY",
+                    "body": {
+                        "value": "super-secret-provider-token"
+                    }
+                }
+            ]
+        });
+        let request = ChatRequest {
+            message: "continue reviewing".to_string(),
+            session_id: Some("session-123".to_string()),
+            tools: vec!["admin-config".to_string()],
+            conversation_history: vec![ChatHistoryMessage {
+                role: "assistant".to_string(),
+                content: format!(
+                    "Here is the change.\n\n```json\n{}\n```",
+                    serde_json::to_string_pretty(&change_set).unwrap()
+                ),
+            }],
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+        let prepared = PreparedChatContext {
+            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
+            tools_used: Vec::new(),
+            retrieval_sources: Vec::new(),
+            activity_steps: Vec::new(),
+        };
+
+        let prompt = build_final_answer_prompt_with_persisted_context(
+            &ai_config,
+            &auth,
+            &HashMap::new(),
+            &request,
+            &prepared,
+            None,
+        );
+
+        assert!(prompt.contains("Admin Change Confirmation summary: Update instance theme"));
+        assert!(prompt.contains("Requests proposed: 2"));
+        assert!(prompt.contains("- PUT /admin/settings"));
+        assert!(prompt.contains("- PUT /admin/deployment/config/LLM_API_KEY"));
+        assert!(!prompt.contains("primary_color"));
+        assert!(!prompt.contains("super-secret-provider-token"));
+        assert!(!prompt.contains("sk-live-secret-value"));
+        assert!(!prompt.contains("\"requests\""));
+    }
+
+    #[test]
+    fn admin_config_prompt_sanitizes_persisted_memory_before_client_history() {
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "continue from memory".to_string(),
+            session_id: Some("session-123".to_string()),
+            tools: vec!["admin-config".to_string()],
+            conversation_history: vec![ChatHistoryMessage {
+                role: "user".to_string(),
+                content: "stale client-only turn".to_string(),
+            }],
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+        let persisted = PersistedConversationContext {
+            summary: None,
+            messages: vec![ChatHistoryMessage {
+                role: "assistant".to_string(),
+                content: r#"Proposal follows:
+{"version":1,"summary":"Rotate model key","requests":[{"method":"PUT","path":"/admin/deployment/config/LLM_API_KEY","body":{"value":"secret-key-body"}}]}"#.to_string(),
+            }],
+        };
+        let prepared = PreparedChatContext {
+            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
+            tools_used: Vec::new(),
+            retrieval_sources: Vec::new(),
+            activity_steps: Vec::new(),
+        };
+
+        let prompt = build_final_answer_prompt_with_persisted_context(
+            &ai_config,
+            &auth,
+            &HashMap::new(),
+            &request,
+            &prepared,
+            Some(&persisted),
+        );
+
+        assert!(prompt.contains("Admin Change Confirmation summary: Rotate model key"));
+        assert!(prompt.contains("- PUT /admin/deployment/config/LLM_API_KEY"));
+        assert!(!prompt.contains("secret-key-body"));
+        assert!(!prompt.contains("stale client-only turn"));
+    }
+
+    #[test]
+    fn non_admin_config_prompt_history_keeps_json_unchanged() {
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Help the user.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 2,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: Some("user-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let raw_json = r#"{"version":1,"summary":"Visible JSON","requests":[{"method":"PUT","path":"/admin/settings","body":{"instance_name":"Keep visible"}}]}"#;
+        let request = ChatRequest {
+            message: "what did I send?".to_string(),
+            session_id: Some("session-123".to_string()),
+            tools: Vec::new(),
+            conversation_history: vec![ChatHistoryMessage {
+                role: "assistant".to_string(),
+                content: raw_json.to_string(),
+            }],
+            tool_context: None,
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+        let prepared = PreparedChatContext {
+            context: String::new(),
+            tools_used: Vec::new(),
+            retrieval_sources: Vec::new(),
+            activity_steps: Vec::new(),
+        };
+
+        let prompt = build_final_answer_prompt_with_persisted_context(
+            &ai_config,
+            &auth,
+            &HashMap::new(),
+            &request,
+            &prepared,
+            None,
+        );
+
+        assert!(prompt.contains("\"requests\""));
+        assert!(prompt.contains("Keep visible"));
+        assert!(!prompt.contains("Admin Change Confirmation summary"));
     }
 
     #[test]
