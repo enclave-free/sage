@@ -1478,7 +1478,13 @@ async fn prepare_explicit_chat_context(
         ));
     }
 
-    let admin_config_context = prepare_admin_config_context(state, request, auth);
+    let admin_config_context = async {
+        if client_tool_context_includes_scoped_config(request.tool_context.as_deref()) {
+            Ok(PreparedChatContext::default())
+        } else {
+            prepare_admin_config_context(state, request, auth).await
+        }
+    };
     let document_context = prepare_uploaded_document_context(state, request, auth);
     let web_context =
         prepare_web_search_context(state, request, client_executed_set.contains("web-search"));
@@ -1551,6 +1557,11 @@ async fn prepare_explicit_chat_context(
         retrieval_sources,
         activity_steps,
     })
+}
+
+fn client_tool_context_includes_scoped_config(tool_context: Option<&str>) -> bool {
+    tool_context
+        .is_some_and(|context| context.contains("SCOPED CONFIG CONTEXT"))
 }
 
 async fn prepare_admin_config_context(
@@ -5538,6 +5549,42 @@ mod tests {
             &user_request,
             &user_auth
         ));
+    }
+
+    #[test]
+    fn client_tool_context_includes_scoped_config_marker() {
+        assert!(!client_tool_context_includes_scoped_config(None));
+        assert!(!client_tool_context_includes_scoped_config(Some(
+            "BOUNDED DOCUMENT CONTEXT\nbrand-guide.pdf"
+        )));
+        assert!(client_tool_context_includes_scoped_config(Some(
+            "SCOPED CONFIG CONTEXT\nscope: instance-settings"
+        )));
+    }
+
+    #[test]
+    fn explicit_chat_context_does_not_duplicate_scoped_config_blocks() {
+        let client_context = [
+            "CLIENT TOOL CONTEXT",
+            "SCOPED CONFIG CONTEXT",
+            "scope: instance-settings",
+            "- default_theme: dark",
+        ]
+        .join("\n");
+        let server_context = [
+            "SCOPED CONFIG CONTEXT",
+            "scope: instance-settings",
+            "- default_theme: dark",
+        ]
+        .join("\n");
+
+        let mut context_parts = vec![format!("CLIENT TOOL CONTEXT\n{}", client_context)];
+        if !client_tool_context_includes_scoped_config(Some(&client_context)) {
+            context_parts.push(server_context);
+        }
+
+        let merged = context_parts.join("\n\n");
+        assert_eq!(merged.matches("SCOPED CONFIG CONTEXT").count(), 1);
     }
 
     #[test]
