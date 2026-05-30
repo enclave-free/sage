@@ -648,6 +648,44 @@ struct InternalDocumentSearchResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct InternalResourceSearchRequest {
+    help_type: String,
+    jurisdiction: Option<String>,
+    language: Option<String>,
+    limit: i32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ResourceRecord {
+    resource_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    resource_type: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    contact: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
+    coverage: Option<String>,
+    #[serde(default)]
+    help_types: Vec<String>,
+    #[serde(default)]
+    verified_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InternalResourceSearchResponse {
+    resources: Vec<ResourceRecord>,
+    #[serde(default)]
+    resolved_country_code: Option<String>,
+    #[serde(default)]
+    help_type: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct InternalScopedConfigContextRequest {
     query: String,
     actor: InternalAuthContext,
@@ -932,6 +970,21 @@ impl InternalAgentClient {
         self.send_json(request).await
     }
 
+    async fn resources_search(
+        &self,
+        payload: &InternalResourceSearchRequest,
+    ) -> Result<InternalResourceSearchResponse> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/internal/agent/resources/search",
+                self.backend_url
+            ))
+            .header("X-Internal-Agent-Token", &self.internal_agent_token)
+            .json(payload);
+        self.send_json(request).await
+    }
+
     async fn admin_db_query(&self, sql: &str) -> Result<Value> {
         let request = self
             .http
@@ -1024,6 +1077,12 @@ struct KnowledgeSearchTool {
 }
 
 #[derive(Clone)]
+struct FindResourcesTool {
+    internal: InternalAgentClient,
+    jurisdiction: Option<String>,
+}
+
+#[derive(Clone)]
 struct SearxWebSearchTool {
     http: Client,
     searxng_url: String,
@@ -1091,6 +1150,99 @@ impl Tool for KnowledgeSearchTool {
             output.push_str("Compiled context:\n");
             output.push_str(&response.context);
         }
+
+        Ok(ToolResult::success(output))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for FindResourcesTool {
+    fn name(&self) -> &str {
+        "find_resources"
+    }
+
+    fn description(&self) -> &str {
+        "Look up trusted, vetted real-world resources to connect a person with help: \
+         lawyers, NGOs, UN bodies, clinics, shelters, food, financial aid. Use this when a \
+         conversation escalates from information to action — when someone needs to be put in \
+         touch with a real organization or person who can help. Results are filtered by region \
+         and the type of help needed and ranked from most-local to global."
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{"help_type":"required: one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es"}"#
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
+        let help_type = args
+            .get("help_type")
+            .cloned()
+            .ok_or_else(|| anyhow!("find_resources requires help_type"))?;
+        let region = args
+            .get("region")
+            .cloned()
+            .or_else(|| self.jurisdiction.clone());
+        let language = args.get("language").cloned();
+
+        let response = self
+            .internal
+            .resources_search(&InternalResourceSearchRequest {
+                help_type: help_type.clone(),
+                jurisdiction: region.clone(),
+                language,
+                limit: 5,
+            })
+            .await?;
+
+        if response.resources.is_empty() {
+            let where_label = region.as_deref().unwrap_or("the requested region");
+            return Ok(ToolResult::success(format!(
+                "No vetted {} resources are currently listed for {}. Do not invent referrals; \
+                 offer general guidance instead and suggest the person seek a trusted local contact.",
+                help_type, where_label
+            )));
+        }
+
+        let mut output = format!("Trusted {} resources (most local first):\n\n", help_type);
+        for (idx, r) in response.resources.iter().enumerate() {
+            let name = r.name.clone().unwrap_or_else(|| r.resource_id.clone());
+            let rtype = r.resource_type.clone().unwrap_or_default();
+            let coverage = r.coverage.clone().unwrap_or_default();
+            output.push_str(&format!("{}. {}", idx + 1, name));
+            if !rtype.is_empty() {
+                output.push_str(&format!(" ({})", rtype));
+            }
+            if !coverage.is_empty() {
+                output.push_str(&format!(" — covers {}", coverage));
+            }
+            if r.verified_at.is_some() {
+                output.push_str(" [verified]");
+            }
+            output.push('\n');
+            if let Some(desc) = &r.description {
+                if !desc.trim().is_empty() {
+                    output.push_str(&format!("   {}\n", desc.trim()));
+                }
+            }
+            if !r.help_types.is_empty() {
+                output.push_str(&format!("   Helps with: {}\n", r.help_types.join(", ")));
+            }
+            if !r.languages.is_empty() {
+                output.push_str(&format!("   Languages: {}\n", r.languages.join(", ")));
+            }
+            for key in ["phone", "email", "url", "secure_channel", "address"] {
+                if let Some(value) = r.contact.get(key) {
+                    if !value.trim().is_empty() {
+                        output.push_str(&format!("   {}: {}\n", key, value));
+                    }
+                }
+            }
+            output.push('\n');
+        }
+        output.push_str(
+            "Relay these to the person plainly. Only share what is listed here — never invent \
+             contact details. Encourage them to verify before acting where possible.",
+        );
 
         Ok(ToolResult::success(output))
     }
@@ -2464,6 +2616,11 @@ async fn query(
         jurisdiction: request.jurisdiction.clone(),
         situation_details: request.situation_details.clone(),
         sources: source_sink.clone(),
+    }));
+
+    registry.register(Arc::new(FindResourcesTool {
+        internal: state.internal.clone(),
+        jurisdiction: request.jurisdiction.clone(),
     }));
 
     if request.tools.iter().any(|tool| tool == "web-search") {
