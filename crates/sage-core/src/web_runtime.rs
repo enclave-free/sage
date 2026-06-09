@@ -1193,17 +1193,26 @@ impl Tool for FindResourcesTool {
                 limit: 5,
             })
             .await?;
+        let response_help_type = fallback_text(&response.help_type, &help_type);
+        let response_region = response
+            .resolved_country_code
+            .as_deref()
+            .or(region.as_deref());
 
         if response.resources.is_empty() {
-            let where_label = region.as_deref().unwrap_or("the requested region");
+            let where_label = response_region.unwrap_or("the requested region");
             return Ok(ToolResult::success(format!(
                 "No vetted {} resources are currently listed for {}. Do not invent referrals; \
                  offer general guidance instead and suggest the person seek a trusted local contact.",
-                help_type, where_label
+                response_help_type, where_label
             )));
         }
 
-        let mut output = format!("Trusted {} resources (most local first):\n\n", help_type);
+        let mut output = format!("Trusted {} resources", response_help_type);
+        if let Some(region) = response_region {
+            output.push_str(&format!(" for {}", region));
+        }
+        output.push_str(" (most local first):\n\n");
         for (idx, r) in response.resources.iter().enumerate() {
             let name = r.name.clone().unwrap_or_else(|| r.resource_id.clone());
             let rtype = r.resource_type.clone().unwrap_or_default();
@@ -2803,7 +2812,7 @@ async fn list_query_sessions(
 
     let mut conversations = Vec::with_capacity(sessions.len());
     for session in sessions {
-        let message_count = count_session_messages_with_conn(&mut *conn, session.agent_id)?;
+        let message_count = count_session_messages_with_conn(&mut conn, session.agent_id)?;
         conversations.push(conversation_history_summary_response(
             session,
             message_count,
@@ -3282,7 +3291,7 @@ fn count_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<i64>
         .db
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
-    count_session_messages_with_conn(&mut *conn, agent_id)
+    count_session_messages_with_conn(&mut conn, agent_id)
 }
 
 fn count_session_messages_with_conn(conn: &mut PgConnection, agent_id: Uuid) -> AppResult<i64> {
@@ -3999,11 +4008,7 @@ fn validate_ai_config_value(
 
 fn validate_trace_visibility_value(key: &str, value: &str) -> AppResult<()> {
     let normalized = value.trim().to_ascii_lowercase();
-    let allowed: &[&str] = if key == "user_trace_visibility" {
-        &["off", "minimal", "summary", "detailed"]
-    } else {
-        &["off", "minimal", "summary", "detailed"]
-    };
+    let allowed: &[&str] = &["off", "minimal", "summary", "detailed"];
 
     if allowed
         .iter()
@@ -4208,7 +4213,7 @@ async fn resolve_public_actor(
                 kind: "user".to_string(),
                 approved: user.approved,
                 pubkey: None,
-                email: user.email.or_else(|| Some(payload.email)),
+                email: user.email.or(Some(payload.email)),
                 name: user.name,
                 user_type_id: user.user_type_id,
                 dev_mode: user.dev_mode,
@@ -4890,7 +4895,7 @@ fn conversation_activity_steps_from_tool_traces(
 ) -> Vec<ConversationActivityStepResponse> {
     tools
         .iter()
-        .map(|tool| conversation_activity_step_from_tool_trace(tool))
+        .map(conversation_activity_step_from_tool_trace)
         .collect()
 }
 
@@ -5244,6 +5249,105 @@ mod tests {
         assert_eq!(summary["results"][0]["target_kind"], "session_memory");
         assert_eq!(summary["results"][0]["action"], "delete_messages");
         assert_eq!(summary["results"][0]["status"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn find_resources_tool_posts_internal_request_and_formats_results() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/resources/search",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) = seen_tx
+                            .lock()
+                            .expect("request recorder should lock")
+                            .take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "resources": [
+                                {
+                                    "resource_id": "mx-legal-aid",
+                                    "name": "Mexico Legal Aid Network",
+                                    "resource_type": "ngo",
+                                    "description": "Connects people with pro bono immigration and asylum counsel.",
+                                    "contact": {
+                                        "phone": "+52-555-0100",
+                                        "url": "https://legal.example.test",
+                                        "secure_channel": "Signal: +52-555-0100"
+                                    },
+                                    "languages": ["es", "en"],
+                                    "coverage": "Mexico",
+                                    "help_types": ["legal", "humanitarian"],
+                                    "verified_at": "2026-05-30T20:00:00Z"
+                                }
+                            ],
+                            "resolved_country_code": "MX",
+                            "help_type": "legal"
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+
+        let tool = FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::builder().build().expect("http client should build"),
+                format!("http://{}", addr),
+                "test-token".to_string(),
+            ),
+            jurisdiction: Some("Mexico".to_string()),
+        };
+        let args = HashMap::from([
+            ("help_type".to_string(), "legal".to_string()),
+            ("language".to_string(), "es".to_string()),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("resource lookup should succeed");
+        server.abort();
+
+        assert!(result.success);
+        assert!(result.output.contains("Trusted legal resources for MX"));
+        assert!(result.output.contains("Mexico Legal Aid Network (ngo)"));
+        assert!(result.output.contains("covers Mexico [verified]"));
+        assert!(result.output.contains("Languages: es, en"));
+        assert!(result.output.contains("phone: +52-555-0100"));
+        assert!(result
+            .output
+            .contains("secure_channel: Signal: +52-555-0100"));
+        assert!(result.output.contains("never invent contact details"));
+
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record the resource request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["help_type"], "legal");
+        assert_eq!(payload["jurisdiction"], "Mexico");
+        assert_eq!(payload["language"], "es");
+        assert_eq!(payload["limit"], 5);
     }
 
     #[test]
