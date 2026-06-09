@@ -56,33 +56,6 @@ fn is_user_allowed(user_id: &str, allowed_users: &[String]) -> bool {
     allowed_users.iter().any(|u| u == user_id)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_user_allowed;
-
-    #[test]
-    fn empty_allowed_users_denies_access() {
-        let allowed_users: Vec<String> = vec![];
-
-        assert!(!is_user_allowed("alice", &allowed_users));
-    }
-
-    #[test]
-    fn wildcard_allowed_users_allows_access() {
-        let allowed_users = vec!["*".to_string()];
-
-        assert!(is_user_allowed("alice", &allowed_users));
-    }
-
-    #[test]
-    fn explicit_allowed_users_match_allows_access() {
-        let allowed_users = vec!["alice".to_string()];
-
-        assert!(is_user_allowed("alice", &allowed_users));
-        assert!(!is_user_allowed("bob", &allowed_users));
-    }
-}
-
 async fn validate_tinfoil_backend(config: &Config, api_key: &str) -> Result<()> {
     let client = reqwest::Client::new();
 
@@ -668,4 +641,31 @@ async fn main() -> Result<()> {
     info!("🌿 Sage has shut down.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_user_allowed;
+
+    #[test]
+    fn empty_allowed_users_denies_access() {
+        let allowed_users: Vec<String> = vec![];
+
+        assert!(!is_user_allowed("alice", &allowed_users));
+    }
+
+    #[test]
+    fn wildcard_allowed_users_allows_access() {
+        let allowed_users = vec!["*".to_string()];
+
+        assert!(is_user_allowed("alice", &allowed_users));
+    }
+
+    #[test]
+    fn explicit_allowed_users_match_allows_access() {
+        let allowed_users = vec!["alice".to_string()];
+
+        assert!(is_user_allowed("alice", &allowed_users));
+        assert!(!is_user_allowed("bob", &allowed_users));
+    }
 }

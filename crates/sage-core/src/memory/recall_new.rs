@@ -245,7 +245,7 @@ impl RecallManager {
             .collect();
 
         // Sort by recency
-        results.sort_by(|a, b| b.message.sequence_id.cmp(&a.message.sequence_id));
+        results.sort_by_key(|result| std::cmp::Reverse(result.message.sequence_id));
         results.truncate(limit);
 
         Ok(results)

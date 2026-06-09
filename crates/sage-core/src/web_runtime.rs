@@ -648,6 +648,44 @@ struct InternalDocumentSearchResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct InternalResourceSearchRequest {
+    help_type: String,
+    jurisdiction: Option<String>,
+    language: Option<String>,
+    limit: i32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ResourceRecord {
+    resource_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    resource_type: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    contact: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
+    coverage: Option<String>,
+    #[serde(default)]
+    help_types: Vec<String>,
+    #[serde(default)]
+    verified_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InternalResourceSearchResponse {
+    resources: Vec<ResourceRecord>,
+    #[serde(default)]
+    resolved_country_code: Option<String>,
+    #[serde(default)]
+    help_type: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct InternalScopedConfigContextRequest {
     query: String,
     actor: InternalAuthContext,
@@ -932,6 +970,21 @@ impl InternalAgentClient {
         self.send_json(request).await
     }
 
+    async fn resources_search(
+        &self,
+        payload: &InternalResourceSearchRequest,
+    ) -> Result<InternalResourceSearchResponse> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/internal/agent/resources/search",
+                self.backend_url
+            ))
+            .header("X-Internal-Agent-Token", &self.internal_agent_token)
+            .json(payload);
+        self.send_json(request).await
+    }
+
     async fn admin_db_query(&self, sql: &str) -> Result<Value> {
         let request = self
             .http
@@ -1024,6 +1077,12 @@ struct KnowledgeSearchTool {
 }
 
 #[derive(Clone)]
+struct FindResourcesTool {
+    internal: InternalAgentClient,
+    jurisdiction: Option<String>,
+}
+
+#[derive(Clone)]
 struct SearxWebSearchTool {
     http: Client,
     searxng_url: String,
@@ -1091,6 +1150,108 @@ impl Tool for KnowledgeSearchTool {
             output.push_str("Compiled context:\n");
             output.push_str(&response.context);
         }
+
+        Ok(ToolResult::success(output))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for FindResourcesTool {
+    fn name(&self) -> &str {
+        "find_resources"
+    }
+
+    fn description(&self) -> &str {
+        "Look up trusted, vetted real-world resources to connect a person with help: \
+         lawyers, NGOs, UN bodies, clinics, shelters, food, financial aid. Use this when a \
+         conversation escalates from information to action — when someone needs to be put in \
+         touch with a real organization or person who can help. Results are filtered by region \
+         and the type of help needed and ranked from most-local to global."
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{"help_type":"required: one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es"}"#
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
+        let help_type = args
+            .get("help_type")
+            .cloned()
+            .ok_or_else(|| anyhow!("find_resources requires help_type"))?;
+        let region = args
+            .get("region")
+            .cloned()
+            .or_else(|| self.jurisdiction.clone());
+        let language = args.get("language").cloned();
+
+        let response = self
+            .internal
+            .resources_search(&InternalResourceSearchRequest {
+                help_type: help_type.clone(),
+                jurisdiction: region.clone(),
+                language,
+                limit: 5,
+            })
+            .await?;
+        let response_help_type = fallback_text(&response.help_type, &help_type);
+        let response_region = response
+            .resolved_country_code
+            .as_deref()
+            .or(region.as_deref());
+
+        if response.resources.is_empty() {
+            let where_label = response_region.unwrap_or("the requested region");
+            return Ok(ToolResult::success(format!(
+                "No vetted {} resources are currently listed for {}. Do not invent referrals; \
+                 offer general guidance instead and suggest the person seek a trusted local contact.",
+                response_help_type, where_label
+            )));
+        }
+
+        let mut output = format!("Trusted {} resources", response_help_type);
+        if let Some(region) = response_region {
+            output.push_str(&format!(" for {}", region));
+        }
+        output.push_str(" (most local first):\n\n");
+        for (idx, r) in response.resources.iter().enumerate() {
+            let name = r.name.clone().unwrap_or_else(|| r.resource_id.clone());
+            let rtype = r.resource_type.clone().unwrap_or_default();
+            let coverage = r.coverage.clone().unwrap_or_default();
+            output.push_str(&format!("{}. {}", idx + 1, name));
+            if !rtype.is_empty() {
+                output.push_str(&format!(" ({})", rtype));
+            }
+            if !coverage.is_empty() {
+                output.push_str(&format!(" — covers {}", coverage));
+            }
+            if r.verified_at.is_some() {
+                output.push_str(" [verified]");
+            }
+            output.push('\n');
+            if let Some(desc) = &r.description {
+                if !desc.trim().is_empty() {
+                    output.push_str(&format!("   {}\n", desc.trim()));
+                }
+            }
+            if !r.help_types.is_empty() {
+                output.push_str(&format!("   Helps with: {}\n", r.help_types.join(", ")));
+            }
+            if !r.languages.is_empty() {
+                output.push_str(&format!("   Languages: {}\n", r.languages.join(", ")));
+            }
+            for key in ["phone", "email", "url", "secure_channel", "address"] {
+                if let Some(value) = r.contact.get(key) {
+                    if !value.trim().is_empty() {
+                        output.push_str(&format!("   {}: {}\n", key, value));
+                    }
+                }
+            }
+            output.push('\n');
+        }
+        output.push_str(
+            "Relay these to the person plainly. Only share what is listed here — never invent \
+             contact details. Encourage them to verify before acting where possible.",
+        );
 
         Ok(ToolResult::success(output))
     }
@@ -2466,6 +2627,11 @@ async fn query(
         sources: source_sink.clone(),
     }));
 
+    registry.register(Arc::new(FindResourcesTool {
+        internal: state.internal.clone(),
+        jurisdiction: request.jurisdiction.clone(),
+    }));
+
     if request.tools.iter().any(|tool| tool == "web-search") {
         registry.register(Arc::new(SearxWebSearchTool {
             http: state.http.clone(),
@@ -2646,7 +2812,7 @@ async fn list_query_sessions(
 
     let mut conversations = Vec::with_capacity(sessions.len());
     for session in sessions {
-        let message_count = count_session_messages_with_conn(&mut *conn, session.agent_id)?;
+        let message_count = count_session_messages_with_conn(&mut conn, session.agent_id)?;
         conversations.push(conversation_history_summary_response(
             session,
             message_count,
@@ -3125,7 +3291,7 @@ fn count_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<i64>
         .db
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
-    count_session_messages_with_conn(&mut *conn, agent_id)
+    count_session_messages_with_conn(&mut conn, agent_id)
 }
 
 fn count_session_messages_with_conn(conn: &mut PgConnection, agent_id: Uuid) -> AppResult<i64> {
@@ -3842,11 +4008,7 @@ fn validate_ai_config_value(
 
 fn validate_trace_visibility_value(key: &str, value: &str) -> AppResult<()> {
     let normalized = value.trim().to_ascii_lowercase();
-    let allowed: &[&str] = if key == "user_trace_visibility" {
-        &["off", "minimal", "summary", "detailed"]
-    } else {
-        &["off", "minimal", "summary", "detailed"]
-    };
+    let allowed: &[&str] = &["off", "minimal", "summary", "detailed"];
 
     if allowed
         .iter()
@@ -4051,7 +4213,7 @@ async fn resolve_public_actor(
                 kind: "user".to_string(),
                 approved: user.approved,
                 pubkey: None,
-                email: user.email.or_else(|| Some(payload.email)),
+                email: user.email.or(Some(payload.email)),
                 name: user.name,
                 user_type_id: user.user_type_id,
                 dev_mode: user.dev_mode,
@@ -4733,7 +4895,7 @@ fn conversation_activity_steps_from_tool_traces(
 ) -> Vec<ConversationActivityStepResponse> {
     tools
         .iter()
-        .map(|tool| conversation_activity_step_from_tool_trace(tool))
+        .map(conversation_activity_step_from_tool_trace)
         .collect()
 }
 
@@ -5087,6 +5249,105 @@ mod tests {
         assert_eq!(summary["results"][0]["target_kind"], "session_memory");
         assert_eq!(summary["results"][0]["action"], "delete_messages");
         assert_eq!(summary["results"][0]["status"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn find_resources_tool_posts_internal_request_and_formats_results() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/resources/search",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) = seen_tx
+                            .lock()
+                            .expect("request recorder should lock")
+                            .take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "resources": [
+                                {
+                                    "resource_id": "mx-legal-aid",
+                                    "name": "Mexico Legal Aid Network",
+                                    "resource_type": "ngo",
+                                    "description": "Connects people with pro bono immigration and asylum counsel.",
+                                    "contact": {
+                                        "phone": "+52-555-0100",
+                                        "url": "https://legal.example.test",
+                                        "secure_channel": "Signal: +52-555-0100"
+                                    },
+                                    "languages": ["es", "en"],
+                                    "coverage": "Mexico",
+                                    "help_types": ["legal", "humanitarian"],
+                                    "verified_at": "2026-05-30T20:00:00Z"
+                                }
+                            ],
+                            "resolved_country_code": "MX",
+                            "help_type": "legal"
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+
+        let tool = FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::builder().build().expect("http client should build"),
+                format!("http://{}", addr),
+                "test-token".to_string(),
+            ),
+            jurisdiction: Some("Mexico".to_string()),
+        };
+        let args = HashMap::from([
+            ("help_type".to_string(), "legal".to_string()),
+            ("language".to_string(), "es".to_string()),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("resource lookup should succeed");
+        server.abort();
+
+        assert!(result.success);
+        assert!(result.output.contains("Trusted legal resources for MX"));
+        assert!(result.output.contains("Mexico Legal Aid Network (ngo)"));
+        assert!(result.output.contains("covers Mexico [verified]"));
+        assert!(result.output.contains("Languages: es, en"));
+        assert!(result.output.contains("phone: +52-555-0100"));
+        assert!(result
+            .output
+            .contains("secure_channel: Signal: +52-555-0100"));
+        assert!(result.output.contains("never invent contact details"));
+
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record the resource request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["help_type"], "legal");
+        assert_eq!(payload["jurisdiction"], "Mexico");
+        assert_eq!(payload["language"], "es");
+        assert_eq!(payload["limit"], 5);
     }
 
     #[test]
