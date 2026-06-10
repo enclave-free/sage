@@ -4158,7 +4158,9 @@ async fn resolve_public_actor(
             .cloned()
     });
     if let Some(token) = admin_token {
-        if let Some(payload) = verify_admin_session_token(&state.web_config.secret_key, &token) {
+        if let Some(payload) =
+            verify_admin_session_token_for_public_actor(&state.web_config.secret_key, &token)
+        {
             let admin = state
                 .internal
                 .admin_record(&payload.pubkey)
@@ -4295,6 +4297,21 @@ fn verify_user_session_token(secret_key: &str, token: &str) -> Option<UserSessio
 }
 
 fn verify_admin_session_token(secret_key: &str, token: &str) -> Option<AdminSessionTokenPayload> {
+    verify_admin_session_token_with_logging(secret_key, token, true)
+}
+
+fn verify_admin_session_token_for_public_actor(
+    secret_key: &str,
+    token: &str,
+) -> Option<AdminSessionTokenPayload> {
+    verify_admin_session_token_with_logging(secret_key, token, false)
+}
+
+fn verify_admin_session_token_with_logging(
+    secret_key: &str,
+    token: &str,
+    log_failures: bool,
+) -> Option<AdminSessionTokenPayload> {
     let serializer = timed_serializer_with_signer(
         default_builder(secret_key.to_string())
             .with_salt(ADMIN_SESSION_SALT)
@@ -4305,7 +4322,9 @@ fn verify_admin_session_token(secret_key: &str, token: &str) -> Option<AdminSess
     let payload = match serializer.unsign::<AdminSessionTokenPayload>(token) {
         Ok(payload) => payload,
         Err(error) => {
-            warn!("admin token unsign failed: {}", error);
+            if log_failures {
+                warn!("admin token unsign failed: {}", error);
+            }
             return None;
         }
     };
@@ -4313,12 +4332,16 @@ fn verify_admin_session_token(secret_key: &str, token: &str) -> Option<AdminSess
         match payload.value_if_not_expired(Duration::from_secs(ADMIN_SESSION_MAX_AGE_SECS)) {
             Ok(payload) => payload,
             Err(error) => {
-                warn!("admin token expired or invalid timestamp: {}", error);
+                if log_failures {
+                    warn!("admin token expired or invalid timestamp: {}", error);
+                }
                 return None;
             }
         };
     if payload.r#type != "admin" {
-        warn!("admin token type mismatch: {:?}", payload.r#type);
+        if log_failures {
+            warn!("admin token type mismatch: {:?}", payload.r#type);
+        }
         return None;
     }
     Some(payload)
@@ -5229,6 +5252,26 @@ mod tests {
 
         assert_eq!(payload.r#type, "admin");
         assert_eq!(payload.session_nonce, 7);
+    }
+
+    #[test]
+    fn public_admin_probe_rejects_user_tokens_without_requiring_admin_shape() {
+        let serializer = timed_serializer_with_signer(
+            default_builder("test-secret".to_string())
+                .with_salt(USER_SESSION_SALT)
+                .build()
+                .into_timestamp_signer(),
+            PythonURLSafeEncoding,
+        );
+        let token = serializer
+            .sign(&json!({
+                "user_id": 42,
+                "email": "reader@example.test"
+            }))
+            .expect("user token should serialize");
+
+        assert!(verify_admin_session_token_for_public_actor("test-secret", &token).is_none());
+        assert!(verify_user_session_token("test-secret", &token).is_some());
     }
 
     #[test]
