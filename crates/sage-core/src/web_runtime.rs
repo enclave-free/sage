@@ -1668,17 +1668,7 @@ impl<'a> ConversationToolTurn<'a> {
             context_parts.push(format!("CLIENT TOOL CONTEXT\n{}", tool_context));
         }
 
-        let client_executed_tools = if request.tool_context.is_some() {
-            request.client_executed_tools.clone().unwrap_or_else(|| {
-                if request.tools.iter().any(|tool| tool == "db-query") {
-                    vec!["db-query".to_string()]
-                } else {
-                    Vec::new()
-                }
-            })
-        } else {
-            Vec::new()
-        };
+        let client_executed_tools = request.client_executed_tools.clone().unwrap_or_default();
         let client_executed_set: HashSet<String> = client_executed_tools.iter().cloned().collect();
         for tool_id in client_executed_tools {
             if is_public_agent_runtime_tool_id(&tool_id)
@@ -1690,6 +1680,7 @@ impl<'a> ConversationToolTurn<'a> {
 
         if auth.kind == "admin"
             && request.tools.iter().any(|tool| tool == "admin-config")
+            && client_executed_set.contains("admin-config")
             && client_tool_context_includes_scoped_config(request.tool_context.as_deref())
         {
             tools_used.push(tool_call_info_for_id(
@@ -1699,7 +1690,9 @@ impl<'a> ConversationToolTurn<'a> {
         }
 
         let admin_config_context = async {
-            if client_tool_context_includes_scoped_config(request.tool_context.as_deref()) {
+            if client_executed_set.contains("admin-config")
+                && client_tool_context_includes_scoped_config(request.tool_context.as_deref())
+            {
                 Ok(PreparedChatContext::default())
             } else {
                 prepare_admin_config_context(internal, request, auth).await
@@ -6431,29 +6424,187 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn explicit_chat_context_does_not_duplicate_scoped_config_blocks() {
-        let client_context = [
-            "CLIENT TOOL CONTEXT",
-            "SCOPED CONFIG CONTEXT",
-            "scope: instance-settings",
-            "- default_theme: dark",
-        ]
-        .join("\n");
-        let server_context = [
-            "SCOPED CONFIG CONTEXT",
-            "scope: instance-settings",
-            "- default_theme: dark",
-        ]
-        .join("\n");
+    #[tokio::test]
+    async fn scoped_client_context_does_not_suppress_server_admin_config_without_client_executed_marker(
+    ) {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/scoped-config-context",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) = seen_tx
+                            .lock()
+                            .expect("request recorder should lock")
+                            .take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "version": 1,
+                            "primary_scope": "deployment-settings",
+                            "included_scopes": ["deployment-settings"],
+                            "context_text": "SCOPED CONFIG CONTEXT\nscope: deployment-settings\nLLM_MODEL = kimi-k2-6",
+                            "warnings": [],
+                            "generated_at": "2026-05-25T12:00:00+00:00",
+                            "secret_policy": { "mode": "masked" }
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let http = Client::builder().build().expect("http client should build");
+        let internal = InternalAgentClient::new(
+            http.clone(),
+            format!("http://{}", addr),
+            "test-token".to_string(),
+        );
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "What is LLM_MODEL?".to_string(),
+            session_id: None,
+            tools: vec!["admin-config".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: Some(
+                "SCOPED CONFIG CONTEXT\nscope: onboarding\nONBOARDING MODE".to_string(),
+            ),
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
 
-        let mut context_parts = vec![format!("CLIENT TOOL CONTEXT\n{}", client_context)];
-        if !client_tool_context_includes_scoped_config(Some(&client_context)) {
-            context_parts.push(server_context);
-        }
+        let prepared = ConversationToolTurn::new(&internal, &http, &request, &auth)
+            .prepare()
+            .await
+            .expect("server admin config should still run");
+        server.abort();
 
-        let merged = context_parts.join("\n\n");
-        assert_eq!(merged.matches("SCOPED CONFIG CONTEXT").count(), 1);
+        assert!(prepared.context.contains("CLIENT TOOL CONTEXT"));
+        assert!(prepared.context.contains("scope: onboarding"));
+        assert!(prepared.context.contains("scope: deployment-settings"));
+        assert!(prepared.context.contains("LLM_MODEL = kimi-k2-6"));
+        assert_eq!(prepared.tools_used.len(), 1);
+        assert_eq!(prepared.tools_used[0].tool_id, "admin-config");
+
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record scoped config request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["query"], "What is LLM_MODEL?");
+        assert_eq!(payload["mode"], "auto");
+    }
+
+    #[tokio::test]
+    async fn client_tool_context_does_not_mark_database_query_as_executed_without_client_marker() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/admin-db-query",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) =
+                            seen_tx.lock().expect("request recorder should lock").take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "columns": ["email"],
+                            "rows": [{ "email": "admin@example.test" }]
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let http = Client::builder().build().expect("http client should build");
+        let internal = InternalAgentClient::new(
+            http.clone(),
+            format!("http://{}", addr),
+            "test-token".to_string(),
+        );
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "SELECT email FROM users LIMIT 1".to_string(),
+            session_id: None,
+            tools: vec!["db-query".to_string()],
+            conversation_history: Vec::new(),
+            tool_context: Some(
+                "SCOPED CONFIG CONTEXT\nscope: onboarding\nONBOARDING MODE".to_string(),
+            ),
+            client_executed_tools: None,
+            conversation_channel: None,
+        };
+
+        let prepared = ConversationToolTurn::new(&internal, &http, &request, &auth)
+            .prepare()
+            .await
+            .expect("server database query should still run");
+        server.abort();
+
+        assert!(prepared.context.contains("CLIENT TOOL CONTEXT"));
+        assert!(prepared.context.contains("scope: onboarding"));
+        assert!(prepared.context.contains("DATABASE CONTEXT"));
+        assert!(prepared.context.contains("admin@example.test"));
+        assert_eq!(prepared.tools_used.len(), 1);
+        assert_eq!(prepared.tools_used[0].tool_id, "db-query");
+
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record database query request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["sql"], "SELECT email FROM users LIMIT 1");
     }
 
     #[tokio::test]
