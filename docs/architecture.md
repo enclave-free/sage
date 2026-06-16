@@ -1,6 +1,7 @@
 # Sage Architecture For The Enclave Web Runtime Branch
 
-This document describes the active `enclave_web` architecture used by `enclave.free-prototype` on `enclave-web-native-auth`.
+This document describes the active `enclave_web` architecture used by the current
+`enclave.free-prototype` staging snapshot.
 
 It does not describe the older Signal-first or Letta-era design notes elsewhere in this repo.
 
@@ -48,7 +49,8 @@ This file contains the branch-specific integration layer:
 - `InternalAgentClient`
 - session ownership checks
 - AI config CRUD and prompt preview
-- tool registration for `/llm/chat` and `/query`
+- current prepared-tool context logic plus the ADR-0023 target Tool Set expansion
+  and model-driven Tool loop execution for Conversation routes
 - prompt assembly helpers
 
 ## Public Routes
@@ -56,8 +58,8 @@ This file contains the branch-specific integration layer:
 | Route | Ownership | Notes |
 | --- | --- | --- |
 | `GET /health` | Sage service health | direct Sage runtime health, usually consumed internally |
-| `POST /llm/chat` | Sage | stateless; optional server-side tools |
-| `POST /query` | Sage | retrieval-first; stateful; memory-backed |
+| `POST /llm/chat` | Sage | Conversation transport with model-driven Tool loop |
+| `POST /query` | Sage | stateful Conversation API compatibility shape |
 | `GET /query/session/{session_id}` | Sage | session inspection |
 | `DELETE /query/session/{session_id}` | Sage | deletes session record |
 | `GET /session-defaults` | Sage | local AI defaults plus Python document defaults |
@@ -78,6 +80,10 @@ Active calls:
 - `POST /internal/agent/document-search`
 - `POST /internal/agent/admin-db-query`
 
+ADR-0023 target calls:
+
+- `POST /internal/agent/admin-config/*`
+
 Compatibility endpoints may still exist in Python, but they are no longer part of the primary Sage call graph:
 
 - `POST /internal/agent/auth-context`
@@ -86,51 +92,46 @@ Compatibility endpoints may still exist in Python, but they are no longer part o
 
 This is the real integration boundary. If request or response shapes change, both repos must change together.
 
-## `/llm/chat` Flow
+## Conversation Flow Target
 
-`/llm/chat` is the stateless route.
+Sage owns the model-driven Tool loop for Conversation routes.
 
 1. enforce CSRF for cookie-authenticated unsafe requests
 2. verify auth natively in Sage
 3. hydrate user/admin identity from Python if needed
 4. load effective AI config and request temperature from Sage Postgres
-5. register route-appropriate tools
-6. create `SageAgent::new_without_memory(...)`
-7. run the agent loop against Tinfoil
-8. return the assistant message plus `tools_used`
+5. expand enabled Tool Sets into concrete Tool contracts
+6. run the model-driven Tool loop against the configured Model Provider
+7. execute authorized Tool calls, inject results, and continue until answer or Executable Change Set
+8. return the assistant message plus Activity/Trace metadata and Tool summaries
 
-Registered tools on this route:
+Tool Sets:
 
-- `web_search` when `web-search` is selected
-- `db_query` when `db-query` is selected by an admin
-- `done`
+- `knowledge-search` exposes `knowledge_search` with Document Access and selected Document constraints
+- `web-search` exposes `web_search`
+- `admin-config` exposes admin-only configuration read/proposal Tools
+- `db-query` exposes admin-only read-only database inspection Tools
+- `done` or the equivalent final-answer signal completes the loop
 
-`tool_context` is admin-only and is intended for trusted client-side context injection such as decrypted DB output or admin config snapshots.
+The frontend should not pre-run Tools or inject admin configuration snapshots through `tool_context`.
 
-## `/query` Flow
+## Stateful Conversation Compatibility
 
-`/query` is the stateful route.
+`/query` remains a stateful public API shape while the product converges on one Conversation runtime.
 
 1. enforce CSRF
 2. verify auth natively in Sage
 3. hydrate user/admin identity from Python if needed
 4. load effective AI config from Sage Postgres
 5. load or create a `web_session`
-6. fetch document access and initial document context through Python
+6. load available Document metadata and Tool constraints as needed
 7. create/update memory blocks:
    - persona block from compiled Enclave prompt profile
    - human block from auth + profile context
 8. persist the user turn
-9. run the agent with optional memory enabled
+9. run the same model-driven Tool loop with memory enabled
 10. persist the assistant turn
 11. return `session_id`, `sources`, `context_used`, and answer
-
-Registered tools on this route:
-
-- `knowledge_search` always
-- `web_search` when selected
-- `db_query` when selected by an admin
-- `done`
 
 This route uses the shared Sage memory system plus Enclave-specific `web_sessions`.
 
@@ -168,7 +169,7 @@ The web runtime depends on shared agent-core changes that let the same engine su
 - no-memory mode
 - configurable per-request temperature
 
-Without those changes, Sage could not cleanly support stateless `/llm/chat` and stateful `/query` in one runtime.
+Without those changes, Sage could not cleanly support stateless and stateful Conversation API shapes in one runtime.
 
 ## Temporary Architecture Choices
 

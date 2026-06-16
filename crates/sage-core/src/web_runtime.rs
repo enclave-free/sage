@@ -358,8 +358,8 @@ pub struct ChatRequest {
     pub tools: Vec<String>,
     #[serde(default)]
     pub conversation_history: Vec<ChatHistoryMessage>,
-    pub tool_context: Option<String>,
-    pub client_executed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub job_ids: Option<Vec<String>>,
     #[serde(default)]
     pub conversation_channel: Option<ConversationChannelRequest>,
 }
@@ -690,27 +690,22 @@ struct InternalResourceSearchResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct InternalScopedConfigContextRequest {
-    query: String,
+struct InternalAdminConfigToolRequest {
     actor: InternalAuthContext,
-    mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_scopes: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-struct InternalScopedConfigContextResponse {
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct InternalAdminConfigToolResponse {
     version: i32,
-    primary_scope: String,
-    included_scopes: Vec<String>,
-    context_text: String,
+    tool: String,
+    data: Value,
     warnings: Vec<String>,
     generated_at: String,
     secret_policy: Value,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ScopedConfigContextError {
+enum AdminConfigToolError {
     Unauthorized,
     Failed(String),
 }
@@ -1001,34 +996,36 @@ impl InternalAgentClient {
         self.send_value(request).await
     }
 
-    async fn scoped_config_context(
+    async fn admin_config_deployment_readiness(
         &self,
-        payload: &InternalScopedConfigContextRequest,
-    ) -> std::result::Result<InternalScopedConfigContextResponse, ScopedConfigContextError> {
+        actor: &InternalAuthContext,
+    ) -> std::result::Result<InternalAdminConfigToolResponse, AdminConfigToolError> {
         let request = self
             .http
             .post(format!(
-                "{}/internal/agent/scoped-config-context",
+                "{}/internal/agent/admin-config/deployment-readiness",
                 self.backend_url
             ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
-            .json(payload);
+            .json(&InternalAdminConfigToolRequest {
+                actor: actor.clone(),
+            });
         let (status, value) = self
             .send_value_with_status(request)
             .await
-            .map_err(|error| ScopedConfigContextError::Failed(error.to_string()))?;
+            .map_err(|error| AdminConfigToolError::Failed(error.to_string()))?;
         if status == StatusCode::FORBIDDEN {
-            return Err(ScopedConfigContextError::Unauthorized);
+            return Err(AdminConfigToolError::Unauthorized);
         }
         if !status.is_success() {
             let detail = value
                 .get("detail")
                 .and_then(|detail| detail.as_str())
-                .unwrap_or("Control plane scoped config request failed.");
-            return Err(ScopedConfigContextError::Failed(detail.to_string()));
+                .unwrap_or("Admin Config tool request failed.");
+            return Err(AdminConfigToolError::Failed(detail.to_string()));
         }
         serde_json::from_value(value).map_err(|error| {
-            ScopedConfigContextError::Failed(format!("Invalid scoped config response: {}", error))
+            AdminConfigToolError::Failed(format!("Invalid Admin Config tool response: {}", error))
         })
     }
 
@@ -1492,13 +1489,6 @@ async fn chat(
     enforce_csrf(&state.web_config, &Method::POST, &headers)?;
     let auth = resolve_public_actor(&state, &headers).await?;
 
-    if request.tool_context.is_some() && auth.kind != "admin" {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "Tool context override is admin-only",
-        ));
-    }
-
     let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     configure_request_lm(&state.config, temperature).await?;
@@ -1653,64 +1643,14 @@ impl<'a> ConversationToolTurn<'a> {
         let internal = self.internal;
         let http = self.http;
 
-        if request.tool_context.is_some() && auth.kind != "admin" {
-            return Err(AppError::new(
-                StatusCode::FORBIDDEN,
-                "Tool context override is admin-only",
-            ));
-        }
-
         let mut context_parts = Vec::new();
         let mut tools_used = Vec::<ToolCallInfoResponse>::new();
         let mut prepared_tool_activity = Vec::<PreparedToolActivity>::new();
 
-        if let Some(tool_context) = request.tool_context.as_deref() {
-            context_parts.push(format!("CLIENT TOOL CONTEXT\n{}", tool_context));
-        }
-
-        let client_executed_tools = request.client_executed_tools.clone().unwrap_or_default();
-        let client_executed_set: HashSet<String> = client_executed_tools.iter().cloned().collect();
-        for tool_id in client_executed_tools {
-            if is_public_agent_runtime_tool_id(&tool_id)
-                && request.tools.iter().any(|enabled| enabled == &tool_id)
-            {
-                tools_used.push(tool_call_info_for_id(&tool_id, request.message.clone()));
-            }
-        }
-
-        if auth.kind == "admin"
-            && request.tools.iter().any(|tool| tool == "admin-config")
-            && client_executed_set.contains("admin-config")
-            && client_tool_context_includes_scoped_config(request.tool_context.as_deref())
-        {
-            tools_used.push(tool_call_info_for_id(
-                "admin-config",
-                request.message.clone(),
-            ));
-        }
-
-        let admin_config_context = async {
-            if client_executed_set.contains("admin-config")
-                && client_tool_context_includes_scoped_config(request.tool_context.as_deref())
-            {
-                Ok(PreparedChatContext::default())
-            } else {
-                prepare_admin_config_context(internal, request, auth).await
-            }
-        };
+        let admin_config_context = prepare_admin_config_context(internal, request, auth);
         let document_context = prepare_uploaded_document_context(internal, request, auth);
-        let web_context = prepare_web_search_context(
-            http,
-            &self.config.searxng_url,
-            request,
-            client_executed_set.contains("web-search"),
-        );
-        let database_context = prepare_database_context(
-            internal,
-            request,
-            auth,
-            client_executed_set.contains("db-query"),
-        );
+        let web_context = prepare_web_search_context(http, &self.config.searxng_url, request);
+        let database_context = prepare_database_context(internal, request, auth);
         let (admin_config_context, document_context, web_context, database_context) = tokio::join!(
             admin_config_context,
             document_context,
@@ -1719,28 +1659,28 @@ impl<'a> ConversationToolTurn<'a> {
         );
         let mut retrieval_sources = Vec::new();
 
-        merge_prepared_tool_context(
+        merge_prepared_context(
             admin_config_context?,
             &mut context_parts,
             &mut tools_used,
             &mut retrieval_sources,
             &mut prepared_tool_activity,
         );
-        merge_prepared_tool_context(
+        merge_prepared_context(
             document_context?,
             &mut context_parts,
             &mut tools_used,
             &mut retrieval_sources,
             &mut prepared_tool_activity,
         );
-        merge_prepared_tool_context(
+        merge_prepared_context(
             web_context?,
             &mut context_parts,
             &mut tools_used,
             &mut retrieval_sources,
             &mut prepared_tool_activity,
         );
-        merge_prepared_tool_context(
+        merge_prepared_context(
             database_context?,
             &mut context_parts,
             &mut tools_used,
@@ -1777,14 +1717,6 @@ impl<'a> ConversationToolTurn<'a> {
     }
 }
 
-fn client_tool_context_includes_scoped_config(tool_context: Option<&str>) -> bool {
-    tool_context.is_some_and(|context| context.contains("SCOPED CONFIG CONTEXT"))
-}
-
-fn is_public_agent_runtime_tool_id(tool_id: &str) -> bool {
-    matches!(tool_id, "admin-config" | "web-search" | "db-query")
-}
-
 async fn prepare_admin_config_context(
     internal: &InternalAgentClient,
     request: &ChatRequest,
@@ -1794,63 +1726,60 @@ async fn prepare_admin_config_context(
         return Ok(PreparedChatContext::default());
     }
 
-    match internal
-        .scoped_config_context(&InternalScopedConfigContextRequest {
-            query: request.message.clone(),
-            actor: auth.clone(),
-            mode: "auto".to_string(),
-            requested_scopes: None,
-        })
-        .await
-    {
-        Ok(response) => Ok(prepared_admin_config_context_from_response(
+    match internal.admin_config_deployment_readiness(auth).await {
+        Ok(response) => Ok(prepared_admin_config_tool_result_from_response(
             request, response,
         )),
-        Err(ScopedConfigContextError::Unauthorized) => Err(AppError::new(
+        Err(AdminConfigToolError::Unauthorized) => Err(AppError::new(
             StatusCode::FORBIDDEN,
-            "Admin scoped config context is not authorized for this actor.",
+            "Admin Config tools are not authorized for this actor.",
         )),
-        Err(ScopedConfigContextError::Failed(_)) => {
-            Ok(prepared_admin_config_context_failure(request))
+        Err(AdminConfigToolError::Failed(_)) => {
+            Ok(prepared_admin_config_tool_result_failure(request))
         }
     }
 }
 
-fn prepared_admin_config_context_from_response(
+fn prepared_admin_config_tool_result_from_response(
     request: &ChatRequest,
-    response: InternalScopedConfigContextResponse,
+    response: InternalAdminConfigToolResponse,
 ) -> PreparedChatContext {
     let mut tool = tool_call_info_for_id("admin-config", request.message.clone());
-    tool.output_summary = Some(build_admin_config_output_summary(
-        &response.primary_scope,
-        &response.included_scopes,
-        &response.warnings,
-    ));
-    tool.warnings =
-        sanitize_admin_config_activity_warnings(&response.included_scopes, &response.warnings);
-    let activity_step = admin_config_activity_step(&tool, &response);
+    tool.output_summary = Some("Read deployment readiness through Admin Config.".to_string());
+    tool.warnings = response.warnings.clone();
+    let activity_step = conversation_activity_step_from_tool(
+        &tool,
+        tool.output_summary.clone(),
+        response.warnings.clone(),
+    );
+    let data = serde_json::to_string_pretty(&response.data).unwrap_or_else(|_| "{}".to_string());
+    let secret_policy =
+        serde_json::to_string(&response.secret_policy).unwrap_or_else(|_| "{}".to_string());
+    let warnings = serde_json::to_string(&response.warnings).unwrap_or_else(|_| "[]".to_string());
 
     PreparedChatContext {
-        context: response.context_text,
+        context: format!(
+            "ADMIN CONFIG TOOL RESULT\nversion: {}\ntool: {}\ngenerated_at: {}\nsecret_policy: {}\nwarnings: {}\ndata:\n{}",
+            response.version, response.tool, response.generated_at, secret_policy, warnings, data
+        ),
         tools_used: vec![tool],
         activity_steps: vec![activity_step],
         retrieval_sources: Vec::new(),
     }
 }
 
-fn prepared_admin_config_context_failure(request: &ChatRequest) -> PreparedChatContext {
+fn prepared_admin_config_tool_result_failure(request: &ChatRequest) -> PreparedChatContext {
     let mut tool = tool_call_info_for_id("admin-config", request.message.clone());
-    tool.output_summary = Some("Scoped config context could not be prepared.".to_string());
-    tool.warnings
-        .push("scoped_config_context_failed".to_string());
+    tool.output_summary = Some("Admin Config tool result could not be read.".to_string());
+    tool.warnings.push("admin_config_tool_failed".to_string());
     let activity_step = conversation_activity_step_from_tool(
         &tool,
-        Some("Scoped config context could not be prepared.".to_string()),
-        vec!["scoped_config_context_failed".to_string()],
+        Some("Admin Config tool result could not be read.".to_string()),
+        vec!["admin_config_tool_failed".to_string()],
     );
 
     PreparedChatContext {
-        context: "SCOPED CONFIG CONTEXT\nScoped config context could not be prepared safely."
+        context: "ADMIN CONFIG TOOL RESULT\nAdmin Config tool result could not be read safely."
             .to_string(),
         tools_used: vec![tool],
         activity_steps: vec![activity_step],
@@ -1858,69 +1787,12 @@ fn prepared_admin_config_context_failure(request: &ChatRequest) -> PreparedChatC
     }
 }
 
-fn build_admin_config_output_summary(
-    primary_scope: &str,
-    included_scopes: &[String],
-    warnings: &[String],
-) -> String {
-    let mut summary = if included_scopes.len() <= 1 {
-        format!("Prepared scoped config context for {}.", primary_scope)
-    } else {
-        format!(
-            "Prepared scoped config context for {} ({} included scopes).",
-            primary_scope,
-            included_scopes.len()
-        )
-    };
-    if !warnings.is_empty() {
-        summary.push_str(&format!(
-            " {} scoped-read warning(s) reported.",
-            warnings.len()
-        ));
-    }
-    summary
-}
-
-fn sanitize_admin_config_activity_warnings(
-    included_scopes: &[String],
-    warnings: &[String],
-) -> Vec<String> {
-    let mut activity_warnings = Vec::new();
-    if warnings.is_empty() {
-        if included_scopes
-            .iter()
-            .any(|scope| scope == "deployment-settings")
-        {
-            activity_warnings.push("deployment_secrets_redacted".to_string());
-        }
-        return activity_warnings;
-    }
-
-    activity_warnings.push(format!("scoped_read_warnings:{}", warnings.len()));
-    activity_warnings
-}
-
-fn admin_config_activity_step(
-    tool: &ToolCallInfoResponse,
-    response: &InternalScopedConfigContextResponse,
-) -> ConversationActivityStepResponse {
-    conversation_activity_step_from_tool(
-        tool,
-        Some(build_admin_config_output_summary(
-            &response.primary_scope,
-            &response.included_scopes,
-            &response.warnings,
-        )),
-        sanitize_admin_config_activity_warnings(&response.included_scopes, &response.warnings),
-    )
-}
-
 async fn prepare_uploaded_document_context(
     internal: &InternalAgentClient,
     request: &ChatRequest,
     auth: &InternalAuthContext,
 ) -> AppResult<PreparedChatContext> {
-    if !should_auto_retrieve_admin_config_context(request, auth) {
+    if !should_prepare_uploaded_document_context(request) {
         return Ok(PreparedChatContext::default());
     }
 
@@ -1929,7 +1801,7 @@ async fn prepare_uploaded_document_context(
             query: request.message.clone(),
             user: auth.clone(),
             top_k: 4,
-            job_ids: None,
+            job_ids: request.job_ids.clone(),
             jurisdiction: None,
             situation_details: None,
         })
@@ -1973,7 +1845,7 @@ fn prepared_uploaded_document_context_from_response(
 }
 
 #[cfg(test)]
-async fn overlap_conversation_tool_context_work<
+async fn overlap_conversation_tool_work<
     DocumentFuture,
     WebFuture,
     DatabaseFuture,
@@ -1997,9 +1869,8 @@ async fn prepare_web_search_context(
     http: &Client,
     searxng_url: &str,
     request: &ChatRequest,
-    client_executed: bool,
 ) -> AppResult<PreparedChatContext> {
-    if client_executed || !request.tools.iter().any(|tool| tool == "web-search") {
+    if !request.tools.iter().any(|tool| tool == "web-search") {
         return Ok(PreparedChatContext::default());
     }
 
@@ -2065,12 +1936,8 @@ async fn prepare_database_context(
     internal: &InternalAgentClient,
     request: &ChatRequest,
     auth: &InternalAuthContext,
-    client_executed: bool,
 ) -> AppResult<PreparedChatContext> {
-    if client_executed
-        || auth.kind != "admin"
-        || !request.tools.iter().any(|tool| tool == "db-query")
-    {
+    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "db-query") {
         return Ok(PreparedChatContext::default());
     }
 
@@ -2081,7 +1948,7 @@ async fn prepare_database_context(
             ..tool_call_info_for_id("db-query", request.message.clone())
         };
         return Ok(PreparedChatContext {
-            context: "DATABASE CONTEXT\nDatabase Query was selected, but Sage requires client-executed decrypted context or a direct read-only SELECT query."
+            context: "DATABASE CONTEXT\nDatabase Query was selected, but Sage requires a direct read-only SELECT query."
                 .to_string(),
             tools_used: vec![tool.clone()],
             retrieval_sources: Vec::new(),
@@ -2109,7 +1976,7 @@ async fn prepare_database_context(
     Ok(prepared)
 }
 
-fn merge_prepared_tool_context(
+fn merge_prepared_context(
     prepared: PreparedChatContext,
     context_parts: &mut Vec<String>,
     tools_used: &mut Vec<ToolCallInfoResponse>,
@@ -2177,33 +2044,8 @@ fn push_unique_warning(warnings: &mut Vec<String>, warning: &str) {
     }
 }
 
-fn should_auto_retrieve_admin_config_context(
-    request: &ChatRequest,
-    auth: &InternalAuthContext,
-) -> bool {
-    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "admin-config") {
-        return false;
-    }
-    let message = request.message.to_ascii_lowercase();
-    let refers_to_uploaded_materials = [
-        "uploaded",
-        "document",
-        "documents",
-        "file",
-        "files",
-        "pdf",
-        "guide",
-        "book",
-        "materials",
-        "resource",
-        "archive",
-        "attached",
-        "attachment",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle));
-
-    refers_to_uploaded_materials
+fn should_prepare_uploaded_document_context(request: &ChatRequest) -> bool {
+    request.tools.iter().any(|tool| tool == "knowledge-search")
 }
 
 fn is_direct_readonly_select_message(message: &str) -> bool {
@@ -2305,7 +2147,7 @@ fn build_final_answer_prompt_with_persisted_context(
         }
     }
     if !prepared.context.trim().is_empty() {
-        prompt.push_str("\n=== PREPARED TOOL CONTEXT ===\n");
+        prompt.push_str("\n=== PREPARED CONTEXT ===\n");
         prompt.push_str(&prepared.context);
         prompt.push('\n');
     }
@@ -2551,12 +2393,6 @@ async fn chat_stream(
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     enforce_csrf(&state.web_config, &Method::POST, &headers)?;
     let auth = resolve_public_actor(&state, &headers).await?;
-    if request.tool_context.is_some() && auth.kind != "admin" {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "Tool context override is admin-only",
-        ));
-    }
     let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
@@ -5353,6 +5189,47 @@ mod tests {
     use serde_json::json;
     use std::io::Write;
 
+    fn fake_deployment_readiness_response() -> Value {
+        json!({
+            "version": 1,
+            "tool": "read_deployment_readiness",
+            "data": {
+                "status": "warnings",
+                "summary": {
+                    "blockers": 0,
+                    "warnings": 1,
+                    "ready": 1,
+                    "total": 2
+                },
+                "items": [
+                    {
+                        "key": "deployment_settings_validation",
+                        "label": "Deployment Settings Validation",
+                        "source": "deployment_validation",
+                        "severity": "ready",
+                        "status": "valid",
+                        "summary": "Deployment Settings validation has no errors or warnings.",
+                        "next_action": "No action required.",
+                        "conversation_blocking": false
+                    },
+                    {
+                        "key": "sage_runtime_env",
+                        "label": "Sage Runtime Config",
+                        "source": "runtime_env",
+                        "severity": "warning",
+                        "status": "not_generated",
+                        "summary": "Sage runtime env has not been generated from Deployment Settings yet.",
+                        "next_action": "Export the Sage runtime env before treating Deployment Settings as applied to Sage.",
+                        "conversation_blocking": false
+                    }
+                ]
+            },
+            "warnings": ["deployment_secrets_redacted"],
+            "generated_at": "2026-06-15T12:00:00+00:00",
+            "secret_policy": { "mode": "masked" }
+        })
+    }
+
     #[test]
     fn admin_session_tokens_deserialize_python_type_field() {
         let serializer = timed_serializer_with_signer(
@@ -5969,12 +5846,11 @@ mod tests {
                     content: "I recommend updating Instance Name and Assistant Name.".to_string(),
                 },
             ],
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
+            context: "ADMIN CONFIG TOOL RESULT\n{}".to_string(),
             tools_used: Vec::new(),
             retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
@@ -6017,12 +5893,11 @@ mod tests {
                 role: "user".to_string(),
                 content: "stale client-only turn".to_string(),
             }],
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
+            context: "ADMIN CONFIG TOOL RESULT\n{}".to_string(),
             tools_used: Vec::new(),
             retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
@@ -6110,12 +5985,11 @@ mod tests {
                     serde_json::to_string_pretty(&change_set).unwrap()
                 ),
             }],
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
+            context: "ADMIN CONFIG TOOL RESULT\n{}".to_string(),
             tools_used: Vec::new(),
             retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
@@ -6166,8 +6040,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "stale client-only turn".to_string(),
             }],
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let persisted = PersistedConversationContext {
@@ -6179,7 +6052,7 @@ mod tests {
             }],
         };
         let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
+            context: "ADMIN CONFIG TOOL RESULT\n{}".to_string(),
             tools_used: Vec::new(),
             retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
@@ -6227,8 +6100,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: raw_json.to_string(),
             }],
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
@@ -6304,8 +6176,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "stale signal client turn".to_string(),
             }],
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: Some(ConversationChannelRequest {
                 kind: "signal".to_string(),
                 delivery: Some("short_messages".to_string()),
@@ -6338,128 +6209,102 @@ mod tests {
     }
 
     #[test]
-    fn admin_config_requests_for_uploaded_materials_trigger_document_retrieval() {
-        let auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
+    fn knowledge_search_tool_selection_triggers_document_retrieval() {
         let request = ChatRequest {
             message: "Can you see the book I uploaded? Get a basic overview.".to_string(),
             session_id: None,
-            tools: vec!["admin-config".to_string()],
+            tools: vec!["knowledge-search".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
 
-        assert!(should_auto_retrieve_admin_config_context(&request, &auth));
+        assert!(should_prepare_uploaded_document_context(&request));
     }
 
     #[test]
-    fn user_and_non_material_admin_requests_do_not_trigger_admin_document_retrieval() {
-        let admin_auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let user_auth = InternalAuthContext {
-            id: 2,
-            kind: "user".to_string(),
-            approved: true,
-            pubkey: None,
-            email: Some("user@example.test".to_string()),
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let admin_request = ChatRequest {
-            message: "What is the current instance name?".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let user_request = ChatRequest {
+    fn admin_config_tool_selection_does_not_trigger_document_retrieval() {
+        let request = ChatRequest {
             message: "Based on the uploaded PDF, configure the theme.".to_string(),
             session_id: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
 
-        assert!(!should_auto_retrieve_admin_config_context(
-            &admin_request,
-            &admin_auth
-        ));
-        assert!(!should_auto_retrieve_admin_config_context(
-            &user_request,
-            &user_auth
-        ));
-    }
-
-    #[test]
-    fn client_tool_context_includes_scoped_config_marker() {
-        assert!(!client_tool_context_includes_scoped_config(None));
-        assert!(!client_tool_context_includes_scoped_config(Some(
-            "BOUNDED DOCUMENT CONTEXT\nbrand-guide.pdf"
-        )));
-        assert!(client_tool_context_includes_scoped_config(Some(
-            "SCOPED CONFIG CONTEXT\nscope: instance-settings"
-        )));
+        assert!(!should_prepare_uploaded_document_context(&request));
     }
 
     #[tokio::test]
-    async fn scoped_client_context_does_not_suppress_server_admin_config_without_client_executed_marker(
-    ) {
-        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+    async fn conversation_tool_turn_reads_deployment_readiness_for_setup_questions() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(String, Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
-        let app = Router::new().route(
-            "/internal/agent/scoped-config-context",
-            post({
-                let seen_tx = seen_tx.clone();
-                move |headers: HeaderMap, Json(payload): Json<Value>| {
+        let app = Router::new()
+            .route(
+                "/internal/agent/admin-config/deployment-readiness",
+                post({
                     let seen_tx = seen_tx.clone();
-                    async move {
-                        let token = headers
-                            .get("x-internal-agent-token")
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_string);
-                        if let Some(sender) = seen_tx
-                            .lock()
-                            .expect("request recorder should lock")
-                            .take()
-                        {
-                            let _ = sender.send((token, payload));
+                    move |headers: HeaderMap, Json(payload): Json<Value>| {
+                        let seen_tx = seen_tx.clone();
+                        async move {
+                            let token = headers
+                                .get("x-internal-agent-token")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string);
+                            if let Some(sender) = seen_tx
+                                .lock()
+                                .expect("request recorder should lock")
+                                .take()
+                            {
+                                let _ = sender.send((
+                                    "/internal/agent/admin-config/deployment-readiness".to_string(),
+                                    token,
+                                    payload,
+                                ));
+                            }
+                            Json(json!({
+                                "version": 1,
+                                "tool": "read_deployment_readiness",
+                                "data": {
+                                    "status": "warnings",
+                                    "summary": {
+                                        "blockers": 0,
+                                        "warnings": 2,
+                                        "ready": 1,
+                                        "total": 3
+                                    },
+                                    "items": [
+                                        {
+                                            "key": "deployment_settings_validation",
+                                            "label": "Deployment Settings Validation",
+                                            "source": "deployment_validation",
+                                            "severity": "ready",
+                                            "status": "valid",
+                                            "summary": "Deployment Settings validation has no errors or warnings.",
+                                            "next_action": "No action required.",
+                                            "conversation_blocking": false
+                                        },
+                                        {
+                                            "key": "sage_runtime_env",
+                                            "label": "Sage Runtime Config",
+                                            "source": "runtime_env",
+                                            "severity": "warning",
+                                            "status": "not_generated",
+                                            "summary": "Sage runtime env has not been generated from Deployment Settings yet.",
+                                            "next_action": "Export the Sage runtime env before treating Deployment Settings as applied to Sage.",
+                                            "conversation_blocking": false
+                                        }
+                                    ]
+                                },
+                                "warnings": ["deployment_secrets_redacted"],
+                                "generated_at": "2026-06-15T12:00:00+00:00",
+                                "secret_policy": { "mode": "masked" }
+                            }))
                         }
-                        Json(json!({
-                            "version": 1,
-                            "primary_scope": "deployment-settings",
-                            "included_scopes": ["deployment-settings"],
-                            "context_text": "SCOPED CONFIG CONTEXT\nscope: deployment-settings\nLLM_MODEL = kimi-k2-6",
-                            "warnings": [],
-                            "generated_at": "2026-05-25T12:00:00+00:00",
-                            "secret_policy": { "mode": "masked" }
-                        }))
                     }
-                }
-            }),
-        );
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test backend should bind");
@@ -6488,44 +6333,53 @@ mod tests {
             dev_mode: false,
         };
         let request = ChatRequest {
-            message: "What is LLM_MODEL?".to_string(),
+            message: "What do we still need to setup for our instance here? It seems mostly good!"
+                .to_string(),
             session_id: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: Vec::new(),
-            tool_context: Some(
-                "SCOPED CONFIG CONTEXT\nscope: onboarding\nONBOARDING MODE".to_string(),
-            ),
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
 
         let prepared = ConversationToolTurn::new(&internal, &http, &request, &auth)
             .prepare()
             .await
-            .expect("server admin config should still run");
+            .expect("deployment readiness should be read through Admin Config");
         server.abort();
 
-        assert!(prepared.context.contains("CLIENT TOOL CONTEXT"));
-        assert!(prepared.context.contains("scope: onboarding"));
-        assert!(prepared.context.contains("scope: deployment-settings"));
-        assert!(prepared.context.contains("LLM_MODEL = kimi-k2-6"));
+        assert!(prepared.context.starts_with("ADMIN CONFIG TOOL RESULT"));
+        assert!(prepared.context.contains("read_deployment_readiness"));
+        assert!(prepared.context.contains("Sage Runtime Config"));
         assert_eq!(prepared.tools_used.len(), 1);
         assert_eq!(prepared.tools_used[0].tool_id, "admin-config");
+        assert_eq!(
+            prepared.tools_used[0].output_summary.as_deref(),
+            Some("Read deployment readiness through Admin Config.")
+        );
+        assert_eq!(
+            prepared.tools_used[0].warnings,
+            vec!["deployment_secrets_redacted".to_string()]
+        );
+        assert_eq!(prepared.activity_steps[0].id, "tool-admin-config");
+        assert_eq!(prepared.activity_steps[0].status, "succeeded");
 
-        let (token, payload) = seen_rx
+        let (path, token, payload) = seen_rx
             .await
-            .expect("test backend should record scoped config request");
+            .expect("test backend should record Admin Config Tool request");
+        assert_eq!(path, "/internal/agent/admin-config/deployment-readiness");
         assert_eq!(token.as_deref(), Some("test-token"));
-        assert_eq!(payload["query"], "What is LLM_MODEL?");
-        assert_eq!(payload["mode"], "auto");
+        assert_eq!(payload["actor"]["type"], "admin");
+        assert!(payload.get("query").is_none());
+        assert!(payload.get("mode").is_none());
     }
 
     #[tokio::test]
-    async fn client_tool_context_does_not_mark_database_query_as_executed_without_client_marker() {
+    async fn conversation_tool_turn_prepares_admin_config_for_selected_admin_tool() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
         let app = Router::new().route(
-            "/internal/agent/admin-db-query",
+            "/internal/agent/admin-config/deployment-readiness",
             post({
                 let seen_tx = seen_tx.clone();
                 move |headers: HeaderMap, Json(payload): Json<Value>| {
@@ -6540,104 +6394,7 @@ mod tests {
                         {
                             let _ = sender.send((token, payload));
                         }
-                        Json(json!({
-                            "columns": ["email"],
-                            "rows": [{ "email": "admin@example.test" }]
-                        }))
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test backend should bind");
-        let addr = listener
-            .local_addr()
-            .expect("test backend should expose local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test backend should serve");
-        });
-        let http = Client::builder().build().expect("http client should build");
-        let internal = InternalAgentClient::new(
-            http.clone(),
-            format!("http://{}", addr),
-            "test-token".to_string(),
-        );
-        let auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let request = ChatRequest {
-            message: "SELECT email FROM users LIMIT 1".to_string(),
-            session_id: None,
-            tools: vec!["db-query".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: Some(
-                "SCOPED CONFIG CONTEXT\nscope: onboarding\nONBOARDING MODE".to_string(),
-            ),
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-
-        let prepared = ConversationToolTurn::new(&internal, &http, &request, &auth)
-            .prepare()
-            .await
-            .expect("server database query should still run");
-        server.abort();
-
-        assert!(prepared.context.contains("CLIENT TOOL CONTEXT"));
-        assert!(prepared.context.contains("scope: onboarding"));
-        assert!(prepared.context.contains("DATABASE CONTEXT"));
-        assert!(prepared.context.contains("admin@example.test"));
-        assert_eq!(prepared.tools_used.len(), 1);
-        assert_eq!(prepared.tools_used[0].tool_id, "db-query");
-
-        let (token, payload) = seen_rx
-            .await
-            .expect("test backend should record database query request");
-        assert_eq!(token.as_deref(), Some("test-token"));
-        assert_eq!(payload["sql"], "SELECT email FROM users LIMIT 1");
-    }
-
-    #[tokio::test]
-    async fn conversation_tool_turn_prepares_admin_config_for_selected_admin_tool() {
-        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
-        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
-        let app = Router::new().route(
-            "/internal/agent/scoped-config-context",
-            post({
-                let seen_tx = seen_tx.clone();
-                move |headers: HeaderMap, Json(payload): Json<Value>| {
-                    let seen_tx = seen_tx.clone();
-                    async move {
-                        let token = headers
-                            .get("x-internal-agent-token")
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_string);
-                        if let Some(sender) = seen_tx
-                            .lock()
-                            .expect("request recorder should lock")
-                            .take()
-                        {
-                            let _ = sender.send((token, payload));
-                        }
-                        Json(json!({
-                            "version": 1,
-                            "primary_scope": "instance-settings",
-                            "included_scopes": ["instance-settings", "deployment-settings"],
-                            "context_text": "SCOPED CONFIG CONTEXT\nscope: instance-settings\nSMTP_PASSWORD = [REDACTED]",
-                            "warnings": [],
-                            "generated_at": "2026-05-25T12:00:00+00:00",
-                            "secret_policy": { "mode": "masked" }
-                        }))
+                        Json(fake_deployment_readiness_response())
                     }
                 }
             }),
@@ -6674,19 +6431,19 @@ mod tests {
             session_id: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
 
         let prepared = ConversationToolTurn::new(&internal, &http, &request, &auth)
             .prepare()
             .await
-            .expect("admin config context should be prepared");
+            .expect("admin config tool result should be prepared");
         server.abort();
 
-        assert!(prepared.context.starts_with("SCOPED CONFIG CONTEXT"));
-        assert!(prepared.context.contains("[REDACTED]"));
+        assert!(prepared.context.starts_with("ADMIN CONFIG TOOL RESULT"));
+        assert!(prepared.context.contains("read_deployment_readiness"));
+        assert!(prepared.context.contains("Sage Runtime Config"));
         assert!(!prepared.context.contains("super-secret"));
         assert_eq!(prepared.tools_used.len(), 1);
         assert_eq!(prepared.tools_used[0].tool_id, "admin-config");
@@ -6704,31 +6461,139 @@ mod tests {
 
         let (token, payload) = seen_rx
             .await
-            .expect("test backend should record scoped config request");
+            .expect("test backend should record Admin Config Tool request");
         assert_eq!(token.as_deref(), Some("test-token"));
-        assert_eq!(payload["query"], "show me the deployment settings");
         assert_eq!(payload["actor"]["type"], "admin");
-        assert_eq!(payload["mode"], "auto");
+        assert!(payload.get("query").is_none());
+        assert!(payload.get("mode").is_none());
+    }
+
+    #[tokio::test]
+    async fn conversation_tool_turn_prepares_knowledge_search_with_selected_document_constraints() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/document-search",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) =
+                            seen_tx.lock().expect("request recorder should lock").take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "sources": [],
+                            "context": "=== RELEVANT PASSAGES ===\n[1] The handbook says setup is complete.",
+                            "search_query": "What does the handbook say?",
+                            "top_k": 4
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let http = Client::builder().build().expect("http client should build");
+        let internal = InternalAgentClient::new(
+            http.clone(),
+            format!("http://{}", addr),
+            "test-token".to_string(),
+        );
+        let auth = InternalAuthContext {
+            id: 2,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: None,
+            email: Some("user@example.test".to_string()),
+            name: None,
+            user_type_id: Some(3),
+            dev_mode: false,
+        };
+        let request: ChatRequest = serde_json::from_value(json!({
+            "message": "What does the handbook say?",
+            "session_id": null,
+            "tools": ["knowledge-search"],
+            "conversation_history": [],
+            "job_ids": ["doc-handbook", "doc-faq"]
+        }))
+        .expect("chat request should deserialize selected document constraints");
+
+        let prepared = ConversationToolTurn::new(&internal, &http, &request, &auth)
+            .prepare()
+            .await
+            .expect("Knowledge Search context should be prepared");
+        server.abort();
+
+        assert!(prepared.context.starts_with("UPLOADED DOCUMENT CONTEXT"));
+        assert!(prepared
+            .context
+            .contains("The handbook says setup is complete."));
+        assert_eq!(prepared.tools_used.len(), 1);
+        assert_eq!(prepared.tools_used[0].tool_id, "knowledge-search");
+
+        let (token, payload) = tokio::time::timeout(Duration::from_secs(1), seen_rx)
+            .await
+            .expect("document search should be called")
+            .expect("test backend should record Knowledge Search request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["query"], "What does the handbook say?");
+        assert_eq!(payload["user"]["type"], "user");
+        assert_eq!(payload["job_ids"], json!(["doc-handbook", "doc-faq"]));
     }
 
     #[tokio::test]
     async fn conversation_tool_turn_reduces_oversized_admin_config_context() {
-        let oversized_context = format!(
-            "SCOPED CONFIG CONTEXT\nscope: deployment-settings\n{}\nraw-secret-after-budget",
+        let oversized_summary = format!(
+            "{}\nraw-secret-after-budget",
             "safe-setting = value\n".repeat(900)
         );
         let app = Router::new().route(
-            "/internal/agent/scoped-config-context",
+            "/internal/agent/admin-config/deployment-readiness",
             post(move || {
-                let context_text = oversized_context.clone();
+                let summary = oversized_summary.clone();
                 async move {
                     Json(json!({
                         "version": 1,
-                        "primary_scope": "deployment-settings",
-                        "included_scopes": ["deployment-settings"],
-                        "context_text": context_text,
-                        "warnings": [],
-                        "generated_at": "2026-05-25T12:00:00+00:00",
+                        "tool": "read_deployment_readiness",
+                        "data": {
+                            "status": "warnings",
+                            "summary": {
+                                "blockers": 0,
+                                "warnings": 1,
+                                "ready": 1,
+                                "total": 2
+                            },
+                            "items": [
+                                {
+                                    "key": "deployment_settings_validation",
+                                    "label": "Deployment Settings Validation",
+                                    "source": "deployment_validation",
+                                    "severity": "warning",
+                                    "status": "oversized",
+                                    "summary": summary,
+                                    "next_action": "Review generated runtime settings.",
+                                    "conversation_blocking": false
+                                }
+                            ]
+                        },
+                        "warnings": ["deployment_secrets_redacted"],
+                        "generated_at": "2026-06-15T12:00:00+00:00",
                         "secret_policy": { "mode": "masked" }
                     }))
                 }
@@ -6766,8 +6631,7 @@ mod tests {
             session_id: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
 
@@ -6777,7 +6641,7 @@ mod tests {
             .expect("oversized admin config context should be reduced");
         server.abort();
 
-        assert!(prepared.context.starts_with("SCOPED CONFIG CONTEXT"));
+        assert!(prepared.context.starts_with("ADMIN CONFIG TOOL RESULT"));
         assert!(prepared.context.len() < 10_000);
         assert!(prepared
             .context
@@ -6815,8 +6679,7 @@ mod tests {
             session_id: None,
             tools: vec!["db-query".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
 
@@ -6899,8 +6762,7 @@ mod tests {
             session_id: None,
             tools: vec!["db-query".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
 
@@ -6956,8 +6818,7 @@ mod tests {
             session_id: None,
             tools: vec!["web-search".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let config = ConversationToolTurnConfig {
@@ -6982,214 +6843,68 @@ mod tests {
             .contains(&"optional_tool_failed".to_string()));
     }
 
-    #[tokio::test]
-    async fn conversation_tool_turn_rejects_user_trusted_admin_context() {
-        let http = Client::builder().build().expect("http client should build");
-        let internal = InternalAgentClient::new(
-            http.clone(),
-            "http://127.0.0.1:9".to_string(),
-            "test-token".to_string(),
-        );
-        let auth = InternalAuthContext {
-            id: 2,
-            kind: "user".to_string(),
-            approved: true,
-            pubkey: None,
-            email: Some("user@example.test".to_string()),
-            name: None,
-            user_type_id: Some(4),
-            dev_mode: false,
-        };
-        let request = ChatRequest {
-            message: "Use this admin context".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string(), "db-query".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: Some(
-                "SCOPED CONFIG CONTEXT\nDeployment secret metadata from an admin turn.".to_string(),
-            ),
-            client_executed_tools: Some(vec!["admin-config".to_string(), "db-query".to_string()]),
-            conversation_channel: None,
-        };
-
-        let error = ConversationToolTurn::new(&internal, &http, &request, &auth)
-            .prepare()
-            .await
-            .expect_err("user turns must not accept trusted admin tool context");
-
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
-        assert_eq!(error.message, "Tool context override is admin-only");
-    }
-
-    #[tokio::test]
-    async fn conversation_tool_turn_ignores_unknown_client_executed_tool_ids() {
-        let http = Client::builder().build().expect("http client should build");
-        let internal = InternalAgentClient::new(
-            http.clone(),
-            "http://127.0.0.1:9".to_string(),
-            "test-token".to_string(),
-        );
-        let auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let request = ChatRequest {
-            message: "Use the trusted context only.".to_string(),
-            session_id: None,
-            tools: vec!["made-up-tool".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: Some("TRUSTED CONTEXT\nOperator supplied note.".to_string()),
-            client_executed_tools: Some(vec!["made-up-tool".to_string()]),
-            conversation_channel: None,
-        };
-
-        let prepared = ConversationToolTurn::new(&internal, &http, &request, &auth)
-            .prepare()
-            .await
-            .expect("admin trusted context should still be accepted");
-
-        assert!(prepared.context.contains("TRUSTED CONTEXT"));
-        assert!(prepared.tools_used.is_empty());
-        assert!(prepared.activity_steps.is_empty());
-    }
-
     #[test]
-    fn prepared_admin_config_context_uses_control_plane_context_text() {
+    fn prepared_admin_config_tool_result_formats_structured_data() {
         let request = ChatRequest {
-            message: "update the theme and primary color".to_string(),
+            message: "what still needs setup?".to_string(),
             session_id: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
-        let response = InternalScopedConfigContextResponse {
-            version: 1,
-            primary_scope: "instance-settings".to_string(),
-            included_scopes: vec!["instance-settings".to_string()],
-            context_text: "SCOPED CONFIG CONTEXT\nscope: instance-settings\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- admin-config (Admin Config): Read instance configuration including settings, deployment configuration, user types, onboarding structure, document access policies, and agent behavior. Ask about what you need to inspect or change, and the tool returns the relevant context with actionable schema for configuration changes. Access: admins only.".to_string(),
-            warnings: Vec::new(),
-            generated_at: "2026-05-25T12:00:00+00:00".to_string(),
-            secret_policy: json!({ "mode": "masked" }),
-        };
+        let response: InternalAdminConfigToolResponse =
+            serde_json::from_value(fake_deployment_readiness_response())
+                .expect("fake readiness response should match contract");
 
-        let prepared = prepared_admin_config_context_from_response(&request, response);
+        let prepared = prepared_admin_config_tool_result_from_response(&request, response);
 
-        assert!(prepared.context.starts_with("SCOPED CONFIG CONTEXT"));
-        assert!(prepared.context.contains("ADMIN-VISIBLE TOOL CAPABILITIES"));
-        assert!(!prepared.context.contains("prompt_sections"));
-        assert!(!prepared.context.contains("compiled_prompt"));
+        assert!(prepared.context.starts_with("ADMIN CONFIG TOOL RESULT"));
+        assert!(prepared.context.contains("tool: read_deployment_readiness"));
+        assert!(prepared.context.contains("Sage Runtime Config"));
+        assert!(prepared.context.contains("\"mode\":\"masked\""));
+        assert!(!prepared.context.contains("super-secret-smtp-password"));
         assert_eq!(prepared.tools_used.len(), 1);
         assert_eq!(prepared.tools_used[0].tool_id, "admin-config");
-    }
-
-    #[test]
-    fn prepared_admin_config_context_surfaces_warnings_in_activity() {
-        let request = ChatRequest {
-            message: "review onboarding fields for user types".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let response = InternalScopedConfigContextResponse {
-            version: 1,
-            primary_scope: "user-types".to_string(),
-            included_scopes: vec!["user-types".to_string()],
-            context_text: "SCOPED CONFIG CONTEXT\nscope: user-types".to_string(),
-            warnings: vec!["user-fields user_type_id=2 failed".to_string()],
-            generated_at: "2026-05-25T12:00:00+00:00".to_string(),
-            secret_policy: json!({ "mode": "masked" }),
-        };
-
-        let prepared = prepared_admin_config_context_from_response(&request, response);
-
         assert_eq!(
             prepared.tools_used[0].output_summary.as_deref(),
-            Some(
-                "Prepared scoped config context for user-types. 1 scoped-read warning(s) reported."
-            )
+            Some("Read deployment readiness through Admin Config.")
         );
         assert_eq!(
             prepared.tools_used[0].warnings,
-            vec!["scoped_read_warnings:1".to_string()]
+            vec!["deployment_secrets_redacted".to_string()]
         );
         assert_eq!(
             prepared.activity_steps[0].summary.as_deref(),
-            Some(
-                "Prepared scoped config context for user-types. 1 scoped-read warning(s) reported."
-            )
+            Some("Read deployment readiness through Admin Config.")
         );
         assert_eq!(
             prepared.activity_steps[0].warnings,
-            vec!["scoped_read_warnings:1".to_string()]
-        );
-    }
-
-    #[test]
-    fn prepared_admin_config_context_does_not_echo_raw_secrets() {
-        let request = ChatRequest {
-            message: "change smtp settings".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let response = InternalScopedConfigContextResponse {
-            version: 1,
-            primary_scope: "deployment-settings".to_string(),
-            included_scopes: vec!["deployment-settings".to_string()],
-            context_text:
-                "SCOPED CONFIG CONTEXT\nscope: deployment-settings\nSMTP_PASSWORD = [REDACTED]"
-                    .to_string(),
-            warnings: Vec::new(),
-            generated_at: "2026-05-25T12:00:00+00:00".to_string(),
-            secret_policy: json!({ "mode": "masked" }),
-        };
-
-        let prepared = prepared_admin_config_context_from_response(&request, response);
-
-        assert!(prepared.context.contains("[REDACTED]"));
-        assert!(!prepared.context.contains("super-secret-smtp-password"));
-        assert_eq!(
-            prepared.tools_used[0].warnings,
             vec!["deployment_secrets_redacted".to_string()]
         );
     }
 
     #[test]
-    fn prepared_admin_config_context_failure_is_safe() {
+    fn prepared_admin_config_tool_result_failure_is_safe() {
         let request = ChatRequest {
             message: "what tools do you have?".to_string(),
             session_id: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
 
-        let prepared = prepared_admin_config_context_failure(&request);
+        let prepared = prepared_admin_config_tool_result_failure(&request);
 
         assert!(prepared
             .context
-            .contains("Scoped config context could not be prepared safely."));
+            .contains("Admin Config tool result could not be read safely."));
         assert!(!prepared.context.contains("backend returned 503"));
         assert!(!prepared.context.contains("secret=should-not-leak"));
         assert_eq!(
             prepared.tools_used[0].warnings,
-            vec!["scoped_config_context_failed".to_string()]
+            vec!["admin_config_tool_failed".to_string()]
         );
     }
 
@@ -7210,12 +6925,11 @@ mod tests {
             session_id: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\nscope: overview\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- web-search (Web Search): Looks up current or external information through the configured SearXNG service. Use this to find best practices, current documentation, or external reference material that may inform configuration decisions. Access: all users when enabled.\n- admin-config (Admin Config): Read instance configuration including settings, deployment configuration, user types, onboarding structure, document access policies, and agent behavior. Ask about what you need to inspect or change, and the tool returns the relevant context with actionable schema for configuration changes. Access: admins only.\n- db-query (Database): Runs safe read-only admin database queries using natural language for analytics, user inspection, troubleshooting, or data analysis. Use this for questions about existing data, patterns, or inventory. Access: admins only.".to_string(),
+            context: "ADMIN TOOL CAPABILITIES\n- web-search (Web Search): Looks up current or external information through the configured SearXNG service. Use this to find best practices, current documentation, or external reference material that may inform configuration decisions. Access: all users when enabled.\n- admin-config (Admin Config): Read instance configuration including settings, deployment configuration, user types, onboarding structure, document access policies, and agent behavior. Ask about what you need to inspect or change, and the tool returns the relevant context with actionable schema for configuration changes. Access: admins only.\n- db-query (Database): Runs safe read-only admin database queries using natural language for analytics, user inspection, troubleshooting, or data analysis. Use this for questions about existing data, patterns, or inventory. Access: admins only.".to_string(),
             tools_used: Vec::new(),
             retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
@@ -7230,13 +6944,13 @@ mod tests {
 
         let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
 
-        assert!(prompt.contains("ADMIN-VISIBLE TOOL CAPABILITIES"));
+        assert!(prompt.contains("ADMIN TOOL CAPABILITIES"));
         assert!(prompt.contains("admin-config (Admin Config)"));
         assert!(!prompt.contains("not a visible toggle in admin chat"));
     }
 
     #[test]
-    fn final_answer_prompt_includes_uploaded_document_context_for_admin_config_turns() {
+    fn final_answer_prompt_includes_uploaded_document_context_for_knowledge_search_turns() {
         let ai_config = InternalEffectiveAiConfig {
             prompt_sections: HashMap::new(),
             parameters: HashMap::new(),
@@ -7256,14 +6970,13 @@ mod tests {
         let request = ChatRequest {
             message: "Configure the theme from the uploaded guide.".to_string(),
             session_id: None,
-            tools: vec!["admin-config".to_string()],
+            tools: vec!["admin-config".to_string(), "knowledge-search".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}\n\nUPLOADED DOCUMENT CONTEXT\nThe guide uses deep blue headings and a shield mark.".to_string(),
+            context: "ADMIN CONFIG TOOL RESULT\n{}\n\nUPLOADED DOCUMENT CONTEXT\nThe guide uses deep blue headings and a shield mark.".to_string(),
             tools_used: Vec::new(),
             retrieval_sources: Vec::new(),
             activity_steps: Vec::new(),
@@ -7277,7 +6990,7 @@ mod tests {
     }
 
     #[test]
-    fn non_streaming_assistant_turn_input_uses_prepared_tool_context() {
+    fn non_streaming_assistant_turn_input_uses_prepared_context() {
         let ai_config = InternalEffectiveAiConfig {
             prompt_sections: HashMap::new(),
             parameters: HashMap::new(),
@@ -7299,13 +7012,12 @@ mod tests {
             session_id: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
             context:
-                "SCOPED CONFIG CONTEXT\nscope: deployment-settings\nSMTP_PASSWORD = [REDACTED]"
+                "ADMIN CONFIG TOOL RESULT\ntool: read_deployment_readiness\nSMTP_PASSWORD = [REDACTED]"
                     .to_string(),
             tools_used: vec![tool_call_info_for_id(
                 "admin-config",
@@ -7325,8 +7037,8 @@ mod tests {
         );
 
         assert!(input.contains("Tool and retrieval preparation for this turn is already complete."));
-        assert!(input.contains("=== PREPARED TOOL CONTEXT ==="));
-        assert!(input.contains("SCOPED CONFIG CONTEXT"));
+        assert!(input.contains("=== PREPARED CONTEXT ==="));
+        assert!(input.contains("ADMIN CONFIG TOOL RESULT"));
         assert!(input.contains("[REDACTED]"));
         assert!(!input.contains("- Use tools and then continue until you have the answer."));
     }
@@ -7352,10 +7064,9 @@ mod tests {
         let request = ChatRequest {
             message: "Learn about my org PPST from my uploaded resource.".to_string(),
             session_id: None,
-            tools: vec!["admin-config".to_string()],
+            tools: vec!["knowledge-search".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = PreparedChatContext {
@@ -7388,10 +7099,9 @@ mod tests {
         let request = ChatRequest {
             message: "Learn about PPST from my uploaded PDF.".to_string(),
             session_id: None,
-            tools: vec!["admin-config".to_string()],
+            tools: vec!["knowledge-search".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = prepared_uploaded_document_context_from_response(
@@ -7432,10 +7142,9 @@ mod tests {
         let request = ChatRequest {
             message: "Learn about PPST from my uploaded PDF.".to_string(),
             session_id: None,
-            tools: vec!["admin-config".to_string()],
+            tools: vec!["knowledge-search".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: None,
             conversation_channel: None,
         };
         let prepared = prepared_uploaded_document_context_from_response(
@@ -7636,10 +7345,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conversation_tool_context_work_overlaps_independent_tools() {
+    async fn conversation_tool_work_overlaps_independent_tools() {
         let started = Instant::now();
 
-        let (documents, web, database) = overlap_conversation_tool_context_work(
+        let (documents, web, database) = overlap_conversation_tool_work(
             async {
                 tokio::time::sleep(Duration::from_millis(60)).await;
                 "documents"
