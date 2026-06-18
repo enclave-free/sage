@@ -8,10 +8,57 @@
 use anyhow::Result;
 use dspy_rs::{configure, BamlType, ChatAdapter, Predict, LM};
 use std::collections::{BTreeMap, HashMap};
+#[cfg(unix)]
+use std::io::Write;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::memory::MemoryManager;
+
+#[cfg(unix)]
+struct StdoutSuppressor {
+    saved_stdout_fd: i32,
+}
+
+#[cfg(unix)]
+impl StdoutSuppressor {
+    fn new() -> Option<Self> {
+        let _ = std::io::stdout().flush();
+        unsafe {
+            let saved_stdout_fd = libc::dup(libc::STDOUT_FILENO);
+            if saved_stdout_fd == -1 {
+                return None;
+            }
+
+            let dev_null = std::ffi::CString::new("/dev/null").ok()?;
+            let dev_null_fd = libc::open(dev_null.as_ptr(), libc::O_WRONLY);
+            if dev_null_fd == -1 {
+                libc::close(saved_stdout_fd);
+                return None;
+            }
+
+            if libc::dup2(dev_null_fd, libc::STDOUT_FILENO) == -1 {
+                libc::close(dev_null_fd);
+                libc::close(saved_stdout_fd);
+                return None;
+            }
+            libc::close(dev_null_fd);
+
+            Some(Self { saved_stdout_fd })
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StdoutSuppressor {
+    fn drop(&mut self) {
+        let _ = std::io::stdout().flush();
+        unsafe {
+            libc::dup2(self.saved_stdout_fd, libc::STDOUT_FILENO);
+            libc::close(self.saved_stdout_fd);
+        }
+    }
+}
 
 /// A tool call requested by the agent
 #[derive(Clone, Debug, Default, BamlType)]
@@ -691,6 +738,9 @@ impl SageAgent {
                 "configure_lm_with_temperature temperature must be between 0.0 and 1.0"
             ));
         }
+
+        #[cfg(unix)]
+        let _stdout_suppressor = StdoutSuppressor::new();
 
         let lm = LM::builder()
             .base_url(api_base.to_string())

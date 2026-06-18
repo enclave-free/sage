@@ -175,7 +175,7 @@ impl EnclaveWebConfig {
                 .parse()
                 .context("ENCLAVE_WEB_PORT must be a valid port")?,
             backend_url: std::env::var("ENCLAVE_BACKEND_URL")
-                .unwrap_or_else(|_| "http://core-backend:8000".to_string()),
+                .unwrap_or_else(|_| "http://core-backend:18000".to_string()),
             internal_agent_token: std::env::var("INTERNAL_AGENT_TOKEN")
                 .context("INTERNAL_AGENT_TOKEN must be set")?,
             secret_key: std::env::var("SECRET_KEY").context("SECRET_KEY must be set")?,
@@ -298,6 +298,22 @@ pub struct ToolTraceResponse {
     pub metadata: Value,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AdminChangeSetRequest {
+    pub method: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AdminChangeSetResponse {
+    pub version: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub requests: Vec<AdminChangeSetRequest>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RetrievalTraceResponse {
     pub source_type: String,
@@ -374,6 +390,8 @@ pub struct ChatResponse {
     #[serde(default)]
     pub tools_used: Vec<ToolCallInfoResponse>,
     pub trace: Option<ConversationTraceResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_change_set: Option<AdminChangeSetResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -398,6 +416,8 @@ pub struct ChatStreamEventPayload {
     pub tools_used: Vec<ToolCallInfoResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_change_set: Option<AdminChangeSetResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -420,6 +440,7 @@ impl ChatStreamEventPayload {
             provider: None,
             tools_used: Vec::new(),
             detail: None,
+            admin_change_set: None,
         }
     }
 }
@@ -1079,9 +1100,16 @@ struct AdminConfigReadTool {
 }
 
 #[derive(Clone)]
+struct AdminConfigProposalTool {
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+    proposal: Arc<Mutex<Option<AdminChangeSetResponse>>>,
+}
+
+#[derive(Clone)]
 struct ConversationToolLoopSinks {
     sources: Arc<Mutex<Vec<QuerySource>>>,
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+    admin_change_set: Arc<Mutex<Option<AdminChangeSetResponse>>>,
 }
 
 impl ConversationToolLoopSinks {
@@ -1089,6 +1117,7 @@ impl ConversationToolLoopSinks {
         Self {
             sources: Arc::new(Mutex::new(Vec::new())),
             traces: Arc::new(Mutex::new(Vec::new())),
+            admin_change_set: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1201,6 +1230,10 @@ fn build_conversation_tool_registry_with_context(
                 traces: sinks.traces.clone(),
             }));
         }
+        registry.register(Arc::new(AdminConfigProposalTool {
+            traces: sinks.traces.clone(),
+            proposal: sinks.admin_change_set.clone(),
+        }));
     }
 
     registry.register(Arc::new(crate::tools::DoneTool));
@@ -1534,6 +1567,495 @@ impl Tool for AdminConfigReadTool {
 }
 
 #[async_trait::async_trait]
+impl Tool for AdminConfigProposalTool {
+    fn name(&self) -> &str {
+        "propose_config_change_set"
+    }
+
+    fn description(&self) -> &str {
+        "Stage a non-mutating Admin Config change set for UI Change Confirmation. Use this for admin write intent instead of putting raw JSON in messages. Canonical paths include PUT /admin/settings and POST /admin/user-types. Use header_tagline, default_language codes like en, default_theme light|dark|system, and auto_approve_users. The admin must still click Apply before any changes are written. If this tool succeeds, keep the final answer short: \"I prepared these changes for review. Use Apply to confirm.\" If a proposal is rejected, correct the request and call this tool again; do not tell the admin to edit supported settings manually."
+    }
+
+    fn args_schema(&self) -> &str {
+        r##"{"summary": "One-sentence summary of the proposed configuration changes", "requests_json": "JSON array of requests. Guided bootstrap example: [{\"method\":\"PUT\",\"path\":\"/admin/settings\",\"body\":{\"instance_name\":\"FreeThem\",\"assistant_name\":\"Political Prisoner Support Team\",\"header_tagline\":\"Political prisoner support team.\",\"description\":\"...\",\"primary_color\":\"#1E40AF\",\"default_theme\":\"dark\",\"default_language\":\"en\",\"auto_approve_users\":true}},{\"method\":\"POST\",\"path\":\"/admin/user-types\",\"body\":{\"name\":\"Current Support\",\"description\":\"Family and friends of currently imprisoned political prisoners\"}}]. Use /admin/user-types with hyphen, never /admin/user_types."}"##
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
+        let summary = args
+            .get("summary")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Admin configuration change set")
+            .to_string();
+        let Some(requests_json) = args.get("requests_json") else {
+            return self.reject("Missing requests_json argument.");
+        };
+
+        let requests = match parse_admin_change_set_requests(requests_json) {
+            Ok(requests) => requests,
+            Err(error) => return self.reject(&error),
+        };
+        if let Err(error) = validate_admin_change_set_requests(&requests) {
+            return self.reject(&error);
+        }
+
+        let change_set = AdminChangeSetResponse {
+            version: 1,
+            summary: Some(summary.clone()),
+            requests,
+        };
+
+        if let Ok(mut proposal) = self.proposal.lock() {
+            *proposal = Some(change_set);
+        }
+        if let Ok(mut traces) = self.traces.lock() {
+            traces.push(ToolCallInfoResponse {
+                tool_id: "admin-config:propose_config_change_set".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: Some("propose_config_change_set_success".to_string()),
+                output_summary: Some(format!(
+                    "Proposed change set: {}",
+                    truncate_chars(&summary, 160)
+                )),
+                warnings: Vec::new(),
+                guarded: false,
+            });
+        }
+
+        Ok(ToolResult::success(
+            "I prepared these changes for review. Use Apply to confirm.".to_string(),
+        ))
+    }
+}
+
+impl AdminConfigProposalTool {
+    fn reject(&self, reason: &str) -> Result<ToolResult> {
+        if let Ok(mut proposal) = self.proposal.lock() {
+            *proposal = None;
+        }
+        if let Ok(mut traces) = self.traces.lock() {
+            traces.push(ToolCallInfoResponse {
+                tool_id: "admin-config:propose_config_change_set".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: Some("propose_config_change_set_rejected".to_string()),
+                output_summary: Some(format!(
+                    "Invalid change set proposal: {}",
+                    truncate_chars(reason, 160)
+                )),
+                warnings: vec!["invalid_admin_change_set".to_string()],
+                guarded: true,
+            });
+        }
+        Ok(ToolResult::error(format!(
+            "Invalid Admin Change Confirmation proposal: {}",
+            reason
+        )))
+    }
+}
+
+fn parse_admin_change_set_requests(
+    raw: &str,
+) -> std::result::Result<Vec<AdminChangeSetRequest>, String> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("requests_json must be a JSON array: {}", error))?;
+    let requests = value
+        .as_array()
+        .ok_or_else(|| "requests_json must be a JSON array.".to_string())?;
+    let mut parsed = Vec::new();
+    for request in requests {
+        let object = request
+            .as_object()
+            .ok_or_else(|| "Each request must be an object.".to_string())?;
+        let method = object
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Each request requires a method.".to_string())?
+            .to_uppercase();
+        let path = object
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Each request requires a path.".to_string())?
+            .to_string();
+        let path = normalize_admin_change_request_path(&path);
+        let body = object
+            .get("body")
+            .cloned()
+            .map(|body| normalize_admin_change_request_body(&method, &path, body));
+        parsed.push(AdminChangeSetRequest { method, path, body });
+    }
+    Ok(parsed)
+}
+
+fn normalize_admin_change_request_path(path: &str) -> String {
+    if path == "/admin/user_types" {
+        "/admin/user-types".to_string()
+    } else if let Some(suffix) = path.strip_prefix("/admin/user_types/") {
+        format!("/admin/user-types/{}", suffix)
+    } else {
+        path.to_string()
+    }
+}
+
+fn normalize_admin_change_request_body(method: &str, path: &str, body: Value) -> Value {
+    if method != "PUT" || path != "/admin/settings" {
+        return body;
+    }
+    let Some(object) = body.as_object() else {
+        return body;
+    };
+
+    let has_header_tagline = object.contains_key("header_tagline");
+    let mut normalized = serde_json::Map::new();
+    for (raw_key, raw_value) in object {
+        if raw_key == "tagline" && has_header_tagline {
+            continue;
+        }
+        let key = if raw_key == "tagline" {
+            "header_tagline"
+        } else {
+            raw_key.as_str()
+        };
+        let value = if key == "default_language" {
+            normalize_default_language_value(raw_value).unwrap_or_else(|| raw_value.clone())
+        } else {
+            raw_value.clone()
+        };
+        normalized.insert(key.to_string(), value);
+    }
+    Value::Object(normalized)
+}
+
+fn normalize_default_language_value(value: &Value) -> Option<Value> {
+    let raw = value.as_str()?.trim();
+    if is_supported_default_language(raw) {
+        return Some(Value::String(raw.to_string()));
+    }
+    let code = match raw.to_ascii_lowercase().as_str() {
+        "arabic" => "ar",
+        "bengali" => "bn",
+        "czech" => "cs",
+        "danish" => "da",
+        "german" => "de",
+        "greek" => "el",
+        "english" => "en",
+        "spanish" => "es",
+        "persian" | "farsi" => "fa",
+        "finnish" => "fi",
+        "french" => "fr",
+        "hebrew" => "he",
+        "hindi" => "hi",
+        "hungarian" => "hu",
+        "indonesian" => "id",
+        "italian" => "it",
+        "japanese" => "ja",
+        "korean" => "ko",
+        "dutch" => "nl",
+        "norwegian" => "no",
+        "polish" => "pl",
+        "portuguese" => "pt",
+        "romanian" => "ro",
+        "russian" => "ru",
+        "swedish" => "sv",
+        "thai" => "th",
+        "turkish" => "tr",
+        "ukrainian" => "uk",
+        "vietnamese" => "vi",
+        "simplified chinese" => "zh-Hans",
+        "traditional chinese" => "zh-Hant",
+        _ => return None,
+    };
+    Some(Value::String(code.to_string()))
+}
+
+fn validate_admin_change_set_requests(
+    requests: &[AdminChangeSetRequest],
+) -> std::result::Result<(), String> {
+    if requests.is_empty() {
+        return Err("Change set contains no requests.".to_string());
+    }
+    if requests.len() > 50 {
+        return Err("Change set has too many requests (max 50).".to_string());
+    }
+
+    for request in requests {
+        if !matches!(request.method.as_str(), "PUT" | "POST" | "DELETE") {
+            return Err(format!("Unsupported method: {}", request.method));
+        }
+        if !request.path.starts_with('/') || request.path.contains("..") {
+            return Err(format!("Invalid request path: {}", request.path));
+        }
+        let path_lower = request.path.to_lowercase();
+        if path_lower.contains("/reveal")
+            || path_lower.contains("/export")
+            || path_lower.contains("/prompts/preview")
+            || path_lower.starts_with("/admin/tools/execute")
+        {
+            return Err(format!("Disallowed request path: {}", request.path));
+        }
+        if !is_allowed_admin_change_request(&request.method, &request.path) {
+            return Err(format!(
+                "Disallowed request: {} {}",
+                request.method, request.path
+            ));
+        }
+        validate_admin_change_request_body(request)?;
+    }
+    Ok(())
+}
+
+fn validate_admin_change_request_body(
+    request: &AdminChangeSetRequest,
+) -> std::result::Result<(), String> {
+    if request.method == "PUT" && request.path == "/admin/settings" {
+        let body = request
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| "PUT /admin/settings requires an object body.".to_string())?;
+        for (key, value) in body {
+            if !is_supported_instance_setting_key(key) {
+                return Err(format!("Unsupported instance setting key: {}", key));
+            }
+            if key == "default_language" {
+                let Some(language) = value.as_str() else {
+                    return Err("default_language must be a string code.".to_string());
+                };
+                if !is_supported_default_language(language) {
+                    return Err(format!("Unsupported default_language value: {}", language));
+                }
+            }
+            if key == "default_theme" {
+                let Some(theme) = value.as_str() else {
+                    return Err("default_theme must be a string.".to_string());
+                };
+                if !matches!(theme, "light" | "dark" | "system") {
+                    return Err(format!("Unsupported default_theme value: {}", theme));
+                }
+            }
+        }
+    }
+
+    if request.method == "POST" && request.path == "/admin/user-types" {
+        let body = request
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| "POST /admin/user-types requires an object body.".to_string())?;
+        let name = body
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if name.is_none() {
+            return Err("POST /admin/user-types requires body.name.".to_string());
+        }
+        for key in body.keys() {
+            if !matches!(
+                key.as_str(),
+                "name" | "description" | "icon" | "display_order"
+            ) {
+                return Err(format!("Unsupported user type body key: {}", key));
+            }
+        }
+    }
+
+    if request.method == "PUT" && request.path.starts_with("/admin/ai-config/") {
+        let body = request
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{} requires an object body.", request.path))?;
+        let value = body
+            .get("value")
+            .ok_or_else(|| format!("{} requires body.value.", request.path))?;
+        if !value.is_string() {
+            return Err(format!("{} body.value must be a string.", request.path));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_supported_instance_setting_key(key: &str) -> bool {
+    matches!(
+        key,
+        "instance_name"
+            | "primary_color"
+            | "description"
+            | "logo_url"
+            | "favicon_url"
+            | "apple_touch_icon_url"
+            | "icon"
+            | "assistant_icon"
+            | "user_icon"
+            | "assistant_name"
+            | "user_label"
+            | "header_layout"
+            | "header_tagline"
+            | "chat_bubble_style"
+            | "chat_bubble_shadow"
+            | "surface_style"
+            | "status_icon_set"
+            | "typography_preset"
+            | "default_language"
+            | "default_theme"
+            | "auto_approve_users"
+            | "reachout_enabled"
+            | "reachout_mode"
+            | "reachout_title"
+            | "reachout_description"
+            | "reachout_button_label"
+            | "reachout_success_message"
+            | "reachout_to_email"
+            | "reachout_subject_prefix"
+            | "reachout_rate_limit_per_hour"
+            | "reachout_rate_limit_per_day"
+            | "reachout_include_ip"
+    )
+}
+
+fn is_supported_default_language(language: &str) -> bool {
+    matches!(
+        language,
+        "ar" | "bn"
+            | "cs"
+            | "da"
+            | "de"
+            | "el"
+            | "en"
+            | "es"
+            | "fa"
+            | "fi"
+            | "fr"
+            | "he"
+            | "hi"
+            | "hu"
+            | "id"
+            | "it"
+            | "ja"
+            | "ko"
+            | "nl"
+            | "no"
+            | "pl"
+            | "pt"
+            | "ro"
+            | "ru"
+            | "sv"
+            | "th"
+            | "tr"
+            | "uk"
+            | "vi"
+            | "zh-Hans"
+            | "zh-Hant"
+    )
+}
+
+fn is_allowed_admin_change_request(method: &str, path: &str) -> bool {
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match method {
+        "PUT" => {
+            path == "/admin/settings"
+                || (parts.len() == 4
+                    && parts[..3] == ["admin", "deployment", "config"]
+                    && is_upper_config_key(parts[3]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "ai-config"]
+                    && is_slug_key(parts[2]))
+                || (parts.len() == 5
+                    && parts[..3] == ["admin", "ai-config", "user-type"]
+                    && is_user_type_segment(parts[3])
+                    && is_slug_key(parts[4]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "user-types"]
+                    && is_numeric_id(parts[2]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "user-fields"]
+                    && is_numeric_id(parts[2]))
+                || (parts.len() == 4
+                    && parts[..2] == ["admin", "user-fields"]
+                    && is_numeric_id(parts[2])
+                    && parts[3] == "encryption")
+                || (parts.len() == 5
+                    && parts[..3] == ["ingest", "admin", "documents"]
+                    && is_doc_id(parts[3])
+                    && parts[4] == "defaults")
+                || path == "/ingest/admin/documents/defaults/batch"
+                || (parts.len() == 7
+                    && parts[..3] == ["ingest", "admin", "documents"]
+                    && is_doc_id(parts[3])
+                    && parts[4] == "defaults"
+                    && parts[5] == "user-type"
+                    && is_user_type_segment(parts[6]))
+                || (parts.len() == 3 && parts[..2] == ["admin", "resources"] && is_doc_id(parts[2]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "help-types"]
+                    && is_slug_key(parts[2]))
+        }
+        "POST" => matches!(
+            path,
+            "/admin/user-types" | "/admin/user-fields" | "/admin/resources"
+        ),
+        "DELETE" => {
+            (parts.len() == 3 && parts[..2] == ["admin", "user-types"] && is_numeric_id(parts[2]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "user-fields"]
+                    && is_numeric_id(parts[2]))
+                || (parts.len() == 5
+                    && parts[..3] == ["admin", "ai-config", "user-type"]
+                    && is_user_type_segment(parts[3])
+                    && is_slug_key(parts[4]))
+                || (parts.len() == 7
+                    && parts[..3] == ["ingest", "admin", "documents"]
+                    && is_doc_id(parts[3])
+                    && parts[4] == "defaults"
+                    && parts[5] == "user-type"
+                    && is_user_type_segment(parts[6]))
+                || (parts.len() == 3 && parts[..2] == ["admin", "resources"] && is_doc_id(parts[2]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "help-types"]
+                    && is_slug_key(parts[2]))
+        }
+        _ => false,
+    }
+}
+
+fn is_upper_config_key(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn is_slug_key(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn is_numeric_id(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_user_type_segment(value: &str) -> bool {
+    is_numeric_id(value)
+        || value
+            .strip_prefix("@type:")
+            .is_some_and(|slug| is_slug_key(slug))
+}
+
+fn is_doc_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+#[async_trait::async_trait]
 impl Tool for AdminDbQueryTool {
     fn name(&self) -> &str {
         "db_query"
@@ -1774,6 +2296,7 @@ async fn chat(
         provider: "sage".to_string(),
         tools_used,
         trace,
+        admin_change_set: tool_loop.admin_change_set,
     }))
 }
 
@@ -2137,6 +2660,7 @@ async fn chat_stream(
         if trace.is_some() {
             let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
             payload.trace = trace;
+            payload.admin_change_set = tool_loop.admin_change_set.clone();
             yield Ok(chat_stream_sse_event("trace_final", &payload));
         }
 
@@ -2144,6 +2668,7 @@ async fn chat_stream(
         done.model = Some(state.config.tinfoil_model.clone());
         done.provider = Some("sage".to_string());
         done.tools_used = tool_loop.tools_used;
+        done.admin_change_set = tool_loop.admin_change_set;
         yield Ok(chat_stream_sse_event("done", &done));
     };
     Ok(Sse::new(stream))
@@ -3086,7 +3611,7 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
         ),
         (
             "prompt_rules",
-            "[\"For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.\", \"Never call prose-only bullets or recommendations a Change Confirmation; include exactly one valid JSON change set when proposing writes.\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
+            "[\"For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.\", \"For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.\", \"Admin Config proposals must use canonical paths and keys: POST /admin/user-types, PUT /admin/settings, header_tagline, default_language codes such as en. If propose_config_change_set succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If propose_config_change_set rejects a supported change, correct the request and call the tool again instead of telling the admin to configure it manually.\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
             "json",
             "prompt_section",
             Some("Array of behavioral rules"),
@@ -3147,20 +3672,74 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
     for (key, value, value_type, category, description) in defaults {
-        diesel::sql_query(
-            "INSERT INTO ai_config (key, value, value_type, category, description, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, NOW()) \
-             ON CONFLICT (key) DO NOTHING",
-        )
-        .bind::<Varchar, _>(key)
-        .bind::<Text, _>(value)
-        .bind::<Varchar, _>(value_type)
-        .bind::<Varchar, _>(category)
-        .bind::<Nullable<Text>, _>(description)
-        .execute(&mut *conn)
-        .map_err(internal_error)?;
+        if key == "prompt_rules" {
+            diesel::sql_query(
+                "INSERT INTO ai_config (key, value, value_type, category, description, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, NOW()) \
+                 ON CONFLICT (key) DO NOTHING",
+            )
+            .bind::<Varchar, _>(key)
+            .bind::<Text, _>(value)
+            .bind::<Varchar, _>(value_type)
+            .bind::<Varchar, _>(category)
+            .bind::<Nullable<Text>, _>(description)
+            .execute(&mut *conn)
+            .map_err(internal_error)?;
+
+            let mut rows = diesel::sql_query(
+                "SELECT key, value, value_type, category, description, updated_at \
+                 FROM ai_config WHERE key = $1",
+            )
+            .bind::<Varchar, _>(key)
+            .load::<AiConfigRow>(&mut *conn)
+            .map_err(internal_error)?;
+            if let Some(row) = rows.pop() {
+                if let Some(merged_rules) = merge_prompt_rules(&row.value, value) {
+                    diesel::update(ai_config::table.filter(ai_config::key.eq(key)))
+                        .set((
+                            ai_config::value.eq(merged_rules),
+                            ai_config::updated_at.eq(chrono::Utc::now()),
+                        ))
+                        .execute(&mut *conn)
+                        .map_err(internal_error)?;
+                }
+            }
+        } else {
+            diesel::sql_query(
+                "INSERT INTO ai_config (key, value, value_type, category, description, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, NOW()) \
+                 ON CONFLICT (key) DO NOTHING",
+            )
+            .bind::<Varchar, _>(key)
+            .bind::<Text, _>(value)
+            .bind::<Varchar, _>(value_type)
+            .bind::<Varchar, _>(category)
+            .bind::<Nullable<Text>, _>(description)
+            .execute(&mut *conn)
+            .map_err(internal_error)?;
+        }
     }
     Ok(())
+}
+
+fn merge_prompt_rules(existing_raw: &str, required_raw: &str) -> Option<String> {
+    let mut existing_rules: Vec<String> = serde_json::from_str(existing_raw).ok()?;
+    let required_rules: Vec<String> = serde_json::from_str(required_raw).ok()?;
+    let mut seen: HashSet<String> = existing_rules.iter().cloned().collect();
+    let mut changed = false;
+
+    for rule in required_rules {
+        if seen.insert(rule.clone()) {
+            existing_rules.push(rule);
+            changed = true;
+        }
+    }
+
+    if changed {
+        serde_json::to_string(&existing_rules).ok()
+    } else {
+        None
+    }
 }
 
 fn load_all_ai_config_rows(state: &WebAppState) -> AppResult<Vec<AiConfigRow>> {
@@ -4039,6 +4618,7 @@ struct ConversationToolLoopOutput {
     tools_used: Vec<ToolCallInfoResponse>,
     retrieval_sources: Vec<QuerySource>,
     activity_steps: Vec<ConversationActivityStepResponse>,
+    admin_change_set: Option<AdminChangeSetResponse>,
 }
 
 async fn run_conversation_tool_loop(
@@ -4057,6 +4637,11 @@ async fn run_conversation_tool_loop(
         .lock()
         .map(|sources| dedupe_sources(sources.clone()))
         .unwrap_or_default();
+    let admin_change_set = sinks
+        .admin_change_set
+        .lock()
+        .map(|change_set| change_set.clone())
+        .unwrap_or_default();
     let activity_steps = conversation_activity_steps_from_tools(&tools_used);
 
     Ok(ConversationToolLoopOutput {
@@ -4064,6 +4649,7 @@ async fn run_conversation_tool_loop(
         tools_used,
         retrieval_sources,
         activity_steps,
+        admin_change_set,
     })
 }
 
@@ -5439,6 +6025,399 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_config_proposal_tool_stages_valid_change_set_without_mutating() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: traces.clone(),
+            proposal: proposal.clone(),
+        };
+        let requests_json = json!([
+            {
+                "method": "PUT",
+                "path": "/admin/settings",
+                "body": {
+                    "instance_name": "FreeThem",
+                    "primary_color": "#4F46E5",
+                    "auto_approve_users": true
+                }
+            },
+            {
+                "method": "POST",
+                "path": "/admin/user-types",
+                "body": {
+                    "name": "Family & Friends",
+                    "description": "Loved ones of current political prisoners"
+                }
+            }
+        ])
+        .to_string();
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Bootstrap FreeThem onboarding".to_string(),
+            ),
+            ("requests_json".to_string(), requests_json),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal tool should execute");
+
+        assert!(result.success);
+        assert_eq!(
+            result.output,
+            "I prepared these changes for review. Use Apply to confirm."
+        );
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("valid proposal should be staged");
+        assert_eq!(staged.version, 1);
+        assert_eq!(
+            staged.summary.as_deref(),
+            Some("Bootstrap FreeThem onboarding")
+        );
+        assert_eq!(staged.requests.len(), 2);
+        assert_eq!(staged.requests[0].path, "/admin/settings");
+        let traces = traces.lock().expect("trace sink should lock");
+        assert_eq!(traces[0].tool_id, "admin-config:propose_config_change_set");
+        assert_eq!(
+            traces[0].query.as_deref(),
+            Some("propose_config_change_set_success")
+        );
+        assert_eq!(
+            traces[0].output_summary.as_deref(),
+            Some("Proposed change set: Bootstrap FreeThem onboarding")
+        );
+        assert!(!traces[0]
+            .output_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("#4F46E5"));
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_stages_freethem_bootstrap_with_user_types() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let requests_json = json!([
+            {
+                "method": "PUT",
+                "path": "/admin/settings",
+                "body": {
+                    "instance_name": "FreeThem",
+                    "assistant_name": "Political Prisoner Support Team",
+                    "header_tagline": "Political prisoner support team.",
+                    "description": "We are the Political Prisoners Support Team, an arm of the World Liberty Congress organization that helps former political prisoners and families of political prisoners get support and information and resources.",
+                    "primary_color": "#1E40AF",
+                    "default_theme": "dark",
+                    "default_language": "en",
+                    "auto_approve_users": true
+                }
+            },
+            {
+                "method": "POST",
+                "path": "/admin/user-types",
+                "body": {
+                    "name": "Current Support",
+                    "description": "Family and friends of currently imprisoned political prisoners"
+                }
+            },
+            {
+                "method": "POST",
+                "path": "/admin/user-types",
+                "body": {
+                    "name": "Post-Release Support",
+                    "description": "Family, friends, and former political prisoners seeking post-release support"
+                }
+            }
+        ])
+        .to_string();
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Bootstrap FreeThem guided setup".to_string(),
+            ),
+            ("requests_json".to_string(), requests_json),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal tool should execute");
+
+        assert!(result.success);
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("valid proposal should be staged");
+        assert_eq!(staged.requests.len(), 3);
+        assert_eq!(staged.requests[0].path, "/admin/settings");
+        let settings_body = staged.requests[0]
+            .body
+            .as_ref()
+            .expect("settings request should include body");
+        assert_eq!(
+            settings_body["header_tagline"],
+            "Political prisoner support team."
+        );
+        assert_eq!(settings_body["default_language"], "en");
+        assert_eq!(staged.requests[1].path, "/admin/user-types");
+        assert_eq!(staged.requests[2].path, "/admin/user-types");
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_normalizes_observed_model_drift() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            ("summary".to_string(), "Normalize drift".to_string()),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/settings",
+                        "body": {
+                            "tagline": "Support for political prisoners and their families",
+                            "default_language": "English"
+                        }
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/admin/user_types",
+                        "body": {
+                            "name": "Current Support",
+                            "description": "Family and friends of current political prisoners"
+                        }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal tool should execute");
+
+        assert!(result.success);
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("normalized proposal should be staged");
+        assert_eq!(staged.requests[0].path, "/admin/settings");
+        let settings_body = staged.requests[0]
+            .body
+            .as_ref()
+            .expect("settings request should include body");
+        assert_eq!(
+            settings_body["header_tagline"],
+            "Support for political prisoners and their families"
+        );
+        assert_eq!(settings_body["default_language"], "en");
+        assert_eq!(staged.requests[1].path, "/admin/user-types");
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_unknown_setting_keys() {
+        let proposal = Arc::new(Mutex::new(Some(AdminChangeSetResponse {
+            version: 1,
+            summary: Some("Old valid proposal".to_string()),
+            requests: vec![AdminChangeSetRequest {
+                method: "PUT".to_string(),
+                path: "/admin/settings".to_string(),
+                body: Some(json!({ "instance_name": "Old" })),
+            }],
+        })));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            ("summary".to_string(), "Unknown setting".to_string()),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/settings",
+                        "body": { "made_up_setting": "nope" }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Unsupported instance setting key"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_invalid_ai_config_body() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            ("summary".to_string(), "Invalid AI config".to_string()),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/ai-config/prompt_tone",
+                        "body": { "value": true }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("invalid AI config body should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("body.value must be a string"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_disallowed_paths() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: traces.clone(),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            ("summary".to_string(), "Unsafe change".to_string()),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/tools/execute",
+                        "body": { "tool_id": "db-query" }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Disallowed request path"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+        let traces = traces.lock().expect("trace sink should lock");
+        assert!(traces[0].guarded);
+        assert_eq!(
+            traces[0].query.as_deref(),
+            Some("propose_config_change_set_rejected")
+        );
+        assert_eq!(traces[0].warnings, vec!["invalid_admin_change_set"]);
+    }
+
+    #[test]
+    fn merge_prompt_rules_preserves_custom_rules_and_appends_missing_defaults() {
+        let existing = serde_json::to_string(&vec![
+            "Custom operator rule".to_string(),
+            "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.".to_string(),
+        ])
+        .expect("existing rules should serialize");
+        let required = serde_json::to_string(&vec![
+            "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.".to_string(),
+            "Admin Config proposals must use canonical paths and keys.".to_string(),
+        ])
+        .expect("required rules should serialize");
+
+        let merged = merge_prompt_rules(&existing, &required)
+            .expect("missing required rules should produce merged JSON");
+        let rules: Vec<String> = serde_json::from_str(&merged).expect("merged rules should parse");
+
+        assert_eq!(rules[0], "Custom operator rule");
+        assert_eq!(
+            rules[1],
+            "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action."
+        );
+        assert_eq!(
+            rules[2],
+            "Admin Config proposals must use canonical paths and keys."
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_malformed_request_json() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool { traces, proposal };
+        let args = HashMap::from([
+            ("summary".to_string(), "Malformed".to_string()),
+            (
+                "requests_json".to_string(),
+                "{\"method\":\"PUT\"}".to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("malformed proposal should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("must be a JSON array"));
+    }
+
+    #[tokio::test]
     async fn knowledge_search_tool_executes_with_selected_document_constraints() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
@@ -5681,6 +6660,7 @@ mod tests {
         assert!(registry.has("read_user_types"));
         assert!(registry.has("read_document_access"));
         assert!(registry.has("read_onboarding_status"));
+        assert!(registry.has("propose_config_change_set"));
         assert!(registry.has("done"));
 
         let user = InternalAuthContext {
@@ -5706,6 +6686,7 @@ mod tests {
         assert!(user_registry.has("web_search"));
         assert!(!user_registry.has("db_query"));
         assert!(!user_registry.has("read_instance_settings"));
+        assert!(!user_registry.has("propose_config_change_set"));
 
         let disabled_request = ChatRequest {
             tools: Vec::new(),
@@ -5723,6 +6704,7 @@ mod tests {
         assert!(!disabled_registry.has("web_search"));
         assert!(!disabled_registry.has("db_query"));
         assert!(!disabled_registry.has("read_instance_settings"));
+        assert!(!disabled_registry.has("propose_config_change_set"));
         assert!(disabled_registry.has("done"));
     }
 
@@ -5920,7 +6902,7 @@ mod tests {
     fn test_web_config() -> EnclaveWebConfig {
         EnclaveWebConfig {
             http_port: 3000,
-            backend_url: "http://core-backend:8000".to_string(),
+            backend_url: "http://core-backend:18000".to_string(),
             internal_agent_token: "internal-test-token".to_string(),
             secret_key: "test-secret".to_string(),
             allowed_origins: vec!["https://app.example.test".to_string()],
