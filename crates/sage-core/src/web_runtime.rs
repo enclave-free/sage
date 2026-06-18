@@ -19,7 +19,7 @@ use base64::{
 use diesel::prelude::*;
 use diesel::sql_types::{Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid, Varchar};
 use flate2::read::ZlibDecoder;
-use futures_util::{Stream, StreamExt};
+use futures_util::Stream;
 use itsdangerous::{
     default_builder, timed_serializer_with_signer, Encoding, IntoTimestampSigner, TimedSerializer,
 };
@@ -68,19 +68,6 @@ Output style:
 - Keep messages concise unless the user asked for depth.
 - Use tools and then continue until you have the answer.
 - Use done only when there is nothing else to do this turn.
-"#;
-
-const ENCLAVE_WEB_FINAL_ANSWER_INSTRUCTION: &str = r#"You are Sage operating enclave.free's web application.
-
-Tool and retrieval preparation for this turn is already complete. You are now writing the final user-visible answer.
-
-Final-answer rules:
-- Answer from the prepared context, session memory, and current user message.
-- Do not say you will search, look up, check, inspect, query, use a tool, or do anything in the background.
-- If prepared uploaded-document context is present, synthesize it directly.
-- If prepared context says no relevant uploaded-document passages were found, say that plainly and ask for the missing document or a narrower question.
-- Never fabricate facts, sources, organizations, contacts, database results, or background work.
-- Do not emit JSON, tool calls, hidden reasoning, raw prompts, raw provider traces, secrets, or unredacted database rows.
 "#;
 
 #[derive(Clone, Copy)]
@@ -188,7 +175,7 @@ impl EnclaveWebConfig {
                 .parse()
                 .context("ENCLAVE_WEB_PORT must be a valid port")?,
             backend_url: std::env::var("ENCLAVE_BACKEND_URL")
-                .unwrap_or_else(|_| "http://core-backend:8000".to_string()),
+                .unwrap_or_else(|_| "http://core-backend:18000".to_string()),
             internal_agent_token: std::env::var("INTERNAL_AGENT_TOKEN")
                 .context("INTERNAL_AGENT_TOKEN must be set")?,
             secret_key: std::env::var("SECRET_KEY").context("SECRET_KEY must be set")?,
@@ -311,6 +298,22 @@ pub struct ToolTraceResponse {
     pub metadata: Value,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AdminChangeSetRequest {
+    pub method: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AdminChangeSetResponse {
+    pub version: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub requests: Vec<AdminChangeSetRequest>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RetrievalTraceResponse {
     pub source_type: String,
@@ -354,8 +357,8 @@ pub struct ChatRequest {
     pub tools: Vec<String>,
     #[serde(default)]
     pub conversation_history: Vec<ChatHistoryMessage>,
-    pub tool_context: Option<String>,
-    pub client_executed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub job_ids: Option<Vec<String>>,
     #[serde(default)]
     pub conversation_channel: Option<ConversationChannelRequest>,
 }
@@ -376,7 +379,6 @@ pub struct ChatHistoryMessage {
 #[derive(Clone, Debug, Default)]
 struct PersistedConversationContext {
     summary: Option<String>,
-    messages: Vec<ChatHistoryMessage>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -388,6 +390,8 @@ pub struct ChatResponse {
     #[serde(default)]
     pub tools_used: Vec<ToolCallInfoResponse>,
     pub trace: Option<ConversationTraceResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_change_set: Option<AdminChangeSetResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -412,32 +416,14 @@ pub struct ChatStreamEventPayload {
     pub tools_used: Vec<ToolCallInfoResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_change_set: Option<AdminChangeSetResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConversationTurnTimingResponse {
     pub phase: String,
     pub elapsed_ms: u128,
-}
-
-#[derive(Clone, Debug, Default)]
-struct PreparedChatContext {
-    context: String,
-    tools_used: Vec<ToolCallInfoResponse>,
-    retrieval_sources: Vec<QuerySource>,
-    activity_steps: Vec<ConversationActivityStepResponse>,
-}
-
-#[derive(Clone, Debug)]
-struct PreparedToolActivity {
-    tool: ToolCallInfoResponse,
-    activity_step: Option<ConversationActivityStepResponse>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct FinalAnswerChunk {
-    delta: Option<String>,
-    done: bool,
 }
 
 impl ChatStreamEventPayload {
@@ -454,6 +440,7 @@ impl ChatStreamEventPayload {
             provider: None,
             tools_used: Vec::new(),
             detail: None,
+            admin_change_set: None,
         }
     }
 }
@@ -648,27 +635,60 @@ struct InternalDocumentSearchResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct InternalScopedConfigContextRequest {
-    query: String,
-    actor: InternalAuthContext,
-    mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_scopes: Option<Vec<String>>,
+struct InternalResourceSearchRequest {
+    help_type: String,
+    jurisdiction: Option<String>,
+    language: Option<String>,
+    limit: i32,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-struct InternalScopedConfigContextResponse {
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ResourceRecord {
+    resource_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    resource_type: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    contact: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
+    coverage: Option<String>,
+    #[serde(default)]
+    help_types: Vec<String>,
+    #[serde(default)]
+    verified_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InternalResourceSearchResponse {
+    resources: Vec<ResourceRecord>,
+    #[serde(default)]
+    resolved_country_code: Option<String>,
+    #[serde(default)]
+    help_type: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct InternalAdminConfigToolRequest {
+    actor: InternalAuthContext,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct InternalAdminConfigToolResponse {
     version: i32,
-    primary_scope: String,
-    included_scopes: Vec<String>,
-    context_text: String,
+    tool: String,
+    data: Value,
     warnings: Vec<String>,
     generated_at: String,
     secret_policy: Value,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ScopedConfigContextError {
+enum AdminConfigToolError {
     Unauthorized,
     Failed(String),
 }
@@ -932,6 +952,21 @@ impl InternalAgentClient {
         self.send_json(request).await
     }
 
+    async fn resources_search(
+        &self,
+        payload: &InternalResourceSearchRequest,
+    ) -> Result<InternalResourceSearchResponse> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/internal/agent/resources/search",
+                self.backend_url
+            ))
+            .header("X-Internal-Agent-Token", &self.internal_agent_token)
+            .json(payload);
+        self.send_json(request).await
+    }
+
     async fn admin_db_query(&self, sql: &str) -> Result<Value> {
         let request = self
             .http
@@ -944,34 +979,37 @@ impl InternalAgentClient {
         self.send_value(request).await
     }
 
-    async fn scoped_config_context(
+    async fn admin_config_tool(
         &self,
-        payload: &InternalScopedConfigContextRequest,
-    ) -> std::result::Result<InternalScopedConfigContextResponse, ScopedConfigContextError> {
+        endpoint: &str,
+        actor: &InternalAuthContext,
+    ) -> std::result::Result<InternalAdminConfigToolResponse, AdminConfigToolError> {
         let request = self
             .http
             .post(format!(
-                "{}/internal/agent/scoped-config-context",
-                self.backend_url
+                "{}/internal/agent/admin-config/{}",
+                self.backend_url, endpoint
             ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
-            .json(payload);
+            .json(&InternalAdminConfigToolRequest {
+                actor: actor.clone(),
+            });
         let (status, value) = self
             .send_value_with_status(request)
             .await
-            .map_err(|error| ScopedConfigContextError::Failed(error.to_string()))?;
+            .map_err(|error| AdminConfigToolError::Failed(error.to_string()))?;
         if status == StatusCode::FORBIDDEN {
-            return Err(ScopedConfigContextError::Unauthorized);
+            return Err(AdminConfigToolError::Unauthorized);
         }
         if !status.is_success() {
             let detail = value
                 .get("detail")
                 .and_then(|detail| detail.as_str())
-                .unwrap_or("Control plane scoped config request failed.");
-            return Err(ScopedConfigContextError::Failed(detail.to_string()));
+                .unwrap_or("Admin Config tool request failed.");
+            return Err(AdminConfigToolError::Failed(detail.to_string()));
         }
         serde_json::from_value(value).map_err(|error| {
-            ScopedConfigContextError::Failed(format!("Invalid scoped config response: {}", error))
+            AdminConfigToolError::Failed(format!("Invalid Admin Config tool response: {}", error))
         })
     }
 
@@ -989,7 +1027,15 @@ impl InternalAgentClient {
     }
 
     async fn send_value(&self, request: reqwest::RequestBuilder) -> Result<Value> {
-        let (_, value) = self.send_value_with_status(request).await?;
+        let (status, value) = self.send_value_with_status(request).await?;
+        if !status.is_success() {
+            let detail = value
+                .get("detail")
+                .and_then(|detail| detail.as_str())
+                .or_else(|| value.get("error").and_then(|error| error.as_str()))
+                .unwrap_or("Backend request failed.");
+            return Err(anyhow!("backend returned {}: {}", status, detail));
+        }
         Ok(value)
     }
 
@@ -1021,6 +1067,13 @@ struct KnowledgeSearchTool {
     jurisdiction: Option<String>,
     situation_details: Option<String>,
     sources: Arc<Mutex<Vec<QuerySource>>>,
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+}
+
+#[derive(Clone)]
+struct FindResourcesTool {
+    internal: InternalAgentClient,
+    jurisdiction: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1034,6 +1087,157 @@ struct SearxWebSearchTool {
 struct AdminDbQueryTool {
     internal: InternalAgentClient,
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+}
+
+#[derive(Clone)]
+struct AdminConfigReadTool {
+    internal: InternalAgentClient,
+    auth: InternalAuthContext,
+    name: String,
+    endpoint: String,
+    description: String,
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+}
+
+#[derive(Clone)]
+struct AdminConfigProposalTool {
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+    proposal: Arc<Mutex<Option<AdminChangeSetResponse>>>,
+}
+
+#[derive(Clone)]
+struct ConversationToolLoopSinks {
+    sources: Arc<Mutex<Vec<QuerySource>>>,
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+    admin_change_set: Arc<Mutex<Option<AdminChangeSetResponse>>>,
+}
+
+impl ConversationToolLoopSinks {
+    fn new() -> Self {
+        Self {
+            sources: Arc::new(Mutex::new(Vec::new())),
+            traces: Arc::new(Mutex::new(Vec::new())),
+            admin_change_set: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+fn build_conversation_tool_registry(
+    internal: &InternalAgentClient,
+    http: &Client,
+    request: &ChatRequest,
+    auth: &InternalAuthContext,
+    top_k: i32,
+    searxng_url: &str,
+) -> (ToolRegistry, ConversationToolLoopSinks) {
+    build_conversation_tool_registry_with_context(
+        internal,
+        http,
+        request,
+        auth,
+        top_k,
+        searxng_url,
+        None,
+        None,
+    )
+}
+
+fn build_conversation_tool_registry_with_context(
+    internal: &InternalAgentClient,
+    http: &Client,
+    request: &ChatRequest,
+    auth: &InternalAuthContext,
+    top_k: i32,
+    searxng_url: &str,
+    jurisdiction: Option<String>,
+    situation_details: Option<String>,
+) -> (ToolRegistry, ConversationToolLoopSinks) {
+    let sinks = ConversationToolLoopSinks::new();
+    let mut registry = ToolRegistry::new();
+
+    if request.tools.iter().any(|tool| tool == "knowledge-search") {
+        registry.register(Arc::new(KnowledgeSearchTool {
+            internal: internal.clone(),
+            user: auth.clone(),
+            top_k,
+            job_ids: request.job_ids.clone(),
+            jurisdiction,
+            situation_details,
+            sources: sinks.sources.clone(),
+            traces: sinks.traces.clone(),
+        }));
+    }
+
+    if request.tools.iter().any(|tool| tool == "web-search") {
+        registry.register(Arc::new(SearxWebSearchTool {
+            http: http.clone(),
+            searxng_url: searxng_url.to_string(),
+            traces: sinks.traces.clone(),
+        }));
+    }
+
+    if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "db-query") {
+        registry.register(Arc::new(AdminDbQueryTool {
+            internal: internal.clone(),
+            traces: sinks.traces.clone(),
+        }));
+    }
+
+    if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "admin-config") {
+        for (name, endpoint, description) in [
+            (
+                "read_instance_settings",
+                "instance-settings",
+                "Read instance branding, language, theme, access, and public UI settings.",
+            ),
+            (
+                "read_deployment_settings",
+                "deployment-settings",
+                "Read masked Deployment Settings, including configured/unconfigured secret status.",
+            ),
+            (
+                "read_deployment_readiness",
+                "deployment-readiness",
+                "Read deployment readiness checks and remaining deployment handoffs.",
+            ),
+            (
+                "read_agent_settings",
+                "agent-settings",
+                "Read global and per-user-type Sage Agent Settings.",
+            ),
+            (
+                "read_user_types",
+                "user-types",
+                "Read configured user types and onboarding questions.",
+            ),
+            (
+                "read_document_access",
+                "document-access",
+                "Read global and per-user-type Document Access defaults and overrides.",
+            ),
+            (
+                "read_onboarding_status",
+                "onboarding-status",
+                "Read first-admin setup state and guided bootstrap checklist status.",
+            ),
+        ] {
+            registry.register(Arc::new(AdminConfigReadTool {
+                internal: internal.clone(),
+                auth: auth.clone(),
+                name: name.to_string(),
+                endpoint: endpoint.to_string(),
+                description: description.to_string(),
+                traces: sinks.traces.clone(),
+            }));
+        }
+        registry.register(Arc::new(AdminConfigProposalTool {
+            traces: sinks.traces.clone(),
+            proposal: sinks.admin_change_set.clone(),
+        }));
+    }
+
+    registry.register(Arc::new(crate::tools::DoneTool));
+    (registry, sinks)
 }
 
 #[async_trait::async_trait]
@@ -1075,6 +1279,24 @@ impl Tool for KnowledgeSearchTool {
         if let Ok(mut sink) = self.sources.lock() {
             sink.extend(response.sources.clone());
         }
+        if let Ok(mut sink) = self.traces.lock() {
+            let mut warnings = Vec::new();
+            let output_summary =
+                if response.sources.is_empty() && response.context.trim().is_empty() {
+                    warnings.push("no_relevant_uploaded_document_context".to_string());
+                    "No relevant uploaded-document passages were found.".to_string()
+                } else {
+                    "Retrieved uploaded-document passages for the answer.".to_string()
+                };
+            sink.push(ToolCallInfoResponse {
+                tool_id: "knowledge-search".to_string(),
+                tool_name: "Knowledge Search".to_string(),
+                query: Some(query.clone()),
+                output_summary: Some(output_summary),
+                warnings,
+                guarded: false,
+            });
+        }
 
         let mut output = String::from("Knowledge search results:\n");
         for (idx, source) in response.sources.iter().take(6).enumerate() {
@@ -1091,6 +1313,108 @@ impl Tool for KnowledgeSearchTool {
             output.push_str("Compiled context:\n");
             output.push_str(&response.context);
         }
+
+        Ok(ToolResult::success(output))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for FindResourcesTool {
+    fn name(&self) -> &str {
+        "find_resources"
+    }
+
+    fn description(&self) -> &str {
+        "Look up trusted, vetted real-world resources to connect a person with help: \
+         lawyers, NGOs, UN bodies, clinics, shelters, food, financial aid. Use this when a \
+         conversation escalates from information to action — when someone needs to be put in \
+         touch with a real organization or person who can help. Results are filtered by region \
+         and the type of help needed and ranked from most-local to global."
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{"help_type":"required: one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es"}"#
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
+        let help_type = args
+            .get("help_type")
+            .cloned()
+            .ok_or_else(|| anyhow!("find_resources requires help_type"))?;
+        let region = args
+            .get("region")
+            .cloned()
+            .or_else(|| self.jurisdiction.clone());
+        let language = args.get("language").cloned();
+
+        let response = self
+            .internal
+            .resources_search(&InternalResourceSearchRequest {
+                help_type: help_type.clone(),
+                jurisdiction: region.clone(),
+                language,
+                limit: 5,
+            })
+            .await?;
+        let response_help_type = fallback_text(&response.help_type, &help_type);
+        let response_region = response
+            .resolved_country_code
+            .as_deref()
+            .or(region.as_deref());
+
+        if response.resources.is_empty() {
+            let where_label = response_region.unwrap_or("the requested region");
+            return Ok(ToolResult::success(format!(
+                "No vetted {} resources are currently listed for {}. Do not invent referrals; \
+                 offer general guidance instead and suggest the person seek a trusted local contact.",
+                response_help_type, where_label
+            )));
+        }
+
+        let mut output = format!("Trusted {} resources", response_help_type);
+        if let Some(region) = response_region {
+            output.push_str(&format!(" for {}", region));
+        }
+        output.push_str(" (most local first):\n\n");
+        for (idx, r) in response.resources.iter().enumerate() {
+            let name = r.name.clone().unwrap_or_else(|| r.resource_id.clone());
+            let rtype = r.resource_type.clone().unwrap_or_default();
+            let coverage = r.coverage.clone().unwrap_or_default();
+            output.push_str(&format!("{}. {}", idx + 1, name));
+            if !rtype.is_empty() {
+                output.push_str(&format!(" ({})", rtype));
+            }
+            if !coverage.is_empty() {
+                output.push_str(&format!(" — covers {}", coverage));
+            }
+            if r.verified_at.is_some() {
+                output.push_str(" [verified]");
+            }
+            output.push('\n');
+            if let Some(desc) = &r.description {
+                if !desc.trim().is_empty() {
+                    output.push_str(&format!("   {}\n", desc.trim()));
+                }
+            }
+            if !r.help_types.is_empty() {
+                output.push_str(&format!("   Helps with: {}\n", r.help_types.join(", ")));
+            }
+            if !r.languages.is_empty() {
+                output.push_str(&format!("   Languages: {}\n", r.languages.join(", ")));
+            }
+            for key in ["phone", "email", "url", "secure_channel", "address"] {
+                if let Some(value) = r.contact.get(key) {
+                    if !value.trim().is_empty() {
+                        output.push_str(&format!("   {}: {}\n", key, value));
+                    }
+                }
+            }
+            output.push('\n');
+        }
+        output.push_str(
+            "Relay these to the person plainly. Only share what is listed here — never invent \
+             contact details. Encourage them to verify before acting where possible.",
+        );
 
         Ok(ToolResult::success(output))
     }
@@ -1186,6 +1510,552 @@ impl Tool for SearxWebSearchTool {
 }
 
 #[async_trait::async_trait]
+impl Tool for AdminConfigReadTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{}"#
+    }
+
+    async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+        let response = match self
+            .internal
+            .admin_config_tool(&self.endpoint, &self.auth)
+            .await
+        {
+            Ok(response) => response,
+            Err(AdminConfigToolError::Unauthorized) => {
+                return Ok(ToolResult::error(
+                    "Admin Config read tools are not authorized for this actor.",
+                ));
+            }
+            Err(AdminConfigToolError::Failed(error)) => {
+                return Ok(ToolResult::error(format!(
+                    "Admin Config read tool failed: {}",
+                    error
+                )));
+            }
+        };
+
+        if let Ok(mut sink) = self.traces.lock() {
+            sink.push(ToolCallInfoResponse {
+                tool_id: format!("admin-config:{}", self.name),
+                tool_name: "Admin Config".to_string(),
+                query: Some(self.name.clone()),
+                output_summary: Some(format!("Read {}.", self.name)),
+                warnings: response.warnings.clone(),
+                guarded: false,
+            });
+        }
+
+        let output = serde_json::to_string_pretty(&json!({
+            "version": response.version,
+            "tool": response.tool,
+            "generated_at": response.generated_at,
+            "secret_policy": response.secret_policy,
+            "warnings": response.warnings,
+            "data": response.data,
+        }))?;
+        Ok(ToolResult::success(output))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for AdminConfigProposalTool {
+    fn name(&self) -> &str {
+        "propose_config_change_set"
+    }
+
+    fn description(&self) -> &str {
+        "Stage a non-mutating Admin Config change set for UI Change Confirmation. Use this for admin write intent instead of putting raw JSON in messages. Canonical paths include PUT /admin/settings and POST /admin/user-types. Use header_tagline, default_language codes like en, default_theme light|dark|system, and auto_approve_users. The admin must still click Apply before any changes are written. If this tool succeeds, keep the final answer short: \"I prepared these changes for review. Use Apply to confirm.\" If a proposal is rejected, correct the request and call this tool again; do not tell the admin to edit supported settings manually."
+    }
+
+    fn args_schema(&self) -> &str {
+        r##"{"summary": "One-sentence summary of the proposed configuration changes", "requests_json": "JSON array of requests. Guided bootstrap example: [{\"method\":\"PUT\",\"path\":\"/admin/settings\",\"body\":{\"instance_name\":\"FreeThem\",\"assistant_name\":\"Political Prisoner Support Team\",\"header_tagline\":\"Political prisoner support team.\",\"description\":\"...\",\"primary_color\":\"#1E40AF\",\"default_theme\":\"dark\",\"default_language\":\"en\",\"auto_approve_users\":true}},{\"method\":\"POST\",\"path\":\"/admin/user-types\",\"body\":{\"name\":\"Current Support\",\"description\":\"Family and friends of currently imprisoned political prisoners\"}}]. Use /admin/user-types with hyphen, never /admin/user_types."}"##
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
+        let summary = args
+            .get("summary")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Admin configuration change set")
+            .to_string();
+        let Some(requests_json) = args.get("requests_json") else {
+            return self.reject("Missing requests_json argument.");
+        };
+
+        let requests = match parse_admin_change_set_requests(requests_json) {
+            Ok(requests) => requests,
+            Err(error) => return self.reject(&error),
+        };
+        if let Err(error) = validate_admin_change_set_requests(&requests) {
+            return self.reject(&error);
+        }
+
+        let change_set = AdminChangeSetResponse {
+            version: 1,
+            summary: Some(summary.clone()),
+            requests,
+        };
+
+        if let Ok(mut proposal) = self.proposal.lock() {
+            *proposal = Some(change_set);
+        }
+        if let Ok(mut traces) = self.traces.lock() {
+            traces.push(ToolCallInfoResponse {
+                tool_id: "admin-config:propose_config_change_set".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: Some("propose_config_change_set_success".to_string()),
+                output_summary: Some(format!(
+                    "Proposed change set: {}",
+                    truncate_chars(&summary, 160)
+                )),
+                warnings: Vec::new(),
+                guarded: false,
+            });
+        }
+
+        Ok(ToolResult::success(
+            "I prepared these changes for review. Use Apply to confirm.".to_string(),
+        ))
+    }
+}
+
+impl AdminConfigProposalTool {
+    fn reject(&self, reason: &str) -> Result<ToolResult> {
+        if let Ok(mut proposal) = self.proposal.lock() {
+            *proposal = None;
+        }
+        if let Ok(mut traces) = self.traces.lock() {
+            traces.push(ToolCallInfoResponse {
+                tool_id: "admin-config:propose_config_change_set".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: Some("propose_config_change_set_rejected".to_string()),
+                output_summary: Some(format!(
+                    "Invalid change set proposal: {}",
+                    truncate_chars(reason, 160)
+                )),
+                warnings: vec!["invalid_admin_change_set".to_string()],
+                guarded: true,
+            });
+        }
+        Ok(ToolResult::error(format!(
+            "Invalid Admin Change Confirmation proposal: {}",
+            reason
+        )))
+    }
+}
+
+fn parse_admin_change_set_requests(
+    raw: &str,
+) -> std::result::Result<Vec<AdminChangeSetRequest>, String> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("requests_json must be a JSON array: {}", error))?;
+    let requests = value
+        .as_array()
+        .ok_or_else(|| "requests_json must be a JSON array.".to_string())?;
+    let mut parsed = Vec::new();
+    for request in requests {
+        let object = request
+            .as_object()
+            .ok_or_else(|| "Each request must be an object.".to_string())?;
+        let method = object
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Each request requires a method.".to_string())?
+            .to_uppercase();
+        let path = object
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Each request requires a path.".to_string())?
+            .to_string();
+        let path = normalize_admin_change_request_path(&path);
+        let body = object
+            .get("body")
+            .cloned()
+            .map(|body| normalize_admin_change_request_body(&method, &path, body));
+        parsed.push(AdminChangeSetRequest { method, path, body });
+    }
+    Ok(parsed)
+}
+
+fn normalize_admin_change_request_path(path: &str) -> String {
+    if path == "/admin/user_types" {
+        "/admin/user-types".to_string()
+    } else if let Some(suffix) = path.strip_prefix("/admin/user_types/") {
+        format!("/admin/user-types/{}", suffix)
+    } else {
+        path.to_string()
+    }
+}
+
+fn normalize_admin_change_request_body(method: &str, path: &str, body: Value) -> Value {
+    if method != "PUT" || path != "/admin/settings" {
+        return body;
+    }
+    let Some(object) = body.as_object() else {
+        return body;
+    };
+
+    let has_header_tagline = object.contains_key("header_tagline");
+    let mut normalized = serde_json::Map::new();
+    for (raw_key, raw_value) in object {
+        if raw_key == "tagline" && has_header_tagline {
+            continue;
+        }
+        let key = if raw_key == "tagline" {
+            "header_tagline"
+        } else {
+            raw_key.as_str()
+        };
+        let value = if key == "default_language" {
+            normalize_default_language_value(raw_value).unwrap_or_else(|| raw_value.clone())
+        } else {
+            raw_value.clone()
+        };
+        normalized.insert(key.to_string(), value);
+    }
+    Value::Object(normalized)
+}
+
+fn normalize_default_language_value(value: &Value) -> Option<Value> {
+    let raw = value.as_str()?.trim();
+    if is_supported_default_language(raw) {
+        return Some(Value::String(raw.to_string()));
+    }
+    let code = match raw.to_ascii_lowercase().as_str() {
+        "arabic" => "ar",
+        "bengali" => "bn",
+        "czech" => "cs",
+        "danish" => "da",
+        "german" => "de",
+        "greek" => "el",
+        "english" => "en",
+        "spanish" => "es",
+        "persian" | "farsi" => "fa",
+        "finnish" => "fi",
+        "french" => "fr",
+        "hebrew" => "he",
+        "hindi" => "hi",
+        "hungarian" => "hu",
+        "indonesian" => "id",
+        "italian" => "it",
+        "japanese" => "ja",
+        "korean" => "ko",
+        "dutch" => "nl",
+        "norwegian" => "no",
+        "polish" => "pl",
+        "portuguese" => "pt",
+        "romanian" => "ro",
+        "russian" => "ru",
+        "swedish" => "sv",
+        "thai" => "th",
+        "turkish" => "tr",
+        "ukrainian" => "uk",
+        "vietnamese" => "vi",
+        "simplified chinese" => "zh-Hans",
+        "traditional chinese" => "zh-Hant",
+        _ => return None,
+    };
+    Some(Value::String(code.to_string()))
+}
+
+fn validate_admin_change_set_requests(
+    requests: &[AdminChangeSetRequest],
+) -> std::result::Result<(), String> {
+    if requests.is_empty() {
+        return Err("Change set contains no requests.".to_string());
+    }
+    if requests.len() > 50 {
+        return Err("Change set has too many requests (max 50).".to_string());
+    }
+
+    for request in requests {
+        if !matches!(request.method.as_str(), "PUT" | "POST" | "DELETE") {
+            return Err(format!("Unsupported method: {}", request.method));
+        }
+        if !request.path.starts_with('/') || request.path.contains("..") {
+            return Err(format!("Invalid request path: {}", request.path));
+        }
+        let path_lower = request.path.to_lowercase();
+        if path_lower.contains("/reveal")
+            || path_lower.contains("/export")
+            || path_lower.contains("/prompts/preview")
+            || path_lower.starts_with("/admin/tools/execute")
+        {
+            return Err(format!("Disallowed request path: {}", request.path));
+        }
+        if !is_allowed_admin_change_request(&request.method, &request.path) {
+            return Err(format!(
+                "Disallowed request: {} {}",
+                request.method, request.path
+            ));
+        }
+        validate_admin_change_request_body(request)?;
+    }
+    Ok(())
+}
+
+fn validate_admin_change_request_body(
+    request: &AdminChangeSetRequest,
+) -> std::result::Result<(), String> {
+    if request.method == "PUT" && request.path == "/admin/settings" {
+        let body = request
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| "PUT /admin/settings requires an object body.".to_string())?;
+        for (key, value) in body {
+            if !is_supported_instance_setting_key(key) {
+                return Err(format!("Unsupported instance setting key: {}", key));
+            }
+            if key == "default_language" {
+                let Some(language) = value.as_str() else {
+                    return Err("default_language must be a string code.".to_string());
+                };
+                if !is_supported_default_language(language) {
+                    return Err(format!("Unsupported default_language value: {}", language));
+                }
+            }
+            if key == "default_theme" {
+                let Some(theme) = value.as_str() else {
+                    return Err("default_theme must be a string.".to_string());
+                };
+                if !matches!(theme, "light" | "dark" | "system") {
+                    return Err(format!("Unsupported default_theme value: {}", theme));
+                }
+            }
+        }
+    }
+
+    if request.method == "POST" && request.path == "/admin/user-types" {
+        let body = request
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| "POST /admin/user-types requires an object body.".to_string())?;
+        let name = body
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if name.is_none() {
+            return Err("POST /admin/user-types requires body.name.".to_string());
+        }
+        for key in body.keys() {
+            if !matches!(
+                key.as_str(),
+                "name" | "description" | "icon" | "display_order"
+            ) {
+                return Err(format!("Unsupported user type body key: {}", key));
+            }
+        }
+    }
+
+    if request.method == "PUT" && request.path.starts_with("/admin/ai-config/") {
+        let body = request
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{} requires an object body.", request.path))?;
+        let value = body
+            .get("value")
+            .ok_or_else(|| format!("{} requires body.value.", request.path))?;
+        if !value.is_string() {
+            return Err(format!("{} body.value must be a string.", request.path));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_supported_instance_setting_key(key: &str) -> bool {
+    matches!(
+        key,
+        "instance_name"
+            | "primary_color"
+            | "description"
+            | "logo_url"
+            | "favicon_url"
+            | "apple_touch_icon_url"
+            | "icon"
+            | "assistant_icon"
+            | "user_icon"
+            | "assistant_name"
+            | "user_label"
+            | "header_layout"
+            | "header_tagline"
+            | "chat_bubble_style"
+            | "chat_bubble_shadow"
+            | "surface_style"
+            | "status_icon_set"
+            | "typography_preset"
+            | "default_language"
+            | "default_theme"
+            | "auto_approve_users"
+            | "reachout_enabled"
+            | "reachout_mode"
+            | "reachout_title"
+            | "reachout_description"
+            | "reachout_button_label"
+            | "reachout_success_message"
+            | "reachout_to_email"
+            | "reachout_subject_prefix"
+            | "reachout_rate_limit_per_hour"
+            | "reachout_rate_limit_per_day"
+            | "reachout_include_ip"
+    )
+}
+
+fn is_supported_default_language(language: &str) -> bool {
+    matches!(
+        language,
+        "ar" | "bn"
+            | "cs"
+            | "da"
+            | "de"
+            | "el"
+            | "en"
+            | "es"
+            | "fa"
+            | "fi"
+            | "fr"
+            | "he"
+            | "hi"
+            | "hu"
+            | "id"
+            | "it"
+            | "ja"
+            | "ko"
+            | "nl"
+            | "no"
+            | "pl"
+            | "pt"
+            | "ro"
+            | "ru"
+            | "sv"
+            | "th"
+            | "tr"
+            | "uk"
+            | "vi"
+            | "zh-Hans"
+            | "zh-Hant"
+    )
+}
+
+fn is_allowed_admin_change_request(method: &str, path: &str) -> bool {
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match method {
+        "PUT" => {
+            path == "/admin/settings"
+                || (parts.len() == 4
+                    && parts[..3] == ["admin", "deployment", "config"]
+                    && is_upper_config_key(parts[3]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "ai-config"]
+                    && is_slug_key(parts[2]))
+                || (parts.len() == 5
+                    && parts[..3] == ["admin", "ai-config", "user-type"]
+                    && is_user_type_segment(parts[3])
+                    && is_slug_key(parts[4]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "user-types"]
+                    && is_numeric_id(parts[2]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "user-fields"]
+                    && is_numeric_id(parts[2]))
+                || (parts.len() == 4
+                    && parts[..2] == ["admin", "user-fields"]
+                    && is_numeric_id(parts[2])
+                    && parts[3] == "encryption")
+                || (parts.len() == 5
+                    && parts[..3] == ["ingest", "admin", "documents"]
+                    && is_doc_id(parts[3])
+                    && parts[4] == "defaults")
+                || path == "/ingest/admin/documents/defaults/batch"
+                || (parts.len() == 7
+                    && parts[..3] == ["ingest", "admin", "documents"]
+                    && is_doc_id(parts[3])
+                    && parts[4] == "defaults"
+                    && parts[5] == "user-type"
+                    && is_user_type_segment(parts[6]))
+                || (parts.len() == 3 && parts[..2] == ["admin", "resources"] && is_doc_id(parts[2]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "help-types"]
+                    && is_slug_key(parts[2]))
+        }
+        "POST" => matches!(
+            path,
+            "/admin/user-types" | "/admin/user-fields" | "/admin/resources"
+        ),
+        "DELETE" => {
+            (parts.len() == 3 && parts[..2] == ["admin", "user-types"] && is_numeric_id(parts[2]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "user-fields"]
+                    && is_numeric_id(parts[2]))
+                || (parts.len() == 5
+                    && parts[..3] == ["admin", "ai-config", "user-type"]
+                    && is_user_type_segment(parts[3])
+                    && is_slug_key(parts[4]))
+                || (parts.len() == 7
+                    && parts[..3] == ["ingest", "admin", "documents"]
+                    && is_doc_id(parts[3])
+                    && parts[4] == "defaults"
+                    && parts[5] == "user-type"
+                    && is_user_type_segment(parts[6]))
+                || (parts.len() == 3 && parts[..2] == ["admin", "resources"] && is_doc_id(parts[2]))
+                || (parts.len() == 3
+                    && parts[..2] == ["admin", "help-types"]
+                    && is_slug_key(parts[2]))
+        }
+        _ => false,
+    }
+}
+
+fn is_upper_config_key(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn is_slug_key(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn is_numeric_id(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_user_type_segment(value: &str) -> bool {
+    is_numeric_id(value)
+        || value
+            .strip_prefix("@type:")
+            .is_some_and(|slug| is_slug_key(slug))
+}
+
+fn is_doc_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+#[async_trait::async_trait]
 impl Tool for AdminDbQueryTool {
     fn name(&self) -> &str {
         "db_query"
@@ -1205,14 +2075,32 @@ impl Tool for AdminDbQueryTool {
             .cloned()
             .ok_or_else(|| anyhow!("db_query requires sql"))?;
         let value = self.internal.admin_db_query(&sql).await?;
+        if value.get("success").and_then(Value::as_bool) == Some(false) {
+            let error = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Database query was rejected by the safe SQL executor.")
+                .to_string();
+            if let Ok(mut sink) = self.traces.lock() {
+                sink.push(ToolCallInfoResponse {
+                    tool_id: "db-query".to_string(),
+                    tool_name: "Database Query".to_string(),
+                    query: Some(sql),
+                    output_summary: Some(error.clone()),
+                    warnings: vec!["db_query_rejected".to_string()],
+                    guarded: true,
+                });
+            }
+            return Ok(ToolResult::error(error));
+        }
 
         if let Ok(mut sink) = self.traces.lock() {
             sink.push(ToolCallInfoResponse {
                 tool_id: "db-query".to_string(),
                 tool_name: "Database Query".to_string(),
                 query: Some(sql.clone()),
-                output_summary: None,
-                warnings: Vec::new(),
+                output_summary: Some("Database results were redacted from the trace.".to_string()),
+                warnings: vec!["raw_results_redacted".to_string()],
                 guarded: false,
             });
         }
@@ -1327,13 +2215,6 @@ async fn chat(
     enforce_csrf(&state.web_config, &Method::POST, &headers)?;
     let auth = resolve_public_actor(&state, &headers).await?;
 
-    if request.tool_context.is_some() && auth.kind != "admin" {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "Tool context override is admin-only",
-        ));
-    }
-
     let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     configure_request_lm(&state.config, temperature).await?;
@@ -1351,73 +2232,45 @@ async fn chat(
             .profile;
     }
 
-    let tool_traces = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
-    let mut tools_used = Vec::<ToolCallInfoResponse>::new();
-
-    let client_executed_tools = if request.tool_context.is_some() {
-        request.client_executed_tools.clone().unwrap_or_else(|| {
-            if request.tools.iter().any(|tool| tool == "db-query") {
-                vec!["db-query".to_string()]
-            } else {
-                Vec::new()
-            }
-        })
-    } else {
-        Vec::new()
-    };
-
-    let client_executed_set: HashSet<String> = client_executed_tools.iter().cloned().collect();
-    for tool_id in client_executed_tools {
-        if request.tools.iter().any(|enabled| enabled == &tool_id) {
-            tools_used.push(tool_call_info_for_id(&tool_id, request.message.clone()));
-        }
-    }
-
-    let mut registry = ToolRegistry::new();
-    if request.tools.iter().any(|tool| tool == "web-search")
-        && !client_executed_set.contains("web-search")
-    {
-        registry.register(Arc::new(SearxWebSearchTool {
-            http: state.http.clone(),
-            searxng_url: std::env::var("SEARXNG_URL")
-                .unwrap_or_else(|_| "http://searxng:8080".to_string()),
-            traces: tool_traces.clone(),
-        }));
-    }
-    if auth.kind == "admin"
-        && request.tools.iter().any(|tool| tool == "db-query")
-        && !client_executed_set.contains("db-query")
-    {
-        registry.register(Arc::new(AdminDbQueryTool {
-            internal: state.internal.clone(),
-            traces: tool_traces.clone(),
-        }));
-    }
-    registry.register(Arc::new(crate::tools::DoneTool));
-
     let memory =
         build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id).await?;
+    let persisted_context = match persisted_conversation_context_from_memory(&memory) {
+        Ok(context) => Some(context),
+        Err(error) => {
+            warn!(
+                "failed to load persisted conversation context for chat session {}: {}",
+                session.id, error
+            );
+            None
+        }
+    };
     let memory_user_id = memory_user_id(&auth);
     memory
         .store_message_sync(&memory_user_id, "user", &request.message)
         .map_err(internal_error)?;
 
+    let top_k = value_as_i32(ai_config.parameters.get("top_k"), 4);
+    let (registry, tool_sinks) = build_conversation_tool_registry(
+        &state.internal,
+        &state.http,
+        &request,
+        &auth,
+        top_k,
+        &std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://searxng:8080".to_string()),
+    );
     let mut agent = SageAgent::new_with_optional_memory(
         registry,
         Some(memory),
-        build_agent_instruction(&ai_config.compiled_prompt, true),
+        build_agent_instruction(
+            &ai_config.compiled_prompt,
+            request.tools.iter().any(|tool| tool == "knowledge-search"),
+        ),
     );
 
-    let mut input = String::new();
-    if let Some(tool_context) = request.tool_context.as_deref() {
-        input.push_str("=== CLIENT TOOL CONTEXT ===\n");
-        input.push_str(tool_context);
-        input.push_str("\n\n");
-    }
-    input.push_str("=== USER MESSAGE ===\n");
-    input.push_str(&request.message);
-
-    let response_text = run_agent_turn(&mut agent, &input).await?;
+    let input =
+        build_conversation_turn_input(&auth, &profile, &request, persisted_context.as_ref());
+    let tool_loop = run_conversation_tool_loop(&mut agent, &input, &tool_sinks).await?;
+    let response_text = tool_loop.answer;
     let assistant_memory_content =
         sanitize_admin_config_message_for_memory(&auth, &request, &response_text);
     if let Err(err) =
@@ -1428,11 +2281,13 @@ async fn chat(
             session.id, err
         );
     }
-    if let Ok(mut trace_lock) = tool_traces.lock() {
-        tools_used.extend(trace_lock.drain(..));
-    }
-    let tools_used = dedupe_tool_calls(tools_used);
-    let trace = build_conversation_trace(&ai_config, &auth, tools_used.clone(), Vec::new());
+    let tools_used = tool_loop.tools_used;
+    let trace = build_conversation_trace(
+        &ai_config,
+        &auth,
+        tools_used.clone(),
+        tool_loop.retrieval_sources,
+    );
 
     Ok(Json(ChatResponse {
         message: response_text,
@@ -1441,621 +2296,61 @@ async fn chat(
         provider: "sage".to_string(),
         tools_used,
         trace,
+        admin_change_set: tool_loop.admin_change_set,
     }))
 }
 
-async fn prepare_explicit_chat_context(
-    state: &WebAppState,
-    request: &ChatRequest,
-    auth: &InternalAuthContext,
-) -> AppResult<PreparedChatContext> {
-    let mut context_parts = Vec::new();
-    let mut tools_used = Vec::<ToolCallInfoResponse>::new();
-    let mut prepared_tool_activity = Vec::<PreparedToolActivity>::new();
-
-    if let Some(tool_context) = request.tool_context.as_deref() {
-        context_parts.push(format!("CLIENT TOOL CONTEXT\n{}", tool_context));
-    }
-
-    let client_executed_tools = if request.tool_context.is_some() {
-        request.client_executed_tools.clone().unwrap_or_else(|| {
-            if request.tools.iter().any(|tool| tool == "db-query") {
-                vec!["db-query".to_string()]
-            } else {
-                Vec::new()
-            }
-        })
-    } else {
-        Vec::new()
-    };
-    let client_executed_set: HashSet<String> = client_executed_tools.iter().cloned().collect();
-    for tool_id in client_executed_tools {
-        if request.tools.iter().any(|enabled| enabled == &tool_id) {
-            tools_used.push(tool_call_info_for_id(&tool_id, request.message.clone()));
-        }
-    }
-
-    if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "admin-config") {
-        tools_used.push(tool_call_info_for_id(
-            "admin-config",
-            request.message.clone(),
-        ));
-    }
-
-    let admin_config_context = async {
-        if client_tool_context_includes_scoped_config(request.tool_context.as_deref()) {
-            Ok(PreparedChatContext::default())
-        } else {
-            prepare_admin_config_context(state, request, auth).await
-        }
-    };
-    let document_context = prepare_uploaded_document_context(state, request, auth);
-    let web_context =
-        prepare_web_search_context(state, request, client_executed_set.contains("web-search"));
-    let database_context = prepare_database_context(
-        state,
-        request,
-        auth,
-        client_executed_set.contains("db-query"),
-    );
-    let (admin_config_context, document_context, web_context, database_context) = tokio::join!(
-        admin_config_context,
-        document_context,
-        web_context,
-        database_context
-    );
-    let mut retrieval_sources = Vec::new();
-
-    merge_prepared_tool_context(
-        admin_config_context?,
-        &mut context_parts,
-        &mut tools_used,
-        &mut retrieval_sources,
-        &mut prepared_tool_activity,
-    );
-    merge_prepared_tool_context(
-        document_context?,
-        &mut context_parts,
-        &mut tools_used,
-        &mut retrieval_sources,
-        &mut prepared_tool_activity,
-    );
-    merge_prepared_tool_context(
-        web_context?,
-        &mut context_parts,
-        &mut tools_used,
-        &mut retrieval_sources,
-        &mut prepared_tool_activity,
-    );
-    merge_prepared_tool_context(
-        database_context?,
-        &mut context_parts,
-        &mut tools_used,
-        &mut retrieval_sources,
-        &mut prepared_tool_activity,
-    );
-
-    tools_used.extend(
-        prepared_tool_activity
-            .iter()
-            .map(|activity| activity.tool.clone()),
-    );
-    let tools_used = dedupe_tool_calls(tools_used);
-    let mut activity_steps = conversation_activity_steps_from_tools(&tools_used);
-    for activity in prepared_tool_activity {
-        if let Some(step) = activity.activity_step {
-            if let Some(existing) = activity_steps
-                .iter_mut()
-                .find(|existing| existing.id == step.id)
-            {
-                *existing = step;
-            } else {
-                activity_steps.push(step);
-            }
-        }
-    }
-
-    Ok(PreparedChatContext {
-        context: context_parts.join("\n\n"),
-        tools_used,
-        retrieval_sources,
-        activity_steps,
-    })
-}
-
-fn client_tool_context_includes_scoped_config(tool_context: Option<&str>) -> bool {
-    tool_context.is_some_and(|context| context.contains("SCOPED CONFIG CONTEXT"))
-}
-
-async fn prepare_admin_config_context(
-    state: &WebAppState,
-    request: &ChatRequest,
-    auth: &InternalAuthContext,
-) -> AppResult<PreparedChatContext> {
-    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "admin-config") {
-        return Ok(PreparedChatContext::default());
-    }
-
-    match state
-        .internal
-        .scoped_config_context(&InternalScopedConfigContextRequest {
-            query: request.message.clone(),
-            actor: auth.clone(),
-            mode: "auto".to_string(),
-            requested_scopes: None,
-        })
-        .await
-    {
-        Ok(response) => Ok(prepared_admin_config_context_from_response(
-            request, response,
-        )),
-        Err(ScopedConfigContextError::Unauthorized) => Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "Admin scoped config context is not authorized for this actor.",
-        )),
-        Err(ScopedConfigContextError::Failed(_)) => {
-            Ok(prepared_admin_config_context_failure(request))
-        }
-    }
-}
-
-fn prepared_admin_config_context_from_response(
-    request: &ChatRequest,
-    response: InternalScopedConfigContextResponse,
-) -> PreparedChatContext {
-    let mut tool = tool_call_info_for_id("admin-config", request.message.clone());
-    tool.output_summary = Some(build_admin_config_output_summary(
-        &response.primary_scope,
-        &response.included_scopes,
-        &response.warnings,
-    ));
-    tool.warnings =
-        sanitize_admin_config_activity_warnings(&response.included_scopes, &response.warnings);
-    let activity_step = admin_config_activity_step(&tool, &response);
-
-    PreparedChatContext {
-        context: response.context_text,
-        tools_used: vec![tool],
-        activity_steps: vec![activity_step],
-        retrieval_sources: Vec::new(),
-    }
-}
-
-fn prepared_admin_config_context_failure(request: &ChatRequest) -> PreparedChatContext {
-    let mut tool = tool_call_info_for_id("admin-config", request.message.clone());
-    tool.output_summary = Some("Scoped config context could not be prepared.".to_string());
-    tool.warnings
-        .push("scoped_config_context_failed".to_string());
-    let activity_step = conversation_activity_step_from_tool(
-        &tool,
-        Some("Scoped config context could not be prepared.".to_string()),
-        vec!["scoped_config_context_failed".to_string()],
-    );
-
-    PreparedChatContext {
-        context: "SCOPED CONFIG CONTEXT\nScoped config context could not be prepared safely."
-            .to_string(),
-        tools_used: vec![tool],
-        activity_steps: vec![activity_step],
-        retrieval_sources: Vec::new(),
-    }
-}
-
-fn build_admin_config_output_summary(
-    primary_scope: &str,
-    included_scopes: &[String],
-    warnings: &[String],
-) -> String {
-    let mut summary = if included_scopes.len() <= 1 {
-        format!("Prepared scoped config context for {}.", primary_scope)
-    } else {
-        format!(
-            "Prepared scoped config context for {} ({} included scopes).",
-            primary_scope,
-            included_scopes.len()
-        )
-    };
-    if !warnings.is_empty() {
-        summary.push_str(&format!(
-            " {} scoped-read warning(s) reported.",
-            warnings.len()
-        ));
-    }
-    summary
-}
-
-fn sanitize_admin_config_activity_warnings(
-    included_scopes: &[String],
-    warnings: &[String],
-) -> Vec<String> {
-    let mut activity_warnings = Vec::new();
-    if warnings.is_empty() {
-        if included_scopes
-            .iter()
-            .any(|scope| scope == "deployment-settings")
-        {
-            activity_warnings.push("deployment_secrets_redacted".to_string());
-        }
-        return activity_warnings;
-    }
-
-    activity_warnings.push(format!("scoped_read_warnings:{}", warnings.len()));
-    activity_warnings
-}
-
-fn admin_config_activity_step(
-    tool: &ToolCallInfoResponse,
-    response: &InternalScopedConfigContextResponse,
-) -> ConversationActivityStepResponse {
-    conversation_activity_step_from_tool(
-        tool,
-        Some(build_admin_config_output_summary(
-            &response.primary_scope,
-            &response.included_scopes,
-            &response.warnings,
-        )),
-        sanitize_admin_config_activity_warnings(&response.included_scopes, &response.warnings),
-    )
-}
-
-async fn prepare_uploaded_document_context(
-    state: &WebAppState,
-    request: &ChatRequest,
-    auth: &InternalAuthContext,
-) -> AppResult<PreparedChatContext> {
-    if !should_auto_retrieve_admin_config_context(request, auth) {
-        return Ok(PreparedChatContext::default());
-    }
-
-    let response = state
-        .internal
-        .document_search(&InternalDocumentSearchRequest {
-            query: request.message.clone(),
-            user: auth.clone(),
-            top_k: 4,
-            job_ids: None,
-            jurisdiction: None,
-            situation_details: None,
-        })
-        .await
-        .map_err(internal_error)?;
-
-    Ok(prepared_uploaded_document_context_from_response(
-        request, response,
-    ))
-}
-
-fn prepared_uploaded_document_context_from_response(
-    request: &ChatRequest,
-    response: InternalDocumentSearchResponse,
-) -> PreparedChatContext {
-    let mut tool = tool_call_info_for_id("knowledge-search", request.message.clone());
-    let has_context = !response.context.trim().is_empty();
-    if has_context {
-        tool.output_summary =
-            Some("Retrieved uploaded-document passages for the answer.".to_string());
-    } else {
-        tool.output_summary =
-            Some("No relevant uploaded-document passages were found for this message.".to_string());
-        tool.warnings
-            .push("no_relevant_uploaded_document_context".to_string());
-    }
-
-    let mut prepared = PreparedChatContext {
-        tools_used: vec![tool],
-        retrieval_sources: response.sources,
-        ..PreparedChatContext::default()
-    };
-    if has_context {
-        prepared.context = format!("UPLOADED DOCUMENT CONTEXT\n{}", response.context.trim());
-    } else {
-        prepared.context =
-            "UPLOADED DOCUMENT CONTEXT\nNo relevant uploaded-document passages were found for this message."
-                .to_string();
-    }
-    prepared
-}
-
-#[cfg(test)]
-async fn overlap_streamed_tool_context_work<
-    DocumentFuture,
-    WebFuture,
-    DatabaseFuture,
-    Document,
-    Web,
-    Database,
->(
-    document_context: DocumentFuture,
-    web_context: WebFuture,
-    database_context: DatabaseFuture,
-) -> (Document, Web, Database)
-where
-    DocumentFuture: std::future::Future<Output = Document>,
-    WebFuture: std::future::Future<Output = Web>,
-    DatabaseFuture: std::future::Future<Output = Database>,
-{
-    tokio::join!(document_context, web_context, database_context)
-}
-
-async fn prepare_web_search_context(
-    state: &WebAppState,
-    request: &ChatRequest,
-    client_executed: bool,
-) -> AppResult<PreparedChatContext> {
-    if client_executed || !request.tools.iter().any(|tool| tool == "web-search") {
-        return Ok(PreparedChatContext::default());
-    }
-
-    let trace_sink = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
-    let tool = SearxWebSearchTool {
-        http: state.http.clone(),
-        searxng_url: std::env::var("SEARXNG_URL")
-            .unwrap_or_else(|_| "http://searxng:8080".to_string()),
-        traces: trace_sink.clone(),
-    };
-    let mut args = HashMap::new();
-    args.insert("query".to_string(), request.message.clone());
-    let result = tool.execute(&args).await.map_err(internal_error)?;
-    let mut prepared = PreparedChatContext::default();
-    if result.success {
-        prepared.context = format!("WEB SEARCH CONTEXT\n{}", result.output);
-    } else if let Some(error) = result.error {
-        prepared.context = format!("WEB SEARCH ERROR\n{}", error);
-    }
-    if let Ok(mut traces) = trace_sink.lock() {
-        prepared.tools_used.extend(traces.drain(..));
-    };
-    Ok(prepared)
-}
-
-async fn prepare_database_context(
-    state: &WebAppState,
-    request: &ChatRequest,
-    auth: &InternalAuthContext,
-    client_executed: bool,
-) -> AppResult<PreparedChatContext> {
-    if client_executed
-        || auth.kind != "admin"
-        || !request.tools.iter().any(|tool| tool == "db-query")
-    {
-        return Ok(PreparedChatContext::default());
-    }
-
-    let trimmed = request.message.trim();
-    if !is_direct_readonly_select_message(trimmed) {
-        let tool = ToolCallInfoResponse {
-            guarded: true,
-            ..tool_call_info_for_id("db-query", request.message.clone())
-        };
-        return Ok(PreparedChatContext {
-            context: "DATABASE CONTEXT\nDatabase Query was selected, but server-side streaming currently requires client-executed decrypted context or a direct SELECT query."
-                .to_string(),
-            tools_used: vec![tool.clone()],
-            retrieval_sources: Vec::new(),
-            activity_steps: vec![guarded_database_activity_step(&tool)],
-        });
-    }
-
-    let trace_sink = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
-    let tool = AdminDbQueryTool {
-        internal: state.internal.clone(),
-        traces: trace_sink.clone(),
-    };
-    let mut args = HashMap::new();
-    args.insert("sql".to_string(), trimmed.to_string());
-    let result = tool.execute(&args).await.map_err(internal_error)?;
-    let mut prepared = PreparedChatContext::default();
-    if result.success {
-        prepared.context = format!("DATABASE CONTEXT\n{}", result.output);
-    } else if let Some(error) = result.error {
-        prepared.context = format!("DATABASE ERROR\n{}", error);
-    }
-    if let Ok(mut traces) = trace_sink.lock() {
-        prepared.tools_used.extend(traces.drain(..));
-    };
-    Ok(prepared)
-}
-
-fn merge_prepared_tool_context(
-    prepared: PreparedChatContext,
-    context_parts: &mut Vec<String>,
-    tools_used: &mut Vec<ToolCallInfoResponse>,
-    retrieval_sources: &mut Vec<QuerySource>,
-    prepared_tool_activity: &mut Vec<PreparedToolActivity>,
-) {
-    if !prepared.context.trim().is_empty() {
-        context_parts.push(prepared.context);
-    }
-    retrieval_sources.extend(prepared.retrieval_sources);
-    if prepared.activity_steps.is_empty() {
-        tools_used.extend(prepared.tools_used);
-        return;
-    }
-
-    prepared_tool_activity.extend(prepared.tools_used.into_iter().map(|tool| {
-        let activity_step = prepared
-            .activity_steps
-            .iter()
-            .find(|step| step.id == format!("tool-{}", tool.tool_id))
-            .cloned();
-        PreparedToolActivity {
-            tool,
-            activity_step,
-        }
-    }));
-}
-
-fn should_auto_retrieve_admin_config_context(
-    request: &ChatRequest,
-    auth: &InternalAuthContext,
-) -> bool {
-    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "admin-config") {
-        return false;
-    }
-    let message = request.message.to_ascii_lowercase();
-    let refers_to_uploaded_materials = [
-        "uploaded",
-        "document",
-        "documents",
-        "file",
-        "files",
-        "pdf",
-        "guide",
-        "book",
-        "materials",
-        "resource",
-        "archive",
-        "attached",
-        "attachment",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle));
-
-    refers_to_uploaded_materials
-}
-
-fn is_direct_readonly_select_message(message: &str) -> bool {
-    let trimmed = message.trim();
-    if trimmed.is_empty() || trimmed.contains(';') {
-        return false;
-    }
-
-    let upper = trimmed.to_ascii_uppercase();
-    if !upper.starts_with("SELECT")
-        || upper
-            .get(6..)
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(|ch| !ch.is_whitespace())
-    {
-        return false;
-    }
-
-    const FORBIDDEN_KEYWORDS: &[&str] = &[
-        "ALTER", "ATTACH", "CREATE", "DELETE", "DETACH", "DROP", "INSERT", "PRAGMA", "REPLACE",
-        "TRUNCATE", "UPDATE", "VACUUM",
-    ];
-    !FORBIDDEN_KEYWORDS
-        .iter()
-        .any(|keyword| contains_sql_keyword(&upper, keyword))
-}
-
-fn contains_sql_keyword(sql: &str, keyword: &str) -> bool {
-    sql.match_indices(keyword).any(|(index, _)| {
-        let before = sql[..index].chars().next_back();
-        let after = sql[index + keyword.len()..].chars().next();
-        !before.is_some_and(is_sql_identifier_char) && !after.is_some_and(is_sql_identifier_char)
-    })
-}
-
-fn is_sql_identifier_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
-}
-
-#[cfg(test)]
-fn build_final_answer_prompt(
-    ai_config: &InternalEffectiveAiConfig,
+fn build_conversation_turn_input(
     auth: &InternalAuthContext,
     profile: &HashMap<String, String>,
     request: &ChatRequest,
-    prepared: &PreparedChatContext,
-) -> String {
-    build_final_answer_prompt_with_persisted_context(
-        ai_config, auth, profile, request, prepared, None,
-    )
-}
-
-fn build_final_answer_prompt_with_persisted_context(
-    ai_config: &InternalEffectiveAiConfig,
-    auth: &InternalAuthContext,
-    profile: &HashMap<String, String>,
-    request: &ChatRequest,
-    prepared: &PreparedChatContext,
     persisted_context: Option<&PersistedConversationContext>,
 ) -> String {
-    let mut prompt = String::new();
-    prompt.push_str("Agent Settings profile:\n");
-    prompt.push_str(&ai_config.compiled_prompt);
-    prompt.push_str("\n\n");
-    prompt.push_str(&build_final_answer_instruction());
-    prompt.push_str("\n\n=== REQUEST CONTEXT ===\n");
-    prompt.push_str(&format!("auth_type: {}\n", auth.kind));
+    let mut input = String::new();
+    input.push_str("=== REQUEST CONTEXT ===\n");
+    input.push_str(&format!("auth_type: {}\n", auth.kind));
     if let Some(user_type_id) = auth.user_type_id {
-        prompt.push_str(&format!("user_type_id: {}\n", user_type_id));
+        input.push_str(&format!("user_type_id: {}\n", user_type_id));
+    }
+    if request.tools.is_empty() {
+        input.push_str("enabled_tool_sets: none\n");
+    } else {
+        input.push_str(&format!(
+            "enabled_tool_sets: {}\n",
+            request.tools.join(", ")
+        ));
+    }
+    if let Some(job_ids) = request
+        .job_ids
+        .as_ref()
+        .filter(|job_ids| !job_ids.is_empty())
+    {
+        input.push_str(&format!("selected_document_ids: {}\n", job_ids.join(", ")));
     }
     if let Some(channel) = &request.conversation_channel {
-        prompt.push_str(&format!("conversation_channel: {}\n", channel.kind));
+        input.push_str(&format!("conversation_channel: {}\n", channel.kind));
         if let Some(delivery) = channel.delivery.as_deref() {
-            prompt.push_str(&format!("channel_delivery: {}\n", delivery));
+            input.push_str(&format!("channel_delivery: {}\n", delivery));
         }
     }
     if !profile.is_empty() {
-        prompt.push_str("\nUSER PROFILE\n");
+        input.push_str("\nUSER PROFILE\n");
         for (key, value) in profile {
-            prompt.push_str(&format!("{}: {}\n", key, value));
+            input.push_str(&format!("{}: {}\n", key, value));
         }
     }
-    if !prepared.context.trim().is_empty() {
-        prompt.push_str("\n=== PREPARED TOOL CONTEXT ===\n");
-        prompt.push_str(&prepared.context);
-        prompt.push('\n');
-    }
-    let persisted_summary = persisted_context
+    if let Some(summary) = persisted_context
         .and_then(|context| context.summary.as_deref())
         .map(str::trim)
-        .filter(|summary| !summary.is_empty());
-    if let Some(summary) = persisted_summary {
-        prompt.push_str("\n=== SESSION MEMORY SUMMARY ===\n");
-        prompt.push_str(&truncate_chars(summary, 4000));
-        prompt.push('\n');
+        .filter(|summary| !summary.is_empty())
+    {
+        input.push_str("\n=== SESSION MEMORY SUMMARY ===\n");
+        input.push_str(&truncate_chars(summary, 4000));
+        input.push('\n');
     }
-
-    let persisted_messages = persisted_context
-        .map(|context| context.messages.as_slice())
-        .unwrap_or(&[]);
-    let history_source = if persisted_context.is_some() && !persisted_messages.is_empty() {
-        persisted_messages
-    } else {
-        request.conversation_history.as_slice()
-    };
-    let sanitize_history = should_sanitize_admin_config_history(auth, request);
-    let history: Vec<ChatHistoryMessage> = history_source
-        .iter()
-        .filter(|message| {
-            matches!(message.role.as_str(), "user" | "assistant")
-                && !message.content.trim().is_empty()
-        })
-        .rev()
-        .take(8)
-        .map(|message| {
-            let mut message = message.clone();
-            if sanitize_history {
-                message.content = sanitize_admin_config_history_content(&message.content);
-            }
-            message
-        })
-        .filter(|message| !message.content.trim().is_empty())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if !history.is_empty() {
-        prompt.push_str("\n=== RECENT CONVERSATION ===\n");
-        for message in history {
-            let role = if message.role == "user" {
-                "User"
-            } else {
-                "Assistant"
-            };
-            prompt.push_str(role);
-            prompt.push_str(": ");
-            prompt.push_str(&truncate_chars(message.content.trim(), 2000));
-            prompt.push('\n');
-        }
-    }
-    prompt.push_str("\n=== USER MESSAGE ===\n");
-    prompt.push_str(&request.message);
-    prompt.push_str("\n\nAnswer in normal user-visible prose.");
-    prompt
+    input.push_str("\n=== USER MESSAGE ===\n");
+    input.push_str(&request.message);
+    input
 }
 
 fn should_sanitize_admin_config_history(auth: &InternalAuthContext, request: &ChatRequest) -> bool {
@@ -2209,29 +2504,10 @@ fn summarize_admin_change_set_json(candidate: &str) -> Option<String> {
 fn persisted_conversation_context_from_memory(
     memory: &MemoryManager,
 ) -> anyhow::Result<PersistedConversationContext> {
-    let (summary, messages) = memory.get_context_messages()?;
+    let (summary, _) = memory.get_context_messages()?;
     Ok(PersistedConversationContext {
         summary: summary.map(|summary| summary.content),
-        messages: messages
-            .into_iter()
-            .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
-            .map(|message| ChatHistoryMessage {
-                role: message.role,
-                content: message.content,
-            })
-            .collect(),
     })
-}
-
-async fn overlap_streamed_pre_answer_work<PrepareFuture, MemoryFuture, Prepared, Memory>(
-    prepare_context: PrepareFuture,
-    hydrate_memory: MemoryFuture,
-) -> (Prepared, Memory)
-where
-    PrepareFuture: std::future::Future<Output = Prepared>,
-    MemoryFuture: std::future::Future<Output = Memory>,
-{
-    tokio::join!(prepare_context, hydrate_memory)
 }
 
 async fn chat_stream(
@@ -2241,14 +2517,9 @@ async fn chat_stream(
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     enforce_csrf(&state.web_config, &Method::POST, &headers)?;
     let auth = resolve_public_actor(&state, &headers).await?;
-    if request.tool_context.is_some() && auth.kind != "admin" {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "Tool context override is admin-only",
-        ));
-    }
     let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
+    configure_request_lm(&state.config, temperature).await?;
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.message)?;
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
@@ -2286,13 +2557,8 @@ async fn chat_stream(
             }
         }
 
-        let (prepared_result, memory_result) = overlap_streamed_pre_answer_work(
-            prepare_explicit_chat_context(&state, &request, &auth),
-            build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id),
-        ).await;
-
-        let prepared = match prepared_result {
-            Ok(prepared) => prepared,
+        let memory = match build_session_memory(&state, &ai_config, &auth, &profile, session.agent_id).await {
+            Ok(memory) => memory,
             Err(error) => {
                 let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
                 payload.detail = Some(error.message);
@@ -2300,7 +2566,63 @@ async fn chat_stream(
                 return;
             }
         };
-        for activity_step in prepared.activity_steps.iter().cloned() {
+
+        let status = chat_stream_status_payload(
+            message_id.clone(),
+            session_id.clone(),
+            "Running enabled tools...",
+            "tool_loop",
+            turn_started_at,
+            include_timing,
+        );
+        yield Ok(chat_stream_sse_event("trace_status", &status));
+
+        let persisted_context = match persisted_conversation_context_from_memory(&memory) {
+            Ok(context) => Some(context),
+            Err(error) => {
+                warn!("failed to load persisted conversation context for streamed chat session {}: {}", session.id, error);
+                None
+            }
+        };
+        let memory_user_id = memory_user_id(&auth);
+        if let Err(error) = memory.store_message_with_compaction_check(&memory_user_id, "user", &request.message).await {
+            warn!("failed to persist streamed user message for session {}: {}", session.id, error);
+        }
+
+        let top_k = value_as_i32(ai_config.parameters.get("top_k"), 4);
+        let (registry, tool_sinks) = build_conversation_tool_registry(
+            &state.internal,
+            &state.http,
+            &request,
+            &auth,
+            top_k,
+            &std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://searxng:8080".to_string()),
+        );
+        let mut agent = SageAgent::new_with_optional_memory(
+            registry,
+            Some(memory),
+            build_agent_instruction(
+                &ai_config.compiled_prompt,
+                request.tools.iter().any(|tool| tool == "knowledge-search"),
+            ),
+        );
+        let input = build_conversation_turn_input(
+            &auth,
+            &profile,
+            &request,
+            persisted_context.as_ref(),
+        );
+        let tool_loop = match run_conversation_tool_loop(&mut agent, &input, &tool_sinks).await {
+            Ok(result) => result,
+            Err(error) => {
+                let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+                payload.detail = Some(error.message);
+                yield Ok(chat_stream_sse_event("error", &payload));
+                return;
+            }
+        };
+
+        for activity_step in tool_loop.activity_steps.iter().cloned() {
             let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
             payload.activity_step = Some(activity_step);
             yield Ok(chat_stream_sse_event("activity_step", &payload));
@@ -2309,103 +2631,44 @@ async fn chat_stream(
         let status = chat_stream_status_payload(
             message_id.clone(),
             session_id.clone(),
-            "Finalizing response...",
+            "Writing answer...",
             "writing_answer",
             turn_started_at,
             include_timing,
         );
         yield Ok(chat_stream_sse_event("trace_status", &status));
 
-        let persisted_context = match memory_result.as_ref() {
-            Ok(memory) => match persisted_conversation_context_from_memory(memory) {
-                Ok(context) => Some(context),
-                Err(error) => {
-                    warn!("failed to load persisted conversation context for streamed chat session {}: {}", session.id, error);
-                    None
-                }
-            },
-            Err(error) => {
-                warn!("failed to build memory for streamed chat session {}: {}", session.id, error.message);
-                None
-            }
-        };
-
-        let prompt = build_final_answer_prompt_with_persisted_context(
-            &ai_config,
-            &auth,
-            &profile,
-            &request,
-            &prepared,
-            persisted_context.as_ref(),
-        );
-        let mut answer = String::new();
-        let stream_result = stream_final_answer_from_model(&state, &prompt, temperature).await;
-        let answer_stream = match stream_result {
-            Ok(stream) => stream,
-            Err(error) => {
-                let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-                payload.detail = Some(error.message);
-                yield Ok(chat_stream_sse_event("error", &payload));
-                return;
-            }
-        };
-        futures_util::pin_mut!(answer_stream);
-
-        while let Some(chunk_result) = answer_stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
-                    if let Some(delta) = chunk.delta {
-                        answer.push_str(&delta);
-                        let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-                        payload.delta = Some(delta);
-                        yield Ok(chat_stream_sse_event("answer_delta", &payload));
-                    }
-                    if chunk.done {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-                    payload.detail = Some(error.message);
-                    yield Ok(chat_stream_sse_event("error", &payload));
-                    return;
-                }
-            }
-        }
-
+        let answer = tool_loop.answer.clone();
         if !answer.trim().is_empty() {
-            match memory_result {
-                Ok(memory) => {
-                    let memory_user_id = memory_user_id(&auth);
-                    if let Err(error) = memory.store_message_with_compaction_check(&memory_user_id, "user", &request.message).await {
-                        warn!("failed to persist streamed user message for session {}: {}", session.id, error);
-                    }
-                    let assistant_memory_content =
-                        sanitize_admin_config_message_for_memory(&auth, &request, &answer);
-                    if let Err(error) = memory.store_message_with_compaction_check(&memory_user_id, "assistant", &assistant_memory_content).await {
-                        warn!("failed to persist streamed assistant message for session {}: {}", session.id, error);
-                    }
-                }
-                Err(error) => warn!("failed to build memory for streamed chat session {}: {}", session.id, error.message),
+            let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+            payload.delta = Some(answer.clone());
+            yield Ok(chat_stream_sse_event("answer_delta", &payload));
+
+            let assistant_memory_content =
+                sanitize_admin_config_message_for_memory(&auth, &request, &answer);
+            if let Err(error) = agent.store_message_with_compaction_check(&memory_user_id, "assistant", &assistant_memory_content).await {
+                warn!("failed to persist streamed assistant message for session {}: {}", session.id, error);
             }
         }
 
         let trace = build_conversation_trace(
             &ai_config,
             &auth,
-            prepared.tools_used.clone(),
-            prepared.retrieval_sources.clone(),
+            tool_loop.tools_used.clone(),
+            tool_loop.retrieval_sources.clone(),
         );
         if trace.is_some() {
             let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
             payload.trace = trace;
+            payload.admin_change_set = tool_loop.admin_change_set.clone();
             yield Ok(chat_stream_sse_event("trace_final", &payload));
         }
 
         let mut done = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
         done.model = Some(state.config.tinfoil_model.clone());
         done.provider = Some("sage".to_string());
-        done.tools_used = prepared.tools_used;
+        done.tools_used = tool_loop.tools_used;
+        done.admin_change_set = tool_loop.admin_change_set;
         yield Ok(chat_stream_sse_event("done", &done));
     };
     Ok(Sse::new(stream))
@@ -2439,51 +2702,6 @@ async fn query(
             .profile;
     }
 
-    let initial_search = state
-        .internal
-        .document_search(&InternalDocumentSearchRequest {
-            query: request.question.clone(),
-            user: auth.clone(),
-            top_k,
-            job_ids: request.job_ids.clone(),
-            jurisdiction: request.jurisdiction.clone(),
-            situation_details: request.situation_details.clone(),
-        })
-        .await
-        .map_err(internal_error)?;
-
-    let source_sink = Arc::new(Mutex::new(initial_search.sources.clone()));
-    let tool_traces = Arc::new(Mutex::new(Vec::<ToolCallInfoResponse>::new()));
-
-    let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(KnowledgeSearchTool {
-        internal: state.internal.clone(),
-        user: auth.clone(),
-        top_k,
-        job_ids: request.job_ids.clone(),
-        jurisdiction: request.jurisdiction.clone(),
-        situation_details: request.situation_details.clone(),
-        sources: source_sink.clone(),
-    }));
-
-    if request.tools.iter().any(|tool| tool == "web-search") {
-        registry.register(Arc::new(SearxWebSearchTool {
-            http: state.http.clone(),
-            searxng_url: std::env::var("SEARXNG_URL")
-                .unwrap_or_else(|_| "http://searxng:8080".to_string()),
-            traces: tool_traces.clone(),
-        }));
-    }
-
-    if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "db-query") {
-        registry.register(Arc::new(AdminDbQueryTool {
-            internal: state.internal.clone(),
-            traces: tool_traces.clone(),
-        }));
-    }
-
-    registry.register(Arc::new(crate::tools::DoneTool));
-
     let tinfoil_key = state
         .config
         .tinfoil_api_key
@@ -2515,15 +2733,34 @@ async fn query(
         .await
         .map_err(internal_error)?;
 
+    let enabled_tools = query_enabled_tool_sets(&request);
+    let chat_request = ChatRequest {
+        message: request.question.clone(),
+        session_id: request.session_id.clone(),
+        tools: enabled_tools,
+        conversation_history: Vec::new(),
+        job_ids: request.job_ids.clone(),
+        conversation_channel: None,
+    };
+    let (registry, tool_sinks) = build_conversation_tool_registry_with_context(
+        &state.internal,
+        &state.http,
+        &chat_request,
+        &auth,
+        top_k,
+        &std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://searxng:8080".to_string()),
+        request.jurisdiction.clone(),
+        request.situation_details.clone(),
+    );
     let mut agent = SageAgent::new_with_optional_memory(
         registry,
         Some(memory),
         build_agent_instruction(&ai_config.compiled_prompt, true),
     );
 
-    let debug_context = build_query_debug_context(&ai_config, &profile, &initial_search, &request);
-    let input = build_query_input(&auth, &profile, &initial_search, &request);
-    let answer = run_agent_turn(&mut agent, &input).await?;
+    let input = build_query_conversation_turn_input(&auth, &profile, &request, None);
+    let tool_loop = run_conversation_tool_loop(&mut agent, &input, &tool_sinks).await?;
+    let answer = tool_loop.answer;
 
     let assistant_user_id = format!("{}:{}", auth.kind, auth.id);
     if let Err(err) = agent
@@ -2536,17 +2773,8 @@ async fn query(
         );
     }
 
-    let sources = dedupe_sources(
-        source_sink
-            .lock()
-            .map(|sources| sources.clone())
-            .unwrap_or_default(),
-    );
-    let tools_used = tool_traces
-        .lock()
-        .map(|traces| dedupe_tool_calls(traces.clone()))
-        .unwrap_or_default();
-    let trace = build_conversation_trace(&ai_config, &auth, tools_used, sources.clone());
+    let sources = tool_loop.retrieval_sources;
+    let trace = build_conversation_trace(&ai_config, &auth, tool_loop.tools_used, sources.clone());
 
     Ok(Json(QueryResponse {
         answer: answer.clone(),
@@ -2555,7 +2783,7 @@ async fn query(
         graph_context: json!({}),
         clarifying_questions: extract_clarifying_questions(&answer),
         search_term: None,
-        context_used: debug_context,
+        context_used: input,
         temperature,
         trace,
     }))
@@ -2646,7 +2874,7 @@ async fn list_query_sessions(
 
     let mut conversations = Vec::with_capacity(sessions.len());
     for session in sessions {
-        let message_count = count_session_messages_with_conn(&mut *conn, session.agent_id)?;
+        let message_count = count_session_messages_with_conn(&mut conn, session.agent_id)?;
         conversations.push(conversation_history_summary_response(
             session,
             message_count,
@@ -3125,7 +3353,7 @@ fn count_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<i64>
         .db
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
-    count_session_messages_with_conn(&mut *conn, agent_id)
+    count_session_messages_with_conn(&mut conn, agent_id)
 }
 
 fn count_session_messages_with_conn(conn: &mut PgConnection, agent_id: Uuid) -> AppResult<i64> {
@@ -3383,7 +3611,7 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
         ),
         (
             "prompt_rules",
-            "[\"For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.\", \"Never call prose-only bullets or recommendations a Change Confirmation; include exactly one valid JSON change set when proposing writes.\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
+            "[\"For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.\", \"For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.\", \"Admin Config proposals must use canonical paths and keys: POST /admin/user-types, PUT /admin/settings, header_tagline, default_language codes such as en. If propose_config_change_set succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If propose_config_change_set rejects a supported change, correct the request and call the tool again instead of telling the admin to configure it manually.\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
             "json",
             "prompt_section",
             Some("Array of behavioral rules"),
@@ -3444,20 +3672,74 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
         .lock()
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
     for (key, value, value_type, category, description) in defaults {
-        diesel::sql_query(
-            "INSERT INTO ai_config (key, value, value_type, category, description, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, NOW()) \
-             ON CONFLICT (key) DO NOTHING",
-        )
-        .bind::<Varchar, _>(key)
-        .bind::<Text, _>(value)
-        .bind::<Varchar, _>(value_type)
-        .bind::<Varchar, _>(category)
-        .bind::<Nullable<Text>, _>(description)
-        .execute(&mut *conn)
-        .map_err(internal_error)?;
+        if key == "prompt_rules" {
+            diesel::sql_query(
+                "INSERT INTO ai_config (key, value, value_type, category, description, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, NOW()) \
+                 ON CONFLICT (key) DO NOTHING",
+            )
+            .bind::<Varchar, _>(key)
+            .bind::<Text, _>(value)
+            .bind::<Varchar, _>(value_type)
+            .bind::<Varchar, _>(category)
+            .bind::<Nullable<Text>, _>(description)
+            .execute(&mut *conn)
+            .map_err(internal_error)?;
+
+            let mut rows = diesel::sql_query(
+                "SELECT key, value, value_type, category, description, updated_at \
+                 FROM ai_config WHERE key = $1",
+            )
+            .bind::<Varchar, _>(key)
+            .load::<AiConfigRow>(&mut *conn)
+            .map_err(internal_error)?;
+            if let Some(row) = rows.pop() {
+                if let Some(merged_rules) = merge_prompt_rules(&row.value, value) {
+                    diesel::update(ai_config::table.filter(ai_config::key.eq(key)))
+                        .set((
+                            ai_config::value.eq(merged_rules),
+                            ai_config::updated_at.eq(chrono::Utc::now()),
+                        ))
+                        .execute(&mut *conn)
+                        .map_err(internal_error)?;
+                }
+            }
+        } else {
+            diesel::sql_query(
+                "INSERT INTO ai_config (key, value, value_type, category, description, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, NOW()) \
+                 ON CONFLICT (key) DO NOTHING",
+            )
+            .bind::<Varchar, _>(key)
+            .bind::<Text, _>(value)
+            .bind::<Varchar, _>(value_type)
+            .bind::<Varchar, _>(category)
+            .bind::<Nullable<Text>, _>(description)
+            .execute(&mut *conn)
+            .map_err(internal_error)?;
+        }
     }
     Ok(())
+}
+
+fn merge_prompt_rules(existing_raw: &str, required_raw: &str) -> Option<String> {
+    let mut existing_rules: Vec<String> = serde_json::from_str(existing_raw).ok()?;
+    let required_rules: Vec<String> = serde_json::from_str(required_raw).ok()?;
+    let mut seen: HashSet<String> = existing_rules.iter().cloned().collect();
+    let mut changed = false;
+
+    for rule in required_rules {
+        if seen.insert(rule.clone()) {
+            existing_rules.push(rule);
+            changed = true;
+        }
+    }
+
+    if changed {
+        serde_json::to_string(&existing_rules).ok()
+    } else {
+        None
+    }
 }
 
 fn load_all_ai_config_rows(state: &WebAppState) -> AppResult<Vec<AiConfigRow>> {
@@ -3842,11 +4124,7 @@ fn validate_ai_config_value(
 
 fn validate_trace_visibility_value(key: &str, value: &str) -> AppResult<()> {
     let normalized = value.trim().to_ascii_lowercase();
-    let allowed: &[&str] = if key == "user_trace_visibility" {
-        &["off", "minimal", "summary", "detailed"]
-    } else {
-        &["off", "minimal", "summary", "detailed"]
-    };
+    let allowed: &[&str] = &["off", "minimal", "summary", "detailed"];
 
     if allowed
         .iter()
@@ -3996,7 +4274,9 @@ async fn resolve_public_actor(
             .cloned()
     });
     if let Some(token) = admin_token {
-        if let Some(payload) = verify_admin_session_token(&state.web_config.secret_key, &token) {
+        if let Some(payload) =
+            verify_admin_session_token_for_public_actor(&state.web_config.secret_key, &token)
+        {
             let admin = state
                 .internal
                 .admin_record(&payload.pubkey)
@@ -4051,7 +4331,7 @@ async fn resolve_public_actor(
                 kind: "user".to_string(),
                 approved: user.approved,
                 pubkey: None,
-                email: user.email.or_else(|| Some(payload.email)),
+                email: user.email.or(Some(payload.email)),
                 name: user.name,
                 user_type_id: user.user_type_id,
                 dev_mode: user.dev_mode,
@@ -4133,6 +4413,21 @@ fn verify_user_session_token(secret_key: &str, token: &str) -> Option<UserSessio
 }
 
 fn verify_admin_session_token(secret_key: &str, token: &str) -> Option<AdminSessionTokenPayload> {
+    verify_admin_session_token_with_logging(secret_key, token, true)
+}
+
+fn verify_admin_session_token_for_public_actor(
+    secret_key: &str,
+    token: &str,
+) -> Option<AdminSessionTokenPayload> {
+    verify_admin_session_token_with_logging(secret_key, token, false)
+}
+
+fn verify_admin_session_token_with_logging(
+    secret_key: &str,
+    token: &str,
+    log_failures: bool,
+) -> Option<AdminSessionTokenPayload> {
     let serializer = timed_serializer_with_signer(
         default_builder(secret_key.to_string())
             .with_salt(ADMIN_SESSION_SALT)
@@ -4143,7 +4438,9 @@ fn verify_admin_session_token(secret_key: &str, token: &str) -> Option<AdminSess
     let payload = match serializer.unsign::<AdminSessionTokenPayload>(token) {
         Ok(payload) => payload,
         Err(error) => {
-            warn!("admin token unsign failed: {}", error);
+            if log_failures {
+                warn!("admin token unsign failed: {}", error);
+            }
             return None;
         }
     };
@@ -4151,12 +4448,16 @@ fn verify_admin_session_token(secret_key: &str, token: &str) -> Option<AdminSess
         match payload.value_if_not_expired(Duration::from_secs(ADMIN_SESSION_MAX_AGE_SECS)) {
             Ok(payload) => payload,
             Err(error) => {
-                warn!("admin token expired or invalid timestamp: {}", error);
+                if log_failures {
+                    warn!("admin token expired or invalid timestamp: {}", error);
+                }
                 return None;
             }
         };
     if payload.r#type != "admin" {
-        warn!("admin token type mismatch: {:?}", payload.r#type);
+        if log_failures {
+            warn!("admin token type mismatch: {:?}", payload.r#type);
+        }
         return None;
     }
     Some(payload)
@@ -4228,21 +4529,37 @@ fn build_agent_instruction(compiled_prompt: &str, include_knowledge_tool: bool) 
     .build_instruction()
 }
 
-fn build_final_answer_instruction() -> String {
-    ENCLAVE_WEB_FINAL_ANSWER_INSTRUCTION.to_string()
+fn query_enabled_tool_sets(request: &QueryRequest) -> Vec<String> {
+    let mut tools = request.tools.clone();
+    if !tools.iter().any(|tool| tool == "knowledge-search") {
+        tools.insert(0, "knowledge-search".to_string());
+    }
+    tools
 }
 
-fn build_query_input(
+fn build_query_conversation_turn_input(
     auth: &InternalAuthContext,
     profile: &HashMap<String, String>,
-    search: &InternalDocumentSearchResponse,
     request: &QueryRequest,
+    persisted_context: Option<&PersistedConversationContext>,
 ) -> String {
+    let enabled_tools = query_enabled_tool_sets(request);
     let mut input = String::new();
     input.push_str("=== REQUEST CONTEXT ===\n");
     input.push_str(&format!("auth_type: {}\n", auth.kind));
     if let Some(user_type_id) = auth.user_type_id {
         input.push_str(&format!("user_type_id: {}\n", user_type_id));
+    }
+    input.push_str(&format!(
+        "enabled_tool_sets: {}\n",
+        enabled_tools.join(", ")
+    ));
+    if let Some(job_ids) = request
+        .job_ids
+        .as_ref()
+        .filter(|job_ids| !job_ids.is_empty())
+    {
+        input.push_str(&format!("selected_document_ids: {}\n", job_ids.join(", ")));
     }
     if let Some(jurisdiction) = request.jurisdiction.as_deref() {
         input.push_str(&format!("jurisdiction: {}\n", jurisdiction));
@@ -4250,50 +4567,24 @@ fn build_query_input(
     if let Some(details) = request.situation_details.as_deref() {
         input.push_str(&format!("situation_details: {}\n", details));
     }
-    if let Some(job_ids) = &request.job_ids {
-        input.push_str(&format!("selected_documents: {}\n", job_ids.join(", ")));
-    }
-
     if !profile.is_empty() {
-        input.push_str("\n=== USER PROFILE ===\n");
+        input.push_str("\nUSER PROFILE\n");
         for (key, value) in profile {
-            input.push_str(&format!("- {}: {}\n", key, value));
+            input.push_str(&format!("{}: {}\n", key, value));
         }
     }
-
-    input.push_str("\n=== INITIAL DOCUMENT CONTEXT ===\n");
-    if search.context.trim().is_empty() {
-        input.push_str("No document context retrieved.\n");
-    } else {
-        input.push_str(&search.context);
+    if let Some(summary) = persisted_context
+        .and_then(|context| context.summary.as_deref())
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+    {
+        input.push_str("\n=== SESSION MEMORY SUMMARY ===\n");
+        input.push_str(&truncate_chars(summary, 4000));
         input.push('\n');
     }
-
     input.push_str("\n=== USER QUESTION ===\n");
     input.push_str(&request.question);
     input
-}
-
-fn build_query_debug_context(
-    ai_config: &InternalEffectiveAiConfig,
-    profile: &HashMap<String, String>,
-    search: &InternalDocumentSearchResponse,
-    request: &QueryRequest,
-) -> String {
-    let profile_keys = if profile.is_empty() {
-        "(none)".to_string()
-    } else {
-        profile.keys().cloned().collect::<Vec<_>>().join(", ")
-    };
-
-    format!(
-        "=== COMPILED PROFILE ===\n{}\n\n=== PROFILE KEYS ===\n{}\n\n=== SEARCH QUERY ===\n{}\n\n=== INITIAL CONTEXT ===\n{}\n\n=== USER QUESTION ===\n{}",
-        ai_config.compiled_prompt,
-        profile_keys,
-        search.search_query,
-        search.context,
-        request.question
-    )
 }
 
 async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String> {
@@ -4320,6 +4611,46 @@ async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String>
         return Ok("I apologize, but I wasn't able to generate a response.".to_string());
     }
     Ok(output)
+}
+
+struct ConversationToolLoopOutput {
+    answer: String,
+    tools_used: Vec<ToolCallInfoResponse>,
+    retrieval_sources: Vec<QuerySource>,
+    activity_steps: Vec<ConversationActivityStepResponse>,
+    admin_change_set: Option<AdminChangeSetResponse>,
+}
+
+async fn run_conversation_tool_loop(
+    agent: &mut SageAgent,
+    input: &str,
+    sinks: &ConversationToolLoopSinks,
+) -> AppResult<ConversationToolLoopOutput> {
+    let answer = run_agent_turn(agent, input).await?;
+    let tools_used = sinks
+        .traces
+        .lock()
+        .map(|traces| dedupe_tool_calls(traces.clone()))
+        .unwrap_or_default();
+    let retrieval_sources = sinks
+        .sources
+        .lock()
+        .map(|sources| dedupe_sources(sources.clone()))
+        .unwrap_or_default();
+    let admin_change_set = sinks
+        .admin_change_set
+        .lock()
+        .map(|change_set| change_set.clone())
+        .unwrap_or_default();
+    let activity_steps = conversation_activity_steps_from_tools(&tools_used);
+
+    Ok(ConversationToolLoopOutput {
+        answer,
+        tools_used,
+        retrieval_sources,
+        activity_steps,
+        admin_change_set,
+    })
 }
 
 fn extract_clarifying_questions(answer: &str) -> Vec<String> {
@@ -4367,203 +4698,6 @@ fn dedupe_sources(sources: Vec<QuerySource>) -> Vec<QuerySource> {
     deduped
 }
 
-async fn stream_final_answer_from_model(
-    state: &WebAppState,
-    prompt: &str,
-    temperature: f64,
-) -> AppResult<impl Stream<Item = AppResult<FinalAnswerChunk>>> {
-    let api_key = state
-        .config
-        .tinfoil_api_key
-        .as_deref()
-        .ok_or_else(|| AppError::internal("TINFOIL_API_KEY not configured"))?;
-    let response = state
-        .http
-        .post(format!(
-            "{}/chat/completions",
-            state.config.tinfoil_api_url.trim_end_matches('/')
-        ))
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header(CONTENT_TYPE, "application/json")
-        .json(&json!({
-            "model": state.config.tinfoil_model.clone(),
-            "messages": [
-                { "role": "user", "content": prompt }
-            ],
-            "stream": true,
-            "temperature": temperature,
-        }))
-        .send()
-        .await
-        .map_err(model_provider_error)?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(AppError::new(
-            StatusCode::BAD_GATEWAY,
-            format!("Model Provider stream failed with {}: {}", status, body),
-        ));
-    }
-
-    let mut bytes = response.bytes_stream();
-    let stream = async_stream::stream! {
-        let mut buffer = String::new();
-        let mut pending_utf8 = Vec::new();
-        loop {
-            let item = match tokio::time::timeout(Duration::from_secs(30), bytes.next()).await {
-                Ok(Some(item)) => item,
-                Ok(None) => break,
-                Err(_) => {
-                    yield Err(model_provider_error("Model Provider stream timed out waiting for data"));
-                    return;
-                }
-            };
-            let chunk = match item {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    yield Err(model_provider_error(error));
-                    return;
-                }
-            };
-            if let Err(error) = append_utf8_chunk(&mut buffer, &mut pending_utf8, &chunk) {
-                yield Err(error);
-                return;
-            }
-            let frames = drain_sse_data_frames(&mut buffer);
-            for frame in frames {
-                match parse_openai_chat_stream_frame(&frame) {
-                    Ok(Some(parsed)) => {
-                        let done = parsed.done;
-                        yield Ok(parsed);
-                        if done {
-                            return;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
-                }
-            }
-        }
-        if !pending_utf8.is_empty() {
-            yield Err(AppError::new(
-                StatusCode::BAD_GATEWAY,
-                "Model Provider stream ended with incomplete UTF-8 data",
-            ));
-            return;
-        }
-        for frame in drain_remaining_sse_data_frames(&mut buffer) {
-            match parse_openai_chat_stream_frame(&frame) {
-                Ok(Some(parsed)) => yield Ok(parsed),
-                Ok(None) => {}
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            }
-        }
-    };
-
-    Ok(stream)
-}
-
-fn append_utf8_chunk(buffer: &mut String, pending: &mut Vec<u8>, chunk: &[u8]) -> AppResult<()> {
-    pending.extend_from_slice(chunk);
-
-    loop {
-        match std::str::from_utf8(pending) {
-            Ok(text) => {
-                buffer.push_str(text);
-                pending.clear();
-                return Ok(());
-            }
-            Err(error) => {
-                let valid_up_to = error.valid_up_to();
-                if valid_up_to > 0 {
-                    let valid =
-                        std::str::from_utf8(&pending[..valid_up_to]).map_err(internal_error)?;
-                    buffer.push_str(valid);
-                    pending.drain(..valid_up_to);
-                    continue;
-                }
-                if error.error_len().is_none() {
-                    return Ok(());
-                }
-                return Err(AppError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "Model Provider stream returned invalid UTF-8 data",
-                ));
-            }
-        }
-    }
-}
-
-fn drain_sse_data_frames(buffer: &mut String) -> Vec<String> {
-    let normalized = buffer.replace("\r\n", "\n").replace('\r', "\n");
-    *buffer = normalized;
-    let mut frames = Vec::new();
-    while let Some(boundary) = buffer.find("\n\n") {
-        let raw = buffer[..boundary].to_string();
-        *buffer = buffer[boundary + 2..].to_string();
-        if let Some(data) = sse_data_from_raw_event(&raw) {
-            frames.push(data);
-        }
-    }
-    frames
-}
-
-fn drain_remaining_sse_data_frames(buffer: &mut String) -> Vec<String> {
-    if buffer.trim().is_empty() {
-        return Vec::new();
-    }
-    let raw = std::mem::take(buffer);
-    sse_data_from_raw_event(&raw).into_iter().collect()
-}
-
-fn sse_data_from_raw_event(raw: &str) -> Option<String> {
-    let lines = raw
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
-    }
-}
-
-fn parse_openai_chat_stream_frame(data: &str) -> AppResult<Option<FinalAnswerChunk>> {
-    let trimmed = data.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    if trimmed == "[DONE]" {
-        return Ok(Some(FinalAnswerChunk {
-            delta: None,
-            done: true,
-        }));
-    }
-    let value = serde_json::from_str::<Value>(trimmed).map_err(model_provider_error)?;
-    let choice = value
-        .get("choices")
-        .and_then(|choices| choices.as_array())
-        .and_then(|choices| choices.first());
-    let delta = choice
-        .and_then(|choice| choice.get("delta"))
-        .and_then(|delta| delta.get("content"))
-        .and_then(|content| content.as_str())
-        .map(ToOwned::to_owned);
-    let done = choice
-        .and_then(|choice| choice.get("finish_reason"))
-        .map(|reason| !reason.is_null())
-        .unwrap_or(false);
-    Ok(Some(FinalAnswerChunk { delta, done }))
-}
-
 fn build_conversation_trace(
     ai_config: &InternalEffectiveAiConfig,
     auth: &InternalAuthContext,
@@ -4597,13 +4731,23 @@ fn build_conversation_trace(
         .into_iter()
         .map(|tool| {
             let is_db_query = tool.tool_id == "db-query";
-            let is_guarded_db_query = is_db_query && tool.guarded;
+            let is_guarded = tool.guarded;
+            let is_guarded_db_query = is_db_query && is_guarded;
             let tool_output_summary = tool.output_summary.clone();
             let tool_warnings = tool.warnings.clone();
+            let guarded_db_output_summary = tool_output_summary.clone().unwrap_or_else(|| {
+                "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
+                    .to_string()
+            });
+            let guarded_db_warnings = if tool_warnings.is_empty() {
+                vec!["direct_select_required".to_string()]
+            } else {
+                tool_warnings.clone()
+            };
             ToolTraceResponse {
                 id: tool.tool_id,
                 name: tool.tool_name,
-                status: if is_guarded_db_query {
+                status: if is_guarded {
                     "guarded".to_string()
                 } else {
                     "completed".to_string()
@@ -4617,23 +4761,20 @@ fn build_conversation_trace(
                     tool.query.map(|query| truncate_chars(&query, 160))
                 },
                 output_summary: if is_guarded_db_query {
-                    Some(
-                        "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
-                            .to_string(),
-                    )
+                    Some(guarded_db_output_summary)
                 } else if is_db_query {
                     Some("Database results were redacted from the trace.".to_string())
                 } else {
                     tool_output_summary
                 },
                 warnings: if is_guarded_db_query {
-                    vec!["direct_select_required".to_string()]
+                    guarded_db_warnings
                 } else if is_db_query {
                     vec!["raw_results_redacted".to_string()]
                 } else {
                     tool_warnings
                 },
-                metadata: if is_guarded_db_query {
+                metadata: if is_guarded {
                     json!({ "guarded": true, "executed": false })
                 } else if is_db_query {
                     json!({ "redacted": true })
@@ -4733,7 +4874,7 @@ fn conversation_activity_steps_from_tool_traces(
 ) -> Vec<ConversationActivityStepResponse> {
     tools
         .iter()
-        .map(|tool| conversation_activity_step_from_tool_trace(tool))
+        .map(conversation_activity_step_from_tool_trace)
         .collect()
 }
 
@@ -5070,6 +5211,26 @@ mod tests {
     }
 
     #[test]
+    fn public_admin_probe_rejects_user_tokens_without_requiring_admin_shape() {
+        let serializer = timed_serializer_with_signer(
+            default_builder("test-secret".to_string())
+                .with_salt(USER_SESSION_SALT)
+                .build()
+                .into_timestamp_signer(),
+            PythonURLSafeEncoding,
+        );
+        let token = serializer
+            .sign(&json!({
+                "user_id": 42,
+                "email": "reader@example.test"
+            }))
+            .expect("user token should serialize");
+
+        assert!(verify_admin_session_token_for_public_actor("test-secret", &token).is_none());
+        assert!(verify_user_session_token("test-secret", &token).is_some());
+    }
+
+    #[test]
     fn session_memory_deletion_summary_reports_deleted_targets() {
         let summary = summarize_session_memory_deletion(SessionMemoryDeletionCounts {
             messages: 2,
@@ -5087,6 +5248,105 @@ mod tests {
         assert_eq!(summary["results"][0]["target_kind"], "session_memory");
         assert_eq!(summary["results"][0]["action"], "delete_messages");
         assert_eq!(summary["results"][0]["status"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn find_resources_tool_posts_internal_request_and_formats_results() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/resources/search",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) = seen_tx
+                            .lock()
+                            .expect("request recorder should lock")
+                            .take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "resources": [
+                                {
+                                    "resource_id": "mx-legal-aid",
+                                    "name": "Mexico Legal Aid Network",
+                                    "resource_type": "ngo",
+                                    "description": "Connects people with pro bono immigration and asylum counsel.",
+                                    "contact": {
+                                        "phone": "+52-555-0100",
+                                        "url": "https://legal.example.test",
+                                        "secure_channel": "Signal: +52-555-0100"
+                                    },
+                                    "languages": ["es", "en"],
+                                    "coverage": "Mexico",
+                                    "help_types": ["legal", "humanitarian"],
+                                    "verified_at": "2026-05-30T20:00:00Z"
+                                }
+                            ],
+                            "resolved_country_code": "MX",
+                            "help_type": "legal"
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+
+        let tool = FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::builder().build().expect("http client should build"),
+                format!("http://{}", addr),
+                "test-token".to_string(),
+            ),
+            jurisdiction: Some("Mexico".to_string()),
+        };
+        let args = HashMap::from([
+            ("help_type".to_string(), "legal".to_string()),
+            ("language".to_string(), "es".to_string()),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("resource lookup should succeed");
+        server.abort();
+
+        assert!(result.success);
+        assert!(result.output.contains("Trusted legal resources for MX"));
+        assert!(result.output.contains("Mexico Legal Aid Network (ngo)"));
+        assert!(result.output.contains("covers Mexico [verified]"));
+        assert!(result.output.contains("Languages: es, en"));
+        assert!(result.output.contains("phone: +52-555-0100"));
+        assert!(result
+            .output
+            .contains("secure_channel: Signal: +52-555-0100"));
+        assert!(result.output.contains("never invent contact details"));
+
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record the resource request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["help_type"], "legal");
+        assert_eq!(payload["jurisdiction"], "Mexico");
+        assert_eq!(payload["language"], "es");
+        assert_eq!(payload["limit"], 5);
     }
 
     #[test]
@@ -5171,59 +5431,6 @@ mod tests {
         assert!(rendered.contains(r#""summary":"Database results were redacted from the trace.""#));
         assert!(!rendered.contains("SELECT encrypted_value"));
         assert!(!rendered.contains("decrypted secret"));
-    }
-
-    #[test]
-    fn model_provider_stream_frames_become_answer_chunks() {
-        let chunk = parse_openai_chat_stream_frame(
-            r#"{"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}"#,
-        )
-        .expect("frame should parse")
-        .expect("frame should produce a chunk");
-        assert_eq!(
-            chunk,
-            FinalAnswerChunk {
-                delta: Some("hel".to_string()),
-                done: false,
-            }
-        );
-
-        let done = parse_openai_chat_stream_frame("[DONE]")
-            .expect("done frame should parse")
-            .expect("done frame should produce a chunk");
-        assert_eq!(
-            done,
-            FinalAnswerChunk {
-                delta: None,
-                done: true,
-            }
-        );
-    }
-
-    #[test]
-    fn sse_data_frames_are_drained_incrementally() {
-        let mut buffer = "data: {\"a\":1}\n\n:data ignored\n\ndata: [DONE]\n\npartial".to_string();
-
-        let frames = drain_sse_data_frames(&mut buffer);
-
-        assert_eq!(frames, vec![r#"{"a":1}"#.to_string(), "[DONE]".to_string()]);
-        assert_eq!(buffer, "partial");
-    }
-
-    #[test]
-    fn stream_utf8_decoder_preserves_split_multibyte_characters() {
-        let mut buffer = String::new();
-        let mut pending = Vec::new();
-        let bytes = "data: {\"choices\":[{\"delta\":{\"content\":\"€\"}}]}\n\n".as_bytes();
-
-        append_utf8_chunk(&mut buffer, &mut pending, &bytes[..44]).expect("prefix should decode");
-        append_utf8_chunk(&mut buffer, &mut pending, &bytes[44..45])
-            .expect("partial character should wait");
-        append_utf8_chunk(&mut buffer, &mut pending, &bytes[45..]).expect("suffix should decode");
-
-        assert!(pending.is_empty());
-        assert!(buffer.contains("€"));
-        assert!(!buffer.contains('\u{fffd}'));
     }
 
     #[test]
@@ -5337,37 +5544,113 @@ mod tests {
     }
 
     #[test]
-    fn database_streaming_guard_distinguishes_direct_select_from_natural_language() {
-        assert!(is_direct_readonly_select_message(
-            "SELECT id, email FROM users LIMIT 10"
-        ));
-        assert!(is_direct_readonly_select_message(
-            "SELECT\nid, email FROM users LIMIT 10"
-        ));
-        assert!(is_direct_readonly_select_message(
-            "SELECT\tid, email FROM users LIMIT 10"
-        ));
-        assert!(!is_direct_readonly_select_message(
-            "SELECTED id, email FROM users LIMIT 10"
-        ));
-        assert!(!is_direct_readonly_select_message(
-            "Which users are active?"
-        ));
-        assert!(!is_direct_readonly_select_message(
-            "Please write a SELECT query for active users"
-        ));
-        assert!(!is_direct_readonly_select_message(
-            "SELECT id, email FROM users; DROP TABLE users"
-        ));
-        assert!(!is_direct_readonly_select_message(
-            "SELECT id, email FROM users;"
-        ));
-        assert!(!is_direct_readonly_select_message(
-            "SELECT id, email FROM users UPDATE users"
-        ));
-        assert!(is_direct_readonly_select_message(
-            "SELECT id, updated_at FROM users LIMIT 10"
-        ));
+    fn rejected_database_trace_preserves_backend_rejection_warning() {
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "admin_trace_visibility".to_string(),
+            Value::String("detailed".to_string()),
+        );
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults,
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let trace = build_conversation_trace(
+            &ai_config,
+            &auth,
+            vec![ToolCallInfoResponse {
+                tool_id: "db-query".to_string(),
+                tool_name: "Database Query".to_string(),
+                query: Some("DROP TABLE users".to_string()),
+                output_summary: Some("Only SELECT queries are allowed.".to_string()),
+                warnings: vec!["db_query_rejected".to_string()],
+                guarded: true,
+            }],
+            Vec::new(),
+        )
+        .expect("admin trace should be visible");
+
+        assert_eq!(trace.tools[0].status, "guarded");
+        assert_eq!(
+            trace.tools[0].output_summary.as_deref(),
+            Some("Only SELECT queries are allowed.")
+        );
+        assert_eq!(
+            trace.tools[0].warnings,
+            vec!["db_query_rejected".to_string()]
+        );
+        assert_eq!(
+            trace.activity_steps[0].summary.as_deref(),
+            Some("Only SELECT queries are allowed.")
+        );
+    }
+
+    #[test]
+    fn optional_tool_failure_trace_reconciles_with_guarded_activity() {
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "admin_trace_visibility".to_string(),
+            Value::String("detailed".to_string()),
+        );
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults,
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let trace = build_conversation_trace(
+            &ai_config,
+            &auth,
+            vec![ToolCallInfoResponse {
+                tool_id: "web-search".to_string(),
+                tool_name: "Web Search".to_string(),
+                query: Some("current compliance references".to_string()),
+                output_summary: Some("Optional tool could not be prepared.".to_string()),
+                warnings: vec!["optional_tool_failed".to_string()],
+                guarded: true,
+            }],
+            Vec::new(),
+        )
+        .expect("admin trace should be visible");
+
+        assert_eq!(trace.tools[0].id, "web-search");
+        assert_eq!(trace.tools[0].status, "guarded");
+        assert_eq!(
+            trace.tools[0].output_summary.as_deref(),
+            Some("Optional tool could not be prepared.")
+        );
+        assert_eq!(
+            trace.tools[0].warnings,
+            vec!["optional_tool_failed".to_string()]
+        );
+        assert_eq!(trace.tools[0].metadata["guarded"], true);
+        assert_eq!(trace.tools[0].metadata["executed"], false);
+        assert_eq!(trace.activity_steps[0].status, "guarded");
+        assert_eq!(
+            trace.activity_steps[0].summary.as_deref(),
+            Some("Optional tool could not be prepared.")
+        );
     }
 
     #[test]
@@ -5431,13 +5714,7 @@ mod tests {
     }
 
     #[test]
-    fn final_answer_prompt_includes_recent_conversation_before_current_message() {
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults: HashMap::new(),
-            compiled_prompt: "Help the admin.".to_string(),
-        };
+    fn conversation_turn_input_uses_session_summary_and_channel_metadata() {
         let auth = InternalAuthContext {
             id: 1,
             kind: "admin".to_string(),
@@ -5449,117 +5726,37 @@ mod tests {
             dev_mode: false,
         };
         let request = ChatRequest {
-            message: "your suggestions above".to_string(),
-            session_id: Some("session-123".to_string()),
-            tools: vec!["admin-config".to_string()],
-            conversation_history: vec![
-                ChatHistoryMessage {
-                    role: "user".to_string(),
-                    content: "Change more of the copy.".to_string(),
-                },
-                ChatHistoryMessage {
-                    role: "assistant".to_string(),
-                    content: "I recommend updating Instance Name and Assistant Name.".to_string(),
-                },
-            ],
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
-            tools_used: Vec::new(),
-            retrieval_sources: Vec::new(),
-            activity_steps: Vec::new(),
-        };
-        let profile = HashMap::new();
-
-        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
-
-        assert!(prompt.contains("=== RECENT CONVERSATION ==="));
-        assert!(prompt.contains("User: Change more of the copy."));
-        assert!(
-            prompt.contains("Assistant: I recommend updating Instance Name and Assistant Name.")
-        );
-        assert!(prompt.contains("=== USER MESSAGE ===\nyour suggestions above"));
-    }
-
-    #[test]
-    fn final_answer_prompt_prefers_persisted_session_memory_over_client_history() {
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults: HashMap::new(),
-            compiled_prompt: "Help the admin.".to_string(),
-        };
-        let auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let request = ChatRequest {
-            message: "continue from memory".to_string(),
+            message: "continue from the same conversation".to_string(),
             session_id: Some("session-123".to_string()),
             tools: vec!["admin-config".to_string()],
             conversation_history: vec![ChatHistoryMessage {
                 role: "user".to_string(),
                 content: "stale client-only turn".to_string(),
             }],
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
-            tools_used: Vec::new(),
-            retrieval_sources: Vec::new(),
-            activity_steps: Vec::new(),
+            job_ids: None,
+            conversation_channel: Some(ConversationChannelRequest {
+                kind: "signal".to_string(),
+                delivery: Some("short_messages".to_string()),
+            }),
         };
         let persisted = PersistedConversationContext {
             summary: Some("Persisted summary from Sage Session Memory.".to_string()),
-            messages: vec![
-                ChatHistoryMessage {
-                    role: "user".to_string(),
-                    content: "persisted user turn".to_string(),
-                },
-                ChatHistoryMessage {
-                    role: "assistant".to_string(),
-                    content: "persisted assistant turn".to_string(),
-                },
-            ],
         };
         let profile = HashMap::new();
 
-        let prompt = build_final_answer_prompt_with_persisted_context(
-            &ai_config,
-            &auth,
-            &profile,
-            &request,
-            &prepared,
-            Some(&persisted),
-        );
+        let input = build_conversation_turn_input(&auth, &profile, &request, Some(&persisted));
 
-        assert!(prompt.contains("=== SESSION MEMORY SUMMARY ==="));
-        assert!(prompt.contains("Persisted summary from Sage Session Memory."));
-        assert!(prompt.contains("User: persisted user turn"));
-        assert!(prompt.contains("Assistant: persisted assistant turn"));
-        assert!(!prompt.contains("stale client-only turn"));
-        assert!(prompt.contains("=== USER MESSAGE ===\ncontinue from memory"));
+        assert!(input.contains("conversation_channel: signal"));
+        assert!(input.contains("channel_delivery: short_messages"));
+        assert!(input.contains("=== SESSION MEMORY SUMMARY ==="));
+        assert!(input.contains("Persisted summary from Sage Session Memory."));
+        assert!(!input.contains("stale client-only turn"));
+        assert!(!input.contains("=== PREPARED CONTEXT ==="));
+        assert_eq!(memory_user_id(&auth), "admin:1");
     }
 
     #[test]
-    fn admin_config_prompt_history_summarizes_change_set_json() {
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults: HashMap::new(),
-            compiled_prompt: "Help the admin.".to_string(),
-        };
+    fn admin_config_memory_sanitizer_summarizes_change_set_json() {
         let auth = InternalAuthContext {
             id: 1,
             kind: "admin".to_string(),
@@ -5596,153 +5793,25 @@ mod tests {
             message: "continue reviewing".to_string(),
             session_id: Some("session-123".to_string()),
             tools: vec!["admin-config".to_string()],
-            conversation_history: vec![ChatHistoryMessage {
-                role: "assistant".to_string(),
-                content: format!(
-                    "Here is the change.\n\n```json\n{}\n```",
-                    serde_json::to_string_pretty(&change_set).unwrap()
-                ),
-            }],
-            tool_context: None,
-            client_executed_tools: None,
+            conversation_history: Vec::new(),
+            job_ids: None,
             conversation_channel: None,
         };
-        let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
-            tools_used: Vec::new(),
-            retrieval_sources: Vec::new(),
-            activity_steps: Vec::new(),
-        };
-
-        let prompt = build_final_answer_prompt_with_persisted_context(
-            &ai_config,
-            &auth,
-            &HashMap::new(),
-            &request,
-            &prepared,
-            None,
+        let content = format!(
+            "Here is the change.\n\n```json\n{}\n```",
+            serde_json::to_string_pretty(&change_set).unwrap()
         );
 
-        assert!(prompt.contains("Admin Change Confirmation summary: Update instance theme"));
-        assert!(prompt.contains("Requests proposed: 2"));
-        assert!(prompt.contains("- PUT /admin/settings"));
-        assert!(prompt.contains("- PUT /admin/deployment/config/LLM_API_KEY"));
-        assert!(!prompt.contains("primary_color"));
-        assert!(!prompt.contains("super-secret-provider-token"));
-        assert!(!prompt.contains("sk-live-secret-value"));
-        assert!(!prompt.contains("\"requests\""));
-    }
+        let sanitized = sanitize_admin_config_message_for_memory(&auth, &request, &content);
 
-    #[test]
-    fn admin_config_prompt_sanitizes_persisted_memory_before_client_history() {
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults: HashMap::new(),
-            compiled_prompt: "Help the admin.".to_string(),
-        };
-        let auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let request = ChatRequest {
-            message: "continue from memory".to_string(),
-            session_id: Some("session-123".to_string()),
-            tools: vec!["admin-config".to_string()],
-            conversation_history: vec![ChatHistoryMessage {
-                role: "user".to_string(),
-                content: "stale client-only turn".to_string(),
-            }],
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let persisted = PersistedConversationContext {
-            summary: None,
-            messages: vec![ChatHistoryMessage {
-                role: "assistant".to_string(),
-                content: r#"Proposal follows:
-{"version":1,"summary":"Rotate model key","requests":[{"method":"PUT","path":"/admin/deployment/config/LLM_API_KEY","body":{"value":"secret-key-body"}}]}"#.to_string(),
-            }],
-        };
-        let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}".to_string(),
-            tools_used: Vec::new(),
-            retrieval_sources: Vec::new(),
-            activity_steps: Vec::new(),
-        };
-
-        let prompt = build_final_answer_prompt_with_persisted_context(
-            &ai_config,
-            &auth,
-            &HashMap::new(),
-            &request,
-            &prepared,
-            Some(&persisted),
-        );
-
-        assert!(prompt.contains("Admin Change Confirmation summary: Rotate model key"));
-        assert!(prompt.contains("- PUT /admin/deployment/config/LLM_API_KEY"));
-        assert!(!prompt.contains("secret-key-body"));
-        assert!(!prompt.contains("stale client-only turn"));
-    }
-
-    #[test]
-    fn non_admin_config_prompt_history_keeps_json_unchanged() {
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults: HashMap::new(),
-            compiled_prompt: "Help the user.".to_string(),
-        };
-        let auth = InternalAuthContext {
-            id: 2,
-            kind: "user".to_string(),
-            approved: true,
-            pubkey: Some("user-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let raw_json = r#"{"version":1,"summary":"Visible JSON","requests":[{"method":"PUT","path":"/admin/settings","body":{"instance_name":"Keep visible"}}]}"#;
-        let request = ChatRequest {
-            message: "what did I send?".to_string(),
-            session_id: Some("session-123".to_string()),
-            tools: Vec::new(),
-            conversation_history: vec![ChatHistoryMessage {
-                role: "assistant".to_string(),
-                content: raw_json.to_string(),
-            }],
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let prepared = PreparedChatContext {
-            context: String::new(),
-            tools_used: Vec::new(),
-            retrieval_sources: Vec::new(),
-            activity_steps: Vec::new(),
-        };
-
-        let prompt = build_final_answer_prompt_with_persisted_context(
-            &ai_config,
-            &auth,
-            &HashMap::new(),
-            &request,
-            &prepared,
-            None,
-        );
-
-        assert!(prompt.contains("\"requests\""));
-        assert!(prompt.contains("Keep visible"));
-        assert!(!prompt.contains("Admin Change Confirmation summary"));
+        assert!(sanitized.contains("Admin Change Confirmation summary: Update instance theme"));
+        assert!(sanitized.contains("Requests proposed: 2"));
+        assert!(sanitized.contains("- PUT /admin/settings"));
+        assert!(sanitized.contains("- PUT /admin/deployment/config/LLM_API_KEY"));
+        assert!(!sanitized.contains("primary_color"));
+        assert!(!sanitized.contains("super-secret-provider-token"));
+        assert!(!sanitized.contains("sk-live-secret-value"));
+        assert!(!sanitized.contains("\"requests\""));
     }
 
     #[test]
@@ -5771,68 +5840,784 @@ mod tests {
         assert_eq!(channel.delivery.as_deref(), Some("short_messages"));
     }
 
-    #[test]
-    fn channel_metadata_is_request_context_not_session_memory_identity() {
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults: HashMap::new(),
-            compiled_prompt: "Help the admin.".to_string(),
-        };
-        let auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let request = ChatRequest {
-            message: "continue from the same conversation".to_string(),
-            session_id: Some("session-123".to_string()),
-            tools: vec!["admin-config".to_string()],
-            conversation_history: vec![ChatHistoryMessage {
-                role: "user".to_string(),
-                content: "stale signal client turn".to_string(),
-            }],
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: Some(ConversationChannelRequest {
-                kind: "signal".to_string(),
-                delivery: Some("short_messages".to_string()),
+    #[tokio::test]
+    async fn database_tool_rejected_select_returns_failed_guarded_result() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/admin-db-query",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) =
+                            seen_tx.lock().expect("request recorder should lock").take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "success": false,
+                            "columns": [],
+                            "rows": [],
+                            "executionTimeMs": 0,
+                            "error": "Only SELECT queries are allowed."
+                        }))
+                    }
+                }
             }),
-        };
-        let prepared = PreparedChatContext::default();
-        let persisted = PersistedConversationContext {
-            summary: None,
-            messages: vec![ChatHistoryMessage {
-                role: "user".to_string(),
-                content: "persisted shared session turn".to_string(),
-            }],
-        };
-        let profile = HashMap::new();
-
-        let prompt = build_final_answer_prompt_with_persisted_context(
-            &ai_config,
-            &auth,
-            &profile,
-            &request,
-            &prepared,
-            Some(&persisted),
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let http = Client::builder().build().expect("http client should build");
+        let internal =
+            InternalAgentClient::new(http, format!("http://{}", addr), "test-token".to_string());
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let tool = AdminDbQueryTool {
+            internal,
+            traces: traces.clone(),
+        };
+        let args = HashMap::from([("sql".to_string(), "DROP TABLE users".to_string())]);
 
-        assert!(prompt.contains("conversation_channel: signal"));
-        assert!(prompt.contains("channel_delivery: short_messages"));
-        assert!(prompt.contains("User: persisted shared session turn"));
-        assert!(!prompt.contains("stale signal client turn"));
-        assert_eq!(memory_user_id(&auth), "admin:1");
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("backend rejection should become a tool result");
+        server.abort();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Only SELECT queries are allowed.")
+        );
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record database request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["sql"], "DROP TABLE users");
+        let traces = traces.lock().expect("trace sink should lock");
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].tool_id, "db-query");
+        assert!(traces[0].guarded);
+        assert_eq!(traces[0].warnings, vec!["db_query_rejected".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn admin_config_read_tool_executes_raw_tool_contract() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/admin-config/deployment-readiness",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) =
+                            seen_tx.lock().expect("request recorder should lock").take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "version": 1,
+                            "tool": "read_deployment_readiness",
+                            "data": {
+                                "status": "warnings",
+                                "summary": {
+                                    "blockers": 0,
+                                    "warnings": 1,
+                                    "ready": 1,
+                                    "total": 2
+                                },
+                                "items": [
+                                    {
+                                        "key": "sage_runtime_env",
+                                        "label": "Sage Runtime Config",
+                                        "source": "runtime_env",
+                                        "severity": "warning",
+                                        "status": "not_generated",
+                                        "summary": "Sage runtime env has not been generated.",
+                                        "next_action": "Export Sage runtime env.",
+                                        "conversation_blocking": false
+                                    }
+                                ]
+                            },
+                            "warnings": ["deployment_secrets_redacted"],
+                            "generated_at": "2026-06-15T12:00:00+00:00",
+                            "secret_policy": { "mode": "masked" }
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let internal = InternalAgentClient::new(
+            Client::builder().build().expect("http client should build"),
+            format!("http://{}", addr),
+            "test-token".to_string(),
+        );
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let tool = AdminConfigReadTool {
+            internal,
+            auth: InternalAuthContext {
+                id: 1,
+                kind: "admin".to_string(),
+                approved: true,
+                pubkey: Some("admin-pubkey".to_string()),
+                email: None,
+                name: None,
+                user_type_id: None,
+                dev_mode: false,
+            },
+            name: "read_deployment_readiness".to_string(),
+            endpoint: "deployment-readiness".to_string(),
+            description: "Read deployment readiness.".to_string(),
+            traces: traces.clone(),
+        };
+
+        let result = tool
+            .execute(&HashMap::new())
+            .await
+            .expect("Admin Config read tool should execute");
+        server.abort();
+
+        assert!(result.success);
+        assert!(result.output.contains("read_deployment_readiness"));
+        assert!(result.output.contains("Sage Runtime Config"));
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record Admin Config request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["actor"]["type"], "admin");
+        let traces = traces.lock().expect("trace sink should lock");
+        assert_eq!(traces[0].tool_id, "admin-config:read_deployment_readiness");
+        assert_eq!(
+            traces[0].warnings,
+            vec!["deployment_secrets_redacted".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_stages_valid_change_set_without_mutating() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: traces.clone(),
+            proposal: proposal.clone(),
+        };
+        let requests_json = json!([
+            {
+                "method": "PUT",
+                "path": "/admin/settings",
+                "body": {
+                    "instance_name": "FreeThem",
+                    "primary_color": "#4F46E5",
+                    "auto_approve_users": true
+                }
+            },
+            {
+                "method": "POST",
+                "path": "/admin/user-types",
+                "body": {
+                    "name": "Family & Friends",
+                    "description": "Loved ones of current political prisoners"
+                }
+            }
+        ])
+        .to_string();
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Bootstrap FreeThem onboarding".to_string(),
+            ),
+            ("requests_json".to_string(), requests_json),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal tool should execute");
+
+        assert!(result.success);
+        assert_eq!(
+            result.output,
+            "I prepared these changes for review. Use Apply to confirm."
+        );
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("valid proposal should be staged");
+        assert_eq!(staged.version, 1);
+        assert_eq!(
+            staged.summary.as_deref(),
+            Some("Bootstrap FreeThem onboarding")
+        );
+        assert_eq!(staged.requests.len(), 2);
+        assert_eq!(staged.requests[0].path, "/admin/settings");
+        let traces = traces.lock().expect("trace sink should lock");
+        assert_eq!(traces[0].tool_id, "admin-config:propose_config_change_set");
+        assert_eq!(
+            traces[0].query.as_deref(),
+            Some("propose_config_change_set_success")
+        );
+        assert_eq!(
+            traces[0].output_summary.as_deref(),
+            Some("Proposed change set: Bootstrap FreeThem onboarding")
+        );
+        assert!(!traces[0]
+            .output_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("#4F46E5"));
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_stages_freethem_bootstrap_with_user_types() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let requests_json = json!([
+            {
+                "method": "PUT",
+                "path": "/admin/settings",
+                "body": {
+                    "instance_name": "FreeThem",
+                    "assistant_name": "Political Prisoner Support Team",
+                    "header_tagline": "Political prisoner support team.",
+                    "description": "We are the Political Prisoners Support Team, an arm of the World Liberty Congress organization that helps former political prisoners and families of political prisoners get support and information and resources.",
+                    "primary_color": "#1E40AF",
+                    "default_theme": "dark",
+                    "default_language": "en",
+                    "auto_approve_users": true
+                }
+            },
+            {
+                "method": "POST",
+                "path": "/admin/user-types",
+                "body": {
+                    "name": "Current Support",
+                    "description": "Family and friends of currently imprisoned political prisoners"
+                }
+            },
+            {
+                "method": "POST",
+                "path": "/admin/user-types",
+                "body": {
+                    "name": "Post-Release Support",
+                    "description": "Family, friends, and former political prisoners seeking post-release support"
+                }
+            }
+        ])
+        .to_string();
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Bootstrap FreeThem guided setup".to_string(),
+            ),
+            ("requests_json".to_string(), requests_json),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal tool should execute");
+
+        assert!(result.success);
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("valid proposal should be staged");
+        assert_eq!(staged.requests.len(), 3);
+        assert_eq!(staged.requests[0].path, "/admin/settings");
+        let settings_body = staged.requests[0]
+            .body
+            .as_ref()
+            .expect("settings request should include body");
+        assert_eq!(
+            settings_body["header_tagline"],
+            "Political prisoner support team."
+        );
+        assert_eq!(settings_body["default_language"], "en");
+        assert_eq!(staged.requests[1].path, "/admin/user-types");
+        assert_eq!(staged.requests[2].path, "/admin/user-types");
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_normalizes_observed_model_drift() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            ("summary".to_string(), "Normalize drift".to_string()),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/settings",
+                        "body": {
+                            "tagline": "Support for political prisoners and their families",
+                            "default_language": "English"
+                        }
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/admin/user_types",
+                        "body": {
+                            "name": "Current Support",
+                            "description": "Family and friends of current political prisoners"
+                        }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal tool should execute");
+
+        assert!(result.success);
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("normalized proposal should be staged");
+        assert_eq!(staged.requests[0].path, "/admin/settings");
+        let settings_body = staged.requests[0]
+            .body
+            .as_ref()
+            .expect("settings request should include body");
+        assert_eq!(
+            settings_body["header_tagline"],
+            "Support for political prisoners and their families"
+        );
+        assert_eq!(settings_body["default_language"], "en");
+        assert_eq!(staged.requests[1].path, "/admin/user-types");
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_unknown_setting_keys() {
+        let proposal = Arc::new(Mutex::new(Some(AdminChangeSetResponse {
+            version: 1,
+            summary: Some("Old valid proposal".to_string()),
+            requests: vec![AdminChangeSetRequest {
+                method: "PUT".to_string(),
+                path: "/admin/settings".to_string(),
+                body: Some(json!({ "instance_name": "Old" })),
+            }],
+        })));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            ("summary".to_string(), "Unknown setting".to_string()),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/settings",
+                        "body": { "made_up_setting": "nope" }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Unsupported instance setting key"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_invalid_ai_config_body() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            ("summary".to_string(), "Invalid AI config".to_string()),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/ai-config/prompt_tone",
+                        "body": { "value": true }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("invalid AI config body should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("body.value must be a string"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_disallowed_paths() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: traces.clone(),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            ("summary".to_string(), "Unsafe change".to_string()),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/tools/execute",
+                        "body": { "tool_id": "db-query" }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Disallowed request path"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+        let traces = traces.lock().expect("trace sink should lock");
+        assert!(traces[0].guarded);
+        assert_eq!(
+            traces[0].query.as_deref(),
+            Some("propose_config_change_set_rejected")
+        );
+        assert_eq!(traces[0].warnings, vec!["invalid_admin_change_set"]);
     }
 
     #[test]
-    fn admin_config_requests_for_uploaded_materials_trigger_document_retrieval() {
-        let auth = InternalAuthContext {
+    fn merge_prompt_rules_preserves_custom_rules_and_appends_missing_defaults() {
+        let existing = serde_json::to_string(&vec![
+            "Custom operator rule".to_string(),
+            "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.".to_string(),
+        ])
+        .expect("existing rules should serialize");
+        let required = serde_json::to_string(&vec![
+            "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.".to_string(),
+            "Admin Config proposals must use canonical paths and keys.".to_string(),
+        ])
+        .expect("required rules should serialize");
+
+        let merged = merge_prompt_rules(&existing, &required)
+            .expect("missing required rules should produce merged JSON");
+        let rules: Vec<String> = serde_json::from_str(&merged).expect("merged rules should parse");
+
+        assert_eq!(rules[0], "Custom operator rule");
+        assert_eq!(
+            rules[1],
+            "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action."
+        );
+        assert_eq!(
+            rules[2],
+            "Admin Config proposals must use canonical paths and keys."
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_malformed_request_json() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool { traces, proposal };
+        let args = HashMap::from([
+            ("summary".to_string(), "Malformed".to_string()),
+            (
+                "requests_json".to_string(),
+                "{\"method\":\"PUT\"}".to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("malformed proposal should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("must be a JSON array"));
+    }
+
+    #[tokio::test]
+    async fn knowledge_search_tool_executes_with_selected_document_constraints() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/document-search",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) =
+                            seen_tx.lock().expect("request recorder should lock").take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "sources": [
+                                {
+                                    "score": 0.92,
+                                    "type": "chunk",
+                                    "text": "The handbook says setup is complete.",
+                                    "chunk_id": "doc-handbook_chunk_0001",
+                                    "job_id": "doc-handbook",
+                                    "source_file": "Support Handbook.pdf",
+                                    "content_ref": "retrieval_chunk:doc-handbook_chunk_0001",
+                                    "hydrated": true,
+                                    "hydration_status": "hydrated"
+                                }
+                            ],
+                            "context": "=== RELEVANT PASSAGES ===\n[1] The handbook says setup is complete.",
+                            "search_query": "What does the handbook say?",
+                            "top_k": 3
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let internal = InternalAgentClient::new(
+            Client::builder().build().expect("http client should build"),
+            format!("http://{}", addr),
+            "test-token".to_string(),
+        );
+        let sources = Arc::new(Mutex::new(Vec::new()));
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let tool = KnowledgeSearchTool {
+            internal,
+            user: InternalAuthContext {
+                id: 2,
+                kind: "user".to_string(),
+                approved: true,
+                pubkey: None,
+                email: Some("user@example.test".to_string()),
+                name: None,
+                user_type_id: Some(3),
+                dev_mode: false,
+            },
+            top_k: 4,
+            job_ids: Some(vec!["doc-handbook".to_string(), "doc-faq".to_string()]),
+            jurisdiction: Some("US".to_string()),
+            situation_details: Some("Need setup status".to_string()),
+            sources: sources.clone(),
+            traces: traces.clone(),
+        };
+        let args = HashMap::from([
+            (
+                "query".to_string(),
+                "What does the handbook say?".to_string(),
+            ),
+            ("top_k".to_string(), "3".to_string()),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("Knowledge Search should execute");
+        server.abort();
+
+        assert!(result.success);
+        assert!(result.output.contains("Support Handbook.pdf"));
+        assert!(result
+            .output
+            .contains("The handbook says setup is complete."));
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record Knowledge Search request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["query"], "What does the handbook say?");
+        assert_eq!(payload["top_k"], 3);
+        assert_eq!(payload["job_ids"], json!(["doc-handbook", "doc-faq"]));
+        assert_eq!(payload["jurisdiction"], "US");
+        let sources = sources.lock().expect("source sink should lock");
+        assert_eq!(sources.len(), 1);
+        let traces = traces.lock().expect("trace sink should lock");
+        assert_eq!(traces[0].tool_id, "knowledge-search");
+        assert_eq!(
+            traces[0].output_summary.as_deref(),
+            Some("Retrieved uploaded-document passages for the answer.")
+        );
+    }
+
+    #[tokio::test]
+    async fn web_search_tool_executes_searx_contract_and_records_trace() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<HashMap<String, String>>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/search",
+            get({
+                let seen_tx = seen_tx.clone();
+                move |Query(query): Query<HashMap<String, String>>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        if let Some(sender) =
+                            seen_tx.lock().expect("request recorder should lock").take()
+                        {
+                            let _ = sender.send(query);
+                        }
+                        Json(json!({
+                            "results": [
+                                {
+                                    "title": "Deployment checklist",
+                                    "url": "https://example.test/checklist",
+                                    "content": "Current deployment setup guidance."
+                                }
+                            ]
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test search server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test search server should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test search server should serve");
+        });
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let tool = SearxWebSearchTool {
+            http: Client::builder().build().expect("http client should build"),
+            searxng_url: format!("http://{}", addr),
+            traces: traces.clone(),
+        };
+        let args = HashMap::from([
+            ("query".to_string(), "deployment checklist".to_string()),
+            ("count".to_string(), "1".to_string()),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("Web Search should execute");
+        server.abort();
+
+        assert!(result.success);
+        assert!(result.output.contains("Deployment checklist"));
+        assert!(result.output.contains("https://example.test/checklist"));
+        let query = seen_rx
+            .await
+            .expect("test search server should record search request");
+        assert_eq!(
+            query.get("q").map(String::as_str),
+            Some("deployment checklist")
+        );
+        assert_eq!(query.get("format").map(String::as_str), Some("json"));
+        let traces = traces.lock().expect("trace sink should lock");
+        assert_eq!(traces[0].tool_id, "web-search");
+        assert_eq!(
+            traces[0].output_summary.as_deref(),
+            Some("Web search results were prepared for the answer.")
+        );
+    }
+
+    #[test]
+    fn selected_tool_sets_expand_to_model_callable_tool_contracts() {
+        let http = Client::builder().build().expect("http client should build");
+        let internal = InternalAgentClient::new(
+            http.clone(),
+            "http://127.0.0.1:9".to_string(),
+            "test-token".to_string(),
+        );
+        let admin = InternalAuthContext {
             id: 1,
             kind: "admin".to_string(),
             approved: true,
@@ -5843,241 +6628,88 @@ mod tests {
             dev_mode: false,
         };
         let request = ChatRequest {
-            message: "Can you see the book I uploaded? Get a basic overview.".to_string(),
+            message: "What still needs setup?".to_string(),
             session_id: None,
-            tools: vec!["admin-config".to_string()],
+            tools: vec![
+                "knowledge-search".to_string(),
+                "web-search".to_string(),
+                "db-query".to_string(),
+                "admin-config".to_string(),
+            ],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: Some(vec!["doc-handbook".to_string()]),
             conversation_channel: None,
         };
 
-        assert!(should_auto_retrieve_admin_config_context(&request, &auth));
-    }
+        let (registry, _) = build_conversation_tool_registry(
+            &internal,
+            &http,
+            &request,
+            &admin,
+            4,
+            "http://searxng:8080",
+        );
 
-    #[test]
-    fn user_and_non_material_admin_requests_do_not_trigger_admin_document_retrieval() {
-        let admin_auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let user_auth = InternalAuthContext {
+        assert!(registry.has("knowledge_search"));
+        assert!(registry.has("web_search"));
+        assert!(registry.has("db_query"));
+        assert!(registry.has("read_instance_settings"));
+        assert!(registry.has("read_deployment_settings"));
+        assert!(registry.has("read_deployment_readiness"));
+        assert!(registry.has("read_agent_settings"));
+        assert!(registry.has("read_user_types"));
+        assert!(registry.has("read_document_access"));
+        assert!(registry.has("read_onboarding_status"));
+        assert!(registry.has("propose_config_change_set"));
+        assert!(registry.has("done"));
+
+        let user = InternalAuthContext {
             id: 2,
             kind: "user".to_string(),
             approved: true,
             pubkey: None,
             email: Some("user@example.test".to_string()),
             name: None,
-            user_type_id: None,
+            user_type_id: Some(7),
             dev_mode: false,
         };
-        let admin_request = ChatRequest {
-            message: "What is the current instance name?".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let user_request = ChatRequest {
-            message: "Based on the uploaded PDF, configure the theme.".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-
-        assert!(!should_auto_retrieve_admin_config_context(
-            &admin_request,
-            &admin_auth
-        ));
-        assert!(!should_auto_retrieve_admin_config_context(
-            &user_request,
-            &user_auth
-        ));
-    }
-
-    #[test]
-    fn client_tool_context_includes_scoped_config_marker() {
-        assert!(!client_tool_context_includes_scoped_config(None));
-        assert!(!client_tool_context_includes_scoped_config(Some(
-            "BOUNDED DOCUMENT CONTEXT\nbrand-guide.pdf"
-        )));
-        assert!(client_tool_context_includes_scoped_config(Some(
-            "SCOPED CONFIG CONTEXT\nscope: instance-settings"
-        )));
-    }
-
-    #[test]
-    fn explicit_chat_context_does_not_duplicate_scoped_config_blocks() {
-        let client_context = [
-            "CLIENT TOOL CONTEXT",
-            "SCOPED CONFIG CONTEXT",
-            "scope: instance-settings",
-            "- default_theme: dark",
-        ]
-        .join("\n");
-        let server_context = [
-            "SCOPED CONFIG CONTEXT",
-            "scope: instance-settings",
-            "- default_theme: dark",
-        ]
-        .join("\n");
-
-        let mut context_parts = vec![format!("CLIENT TOOL CONTEXT\n{}", client_context)];
-        if !client_tool_context_includes_scoped_config(Some(&client_context)) {
-            context_parts.push(server_context);
-        }
-
-        let merged = context_parts.join("\n\n");
-        assert_eq!(merged.matches("SCOPED CONFIG CONTEXT").count(), 1);
-    }
-
-    #[test]
-    fn prepared_admin_config_context_uses_control_plane_context_text() {
-        let request = ChatRequest {
-            message: "update the theme and primary color".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let response = InternalScopedConfigContextResponse {
-            version: 1,
-            primary_scope: "instance-settings".to_string(),
-            included_scopes: vec!["instance-settings".to_string()],
-            context_text: "SCOPED CONFIG CONTEXT\nscope: instance-settings\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- admin-config (Admin Config): Read instance configuration including settings, deployment configuration, user types, onboarding structure, document access policies, and agent behavior. Ask about what you need to inspect or change, and the tool returns the relevant context with actionable schema for configuration changes. Access: admins only.".to_string(),
-            warnings: Vec::new(),
-            generated_at: "2026-05-25T12:00:00+00:00".to_string(),
-            secret_policy: json!({ "mode": "masked" }),
-        };
-
-        let prepared = prepared_admin_config_context_from_response(&request, response);
-
-        assert!(prepared.context.starts_with("SCOPED CONFIG CONTEXT"));
-        assert!(prepared.context.contains("ADMIN-VISIBLE TOOL CAPABILITIES"));
-        assert!(!prepared.context.contains("prompt_sections"));
-        assert!(!prepared.context.contains("compiled_prompt"));
-        assert_eq!(prepared.tools_used.len(), 1);
-        assert_eq!(prepared.tools_used[0].tool_id, "admin-config");
-    }
-
-    #[test]
-    fn prepared_admin_config_context_surfaces_warnings_in_activity() {
-        let request = ChatRequest {
-            message: "review onboarding fields for user types".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let response = InternalScopedConfigContextResponse {
-            version: 1,
-            primary_scope: "user-types".to_string(),
-            included_scopes: vec!["user-types".to_string()],
-            context_text: "SCOPED CONFIG CONTEXT\nscope: user-types".to_string(),
-            warnings: vec!["user-fields user_type_id=2 failed".to_string()],
-            generated_at: "2026-05-25T12:00:00+00:00".to_string(),
-            secret_policy: json!({ "mode": "masked" }),
-        };
-
-        let prepared = prepared_admin_config_context_from_response(&request, response);
-
-        assert_eq!(
-            prepared.tools_used[0].output_summary.as_deref(),
-            Some(
-                "Prepared scoped config context for user-types. 1 scoped-read warning(s) reported."
-            )
+        let (user_registry, _) = build_conversation_tool_registry(
+            &internal,
+            &http,
+            &request,
+            &user,
+            4,
+            "http://searxng:8080",
         );
-        assert_eq!(
-            prepared.tools_used[0].warnings,
-            vec!["scoped_read_warnings:1".to_string()]
+
+        assert!(user_registry.has("knowledge_search"));
+        assert!(user_registry.has("web_search"));
+        assert!(!user_registry.has("db_query"));
+        assert!(!user_registry.has("read_instance_settings"));
+        assert!(!user_registry.has("propose_config_change_set"));
+
+        let disabled_request = ChatRequest {
+            tools: Vec::new(),
+            ..request
+        };
+        let (disabled_registry, _) = build_conversation_tool_registry(
+            &internal,
+            &http,
+            &disabled_request,
+            &admin,
+            4,
+            "http://searxng:8080",
         );
-        assert_eq!(
-            prepared.activity_steps[0].summary.as_deref(),
-            Some(
-                "Prepared scoped config context for user-types. 1 scoped-read warning(s) reported."
-            )
-        );
-        assert_eq!(
-            prepared.activity_steps[0].warnings,
-            vec!["scoped_read_warnings:1".to_string()]
-        );
+        assert!(!disabled_registry.has("knowledge_search"));
+        assert!(!disabled_registry.has("web_search"));
+        assert!(!disabled_registry.has("db_query"));
+        assert!(!disabled_registry.has("read_instance_settings"));
+        assert!(!disabled_registry.has("propose_config_change_set"));
+        assert!(disabled_registry.has("done"));
     }
 
     #[test]
-    fn prepared_admin_config_context_does_not_echo_raw_secrets() {
-        let request = ChatRequest {
-            message: "change smtp settings".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let response = InternalScopedConfigContextResponse {
-            version: 1,
-            primary_scope: "deployment-settings".to_string(),
-            included_scopes: vec!["deployment-settings".to_string()],
-            context_text:
-                "SCOPED CONFIG CONTEXT\nscope: deployment-settings\nSMTP_PASSWORD = [REDACTED]"
-                    .to_string(),
-            warnings: Vec::new(),
-            generated_at: "2026-05-25T12:00:00+00:00".to_string(),
-            secret_policy: json!({ "mode": "masked" }),
-        };
-
-        let prepared = prepared_admin_config_context_from_response(&request, response);
-
-        assert!(prepared.context.contains("[REDACTED]"));
-        assert!(!prepared.context.contains("super-secret-smtp-password"));
-        assert_eq!(
-            prepared.tools_used[0].warnings,
-            vec!["deployment_secrets_redacted".to_string()]
-        );
-    }
-
-    #[test]
-    fn prepared_admin_config_context_failure_is_safe() {
-        let request = ChatRequest {
-            message: "what tools do you have?".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-
-        let prepared = prepared_admin_config_context_failure(&request);
-
-        assert!(prepared
-            .context
-            .contains("Scoped config context could not be prepared safely."));
-        assert!(!prepared.context.contains("backend returned 503"));
-        assert!(!prepared.context.contains("secret=should-not-leak"));
-        assert_eq!(
-            prepared.tools_used[0].warnings,
-            vec!["scoped_config_context_failed".to_string()]
-        );
-    }
-
-    #[test]
-    fn admin_config_context_describes_admin_tool_capabilities() {
+    fn non_streaming_assistant_turn_input_uses_model_driven_tool_context() {
         let auth = InternalAuthContext {
             id: 1,
             kind: "admin".to_string(),
@@ -6089,211 +6721,56 @@ mod tests {
             dev_mode: false,
         };
         let request = ChatRequest {
-            message: "What tools do you have?".to_string(),
+            message: "show me the deployment settings".to_string(),
             session_id: None,
-            tools: vec!["admin-config".to_string()],
+            tools: vec!["admin-config".to_string(), "knowledge-search".to_string()],
             conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
+            job_ids: Some(vec!["doc-handbook".to_string()]),
             conversation_channel: None,
         };
-        let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\nscope: overview\n\nADMIN-VISIBLE TOOL CAPABILITIES\n- web-search (Web Search): Looks up current or external information through the configured SearXNG service. Use this to find best practices, current documentation, or external reference material that may inform configuration decisions. Access: all users when enabled.\n- admin-config (Admin Config): Read instance configuration including settings, deployment configuration, user types, onboarding structure, document access policies, and agent behavior. Ask about what you need to inspect or change, and the tool returns the relevant context with actionable schema for configuration changes. Access: admins only.\n- db-query (Database): Runs safe read-only admin database queries using natural language for analytics, user inspection, troubleshooting, or data analysis. Use this for questions about existing data, patterns, or inventory. Access: admins only.".to_string(),
-            tools_used: Vec::new(),
-            retrieval_sources: Vec::new(),
-            activity_steps: Vec::new(),
-        };
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults: HashMap::new(),
-            compiled_prompt: "Help the admin operate the Instance.".to_string(),
-        };
-        let profile = HashMap::new();
+        let input = build_conversation_turn_input(&auth, &HashMap::new(), &request, None);
 
-        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
-
-        assert!(prompt.contains("ADMIN-VISIBLE TOOL CAPABILITIES"));
-        assert!(prompt.contains("admin-config (Admin Config)"));
-        assert!(!prompt.contains("not a visible toggle in admin chat"));
-    }
-
-    #[test]
-    fn final_answer_prompt_includes_uploaded_document_context_for_admin_config_turns() {
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults: HashMap::new(),
-            compiled_prompt: "Help the admin configure the Instance.".to_string(),
-        };
-        let auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let request = ChatRequest {
-            message: "Configure the theme from the uploaded guide.".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let prepared = PreparedChatContext {
-            context: "SCOPED CONFIG CONTEXT\n{}\n\nUPLOADED DOCUMENT CONTEXT\nThe guide uses deep blue headings and a shield mark.".to_string(),
-            tools_used: Vec::new(),
-            retrieval_sources: Vec::new(),
-            activity_steps: Vec::new(),
-        };
-        let profile = HashMap::new();
-
-        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
-
-        assert!(prompt.contains("UPLOADED DOCUMENT CONTEXT"));
-        assert!(prompt.contains("deep blue headings"));
-    }
-
-    #[test]
-    fn final_answer_prompt_is_synthesis_only_after_tool_preparation() {
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults: HashMap::new(),
-            compiled_prompt: "Help the admin operate the Instance.".to_string(),
-        };
-        let auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let request = ChatRequest {
-            message: "Learn about my org PPST from my uploaded resource.".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let prepared = PreparedChatContext {
-            context: "UPLOADED DOCUMENT CONTEXT\nNo relevant uploaded-document passages were found for this message.".to_string(),
-            tools_used: Vec::new(),
-            retrieval_sources: Vec::new(),
-            activity_steps: Vec::new(),
-        };
-        let profile = HashMap::new();
-
-        let prompt = build_final_answer_prompt(&ai_config, &auth, &profile, &request, &prepared);
-
+        assert!(input.contains("=== REQUEST CONTEXT ==="));
+        assert!(input.contains("auth_type: admin"));
+        assert!(input.contains("enabled_tool_sets: admin-config, knowledge-search"));
+        assert!(input.contains("selected_document_ids: doc-handbook"));
+        assert!(input.contains("=== USER MESSAGE ==="));
+        assert!(input.contains("show me the deployment settings"));
+        assert!(!input.contains("=== PREPARED CONTEXT ==="));
         assert!(
-            prompt.contains("Tool and retrieval preparation for this turn is already complete.")
-        );
-        assert!(prompt.contains("Do not say you will search"));
-        assert!(!prompt.contains("- Use tools when they materially improve the answer."));
-        assert!(!prompt.contains("- Use tools and then continue until you have the answer."));
-        let compiled_profile_index = prompt
-            .find("Help the admin operate the Instance.")
-            .expect("compiled profile should be present");
-        let final_answer_index = prompt
-            .find("Tool and retrieval preparation for this turn is already complete.")
-            .expect("final-answer constraints should be present");
-        assert!(compiled_profile_index < final_answer_index);
-    }
-
-    #[test]
-    fn empty_uploaded_document_context_is_explicit_in_prompt_and_activity() {
-        let request = ChatRequest {
-            message: "Learn about PPST from my uploaded PDF.".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
-        };
-        let prepared = prepared_uploaded_document_context_from_response(
-            &request,
-            InternalDocumentSearchResponse {
-                sources: Vec::new(),
-                context: String::new(),
-                search_query: request.message.clone(),
-                top_k: 4,
-            },
-        );
-
-        assert!(prepared
-            .context
-            .contains("No relevant uploaded-document passages were found for this message."));
-        assert_eq!(
-            prepared.tools_used[0].output_summary.as_deref(),
-            Some("No relevant uploaded-document passages were found for this message.")
-        );
-        assert_eq!(
-            prepared.tools_used[0].warnings,
-            vec!["no_relevant_uploaded_document_context".to_string()]
-        );
-
-        let steps = conversation_activity_steps_from_tools(&prepared.tools_used);
-        assert_eq!(
-            steps[0].summary.as_deref(),
-            Some("No relevant uploaded-document passages were found for this message.")
-        );
-        assert_eq!(
-            steps[0].warnings,
-            vec!["no_relevant_uploaded_document_context".to_string()]
+            !input.contains("Tool and retrieval preparation for this turn is already complete.")
         );
     }
 
     #[test]
-    fn uploaded_document_context_carries_retrieval_sources_to_trace() {
-        let request = ChatRequest {
-            message: "Learn about PPST from my uploaded PDF.".to_string(),
-            session_id: None,
-            tools: vec!["admin-config".to_string()],
-            conversation_history: Vec::new(),
-            tool_context: None,
-            client_executed_tools: None,
-            conversation_channel: None,
+    fn query_input_uses_knowledge_tool_constraints_without_initial_document_context() {
+        let auth = InternalAuthContext {
+            id: 2,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: None,
+            email: Some("user@example.test".to_string()),
+            name: None,
+            user_type_id: Some(3),
+            dev_mode: false,
         };
-        let prepared = prepared_uploaded_document_context_from_response(
-            &request,
-            InternalDocumentSearchResponse {
-                sources: vec![QuerySource {
-                    score: 0.87,
-                    source_type: "chunk".to_string(),
-                    text: "PPST organizes support for political prisoners.".to_string(),
-                    chunk_id: "wlc_chunk_0001".to_string(),
-                    job_id: "wlc-political-prisoners".to_string(),
-                    source_file: "WLC_Political-Prisoners_EN.pdf".to_string(),
-                    content_ref: "retrieval_chunk:wlc_chunk_0001".to_string(),
-                    hydrated: true,
-                    hydration_status: "hydrated".to_string(),
-                }],
-                context:
-                    "=== RELEVANT PASSAGES ===\n[1] PPST organizes support for political prisoners."
-                        .to_string(),
-                search_query: request.message.clone(),
-                top_k: 4,
-            },
-        );
+        let request = QueryRequest {
+            question: "What should I know from the document?".to_string(),
+            session_id: None,
+            top_k: None,
+            graph_hops: None,
+            jurisdiction: None,
+            situation_details: None,
+            tools: Vec::new(),
+            job_ids: Some(vec!["large-doc".to_string()]),
+        };
 
-        assert_eq!(prepared.retrieval_sources.len(), 1);
-        assert!(prepared.context.contains("PPST organizes support"));
-        assert_eq!(
-            prepared.tools_used[0].output_summary.as_deref(),
-            Some("Retrieved uploaded-document passages for the answer.")
-        );
+        let input = build_query_conversation_turn_input(&auth, &HashMap::new(), &request, None);
+
+        assert!(input.contains("enabled_tool_sets: knowledge-search"));
+        assert!(input.contains("selected_document_ids: large-doc"));
+        assert!(!input.contains("=== INITIAL DOCUMENT CONTEXT ==="));
+        assert!(input.contains("=== USER QUESTION ==="));
     }
 
     #[test]
@@ -6398,59 +6875,6 @@ mod tests {
         assert!(!rendered.contains("super-secret-tinfoil-key"));
     }
 
-    #[tokio::test]
-    async fn streamed_pre_answer_work_overlaps_context_and_memory_hydration() {
-        let started = Instant::now();
-
-        let (prepared, memory) = overlap_streamed_pre_answer_work(
-            async {
-                tokio::time::sleep(Duration::from_millis(60)).await;
-                "prepared_context"
-            },
-            async {
-                tokio::time::sleep(Duration::from_millis(60)).await;
-                "session_memory"
-            },
-        )
-        .await;
-
-        assert_eq!(prepared, "prepared_context");
-        assert_eq!(memory, "session_memory");
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "pre-answer work should overlap instead of running serially"
-        );
-    }
-
-    #[tokio::test]
-    async fn streamed_tool_context_work_overlaps_independent_tools() {
-        let started = Instant::now();
-
-        let (documents, web, database) = overlap_streamed_tool_context_work(
-            async {
-                tokio::time::sleep(Duration::from_millis(60)).await;
-                "documents"
-            },
-            async {
-                tokio::time::sleep(Duration::from_millis(60)).await;
-                "web"
-            },
-            async {
-                tokio::time::sleep(Duration::from_millis(60)).await;
-                "database"
-            },
-        )
-        .await;
-
-        assert_eq!(documents, "documents");
-        assert_eq!(web, "web");
-        assert_eq!(database, "database");
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "independent streamed tool context work should overlap instead of running serially"
-        );
-    }
-
     fn test_config_with_tinfoil_key(secret: &str) -> Config {
         Config {
             tinfoil_api_url: "http://tinfoil-proxy:8089/v1".to_string(),
@@ -6478,7 +6902,7 @@ mod tests {
     fn test_web_config() -> EnclaveWebConfig {
         EnclaveWebConfig {
             http_port: 3000,
-            backend_url: "http://core-backend:8000".to_string(),
+            backend_url: "http://core-backend:18000".to_string(),
             internal_agent_token: "internal-test-token".to_string(),
             secret_key: "test-secret".to_string(),
             allowed_origins: vec!["https://app.example.test".to_string()],
