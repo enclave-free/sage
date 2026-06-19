@@ -45,6 +45,8 @@ use crate::schema::{
 };
 
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
+const CURATED_RESOURCES_TOOL_SET_ID: &str = "curated-resources";
+const KNOWLEDGE_SEARCH_TOOL_SET_ID: &str = "knowledge-search";
 const USER_SESSION_SALT: &str = "session";
 const USER_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const ADMIN_SESSION_SALT: &str = "admin-session";
@@ -1074,6 +1076,7 @@ struct KnowledgeSearchTool {
 struct FindResourcesTool {
     internal: InternalAgentClient,
     jurisdiction: Option<String>,
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
 }
 
 #[derive(Clone)]
@@ -1155,15 +1158,31 @@ fn build_conversation_tool_registry_with_context(
     let sinks = ConversationToolLoopSinks::new();
     let mut registry = ToolRegistry::new();
 
-    if request.tools.iter().any(|tool| tool == "knowledge-search") {
+    if request
+        .tools
+        .iter()
+        .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID)
+    {
         registry.register(Arc::new(KnowledgeSearchTool {
             internal: internal.clone(),
             user: auth.clone(),
             top_k,
             job_ids: request.job_ids.clone(),
-            jurisdiction,
+            jurisdiction: jurisdiction.clone(),
             situation_details,
             sources: sinks.sources.clone(),
+            traces: sinks.traces.clone(),
+        }));
+    }
+
+    if request
+        .tools
+        .iter()
+        .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID)
+    {
+        registry.register(Arc::new(FindResourcesTool {
+            internal: internal.clone(),
+            jurisdiction,
             traces: sinks.traces.clone(),
         }));
     }
@@ -1361,14 +1380,39 @@ impl Tool for FindResourcesTool {
             .resolved_country_code
             .as_deref()
             .or(region.as_deref());
+        let trace_query = match response_region {
+            Some(region) => format!("{} resources for {}", response_help_type, region),
+            None => format!("{} resources", response_help_type),
+        };
 
         if response.resources.is_empty() {
             let where_label = response_region.unwrap_or("the requested region");
+            if let Ok(mut sink) = self.traces.lock() {
+                sink.push(ToolCallInfoResponse {
+                    tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
+                    tool_name: "Curated Resources".to_string(),
+                    query: Some(trace_query),
+                    output_summary: Some("No matching curated resources were found.".to_string()),
+                    warnings: vec!["no_curated_resources".to_string()],
+                    guarded: false,
+                });
+            }
             return Ok(ToolResult::success(format!(
                 "No vetted {} resources are currently listed for {}. Do not invent referrals; \
                  offer general guidance instead and suggest the person seek a trusted local contact.",
                 response_help_type, where_label
             )));
+        }
+
+        if let Ok(mut sink) = self.traces.lock() {
+            sink.push(ToolCallInfoResponse {
+                tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
+                tool_name: "Curated Resources".to_string(),
+                query: Some(trace_query),
+                output_summary: Some("Found vetted curated resources for the answer.".to_string()),
+                warnings: Vec::new(),
+                guarded: false,
+            });
         }
 
         let mut output = format!("Trusted {} resources", response_help_type);
@@ -2263,7 +2307,14 @@ async fn chat(
         Some(memory),
         build_agent_instruction(
             &ai_config.compiled_prompt,
-            request.tools.iter().any(|tool| tool == "knowledge-search"),
+            request
+                .tools
+                .iter()
+                .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
+            request
+                .tools
+                .iter()
+                .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
         ),
     );
 
@@ -2603,7 +2654,14 @@ async fn chat_stream(
             Some(memory),
             build_agent_instruction(
                 &ai_config.compiled_prompt,
-                request.tools.iter().any(|tool| tool == "knowledge-search"),
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
             ),
         );
         let input = build_conversation_turn_input(
@@ -2755,7 +2813,14 @@ async fn query(
     let mut agent = SageAgent::new_with_optional_memory(
         registry,
         Some(memory),
-        build_agent_instruction(&ai_config.compiled_prompt, true),
+        build_agent_instruction(
+            &ai_config.compiled_prompt,
+            true,
+            chat_request
+                .tools
+                .iter()
+                .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
+        ),
     );
 
     let input = build_query_conversation_turn_input(&auth, &profile, &request, None);
@@ -4504,6 +4569,7 @@ fn build_human_block(auth: &InternalAuthContext, profile: &HashMap<String, Strin
 struct EnclaveWebRuntimeProfile<'a> {
     compiled_prompt: &'a str,
     include_knowledge_tool: bool,
+    include_curated_resources_tool: bool,
 }
 
 impl<'a> EnclaveWebRuntimeProfile<'a> {
@@ -4515,24 +4581,43 @@ impl<'a> EnclaveWebRuntimeProfile<'a> {
                 "\nTool preference:\n- Use knowledge_search first for uploaded-document questions.\n",
             );
         }
+        if self.include_curated_resources_tool {
+            instruction.push_str(
+                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Only share contact details returned by find_resources.\n",
+            );
+        }
         instruction.push_str("\nAgent Settings profile:\n");
         instruction.push_str(self.compiled_prompt);
         instruction
     }
 }
 
-fn build_agent_instruction(compiled_prompt: &str, include_knowledge_tool: bool) -> String {
+fn build_agent_instruction(
+    compiled_prompt: &str,
+    include_knowledge_tool: bool,
+    include_curated_resources_tool: bool,
+) -> String {
     EnclaveWebRuntimeProfile {
         compiled_prompt,
         include_knowledge_tool,
+        include_curated_resources_tool,
     }
     .build_instruction()
 }
 
 fn query_enabled_tool_sets(request: &QueryRequest) -> Vec<String> {
     let mut tools = request.tools.clone();
-    if !tools.iter().any(|tool| tool == "knowledge-search") {
-        tools.insert(0, "knowledge-search".to_string());
+    if !tools
+        .iter()
+        .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID)
+    {
+        tools.insert(0, KNOWLEDGE_SEARCH_TOOL_SET_ID.to_string());
+    }
+    if !tools
+        .iter()
+        .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID)
+    {
+        tools.insert(0, CURATED_RESOURCES_TOOL_SET_ID.to_string());
     }
     tools
 }
@@ -4943,6 +5028,7 @@ fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
     let tool_name = match tool_id {
         "admin-config" => "Admin Config",
         "web-search" => "Web Search",
+        "curated-resources" => "Curated Resources",
         "db-query" => "Database Query",
         other => other,
     };
@@ -5316,6 +5402,7 @@ mod tests {
                 "test-token".to_string(),
             ),
             jurisdiction: Some("Mexico".to_string()),
+            traces: Arc::new(Mutex::new(Vec::new())),
         };
         let args = HashMap::from([
             ("help_type".to_string(), "legal".to_string()),
@@ -5338,6 +5425,15 @@ mod tests {
             .output
             .contains("secure_channel: Signal: +52-555-0100"));
         assert!(result.output.contains("never invent contact details"));
+
+        let traces = tool.traces.lock().expect("trace sink should lock");
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].tool_id, "curated-resources");
+        assert_eq!(traces[0].tool_name, "Curated Resources");
+        assert_eq!(
+            traces[0].output_summary.as_deref(),
+            Some("Found vetted curated resources for the answer.")
+        );
 
         let (token, payload) = seen_rx
             .await
@@ -5399,7 +5495,7 @@ mod tests {
 
     #[test]
     fn enclave_web_instruction_uses_runtime_profile_boundary() {
-        let instruction = build_agent_instruction("PROFILE: custom instance", false);
+        let instruction = build_agent_instruction("PROFILE: custom instance", false, false);
 
         assert!(instruction.contains("Runtime profile: enclave_web"));
         assert!(instruction.contains("Agent Settings profile:"));
@@ -6632,6 +6728,7 @@ mod tests {
             session_id: None,
             tools: vec![
                 "knowledge-search".to_string(),
+                "curated-resources".to_string(),
                 "web-search".to_string(),
                 "db-query".to_string(),
                 "admin-config".to_string(),
@@ -6651,6 +6748,7 @@ mod tests {
         );
 
         assert!(registry.has("knowledge_search"));
+        assert!(registry.has("find_resources"));
         assert!(registry.has("web_search"));
         assert!(registry.has("db_query"));
         assert!(registry.has("read_instance_settings"));
@@ -6683,6 +6781,7 @@ mod tests {
         );
 
         assert!(user_registry.has("knowledge_search"));
+        assert!(user_registry.has("find_resources"));
         assert!(user_registry.has("web_search"));
         assert!(!user_registry.has("db_query"));
         assert!(!user_registry.has("read_instance_settings"));
@@ -6701,6 +6800,7 @@ mod tests {
             "http://searxng:8080",
         );
         assert!(!disabled_registry.has("knowledge_search"));
+        assert!(!disabled_registry.has("find_resources"));
         assert!(!disabled_registry.has("web_search"));
         assert!(!disabled_registry.has("db_query"));
         assert!(!disabled_registry.has("read_instance_settings"));
@@ -6767,7 +6867,7 @@ mod tests {
 
         let input = build_query_conversation_turn_input(&auth, &HashMap::new(), &request, None);
 
-        assert!(input.contains("enabled_tool_sets: knowledge-search"));
+        assert!(input.contains("enabled_tool_sets: curated-resources, knowledge-search"));
         assert!(input.contains("selected_document_ids: large-doc"));
         assert!(!input.contains("=== INITIAL DOCUMENT CONTEXT ==="));
         assert!(input.contains("=== USER QUESTION ==="));
