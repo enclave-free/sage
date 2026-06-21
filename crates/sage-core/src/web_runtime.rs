@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::memory::MemoryManager;
-use crate::sage_agent::{SageAgent, Tool, ToolRegistry, ToolResult};
+use crate::sage_agent::{SageAgent, StepResult, Tool, ToolRegistry, ToolResult};
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
     summaries, user_preferences, web_sessions,
@@ -1617,11 +1617,11 @@ impl Tool for AdminConfigProposalTool {
     }
 
     fn description(&self) -> &str {
-        "Stage a non-mutating Admin Config change set for UI Change Confirmation. Use this for admin write intent instead of putting raw JSON in messages. Canonical paths include PUT /admin/settings and POST /admin/user-types. Use header_tagline, default_language codes like en, default_theme light|dark|system, and auto_approve_users. The admin must still click Apply before any changes are written. If this tool succeeds, keep the final answer short: \"I prepared these changes for review. Use Apply to confirm.\" If a proposal is rejected, correct the request and call this tool again; do not tell the admin to edit supported settings manually."
+        "Stage a non-mutating Admin Config change set for UI Change Confirmation. Use this for admin write intent instead of putting raw JSON in messages. Canonical paths include PUT /admin/settings for Instance Settings, PUT /admin/ai-config/prompt_rules for Agent Settings behavior rules, PUT /admin/ai-config/{key} for other Agent Settings, and POST /admin/user-types. Use header_tagline, default_language codes like en, default_theme light|dark|system, and auto_approve_users for Instance Settings. Behavior rules use /admin/ai-config/prompt_rules with body.value set to a JSON string array, for example {\"value\":\"[\\\"Ask users where they are from before giving location-specific guidance.\\\"]\"}. The admin must still click Apply before any changes are written. If this tool succeeds, keep the final answer short: \"I prepared these changes for review. Use Apply to confirm.\" If a proposal is rejected, correct the request and call this tool again; do not tell the admin to edit supported settings manually."
     }
 
     fn args_schema(&self) -> &str {
-        r##"{"summary": "One-sentence summary of the proposed configuration changes", "requests_json": "JSON array of requests. Guided bootstrap example: [{\"method\":\"PUT\",\"path\":\"/admin/settings\",\"body\":{\"instance_name\":\"FreeThem\",\"assistant_name\":\"Political Prisoner Support Team\",\"header_tagline\":\"Political prisoner support team.\",\"description\":\"...\",\"primary_color\":\"#1E40AF\",\"default_theme\":\"dark\",\"default_language\":\"en\",\"auto_approve_users\":true}},{\"method\":\"POST\",\"path\":\"/admin/user-types\",\"body\":{\"name\":\"Current Support\",\"description\":\"Family and friends of currently imprisoned political prisoners\"}}]. Use /admin/user-types with hyphen, never /admin/user_types."}"##
+        r##"{"summary": "One-sentence summary of the proposed configuration changes", "requests_json": "JSON array of requests. Guided bootstrap example: [{\"method\":\"PUT\",\"path\":\"/admin/settings\",\"body\":{\"instance_name\":\"FreeThem\",\"assistant_name\":\"Political Prisoner Support Team\",\"header_tagline\":\"Political prisoner support team.\",\"description\":\"...\",\"primary_color\":\"#1E40AF\",\"default_theme\":\"dark\",\"default_language\":\"en\",\"auto_approve_users\":true}},{\"method\":\"POST\",\"path\":\"/admin/user-types\",\"body\":{\"name\":\"Current Support\",\"description\":\"Family and friends of currently imprisoned political prisoners\"}}]. Agent Settings behavior-rule example: [{\"method\":\"PUT\",\"path\":\"/admin/ai-config/prompt_rules\",\"body\":{\"value\":\"[\\\"Ask users where they are from before giving location-specific guidance.\\\"]\"}}]. Use /admin/user-types with hyphen, never /admin/user_types. Use /admin/ai-config/prompt_rules for Sage behavior rules; never put prompt_rules in /admin/settings."}"##
     }
 
     async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
@@ -1916,8 +1916,29 @@ fn validate_admin_change_request_body(
         let value = body
             .get("value")
             .ok_or_else(|| format!("{} requires body.value.", request.path))?;
-        if !value.is_string() {
+        let Some(value) = value.as_str() else {
             return Err(format!("{} body.value must be a string.", request.path));
+        };
+        let key = request.path.rsplit('/').next().unwrap_or_default();
+        if matches!(key, "prompt_rules" | "prompt_forbidden") {
+            let parsed: Value = serde_json::from_str(value).map_err(|error| {
+                format!(
+                    "{} body.value must be a JSON array of strings: {}",
+                    request.path, error
+                )
+            })?;
+            let items = parsed.as_array().ok_or_else(|| {
+                format!(
+                    "{} body.value must be a JSON array of strings.",
+                    request.path
+                )
+            })?;
+            if !items.iter().all(Value::is_string) {
+                return Err(format!(
+                    "{} body.value must be a JSON array of strings.",
+                    request.path
+                ));
+            }
         }
     }
 
@@ -4679,7 +4700,9 @@ async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String>
             .step(input, step == 0)
             .await
             .map_err(model_provider_error)?;
-        messages.extend(result.messages);
+        if should_include_step_messages(&result) {
+            messages.extend(result.messages);
+        }
         if result.done {
             break;
         }
@@ -4696,6 +4719,12 @@ async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String>
         return Ok("I apologize, but I wasn't able to generate a response.".to_string());
     }
     Ok(output)
+}
+
+fn should_include_step_messages(result: &StepResult) -> bool {
+    !result.executed_tools.iter().any(|executed| {
+        executed.tool_call.name == "propose_config_change_set" && !executed.result.success
+    })
 }
 
 struct ConversationToolLoopOutput {
@@ -6327,6 +6356,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_config_proposal_tool_stages_prompt_rules_agent_setting() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        assert!(tool.description().contains("/admin/ai-config/prompt_rules"));
+        assert!(tool.args_schema().contains("/admin/ai-config/prompt_rules"));
+        let requested_rules =
+            json!(["Ask users where they are from before giving location-specific guidance."])
+                .to_string();
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Ask users where they are from".to_string(),
+            ),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/ai-config/prompt_rules",
+                        "body": { "value": requested_rules }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("prompt_rules proposal should execute");
+
+        assert!(result.success);
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("prompt_rules proposal should be staged");
+        assert_eq!(staged.requests.len(), 1);
+        assert_eq!(staged.requests[0].method, "PUT");
+        assert_eq!(staged.requests[0].path, "/admin/ai-config/prompt_rules");
+        assert_eq!(
+            staged.requests[0].body,
+            Some(json!({ "value": requested_rules }))
+        );
+    }
+
+    #[test]
+    fn failed_admin_config_proposal_step_messages_are_suppressed() {
+        let result = StepResult {
+            messages: vec!["I prepared these changes for review. Use Apply to confirm.".to_string()],
+            tool_calls: Vec::new(),
+            executed_tools: vec![crate::sage_agent::ExecutedTool {
+                tool_call: crate::sage_agent::ToolCall {
+                    name: "propose_config_change_set".to_string(),
+                    args: HashMap::new(),
+                },
+                result: ToolResult::error(
+                    "Invalid change set proposal: Unsupported instance setting key: prompt_rules",
+                ),
+            }],
+            done: false,
+        };
+
+        assert!(!should_include_step_messages(&result));
+    }
+
+    #[test]
+    fn successful_admin_config_proposal_step_messages_are_kept() {
+        let result = StepResult {
+            messages: vec!["I prepared these changes for review. Use Apply to confirm.".to_string()],
+            tool_calls: Vec::new(),
+            executed_tools: vec![crate::sage_agent::ExecutedTool {
+                tool_call: crate::sage_agent::ToolCall {
+                    name: "propose_config_change_set".to_string(),
+                    args: HashMap::new(),
+                },
+                result: ToolResult::success(
+                    "I prepared these changes for review. Use Apply to confirm.",
+                ),
+            }],
+            done: false,
+        };
+
+        assert!(should_include_step_messages(&result));
+    }
+
+    #[tokio::test]
     async fn admin_config_proposal_tool_rejects_unknown_setting_keys() {
         let proposal = Arc::new(Mutex::new(Some(AdminChangeSetResponse {
             version: 1,
@@ -6406,6 +6525,48 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("body.value must be a string"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_invalid_prompt_rules_value() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Invalid behavior rule payload".to_string(),
+            ),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/ai-config/prompt_rules",
+                        "body": { "value": "Ask users where they are from." }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("invalid prompt_rules proposal should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("body.value must be a JSON array of strings"));
         assert!(proposal
             .lock()
             .expect("proposal sink should lock")
