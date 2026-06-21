@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::memory::MemoryManager;
-use crate::sage_agent::{SageAgent, StepResult, Tool, ToolRegistry, ToolResult};
+use crate::sage_agent::{ExecutedTool, SageAgent, StepResult, Tool, ToolRegistry, ToolResult};
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
     summaries, user_preferences, web_sessions,
@@ -1103,6 +1103,13 @@ struct AdminConfigReadTool {
 }
 
 #[derive(Clone)]
+struct AdminAgentSettingsReadTool {
+    state: WebAppState,
+    auth: InternalAuthContext,
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+}
+
+#[derive(Clone)]
 struct AdminConfigProposalTool {
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
     proposal: Arc<Mutex<Option<AdminChangeSetResponse>>>,
@@ -1132,6 +1139,7 @@ fn build_conversation_tool_registry(
     auth: &InternalAuthContext,
     top_k: i32,
     searxng_url: &str,
+    state: Option<&WebAppState>,
 ) -> (ToolRegistry, ConversationToolLoopSinks) {
     build_conversation_tool_registry_with_context(
         internal,
@@ -1142,6 +1150,7 @@ fn build_conversation_tool_registry(
         searxng_url,
         None,
         None,
+        state,
     )
 }
 
@@ -1154,6 +1163,7 @@ fn build_conversation_tool_registry_with_context(
     searxng_url: &str,
     jurisdiction: Option<String>,
     situation_details: Option<String>,
+    state: Option<&WebAppState>,
 ) -> (ToolRegistry, ConversationToolLoopSinks) {
     let sinks = ConversationToolLoopSinks::new();
     let mut registry = ToolRegistry::new();
@@ -1240,6 +1250,16 @@ fn build_conversation_tool_registry_with_context(
                 "Read first-admin setup state and guided bootstrap checklist status.",
             ),
         ] {
+            if name == "read_agent_settings" {
+                if let Some(state) = state.cloned() {
+                    registry.register(Arc::new(AdminAgentSettingsReadTool {
+                        state,
+                        auth: auth.clone(),
+                        traces: sinks.traces.clone(),
+                    }));
+                    continue;
+                }
+            }
             registry.register(Arc::new(AdminConfigReadTool {
                 internal: internal.clone(),
                 auth: auth.clone(),
@@ -1605,6 +1625,102 @@ impl Tool for AdminConfigReadTool {
             "secret_policy": response.secret_policy,
             "warnings": response.warnings,
             "data": response.data,
+        }))?;
+        Ok(ToolResult::success(output))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for AdminAgentSettingsReadTool {
+    fn name(&self) -> &str {
+        "read_agent_settings"
+    }
+
+    fn description(&self) -> &str {
+        "Read global and per-user-type Sage Agent Settings."
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{}"#
+    }
+
+    async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+        let global = match load_ai_config_response(&self.state) {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(ToolResult::error(format!(
+                    "Admin Config read tool failed: {}",
+                    error.message
+                )));
+            }
+        };
+        let user_types_response = match self
+            .state
+            .internal
+            .admin_config_tool("user-types", &self.auth)
+            .await
+        {
+            Ok(response) => response,
+            Err(AdminConfigToolError::Unauthorized) => {
+                return Ok(ToolResult::error(
+                    "Admin Config read tools are not authorized for this actor.",
+                ));
+            }
+            Err(AdminConfigToolError::Failed(error)) => {
+                return Ok(ToolResult::error(format!(
+                    "Admin Config read tool failed: {}",
+                    error
+                )));
+            }
+        };
+        let user_types: Vec<InternalUserTypeResponse> = match serde_json::from_value(
+            user_types_response
+                .data
+                .get("user_types")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        ) {
+            Ok(user_types) => user_types,
+            Err(error) => {
+                return Ok(ToolResult::error(format!(
+                    "Admin Config read tool failed: invalid user type payload: {}",
+                    error
+                )));
+            }
+        };
+        let mut per_user_type = Vec::new();
+        for user_type in user_types {
+            match load_ai_config_user_type_response(&self.state, &user_type) {
+                Ok(response) => per_user_type.push(response),
+                Err(error) => {
+                    return Ok(ToolResult::error(format!(
+                        "Admin Config read tool failed: {}",
+                        error.message
+                    )));
+                }
+            }
+        }
+        let warnings = user_types_response.warnings.clone();
+        let data = sage_agent_settings_tool_data_from_responses(global, per_user_type);
+
+        if let Ok(mut sink) = self.traces.lock() {
+            sink.push(ToolCallInfoResponse {
+                tool_id: "admin-config:read_agent_settings".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: Some("read_agent_settings".to_string()),
+                output_summary: Some("Read read_agent_settings.".to_string()),
+                warnings: warnings.clone(),
+                guarded: false,
+            });
+        }
+
+        let output = serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "tool": "read_agent_settings",
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "secret_policy": { "mode": "masked" },
+            "warnings": warnings,
+            "data": data,
         }))?;
         Ok(ToolResult::success(output))
     }
@@ -2322,6 +2438,7 @@ async fn chat(
         &auth,
         top_k,
         &std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://searxng:8080".to_string()),
+        Some(&state),
     );
     let mut agent = SageAgent::new_with_optional_memory(
         registry,
@@ -2341,7 +2458,8 @@ async fn chat(
 
     let input =
         build_conversation_turn_input(&auth, &profile, &request, persisted_context.as_ref());
-    let tool_loop = run_conversation_tool_loop(&mut agent, &input, &tool_sinks).await?;
+    let tool_loop =
+        run_conversation_tool_loop(&mut agent, &input, &tool_sinks, Some(&memory_user_id)).await?;
     let response_text = tool_loop.answer;
     let assistant_memory_content =
         sanitize_admin_config_message_for_memory(&auth, &request, &response_text);
@@ -2420,9 +2538,81 @@ fn build_conversation_turn_input(
         input.push_str(&truncate_chars(summary, 4000));
         input.push('\n');
     }
+    let confirmation_events = client_confirmation_events_for_turn_input(auth, request);
+    if !confirmation_events.is_empty() {
+        input.push_str("\n=== CLIENT CONFIRMATION EVENTS ===\n");
+        for event in confirmation_events {
+            input.push_str("- ");
+            input.push_str(&event);
+            input.push('\n');
+        }
+    }
     input.push_str("\n=== USER MESSAGE ===\n");
     input.push_str(&request.message);
     input
+}
+
+fn client_confirmation_events_for_turn_input(
+    auth: &InternalAuthContext,
+    request: &ChatRequest,
+) -> Vec<String> {
+    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "admin-config") {
+        return Vec::new();
+    }
+
+    request
+        .conversation_history
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| {
+            let content = message.content.trim();
+            is_admin_config_apply_summary_content(content).then(|| truncate_chars(content, 1000))
+        })
+        .collect()
+}
+
+fn is_admin_config_apply_summary_content(content: &str) -> bool {
+    (content.starts_with("Applied ") && content.contains("change(s)"))
+        || content.starts_with("The change set was applied successfully")
+}
+
+fn admin_config_tool_memory_content(executed: &ExecutedTool) -> Option<String> {
+    if !executed.result.success || !is_admin_config_tool_name(&executed.tool_call.name) {
+        return None;
+    }
+
+    if executed.tool_call.name == "propose_config_change_set" {
+        let summary = executed
+            .tool_call
+            .args
+            .get("summary")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Admin configuration change set");
+        return Some(format!(
+            "Admin Config tool completed: propose_config_change_set. Proposed change set: {}",
+            truncate_chars(summary, 240)
+        ));
+    }
+
+    Some(format!(
+        "Admin Config tool completed: {}.",
+        executed.tool_call.name
+    ))
+}
+
+fn is_admin_config_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "read_instance_settings"
+            | "read_deployment_settings"
+            | "read_deployment_readiness"
+            | "read_agent_settings"
+            | "read_user_types"
+            | "read_document_access"
+            | "read_onboarding_status"
+            | "propose_config_change_set"
+    )
 }
 
 fn should_sanitize_admin_config_history(auth: &InternalAuthContext, request: &ChatRequest) -> bool {
@@ -2669,6 +2859,7 @@ async fn chat_stream(
             &auth,
             top_k,
             &std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://searxng:8080".to_string()),
+            Some(&state),
         );
         let mut agent = SageAgent::new_with_optional_memory(
             registry,
@@ -2691,7 +2882,14 @@ async fn chat_stream(
             &request,
             persisted_context.as_ref(),
         );
-        let tool_loop = match run_conversation_tool_loop(&mut agent, &input, &tool_sinks).await {
+        let tool_loop = match run_conversation_tool_loop(
+            &mut agent,
+            &input,
+            &tool_sinks,
+            Some(&memory_user_id),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(error) => {
                 let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
@@ -2830,6 +3028,7 @@ async fn query(
         &std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://searxng:8080".to_string()),
         request.jurisdiction.clone(),
         request.situation_details.clone(),
+        Some(&state),
     );
     let mut agent = SageAgent::new_with_optional_memory(
         registry,
@@ -2845,7 +3044,8 @@ async fn query(
     );
 
     let input = build_query_conversation_turn_input(&auth, &profile, &request, None);
-    let tool_loop = run_conversation_tool_loop(&mut agent, &input, &tool_sinks).await?;
+    let tool_loop =
+        run_conversation_tool_loop(&mut agent, &input, &tool_sinks, Some(&memory_user_id)).await?;
     let answer = tool_loop.answer;
 
     let assistant_user_id = format!("{}:{}", auth.kind, auth.id);
@@ -3989,6 +4189,80 @@ fn load_ai_config_user_type_response(
     Ok(response)
 }
 
+fn sage_agent_settings_tool_data_from_responses(
+    global: AIConfigResponseBody,
+    per_user_type: Vec<AIConfigUserTypeResponseBody>,
+) -> Value {
+    let user_type_count = per_user_type.len();
+    let per_user_type = per_user_type
+        .into_iter()
+        .map(|user_type| {
+            let overrides = ai_config_override_items_by_key(&user_type);
+            json!({
+                "user_type_id": user_type.user_type_id,
+                "user_type_name": user_type.user_type_name,
+                "overrides": overrides,
+                "effective_values": {
+                    "prompt_sections": ai_config_inherited_items_by_key(user_type.prompt_sections),
+                    "parameters": ai_config_inherited_items_by_key(user_type.parameters),
+                    "defaults": ai_config_inherited_items_by_key(user_type.defaults),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "global": {
+            "prompt_sections": ai_config_items_by_key(global.prompt_sections),
+            "parameters": ai_config_items_by_key(global.parameters),
+            "defaults": ai_config_items_by_key(global.defaults),
+        },
+        "per_user_type": per_user_type,
+        "limits": {
+            "user_types_returned": user_type_count,
+        },
+    })
+}
+
+fn ai_config_items_by_key(items: Vec<AIConfigItemResponse>) -> Value {
+    let mut map = serde_json::Map::new();
+    for item in items {
+        map.insert(
+            item.key.clone(),
+            serde_json::to_value(item).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(map)
+}
+
+fn ai_config_inherited_items_by_key(items: Vec<AIConfigWithInheritanceResponse>) -> Value {
+    let mut map = serde_json::Map::new();
+    for item in items {
+        map.insert(
+            item.key.clone(),
+            serde_json::to_value(item).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(map)
+}
+
+fn ai_config_override_items_by_key(user_type: &AIConfigUserTypeResponseBody) -> Value {
+    let mut map = serde_json::Map::new();
+    for item in user_type
+        .prompt_sections
+        .iter()
+        .chain(user_type.parameters.iter())
+        .chain(user_type.defaults.iter())
+        .filter(|item| item.is_override)
+    {
+        map.insert(
+            item.key.clone(),
+            serde_json::to_value(item).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(map)
+}
+
 fn load_effective_ai_config_rows(
     state: &WebAppState,
     user_type_id: i32,
@@ -4693,13 +4967,18 @@ fn build_query_conversation_turn_input(
     input
 }
 
-async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String> {
+async fn run_agent_turn(
+    agent: &mut SageAgent,
+    input: &str,
+    memory_user_id: Option<&str>,
+) -> AppResult<String> {
     let mut messages = Vec::new();
     for step in 0..8 {
         let result = agent
             .step(input, step == 0)
             .await
             .map_err(model_provider_error)?;
+        persist_successful_admin_config_tools(agent, memory_user_id, &result.executed_tools).await;
         if should_include_step_messages(&result) {
             messages.extend(result.messages);
         }
@@ -4721,6 +5000,28 @@ async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String>
     Ok(output)
 }
 
+async fn persist_successful_admin_config_tools(
+    agent: &SageAgent,
+    memory_user_id: Option<&str>,
+    executed_tools: &[ExecutedTool],
+) {
+    let Some(memory_user_id) = memory_user_id else {
+        return;
+    };
+
+    for content in executed_tools
+        .iter()
+        .filter_map(admin_config_tool_memory_content)
+    {
+        if let Err(error) = agent
+            .store_message_with_compaction_check(memory_user_id, "tool", &content)
+            .await
+        {
+            warn!("failed to persist Admin Config tool context: {}", error);
+        }
+    }
+}
+
 fn should_include_step_messages(result: &StepResult) -> bool {
     !result.executed_tools.iter().any(|executed| {
         executed.tool_call.name == "propose_config_change_set" && !executed.result.success
@@ -4739,8 +5040,9 @@ async fn run_conversation_tool_loop(
     agent: &mut SageAgent,
     input: &str,
     sinks: &ConversationToolLoopSinks,
+    memory_user_id: Option<&str>,
 ) -> AppResult<ConversationToolLoopOutput> {
-    let answer = run_agent_turn(agent, input).await?;
+    let answer = run_agent_turn(agent, input, memory_user_id).await?;
     let tools_used = sinks
         .traces
         .lock()
@@ -5881,6 +6183,46 @@ mod tests {
     }
 
     #[test]
+    fn conversation_turn_input_includes_admin_config_apply_summary_events() {
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "what did you do?".to_string(),
+            session_id: Some("session-123".to_string()),
+            tools: vec!["admin-config".to_string()],
+            conversation_history: vec![
+                ChatHistoryMessage {
+                    role: "user".to_string(),
+                    content: "stale client-only turn".to_string(),
+                },
+                ChatHistoryMessage {
+                    role: "assistant".to_string(),
+                    content:
+                        "Applied 1/1 change(s). Config validation: valid. Restart required: no."
+                            .to_string(),
+                },
+            ],
+            job_ids: None,
+            conversation_channel: None,
+        };
+        let profile = HashMap::new();
+
+        let input = build_conversation_turn_input(&auth, &profile, &request, None);
+
+        assert!(input.contains("=== CLIENT CONFIRMATION EVENTS ==="));
+        assert!(input.contains("Applied 1/1 change(s). Config validation: valid."));
+        assert!(!input.contains("stale client-only turn"));
+    }
+
+    #[test]
     fn admin_config_memory_sanitizer_summarizes_change_set_json() {
         let auth = InternalAuthContext {
             id: 1,
@@ -5937,6 +6279,37 @@ mod tests {
         assert!(!sanitized.contains("super-secret-provider-token"));
         assert!(!sanitized.contains("sk-live-secret-value"));
         assert!(!sanitized.contains("\"requests\""));
+    }
+
+    #[test]
+    fn admin_config_tool_memory_content_omits_raw_change_set_requests() {
+        let executed = crate::sage_agent::ExecutedTool {
+            tool_call: crate::sage_agent::ToolCall {
+                name: "propose_config_change_set".to_string(),
+                args: HashMap::from([
+                    (
+                        "summary".to_string(),
+                        "Add a legal-disclaimer behavior rule".to_string(),
+                    ),
+                    (
+                        "requests_json".to_string(),
+                        r#"[{"method":"PUT","path":"/admin/ai-config/prompt_rules","body":{"value":"[\"secret raw body\"]"}}"#
+                            .to_string(),
+                    ),
+                ]),
+            },
+            result: ToolResult::success(
+                "I prepared these changes for review. Use Apply to confirm.",
+            ),
+        };
+
+        let content = admin_config_tool_memory_content(&executed)
+            .expect("successful Admin Config proposal should be persisted");
+
+        assert!(content.contains("propose_config_change_set"));
+        assert!(content.contains("Add a legal-disclaimer behavior rule"));
+        assert!(!content.contains("requests_json"));
+        assert!(!content.contains("secret raw body"));
     }
 
     #[test]
@@ -6147,6 +6520,62 @@ mod tests {
             traces[0].warnings,
             vec!["deployment_secrets_redacted".to_string()]
         );
+    }
+
+    #[test]
+    fn sage_agent_settings_tool_data_groups_sage_ai_config_rows() {
+        let global = AIConfigResponseBody {
+            prompt_sections: vec![AIConfigItemResponse {
+                key: "prompt_rules".to_string(),
+                value: "[\"Do not over-disclaim legal advice.\"]".to_string(),
+                value_type: "json".to_string(),
+                category: "prompt_section".to_string(),
+                description: Some("Array of behavioral rules".to_string()),
+                updated_at: Some("2026-06-21T12:00:00+00:00".to_string()),
+            }],
+            parameters: vec![AIConfigItemResponse {
+                key: "temperature".to_string(),
+                value: "0.1".to_string(),
+                value_type: "float".to_string(),
+                category: "parameter".to_string(),
+                description: None,
+                updated_at: None,
+            }],
+            defaults: Vec::new(),
+        };
+        let per_user_type = vec![AIConfigUserTypeResponseBody {
+            user_type_id: 7,
+            user_type_name: Some("Advocate".to_string()),
+            prompt_sections: vec![AIConfigWithInheritanceResponse {
+                key: "prompt_rules".to_string(),
+                value: "[\"Keep legal caveats targeted.\"]".to_string(),
+                value_type: "json".to_string(),
+                category: "prompt_section".to_string(),
+                description: Some("Array of behavioral rules".to_string()),
+                updated_at: Some("2026-06-21T12:05:00+00:00".to_string()),
+                is_override: true,
+                override_user_type_id: Some(7),
+            }],
+            parameters: Vec::new(),
+            defaults: Vec::new(),
+        }];
+
+        let data = sage_agent_settings_tool_data_from_responses(global, per_user_type);
+
+        assert_eq!(
+            data["global"]["prompt_sections"]["prompt_rules"]["value"],
+            "[\"Do not over-disclaim legal advice.\"]"
+        );
+        assert_eq!(
+            data["per_user_type"][0]["overrides"]["prompt_rules"]["value"],
+            "[\"Keep legal caveats targeted.\"]"
+        );
+        assert_eq!(
+            data["per_user_type"][0]["effective_values"]["prompt_sections"]["prompt_rules"]
+                ["is_override"],
+            true
+        );
+        assert_eq!(data["limits"]["user_types_returned"], 1);
     }
 
     #[tokio::test]
@@ -6906,6 +7335,7 @@ mod tests {
             &admin,
             4,
             "http://searxng:8080",
+            None,
         );
 
         assert!(registry.has("knowledge_search"));
@@ -6939,6 +7369,7 @@ mod tests {
             &user,
             4,
             "http://searxng:8080",
+            None,
         );
 
         assert!(user_registry.has("knowledge_search"));
@@ -6959,6 +7390,7 @@ mod tests {
             &admin,
             4,
             "http://searxng:8080",
+            None,
         );
         assert!(!disabled_registry.has("knowledge_search"));
         assert!(!disabled_registry.has("find_resources"));
