@@ -54,6 +54,8 @@ const USER_SESSION_SALT: &str = "session";
 const USER_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const ADMIN_SESSION_SALT: &str = "admin-session";
 const ADMIN_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const EMPTY_AGENT_RESPONSE_FALLBACK: &str =
+    "I apologize, but I wasn't able to generate a response.";
 const ENCLAVE_WEB_BASE_INSTRUCTION: &str = r#"You are Sage operating enclave.free's web application.
 
 This is not Signal, not a companion chat, and not a friendship simulator.
@@ -743,6 +745,29 @@ struct InternalResourceSearchResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct InternalSessionLogTurn {
+    role: String,
+    content: String,
+    ts: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct InternalSessionLogRequest {
+    actor: InternalAuthContext,
+    turns: Vec<InternalSessionLogTurn>,
+    sage_session_id: Option<String>,
+    user_type_id: Option<i32>,
+    title: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InternalSessionLogResponse {
+    log_id: String,
+    status: String,
+    turn_count: i32,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct InternalAdminConfigToolRequest {
     actor: InternalAuthContext,
 }
@@ -1047,6 +1072,18 @@ impl InternalAgentClient {
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(&json!({ "sql": sql }));
         self.send_value(request).await
+    }
+
+    async fn log_user_session(
+        &self,
+        payload: &InternalSessionLogRequest,
+    ) -> Result<InternalSessionLogResponse> {
+        let request = self
+            .http
+            .post(format!("{}/internal/agent/session-logs", self.backend_url))
+            .header("X-Internal-Agent-Token", &self.internal_agent_token)
+            .json(payload);
+        self.send_json(request).await
     }
 
     async fn admin_config_tool(
@@ -2937,6 +2974,13 @@ async fn chat(
             );
         }
     }
+    persist_user_session_log(
+        &state.internal,
+        &auth,
+        session.id,
+        chat_request_session_log_turns(&request, &response_text),
+    )
+    .await;
 
     Ok(Json(ChatResponse {
         message: response_text,
@@ -3431,6 +3475,14 @@ async fn chat_stream(
             }
         }
 
+        persist_user_session_log(
+            &state.internal,
+            &auth,
+            session.id,
+            chat_request_session_log_turns(&request, &answer),
+        )
+        .await;
+
         if trace.is_some() {
             let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
             payload.trace = trace;
@@ -3580,6 +3632,13 @@ async fn query(
             );
         }
     }
+    persist_user_session_log(
+        &state.internal,
+        &auth,
+        session.id,
+        query_request_session_log_turns(&request, &answer),
+    )
+    .await;
 
     Ok(Json(QueryResponse {
         answer: answer.clone(),
@@ -4078,6 +4137,83 @@ async fn build_session_memory(
 
 fn memory_user_id(auth: &InternalAuthContext) -> String {
     format!("{}:{}", auth.kind, auth.id)
+}
+
+fn session_log_title(auth: &InternalAuthContext) -> String {
+    auth.name
+        .as_ref()
+        .or(auth.email.as_ref())
+        .map(|name| format!("User Conversation - {}", name))
+        .unwrap_or_else(|| "User Conversation".to_string())
+}
+
+fn chat_request_session_log_turns(
+    request: &ChatRequest,
+    assistant_answer: &str,
+) -> Vec<InternalSessionLogTurn> {
+    let mut turns = request
+        .conversation_history
+        .iter()
+        .filter(|turn| matches!(turn.role.as_str(), "user" | "assistant" | "system"))
+        .map(|turn| InternalSessionLogTurn {
+            role: turn.role.clone(),
+            content: turn.content.clone(),
+            ts: None,
+        })
+        .collect::<Vec<_>>();
+    turns.push(InternalSessionLogTurn {
+        role: "user".to_string(),
+        content: request.message.clone(),
+        ts: None,
+    });
+    turns.push(InternalSessionLogTurn {
+        role: "assistant".to_string(),
+        content: assistant_answer.to_string(),
+        ts: None,
+    });
+    turns
+}
+
+fn query_request_session_log_turns(
+    request: &QueryRequest,
+    assistant_answer: &str,
+) -> Vec<InternalSessionLogTurn> {
+    vec![
+        InternalSessionLogTurn {
+            role: "user".to_string(),
+            content: request.question.clone(),
+            ts: None,
+        },
+        InternalSessionLogTurn {
+            role: "assistant".to_string(),
+            content: assistant_answer.to_string(),
+            ts: None,
+        },
+    ]
+}
+
+async fn persist_user_session_log(
+    internal: &InternalAgentClient,
+    auth: &InternalAuthContext,
+    session_id: Uuid,
+    turns: Vec<InternalSessionLogTurn>,
+) {
+    if auth.kind != "user" || auth.id == -1 || turns.is_empty() {
+        return;
+    }
+    let payload = InternalSessionLogRequest {
+        actor: auth.clone(),
+        turns,
+        sage_session_id: Some(session_id.to_string()),
+        user_type_id: auth.user_type_id,
+        title: Some(session_log_title(auth)),
+    };
+    if let Err(error) = internal.log_user_session(&payload).await {
+        warn!(
+            "failed to persist encrypted beta user session log for session {}: {}",
+            session_id, error
+        );
+    }
 }
 
 fn maybe_load_web_session(
@@ -5528,7 +5664,7 @@ async fn run_agent_turn(
         .join("\n\n");
 
     if output.is_empty() {
-        return Ok("I apologize, but I wasn't able to generate a response.".to_string());
+        return Ok(EMPTY_AGENT_RESPONSE_FALLBACK.to_string());
     }
     Ok(output)
 }
@@ -5561,6 +5697,19 @@ fn should_include_step_messages(result: &StepResult) -> bool {
     })
 }
 
+fn finalize_tool_loop_answer(
+    raw_answer: String,
+    admin_change_set: Option<&AdminChangeSetResponse>,
+) -> String {
+    let has_reviewable_changes = admin_change_set
+        .map(|change_set| !change_set.requests.is_empty())
+        .unwrap_or(false);
+    if raw_answer.trim() == EMPTY_AGENT_RESPONSE_FALLBACK && has_reviewable_changes {
+        return "I prepared these changes for review. Use Apply to confirm.".to_string();
+    }
+    raw_answer
+}
+
 struct ConversationToolLoopOutput {
     answer: String,
     tools_used: Vec<ToolCallInfoResponse>,
@@ -5576,7 +5725,7 @@ async fn run_conversation_tool_loop(
     memory_user_id: Option<&str>,
 ) -> AppResult<ConversationToolLoopOutput> {
     let turn_started_at = Instant::now();
-    let answer = run_agent_turn(agent, input, memory_user_id).await?;
+    let raw_answer = run_agent_turn(agent, input, memory_user_id).await?;
     sinks.trace_deltas.emit(turn_timing_trace_delta(
         turn_started_at.elapsed().as_millis(),
     ));
@@ -5596,6 +5745,7 @@ async fn run_conversation_tool_loop(
         .map(|change_set| change_set.clone())
         .unwrap_or_default();
     let activity_steps = conversation_activity_steps_from_tools(&tools_used);
+    let answer = finalize_tool_loop_answer(raw_answer, admin_change_set.as_ref());
 
     Ok(ConversationToolLoopOutput {
         answer,
@@ -6153,6 +6303,132 @@ mod tests {
         assert_eq!(summary["results"][0]["target_kind"], "session_memory");
         assert_eq!(summary["results"][0]["action"], "delete_messages");
         assert_eq!(summary["results"][0]["status"], "succeeded");
+    }
+
+    #[test]
+    fn admin_change_set_suppresses_empty_response_apology() {
+        let change_set = AdminChangeSetResponse {
+            version: 1,
+            summary: Some("Update instance name".to_string()),
+            requests: vec![AdminChangeSetRequest {
+                method: "PUT".to_string(),
+                path: "/admin/settings".to_string(),
+                body: Some(json!({ "instance_name": "World Liberty Congress" })),
+            }],
+        };
+
+        let answer =
+            finalize_tool_loop_answer(EMPTY_AGENT_RESPONSE_FALLBACK.to_string(), Some(&change_set));
+
+        assert_eq!(
+            answer,
+            "I prepared these changes for review. Use Apply to confirm."
+        );
+    }
+
+    #[test]
+    fn empty_response_apology_remains_without_reviewable_changes() {
+        let answer = finalize_tool_loop_answer(EMPTY_AGENT_RESPONSE_FALLBACK.to_string(), None);
+
+        assert_eq!(answer, EMPTY_AGENT_RESPONSE_FALLBACK);
+    }
+
+    #[tokio::test]
+    async fn internal_client_posts_user_session_logs_with_token() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/session-logs",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) =
+                            seen_tx.lock().expect("request recorder should lock").take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "log_id": "log_123",
+                            "status": "saved",
+                            "turn_count": 2
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let client = InternalAgentClient::new(
+            Client::builder().build().expect("http client should build"),
+            format!("http://{}", addr),
+            "test-token".to_string(),
+        );
+        let actor = InternalAuthContext {
+            id: 42,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: None,
+            email: Some("person@example.test".to_string()),
+            name: Some("Test Person".to_string()),
+            user_type_id: Some(7),
+            dev_mode: false,
+        };
+        let payload = InternalSessionLogRequest {
+            actor,
+            turns: vec![
+                InternalSessionLogTurn {
+                    role: "user".to_string(),
+                    content: "Hello".to_string(),
+                    ts: None,
+                },
+                InternalSessionLogTurn {
+                    role: "assistant".to_string(),
+                    content: "Hi".to_string(),
+                    ts: None,
+                },
+            ],
+            sage_session_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            user_type_id: Some(7),
+            title: Some("User Conversation - Test Person".to_string()),
+        };
+
+        let response = client
+            .log_user_session(&payload)
+            .await
+            .expect("session log request should succeed");
+        server.abort();
+
+        assert_eq!(response.log_id, "log_123");
+        assert_eq!(response.status, "saved");
+        assert_eq!(response.turn_count, 2);
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record the session log request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert_eq!(payload["actor"]["type"], "user");
+        assert_eq!(payload["actor"]["id"], 42);
+        assert_eq!(
+            payload["sage_session_id"],
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(payload["title"], "User Conversation - Test Person");
+        assert_eq!(payload["turns"][0]["role"], "user");
+        assert_eq!(payload["turns"][1]["content"], "Hi");
     }
 
     #[tokio::test]
