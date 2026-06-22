@@ -32,19 +32,24 @@ use std::convert::Infallible;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::memory::MemoryManager;
-use crate::sage_agent::{SageAgent, Tool, ToolRegistry, ToolResult};
+use crate::sage_agent::{
+    AgentTraceEvent, ExecutedTool, SageAgent, StepResult, Tool, ToolRegistry, ToolResult,
+};
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
     summaries, user_preferences, web_sessions,
 };
 
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
+const CURATED_RESOURCES_TOOL_SET_ID: &str = "curated-resources";
+const KNOWLEDGE_SEARCH_TOOL_SET_ID: &str = "knowledge-search";
 const USER_SESSION_SALT: &str = "session";
 const USER_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const ADMIN_SESSION_SALT: &str = "admin-session";
@@ -328,6 +333,8 @@ pub struct RetrievalTraceResponse {
 pub struct ConversationTraceResponse {
     pub visibility: String,
     pub reasoning: ReasoningTraceResponse,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace_deltas: Vec<ConversationTraceDeltaResponse>,
     #[serde(default)]
     pub tools: Vec<ToolTraceResponse>,
     #[serde(default)]
@@ -347,6 +354,24 @@ pub struct ConversationActivityStepResponse {
     pub summary: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ConversationTraceDeltaResponse {
+    pub id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "is_empty_json_object")]
+    pub metadata: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -409,6 +434,8 @@ pub struct ChatStreamEventPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_step: Option<ConversationActivityStepResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_delta: Option<ConversationTraceDeltaResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -436,6 +463,7 @@ impl ChatStreamEventPayload {
             delta: None,
             trace: None,
             activity_step: None,
+            trace_delta: None,
             model: None,
             provider: None,
             tools_used: Vec::new(),
@@ -443,6 +471,48 @@ impl ChatStreamEventPayload {
             admin_change_set: None,
         }
     }
+
+    #[cfg(test)]
+    fn guard_trace_delta(&mut self) {
+        if let Some(delta) = self.trace_delta.take() {
+            self.trace_delta = Some(guard_trace_delta(delta));
+        }
+    }
+}
+
+fn is_empty_json_object(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| object.is_empty())
+}
+
+fn guard_trace_delta(mut delta: ConversationTraceDeltaResponse) -> ConversationTraceDeltaResponse {
+    if delta
+        .content
+        .as_deref()
+        .is_some_and(trace_content_needs_redaction)
+    {
+        delta.content = Some("[redacted]".to_string());
+        delta.status = Some("guarded".to_string());
+    }
+    delta
+}
+
+fn trace_content_needs_redaction(content: &str) -> bool {
+    let normalized = content.to_ascii_lowercase();
+    [
+        "api_token",
+        "api key",
+        "api_key",
+        "authorization:",
+        "bearer ",
+        "private key",
+        "system prompt",
+        "developer instruction",
+        "developer message",
+        "secret",
+        "sk-",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1074,6 +1144,7 @@ struct KnowledgeSearchTool {
 struct FindResourcesTool {
     internal: InternalAgentClient,
     jurisdiction: Option<String>,
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
 }
 
 #[derive(Clone)]
@@ -1100,25 +1171,352 @@ struct AdminConfigReadTool {
 }
 
 #[derive(Clone)]
+struct AdminAgentSettingsReadTool {
+    state: WebAppState,
+    auth: InternalAuthContext,
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+}
+
+#[derive(Clone)]
 struct AdminConfigProposalTool {
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
     proposal: Arc<Mutex<Option<AdminChangeSetResponse>>>,
 }
 
 #[derive(Clone)]
+struct ConversationTraceDeltaSink {
+    deltas: Arc<Mutex<Vec<ConversationTraceDeltaResponse>>>,
+    sender: Option<mpsc::UnboundedSender<ConversationTraceDeltaResponse>>,
+}
+
+impl ConversationTraceDeltaSink {
+    fn new(sender: Option<mpsc::UnboundedSender<ConversationTraceDeltaResponse>>) -> Self {
+        Self {
+            deltas: Arc::new(Mutex::new(Vec::new())),
+            sender,
+        }
+    }
+
+    fn emit(&self, delta: ConversationTraceDeltaResponse) {
+        let guarded = guard_trace_delta(delta);
+        if let Ok(mut deltas) = self.deltas.lock() {
+            deltas.push(guarded.clone());
+        }
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(guarded);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<ConversationTraceDeltaResponse> {
+        self.deltas
+            .lock()
+            .map(|deltas| deltas.clone())
+            .unwrap_or_default()
+    }
+}
+
+struct TracedTool {
+    inner: Arc<dyn Tool>,
+    trace_deltas: ConversationTraceDeltaSink,
+}
+
+#[async_trait::async_trait]
+impl Tool for TracedTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn args_schema(&self) -> &str {
+        self.inner.args_schema()
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
+        let started_at = Instant::now();
+        let tool_name = self.name().to_string();
+        self.trace_deltas
+            .emit(tool_call_trace_delta(&tool_name, args));
+        let result = self.inner.execute(args).await;
+        let elapsed_ms = started_at.elapsed().as_millis();
+        match &result {
+            Ok(tool_result) => {
+                self.trace_deltas
+                    .emit(tool_result_trace_delta(&tool_name, tool_result, elapsed_ms))
+            }
+            Err(error) => self.trace_deltas.emit(tool_error_trace_delta(
+                &tool_name,
+                &error.to_string(),
+                elapsed_ms,
+            )),
+        }
+        result
+    }
+}
+
+#[derive(Clone)]
 struct ConversationToolLoopSinks {
     sources: Arc<Mutex<Vec<QuerySource>>>,
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+    trace_deltas: ConversationTraceDeltaSink,
     admin_change_set: Arc<Mutex<Option<AdminChangeSetResponse>>>,
 }
 
 impl ConversationToolLoopSinks {
-    fn new() -> Self {
+    fn new(sender: Option<mpsc::UnboundedSender<ConversationTraceDeltaResponse>>) -> Self {
         Self {
             sources: Arc::new(Mutex::new(Vec::new())),
             traces: Arc::new(Mutex::new(Vec::new())),
+            trace_deltas: ConversationTraceDeltaSink::new(sender),
             admin_change_set: Arc::new(Mutex::new(None)),
         }
+    }
+}
+
+fn traced_tool(tool: Arc<dyn Tool>, trace_deltas: &ConversationTraceDeltaSink) -> Arc<dyn Tool> {
+    Arc::new(TracedTool {
+        inner: tool,
+        trace_deltas: trace_deltas.clone(),
+    })
+}
+
+fn trace_delta_id(prefix: &str, name: &str) -> String {
+    format!(
+        "{}-{}-{}",
+        prefix,
+        name.replace('_', "-"),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn tool_trace_title(tool_name: &str) -> String {
+    match tool_name {
+        "knowledge_search" => "Knowledge Search",
+        "web_search" => "Web Search",
+        "db_query" => "Database Query",
+        "propose_config_change_set"
+        | "read_instance_settings"
+        | "read_deployment_settings"
+        | "read_deployment_readiness"
+        | "read_agent_settings"
+        | "read_user_types"
+        | "read_document_access"
+        | "read_onboarding_status" => "Admin Config",
+        other => other,
+    }
+    .to_string()
+}
+
+fn tool_call_trace_delta(
+    tool_name: &str,
+    args: &HashMap<String, String>,
+) -> ConversationTraceDeltaResponse {
+    let arg_names = args.keys().cloned().collect::<Vec<_>>();
+    ConversationTraceDeltaResponse {
+        id: trace_delta_id("tool-call", tool_name),
+        kind: "tool_call".to_string(),
+        title: Some(tool_trace_title(tool_name)),
+        content: Some(format!("Calling {}.", tool_name)),
+        tool_name: Some(tool_name.to_string()),
+        status: Some("running".to_string()),
+        metadata: json!({ "args": arg_names }),
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+    }
+}
+
+fn tool_result_trace_delta(
+    tool_name: &str,
+    result: &ToolResult,
+    elapsed_ms: u128,
+) -> ConversationTraceDeltaResponse {
+    let status = if result.success {
+        "succeeded"
+    } else if tool_name == "db_query" || tool_name == "propose_config_change_set" {
+        "guarded"
+    } else {
+        "failed"
+    };
+    let content = if result.success {
+        "Tool completed.".to_string()
+    } else {
+        result
+            .error
+            .as_deref()
+            .map(|error| truncate_chars(error, 240))
+            .unwrap_or_else(|| "Tool failed.".to_string())
+    };
+    ConversationTraceDeltaResponse {
+        id: trace_delta_id("tool-result", tool_name),
+        kind: "tool_result".to_string(),
+        title: Some(tool_trace_title(tool_name)),
+        content: Some(content),
+        tool_name: Some(tool_name.to_string()),
+        status: Some(status.to_string()),
+        metadata: json!({ "duration_ms": elapsed_ms }),
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+    }
+}
+
+fn tool_error_trace_delta(
+    tool_name: &str,
+    error: &str,
+    elapsed_ms: u128,
+) -> ConversationTraceDeltaResponse {
+    ConversationTraceDeltaResponse {
+        id: trace_delta_id("tool-result", tool_name),
+        kind: "tool_result".to_string(),
+        title: Some(tool_trace_title(tool_name)),
+        content: Some(truncate_chars(error, 240)),
+        tool_name: Some(tool_name.to_string()),
+        status: Some("failed".to_string()),
+        metadata: json!({ "duration_ms": elapsed_ms }),
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+    }
+}
+
+fn guarded_database_trace_delta() -> ConversationTraceDeltaResponse {
+    ConversationTraceDeltaResponse {
+        id: trace_delta_id("tool-result", "db_query_guarded"),
+        kind: "tool_result".to_string(),
+        title: Some("Database Query".to_string()),
+        content: Some(
+            "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
+                .to_string(),
+        ),
+        tool_name: Some("db_query".to_string()),
+        status: Some("guarded".to_string()),
+        metadata: json!({ "guarded": true, "executed": false }),
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+    }
+}
+
+fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResponse {
+    match event {
+        AgentTraceEvent::ModelStepStarted { step, attempt } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("model-step", &format!("{}-{}-started", step, attempt)),
+            kind: "model_step".to_string(),
+            title: Some("Model step".to_string()),
+            content: Some(format!(
+                "Calling model for step {} attempt {}.",
+                step + 1,
+                attempt
+            )),
+            tool_name: None,
+            status: Some("running".to_string()),
+            metadata: json!({ "step": step, "attempt": attempt }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ModelStepCompleted {
+            step,
+            attempt,
+            elapsed_ms,
+        } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("model-step", &format!("{}-{}-completed", step, attempt)),
+            kind: "model_step".to_string(),
+            title: Some("Model step".to_string()),
+            content: Some(format!("Model step {} completed.", step + 1)),
+            tool_name: None,
+            status: Some("succeeded".to_string()),
+            metadata: json!({ "step": step, "attempt": attempt, "duration_ms": elapsed_ms }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ProviderReasoning { step, content } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("reasoning", &step.to_string()),
+            kind: "reasoning".to_string(),
+            title: Some("Provider reasoning".to_string()),
+            content: Some(content),
+            tool_name: None,
+            status: Some("succeeded".to_string()),
+            metadata: json!({ "step": step, "source": "provider" }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ModelStepFailed {
+            step,
+            attempt,
+            elapsed_ms,
+            error,
+        } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("model-step", &format!("{}-{}-failed", step, attempt)),
+            kind: "model_step".to_string(),
+            title: Some("Model step".to_string()),
+            content: Some(truncate_chars(&error, 240)),
+            tool_name: None,
+            status: Some("failed".to_string()),
+            metadata: json!({ "step": step, "attempt": attempt, "duration_ms": elapsed_ms }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::RetryScheduled { step, attempt } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("retry", &format!("{}-{}", step, attempt)),
+            kind: "retry".to_string(),
+            title: Some("Retry".to_string()),
+            content: Some(format!(
+                "Retrying model step {} after attempt {}.",
+                step + 1,
+                attempt
+            )),
+            tool_name: None,
+            status: Some("running".to_string()),
+            metadata: json!({ "step": step, "attempt": attempt }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::CorrectionStarted {
+            step,
+            attempt,
+            error,
+        } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("correction", &format!("{}-{}-started", step, attempt)),
+            kind: "correction".to_string(),
+            title: Some("Correction".to_string()),
+            content: Some(truncate_chars(&error, 240)),
+            tool_name: None,
+            status: Some("running".to_string()),
+            metadata: json!({ "step": step, "attempt": attempt }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::CorrectionCompleted {
+            step,
+            attempt,
+            elapsed_ms,
+        } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("correction", &format!("{}-{}-completed", step, attempt)),
+            kind: "correction".to_string(),
+            title: Some("Correction".to_string()),
+            content: Some("Structured response correction completed.".to_string()),
+            tool_name: None,
+            status: Some("succeeded".to_string()),
+            metadata: json!({ "step": step, "attempt": attempt, "duration_ms": elapsed_ms }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::CorrectionFailed {
+            step,
+            attempt,
+            elapsed_ms,
+            error,
+        } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("correction", &format!("{}-{}-failed", step, attempt)),
+            kind: "correction".to_string(),
+            title: Some("Correction".to_string()),
+            content: Some(truncate_chars(&error, 240)),
+            tool_name: None,
+            status: Some("failed".to_string()),
+            metadata: json!({ "step": step, "attempt": attempt, "duration_ms": elapsed_ms }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+    }
+}
+
+fn turn_timing_trace_delta(elapsed_ms: u128) -> ConversationTraceDeltaResponse {
+    ConversationTraceDeltaResponse {
+        id: trace_delta_id("timing", "turn"),
+        kind: "timing".to_string(),
+        title: Some("Turn timing".to_string()),
+        content: Some("Conversation turn completed.".to_string()),
+        tool_name: None,
+        status: Some("succeeded".to_string()),
+        metadata: json!({ "duration_ms": elapsed_ms }),
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
     }
 }
 
@@ -1129,6 +1527,7 @@ fn build_conversation_tool_registry(
     auth: &InternalAuthContext,
     top_k: i32,
     searxng_url: &str,
+    state: Option<&WebAppState>,
 ) -> (ToolRegistry, ConversationToolLoopSinks) {
     build_conversation_tool_registry_with_context(
         internal,
@@ -1138,6 +1537,8 @@ fn build_conversation_tool_registry(
         top_k,
         searxng_url,
         None,
+        None,
+        state,
         None,
     )
 }
@@ -1151,36 +1552,70 @@ fn build_conversation_tool_registry_with_context(
     searxng_url: &str,
     jurisdiction: Option<String>,
     situation_details: Option<String>,
+    state: Option<&WebAppState>,
+    trace_sender: Option<mpsc::UnboundedSender<ConversationTraceDeltaResponse>>,
 ) -> (ToolRegistry, ConversationToolLoopSinks) {
-    let sinks = ConversationToolLoopSinks::new();
+    let sinks = ConversationToolLoopSinks::new(trace_sender);
     let mut registry = ToolRegistry::new();
 
-    if request.tools.iter().any(|tool| tool == "knowledge-search") {
-        registry.register(Arc::new(KnowledgeSearchTool {
-            internal: internal.clone(),
-            user: auth.clone(),
-            top_k,
-            job_ids: request.job_ids.clone(),
-            jurisdiction,
-            situation_details,
-            sources: sinks.sources.clone(),
-            traces: sinks.traces.clone(),
-        }));
+    if request
+        .tools
+        .iter()
+        .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID)
+    {
+        registry.register(traced_tool(
+            Arc::new(KnowledgeSearchTool {
+                internal: internal.clone(),
+                user: auth.clone(),
+                top_k,
+                job_ids: request.job_ids.clone(),
+                jurisdiction: jurisdiction.clone(),
+                situation_details: situation_details.clone(),
+                sources: sinks.sources.clone(),
+                traces: sinks.traces.clone(),
+            }),
+            &sinks.trace_deltas,
+        ));
+    }
+
+    if request
+        .tools
+        .iter()
+        .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID)
+    {
+        registry.register(traced_tool(
+            Arc::new(FindResourcesTool {
+                internal: internal.clone(),
+                jurisdiction: jurisdiction.clone(),
+                traces: sinks.traces.clone(),
+            }),
+            &sinks.trace_deltas,
+        ));
     }
 
     if request.tools.iter().any(|tool| tool == "web-search") {
-        registry.register(Arc::new(SearxWebSearchTool {
-            http: http.clone(),
-            searxng_url: searxng_url.to_string(),
-            traces: sinks.traces.clone(),
-        }));
+        registry.register(traced_tool(
+            Arc::new(SearxWebSearchTool {
+                http: http.clone(),
+                searxng_url: searxng_url.to_string(),
+                traces: sinks.traces.clone(),
+            }),
+            &sinks.trace_deltas,
+        ));
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "db-query") {
-        registry.register(Arc::new(AdminDbQueryTool {
-            internal: internal.clone(),
-            traces: sinks.traces.clone(),
-        }));
+        if is_direct_database_select(&request.message) {
+            registry.register(traced_tool(
+                Arc::new(AdminDbQueryTool {
+                    internal: internal.clone(),
+                    traces: sinks.traces.clone(),
+                }),
+                &sinks.trace_deltas,
+            ));
+        } else {
+            record_guarded_database_selection(&sinks, &request.message);
+        }
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "admin-config") {
@@ -1221,23 +1656,65 @@ fn build_conversation_tool_registry_with_context(
                 "Read first-admin setup state and guided bootstrap checklist status.",
             ),
         ] {
-            registry.register(Arc::new(AdminConfigReadTool {
-                internal: internal.clone(),
-                auth: auth.clone(),
-                name: name.to_string(),
-                endpoint: endpoint.to_string(),
-                description: description.to_string(),
-                traces: sinks.traces.clone(),
-            }));
+            if name == "read_agent_settings" {
+                if let Some(state) = state.cloned() {
+                    registry.register(traced_tool(
+                        Arc::new(AdminAgentSettingsReadTool {
+                            state,
+                            auth: auth.clone(),
+                            traces: sinks.traces.clone(),
+                        }),
+                        &sinks.trace_deltas,
+                    ));
+                    continue;
+                }
+            }
+            registry.register(traced_tool(
+                Arc::new(AdminConfigReadTool {
+                    internal: internal.clone(),
+                    auth: auth.clone(),
+                    name: name.to_string(),
+                    endpoint: endpoint.to_string(),
+                    description: description.to_string(),
+                    traces: sinks.traces.clone(),
+                }),
+                &sinks.trace_deltas,
+            ));
         }
-        registry.register(Arc::new(AdminConfigProposalTool {
-            traces: sinks.traces.clone(),
-            proposal: sinks.admin_change_set.clone(),
-        }));
+        registry.register(traced_tool(
+            Arc::new(AdminConfigProposalTool {
+                traces: sinks.traces.clone(),
+                proposal: sinks.admin_change_set.clone(),
+            }),
+            &sinks.trace_deltas,
+        ));
     }
 
     registry.register(Arc::new(crate::tools::DoneTool));
     (registry, sinks)
+}
+
+fn is_direct_database_select(message: &str) -> bool {
+    let trimmed = message.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    upper == "SELECT" || upper.starts_with("SELECT ")
+}
+
+fn record_guarded_database_selection(sinks: &ConversationToolLoopSinks, message: &str) {
+    if let Ok(mut sink) = sinks.traces.lock() {
+        sink.push(ToolCallInfoResponse {
+            tool_id: "db-query".to_string(),
+            tool_name: "Database Query".to_string(),
+            query: Some(truncate_chars(message, 160)),
+            output_summary: Some(
+                "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
+                    .to_string(),
+            ),
+            warnings: vec!["direct_select_required".to_string()],
+            guarded: true,
+        });
+    }
+    sinks.trace_deltas.emit(guarded_database_trace_delta());
 }
 
 #[async_trait::async_trait]
@@ -1361,14 +1838,39 @@ impl Tool for FindResourcesTool {
             .resolved_country_code
             .as_deref()
             .or(region.as_deref());
+        let trace_query = match response_region {
+            Some(region) => format!("{} resources for {}", response_help_type, region),
+            None => format!("{} resources", response_help_type),
+        };
 
         if response.resources.is_empty() {
             let where_label = response_region.unwrap_or("the requested region");
+            if let Ok(mut sink) = self.traces.lock() {
+                sink.push(ToolCallInfoResponse {
+                    tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
+                    tool_name: "Curated Resources".to_string(),
+                    query: Some(trace_query),
+                    output_summary: Some("No matching curated resources were found.".to_string()),
+                    warnings: vec!["no_curated_resources".to_string()],
+                    guarded: false,
+                });
+            }
             return Ok(ToolResult::success(format!(
                 "No vetted {} resources are currently listed for {}. Do not invent referrals; \
                  offer general guidance instead and suggest the person seek a trusted local contact.",
                 response_help_type, where_label
             )));
+        }
+
+        if let Ok(mut sink) = self.traces.lock() {
+            sink.push(ToolCallInfoResponse {
+                tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
+                tool_name: "Curated Resources".to_string(),
+                query: Some(trace_query),
+                output_summary: Some("Found vetted curated resources for the answer.".to_string()),
+                warnings: Vec::new(),
+                guarded: false,
+            });
         }
 
         let mut output = format!("Trusted {} resources", response_help_type);
@@ -1567,17 +2069,113 @@ impl Tool for AdminConfigReadTool {
 }
 
 #[async_trait::async_trait]
+impl Tool for AdminAgentSettingsReadTool {
+    fn name(&self) -> &str {
+        "read_agent_settings"
+    }
+
+    fn description(&self) -> &str {
+        "Read global and per-user-type Sage Agent Settings."
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{}"#
+    }
+
+    async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+        let global = match load_ai_config_response(&self.state) {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(ToolResult::error(format!(
+                    "Admin Config read tool failed: {}",
+                    error.message
+                )));
+            }
+        };
+        let user_types_response = match self
+            .state
+            .internal
+            .admin_config_tool("user-types", &self.auth)
+            .await
+        {
+            Ok(response) => response,
+            Err(AdminConfigToolError::Unauthorized) => {
+                return Ok(ToolResult::error(
+                    "Admin Config read tools are not authorized for this actor.",
+                ));
+            }
+            Err(AdminConfigToolError::Failed(error)) => {
+                return Ok(ToolResult::error(format!(
+                    "Admin Config read tool failed: {}",
+                    error
+                )));
+            }
+        };
+        let user_types: Vec<InternalUserTypeResponse> = match serde_json::from_value(
+            user_types_response
+                .data
+                .get("user_types")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        ) {
+            Ok(user_types) => user_types,
+            Err(error) => {
+                return Ok(ToolResult::error(format!(
+                    "Admin Config read tool failed: invalid user type payload: {}",
+                    error
+                )));
+            }
+        };
+        let mut per_user_type = Vec::new();
+        for user_type in user_types {
+            match load_ai_config_user_type_response(&self.state, &user_type) {
+                Ok(response) => per_user_type.push(response),
+                Err(error) => {
+                    return Ok(ToolResult::error(format!(
+                        "Admin Config read tool failed: {}",
+                        error.message
+                    )));
+                }
+            }
+        }
+        let warnings = user_types_response.warnings.clone();
+        let data = sage_agent_settings_tool_data_from_responses(global, per_user_type);
+
+        if let Ok(mut sink) = self.traces.lock() {
+            sink.push(ToolCallInfoResponse {
+                tool_id: "admin-config:read_agent_settings".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: Some("read_agent_settings".to_string()),
+                output_summary: Some("Read read_agent_settings.".to_string()),
+                warnings: warnings.clone(),
+                guarded: false,
+            });
+        }
+
+        let output = serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "tool": "read_agent_settings",
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "secret_policy": { "mode": "masked" },
+            "warnings": warnings,
+            "data": data,
+        }))?;
+        Ok(ToolResult::success(output))
+    }
+}
+
+#[async_trait::async_trait]
 impl Tool for AdminConfigProposalTool {
     fn name(&self) -> &str {
         "propose_config_change_set"
     }
 
     fn description(&self) -> &str {
-        "Stage a non-mutating Admin Config change set for UI Change Confirmation. Use this for admin write intent instead of putting raw JSON in messages. Canonical paths include PUT /admin/settings and POST /admin/user-types. Use header_tagline, default_language codes like en, default_theme light|dark|system, and auto_approve_users. The admin must still click Apply before any changes are written. If this tool succeeds, keep the final answer short: \"I prepared these changes for review. Use Apply to confirm.\" If a proposal is rejected, correct the request and call this tool again; do not tell the admin to edit supported settings manually."
+        "Stage a non-mutating Admin Config change set for UI Change Confirmation. Use this for admin write intent instead of putting raw JSON in messages. Canonical paths include PUT /admin/settings for Instance Settings, PUT /admin/ai-config/prompt_rules for Agent Settings behavior rules, PUT /admin/ai-config/{key} for other Agent Settings, and POST /admin/user-types. Use header_tagline, default_language codes like en, default_theme light|dark|system, and auto_approve_users for Instance Settings. Behavior rules use /admin/ai-config/prompt_rules with body.value set to a JSON string array, for example {\"value\":\"[\\\"Ask users where they are from before giving location-specific guidance.\\\"]\"}. The admin must still click Apply before any changes are written. If this tool succeeds, keep the final answer short: \"I prepared these changes for review. Use Apply to confirm.\" If a proposal is rejected, correct the request and call this tool again; do not tell the admin to edit supported settings manually."
     }
 
     fn args_schema(&self) -> &str {
-        r##"{"summary": "One-sentence summary of the proposed configuration changes", "requests_json": "JSON array of requests. Guided bootstrap example: [{\"method\":\"PUT\",\"path\":\"/admin/settings\",\"body\":{\"instance_name\":\"FreeThem\",\"assistant_name\":\"Political Prisoner Support Team\",\"header_tagline\":\"Political prisoner support team.\",\"description\":\"...\",\"primary_color\":\"#1E40AF\",\"default_theme\":\"dark\",\"default_language\":\"en\",\"auto_approve_users\":true}},{\"method\":\"POST\",\"path\":\"/admin/user-types\",\"body\":{\"name\":\"Current Support\",\"description\":\"Family and friends of currently imprisoned political prisoners\"}}]. Use /admin/user-types with hyphen, never /admin/user_types."}"##
+        r##"{"summary": "One-sentence summary of the proposed configuration changes", "requests_json": "JSON array of requests. Guided bootstrap example: [{\"method\":\"PUT\",\"path\":\"/admin/settings\",\"body\":{\"instance_name\":\"FreeThem\",\"assistant_name\":\"Political Prisoner Support Team\",\"header_tagline\":\"Political prisoner support team.\",\"description\":\"...\",\"primary_color\":\"#1E40AF\",\"default_theme\":\"dark\",\"default_language\":\"en\",\"auto_approve_users\":true}},{\"method\":\"POST\",\"path\":\"/admin/user-types\",\"body\":{\"name\":\"Current Support\",\"description\":\"Family and friends of currently imprisoned political prisoners\"}}]. Agent Settings behavior-rule example: [{\"method\":\"PUT\",\"path\":\"/admin/ai-config/prompt_rules\",\"body\":{\"value\":\"[\\\"Ask users where they are from before giving location-specific guidance.\\\"]\"}}]. Use /admin/user-types with hyphen, never /admin/user_types. Use /admin/ai-config/prompt_rules for Sage behavior rules; never put prompt_rules in /admin/settings."}"##
     }
 
     async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
@@ -1796,6 +2394,12 @@ fn validate_admin_change_set_requests(
         {
             return Err(format!("Disallowed request path: {}", request.path));
         }
+        if is_legacy_trace_visibility_admin_path(&request.path) {
+            return Err(format!(
+                "Disallowed legacy trace visibility setting: {}",
+                request.path
+            ));
+        }
         if !is_allowed_admin_change_request(&request.method, &request.path) {
             return Err(format!(
                 "Disallowed request: {} {}",
@@ -1872,8 +2476,29 @@ fn validate_admin_change_request_body(
         let value = body
             .get("value")
             .ok_or_else(|| format!("{} requires body.value.", request.path))?;
-        if !value.is_string() {
+        let Some(value) = value.as_str() else {
             return Err(format!("{} body.value must be a string.", request.path));
+        };
+        let key = request.path.rsplit('/').next().unwrap_or_default();
+        if matches!(key, "prompt_rules" | "prompt_forbidden") {
+            let parsed: Value = serde_json::from_str(value).map_err(|error| {
+                format!(
+                    "{} body.value must be a JSON array of strings: {}",
+                    request.path, error
+                )
+            })?;
+            let items = parsed.as_array().ok_or_else(|| {
+                format!(
+                    "{} body.value must be a JSON array of strings.",
+                    request.path
+                )
+            })?;
+            if !items.iter().all(Value::is_string) {
+                return Err(format!(
+                    "{} body.value must be a JSON array of strings.",
+                    request.path
+                ));
+            }
         }
     }
 
@@ -2257,37 +2882,61 @@ async fn chat(
         &auth,
         top_k,
         &std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://searxng:8080".to_string()),
+        Some(&state),
     );
     let mut agent = SageAgent::new_with_optional_memory(
         registry,
         Some(memory),
         build_agent_instruction(
             &ai_config.compiled_prompt,
-            request.tools.iter().any(|tool| tool == "knowledge-search"),
+            request
+                .tools
+                .iter()
+                .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
+            request
+                .tools
+                .iter()
+                .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
         ),
     );
+    let agent_trace_sink = tool_sinks.trace_deltas.clone();
+    agent.set_trace_hook(Arc::new(move |event| {
+        agent_trace_sink.emit(agent_trace_event_delta(event));
+    }));
 
     let input =
         build_conversation_turn_input(&auth, &profile, &request, persisted_context.as_ref());
-    let tool_loop = run_conversation_tool_loop(&mut agent, &input, &tool_sinks).await?;
+    let tool_loop =
+        run_conversation_tool_loop(&mut agent, &input, &tool_sinks, Some(&memory_user_id)).await?;
     let response_text = tool_loop.answer;
-    let assistant_memory_content =
-        sanitize_admin_config_message_for_memory(&auth, &request, &response_text);
-    if let Err(err) =
-        agent.store_message_sync(&memory_user_id, "assistant", &assistant_memory_content)
-    {
-        warn!(
-            "failed to persist assistant message for session {}: {}",
-            session.id, err
-        );
-    }
     let tools_used = tool_loop.tools_used;
     let trace = build_conversation_trace(
         &ai_config,
         &auth,
         tools_used.clone(),
         tool_loop.retrieval_sources,
+        tool_sinks.trace_deltas.snapshot(),
     );
+    let assistant_memory_content =
+        sanitize_admin_config_message_for_memory(&auth, &request, &response_text);
+    match agent.store_message_sync(&memory_user_id, "assistant", &assistant_memory_content) {
+        Ok(message_id) => {
+            if let Some(trace) = &trace {
+                if let Err(err) = persist_assistant_trace_metadata(&state, message_id, trace) {
+                    warn!(
+                        "failed to persist assistant trace for session {}: {:?}",
+                        session.id, err
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                "failed to persist assistant message for session {}: {}",
+                session.id, err
+            );
+        }
+    }
 
     Ok(Json(ChatResponse {
         message: response_text,
@@ -2348,9 +2997,81 @@ fn build_conversation_turn_input(
         input.push_str(&truncate_chars(summary, 4000));
         input.push('\n');
     }
+    let confirmation_events = client_confirmation_events_for_turn_input(auth, request);
+    if !confirmation_events.is_empty() {
+        input.push_str("\n=== CLIENT CONFIRMATION EVENTS ===\n");
+        for event in confirmation_events {
+            input.push_str("- ");
+            input.push_str(&event);
+            input.push('\n');
+        }
+    }
     input.push_str("\n=== USER MESSAGE ===\n");
     input.push_str(&request.message);
     input
+}
+
+fn client_confirmation_events_for_turn_input(
+    auth: &InternalAuthContext,
+    request: &ChatRequest,
+) -> Vec<String> {
+    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "admin-config") {
+        return Vec::new();
+    }
+
+    request
+        .conversation_history
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| {
+            let content = message.content.trim();
+            is_admin_config_apply_summary_content(content).then(|| truncate_chars(content, 1000))
+        })
+        .collect()
+}
+
+fn is_admin_config_apply_summary_content(content: &str) -> bool {
+    (content.starts_with("Applied ") && content.contains("change(s)"))
+        || content.starts_with("The change set was applied successfully")
+}
+
+fn admin_config_tool_memory_content(executed: &ExecutedTool) -> Option<String> {
+    if !executed.result.success || !is_admin_config_tool_name(&executed.tool_call.name) {
+        return None;
+    }
+
+    if executed.tool_call.name == "propose_config_change_set" {
+        let summary = executed
+            .tool_call
+            .args
+            .get("summary")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Admin configuration change set");
+        return Some(format!(
+            "Admin Config tool completed: propose_config_change_set. Proposed change set: {}",
+            truncate_chars(summary, 240)
+        ));
+    }
+
+    Some(format!(
+        "Admin Config tool completed: {}.",
+        executed.tool_call.name
+    ))
+}
+
+fn is_admin_config_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "read_instance_settings"
+            | "read_deployment_settings"
+            | "read_deployment_readiness"
+            | "read_agent_settings"
+            | "read_user_types"
+            | "read_document_access"
+            | "read_onboarding_status"
+            | "propose_config_change_set"
+    )
 }
 
 fn should_sanitize_admin_config_history(auth: &InternalAuthContext, request: &ChatRequest) -> bool {
@@ -2590,29 +3311,68 @@ async fn chat_stream(
         }
 
         let top_k = value_as_i32(ai_config.parameters.get("top_k"), 4);
-        let (registry, tool_sinks) = build_conversation_tool_registry(
+        let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+        let (registry, tool_sinks) = build_conversation_tool_registry_with_context(
             &state.internal,
             &state.http,
             &request,
             &auth,
             top_k,
             &std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://searxng:8080".to_string()),
+            None,
+            None,
+            Some(&state),
+            Some(trace_tx),
         );
         let mut agent = SageAgent::new_with_optional_memory(
             registry,
             Some(memory),
             build_agent_instruction(
                 &ai_config.compiled_prompt,
-                request.tools.iter().any(|tool| tool == "knowledge-search"),
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
             ),
         );
+        let agent_trace_sink = tool_sinks.trace_deltas.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            agent_trace_sink.emit(agent_trace_event_delta(event));
+        }));
         let input = build_conversation_turn_input(
             &auth,
             &profile,
             &request,
             persisted_context.as_ref(),
         );
-        let tool_loop = match run_conversation_tool_loop(&mut agent, &input, &tool_sinks).await {
+        let tool_loop = {
+            let tool_loop_future =
+                run_conversation_tool_loop(&mut agent, &input, &tool_sinks, Some(&memory_user_id));
+            tokio::pin!(tool_loop_future);
+            let tool_loop = loop {
+                tokio::select! {
+                    Some(trace_delta) = trace_rx.recv() => {
+                        let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+                        payload.trace_delta = Some(trace_delta);
+                        yield Ok(chat_stream_sse_event("trace_delta", &payload));
+                    }
+                    result = &mut tool_loop_future => {
+                        break result;
+                    }
+                }
+            };
+            while let Ok(trace_delta) = trace_rx.try_recv() {
+                let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
+                payload.trace_delta = Some(trace_delta);
+                yield Ok(chat_stream_sse_event("trace_delta", &payload));
+            }
+            tool_loop
+        };
+        let tool_loop = match tool_loop {
             Ok(result) => result,
             Err(error) => {
                 let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
@@ -2638,6 +3398,14 @@ async fn chat_stream(
         );
         yield Ok(chat_stream_sse_event("trace_status", &status));
 
+        let trace = build_conversation_trace(
+            &ai_config,
+            &auth,
+            tool_loop.tools_used.clone(),
+            tool_loop.retrieval_sources.clone(),
+            tool_sinks.trace_deltas.snapshot(),
+        );
+
         let answer = tool_loop.answer.clone();
         if !answer.trim().is_empty() {
             let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
@@ -2646,17 +3414,23 @@ async fn chat_stream(
 
             let assistant_memory_content =
                 sanitize_admin_config_message_for_memory(&auth, &request, &answer);
-            if let Err(error) = agent.store_message_with_compaction_check(&memory_user_id, "assistant", &assistant_memory_content).await {
-                warn!("failed to persist streamed assistant message for session {}: {}", session.id, error);
+            match agent.store_message_with_compaction_check(&memory_user_id, "assistant", &assistant_memory_content).await {
+                Ok((message_id, _)) => {
+                    if let Some(trace) = &trace {
+                        if let Err(error) = persist_assistant_trace_metadata(&state, message_id, trace) {
+                            warn!(
+                                "failed to persist streamed assistant trace for session {}: {:?}",
+                                session.id, error
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!("failed to persist streamed assistant message for session {}: {}", session.id, error);
+                }
             }
         }
 
-        let trace = build_conversation_trace(
-            &ai_config,
-            &auth,
-            tool_loop.tools_used.clone(),
-            tool_loop.retrieval_sources.clone(),
-        );
         if trace.is_some() {
             let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
             payload.trace = trace;
@@ -2751,30 +3525,61 @@ async fn query(
         &std::env::var("SEARXNG_URL").unwrap_or_else(|_| "http://searxng:8080".to_string()),
         request.jurisdiction.clone(),
         request.situation_details.clone(),
+        Some(&state),
+        None,
     );
     let mut agent = SageAgent::new_with_optional_memory(
         registry,
         Some(memory),
-        build_agent_instruction(&ai_config.compiled_prompt, true),
+        build_agent_instruction(
+            &ai_config.compiled_prompt,
+            true,
+            chat_request
+                .tools
+                .iter()
+                .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
+        ),
     );
+    let agent_trace_sink = tool_sinks.trace_deltas.clone();
+    agent.set_trace_hook(Arc::new(move |event| {
+        agent_trace_sink.emit(agent_trace_event_delta(event));
+    }));
 
     let input = build_query_conversation_turn_input(&auth, &profile, &request, None);
-    let tool_loop = run_conversation_tool_loop(&mut agent, &input, &tool_sinks).await?;
+    let tool_loop =
+        run_conversation_tool_loop(&mut agent, &input, &tool_sinks, Some(&memory_user_id)).await?;
     let answer = tool_loop.answer;
+    let sources = tool_loop.retrieval_sources;
+    let trace = build_conversation_trace(
+        &ai_config,
+        &auth,
+        tool_loop.tools_used,
+        sources.clone(),
+        tool_sinks.trace_deltas.snapshot(),
+    );
 
     let assistant_user_id = format!("{}:{}", auth.kind, auth.id);
-    if let Err(err) = agent
+    match agent
         .store_message(&assistant_user_id, "assistant", &answer)
         .await
     {
-        warn!(
-            "failed to persist assistant message for session {}: {}",
-            session.id, err
-        );
+        Ok(message_id) => {
+            if let Some(trace) = &trace {
+                if let Err(err) = persist_assistant_trace_metadata(&state, message_id, trace) {
+                    warn!(
+                        "failed to persist assistant trace for session {}: {:?}",
+                        session.id, err
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                "failed to persist assistant message for session {}: {}",
+                session.id, err
+            );
+        }
     }
-
-    let sources = tool_loop.retrieval_sources;
-    let trace = build_conversation_trace(&ai_config, &auth, tool_loop.tools_used, sources.clone());
 
     Ok(Json(QueryResponse {
         answer: answer.clone(),
@@ -2802,11 +3607,18 @@ async fn get_query_session(
     let serialized_messages: Vec<Value> = messages
         .into_iter()
         .map(|message| {
+            let trace = conversation_trace_from_message_metadata(message.tool_results.as_ref());
+            let activity_steps = trace
+                .as_ref()
+                .map(|trace| json!(trace.activity_steps))
+                .unwrap_or(Value::Null);
             json!({
                 "role": message.role,
                 "content": message.content,
                 "id": message.id.to_string(),
                 "timestamp": message.created_at.to_rfc3339(),
+                "trace": trace,
+                "activity_steps": activity_steps,
             })
         })
         .collect();
@@ -3348,6 +4160,34 @@ fn load_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<Vec<S
         .map_err(internal_error)
 }
 
+fn assistant_trace_metadata(trace: &ConversationTraceResponse) -> Value {
+    json!({ "conversation_trace": trace })
+}
+
+fn conversation_trace_from_message_metadata(
+    value: Option<&Value>,
+) -> Option<ConversationTraceResponse> {
+    let trace = value?.get("conversation_trace")?.clone();
+    serde_json::from_value(trace).ok()
+}
+
+fn persist_assistant_trace_metadata(
+    state: &WebAppState,
+    message_id: Uuid,
+    trace: &ConversationTraceResponse,
+) -> AppResult<()> {
+    let metadata = assistant_trace_metadata(trace);
+    let mut conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+    diesel::update(messages::table.filter(messages::id.eq(message_id)))
+        .set(messages::tool_results.eq(Some(metadata)))
+        .execute(&mut *conn)
+        .map_err(internal_error)?;
+    Ok(())
+}
+
 fn count_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<i64> {
     let mut conn = state
         .db
@@ -3651,20 +4491,6 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
             "default",
             Some("Web search active by default for new sessions"),
         ),
-        (
-            "admin_trace_visibility",
-            "detailed",
-            "string",
-            "default",
-            Some("Conversation Trace visibility for Admin Conversations"),
-        ),
-        (
-            "user_trace_visibility",
-            "minimal",
-            "string",
-            "default",
-            Some("Conversation Trace visibility for User Conversations"),
-        ),
     ];
 
     let mut conn = state
@@ -3749,13 +4575,21 @@ fn load_all_ai_config_rows(state: &WebAppState) -> AppResult<Vec<AiConfigRow>> {
         .map_err(|_| AppError::internal("failed to acquire database lock"))?;
     diesel::sql_query(
         "SELECT key, value, value_type, category, description, updated_at \
-         FROM ai_config ORDER BY category, key",
+         FROM ai_config \
+         WHERE key NOT IN ('admin_trace_visibility', 'user_trace_visibility') \
+         ORDER BY category, key",
     )
     .load::<AiConfigRow>(&mut *conn)
     .map_err(internal_error)
 }
 
 fn load_ai_config_row(state: &WebAppState, key: &str) -> AppResult<AiConfigRow> {
+    if is_legacy_trace_visibility_key(key) {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            format!("Config key not found: {}", key),
+        ));
+    }
     let mut conn = state
         .db
         .lock()
@@ -3773,6 +4607,20 @@ fn load_ai_config_row(state: &WebAppState, key: &str) -> AppResult<AiConfigRow> 
             format!("Config key not found: {}", key),
         )
     })
+}
+
+fn is_legacy_trace_visibility_key(key: &str) -> bool {
+    matches!(key, "admin_trace_visibility" | "user_trace_visibility")
+}
+
+fn is_legacy_trace_visibility_admin_path(path: &str) -> bool {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    (parts.len() == 3
+        && parts[..2] == ["admin", "ai-config"]
+        && is_legacy_trace_visibility_key(parts[2]))
+        || (parts.len() == 5
+            && parts[..3] == ["admin", "ai-config", "user-type"]
+            && is_legacy_trace_visibility_key(parts[4]))
 }
 
 fn load_ai_config_override_rows(
@@ -3901,6 +4749,80 @@ fn load_ai_config_user_type_response(
         }
     }
     Ok(response)
+}
+
+fn sage_agent_settings_tool_data_from_responses(
+    global: AIConfigResponseBody,
+    per_user_type: Vec<AIConfigUserTypeResponseBody>,
+) -> Value {
+    let user_type_count = per_user_type.len();
+    let per_user_type = per_user_type
+        .into_iter()
+        .map(|user_type| {
+            let overrides = ai_config_override_items_by_key(&user_type);
+            json!({
+                "user_type_id": user_type.user_type_id,
+                "user_type_name": user_type.user_type_name,
+                "overrides": overrides,
+                "effective_values": {
+                    "prompt_sections": ai_config_inherited_items_by_key(user_type.prompt_sections),
+                    "parameters": ai_config_inherited_items_by_key(user_type.parameters),
+                    "defaults": ai_config_inherited_items_by_key(user_type.defaults),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "global": {
+            "prompt_sections": ai_config_items_by_key(global.prompt_sections),
+            "parameters": ai_config_items_by_key(global.parameters),
+            "defaults": ai_config_items_by_key(global.defaults),
+        },
+        "per_user_type": per_user_type,
+        "limits": {
+            "user_types_returned": user_type_count,
+        },
+    })
+}
+
+fn ai_config_items_by_key(items: Vec<AIConfigItemResponse>) -> Value {
+    let mut map = serde_json::Map::new();
+    for item in items {
+        map.insert(
+            item.key.clone(),
+            serde_json::to_value(item).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(map)
+}
+
+fn ai_config_inherited_items_by_key(items: Vec<AIConfigWithInheritanceResponse>) -> Value {
+    let mut map = serde_json::Map::new();
+    for item in items {
+        map.insert(
+            item.key.clone(),
+            serde_json::to_value(item).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(map)
+}
+
+fn ai_config_override_items_by_key(user_type: &AIConfigUserTypeResponseBody) -> Value {
+    let mut map = serde_json::Map::new();
+    for item in user_type
+        .prompt_sections
+        .iter()
+        .chain(user_type.parameters.iter())
+        .chain(user_type.defaults.iter())
+        .filter(|item| item.is_override)
+    {
+        map.insert(
+            item.key.clone(),
+            serde_json::to_value(item).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(map)
 }
 
 fn load_effective_ai_config_rows(
@@ -4108,10 +5030,6 @@ fn validate_ai_config_value(
         _ => {}
     }
 
-    if matches!(key, "admin_trace_visibility" | "user_trace_visibility") {
-        validate_trace_visibility_value(key, value)?;
-    }
-
     if category == "prompt_section" && value.len() > 5000 {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
@@ -4120,31 +5038,6 @@ fn validate_ai_config_value(
     }
 
     Ok(())
-}
-
-fn validate_trace_visibility_value(key: &str, value: &str) -> AppResult<()> {
-    let normalized = value.trim().to_ascii_lowercase();
-    let allowed: &[&str] = &["off", "minimal", "summary", "detailed"];
-
-    if allowed
-        .iter()
-        .any(|allowed_value| *allowed_value == normalized)
-    {
-        return Ok(());
-    }
-
-    Err(AppError::new(
-        StatusCode::BAD_REQUEST,
-        format!(
-            "Trace visibility for {} must be one of: {}",
-            if key == "admin_trace_visibility" {
-                "admin"
-            } else {
-                "user"
-            },
-            allowed.join(", ")
-        ),
-    ))
 }
 
 fn parse_ai_config_value(value_type: &str, value: &str) -> Value {
@@ -4504,6 +5397,7 @@ fn build_human_block(auth: &InternalAuthContext, profile: &HashMap<String, Strin
 struct EnclaveWebRuntimeProfile<'a> {
     compiled_prompt: &'a str,
     include_knowledge_tool: bool,
+    include_curated_resources_tool: bool,
 }
 
 impl<'a> EnclaveWebRuntimeProfile<'a> {
@@ -4515,24 +5409,43 @@ impl<'a> EnclaveWebRuntimeProfile<'a> {
                 "\nTool preference:\n- Use knowledge_search first for uploaded-document questions.\n",
             );
         }
+        if self.include_curated_resources_tool {
+            instruction.push_str(
+                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Only share contact details returned by find_resources.\n",
+            );
+        }
         instruction.push_str("\nAgent Settings profile:\n");
         instruction.push_str(self.compiled_prompt);
         instruction
     }
 }
 
-fn build_agent_instruction(compiled_prompt: &str, include_knowledge_tool: bool) -> String {
+fn build_agent_instruction(
+    compiled_prompt: &str,
+    include_knowledge_tool: bool,
+    include_curated_resources_tool: bool,
+) -> String {
     EnclaveWebRuntimeProfile {
         compiled_prompt,
         include_knowledge_tool,
+        include_curated_resources_tool,
     }
     .build_instruction()
 }
 
 fn query_enabled_tool_sets(request: &QueryRequest) -> Vec<String> {
     let mut tools = request.tools.clone();
-    if !tools.iter().any(|tool| tool == "knowledge-search") {
-        tools.insert(0, "knowledge-search".to_string());
+    if !tools
+        .iter()
+        .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID)
+    {
+        tools.insert(0, KNOWLEDGE_SEARCH_TOOL_SET_ID.to_string());
+    }
+    if !tools
+        .iter()
+        .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID)
+    {
+        tools.insert(0, CURATED_RESOURCES_TOOL_SET_ID.to_string());
     }
     tools
 }
@@ -4587,14 +5500,21 @@ fn build_query_conversation_turn_input(
     input
 }
 
-async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String> {
+async fn run_agent_turn(
+    agent: &mut SageAgent,
+    input: &str,
+    memory_user_id: Option<&str>,
+) -> AppResult<String> {
     let mut messages = Vec::new();
     for step in 0..8 {
         let result = agent
             .step(input, step == 0)
             .await
             .map_err(model_provider_error)?;
-        messages.extend(result.messages);
+        persist_successful_admin_config_tools(agent, memory_user_id, &result.executed_tools).await;
+        if should_include_step_messages(&result) {
+            messages.extend(result.messages);
+        }
         if result.done {
             break;
         }
@@ -4613,6 +5533,34 @@ async fn run_agent_turn(agent: &mut SageAgent, input: &str) -> AppResult<String>
     Ok(output)
 }
 
+async fn persist_successful_admin_config_tools(
+    agent: &SageAgent,
+    memory_user_id: Option<&str>,
+    executed_tools: &[ExecutedTool],
+) {
+    let Some(memory_user_id) = memory_user_id else {
+        return;
+    };
+
+    for content in executed_tools
+        .iter()
+        .filter_map(admin_config_tool_memory_content)
+    {
+        if let Err(error) = agent
+            .store_message_with_compaction_check(memory_user_id, "tool", &content)
+            .await
+        {
+            warn!("failed to persist Admin Config tool context: {}", error);
+        }
+    }
+}
+
+fn should_include_step_messages(result: &StepResult) -> bool {
+    !result.executed_tools.iter().any(|executed| {
+        executed.tool_call.name == "propose_config_change_set" && !executed.result.success
+    })
+}
+
 struct ConversationToolLoopOutput {
     answer: String,
     tools_used: Vec<ToolCallInfoResponse>,
@@ -4625,8 +5573,13 @@ async fn run_conversation_tool_loop(
     agent: &mut SageAgent,
     input: &str,
     sinks: &ConversationToolLoopSinks,
+    memory_user_id: Option<&str>,
 ) -> AppResult<ConversationToolLoopOutput> {
-    let answer = run_agent_turn(agent, input).await?;
+    let turn_started_at = Instant::now();
+    let answer = run_agent_turn(agent, input, memory_user_id).await?;
+    sinks.trace_deltas.emit(turn_timing_trace_delta(
+        turn_started_at.elapsed().as_millis(),
+    ));
     let tools_used = sinks
         .traces
         .lock()
@@ -4699,34 +5652,12 @@ fn dedupe_sources(sources: Vec<QuerySource>) -> Vec<QuerySource> {
 }
 
 fn build_conversation_trace(
-    ai_config: &InternalEffectiveAiConfig,
-    auth: &InternalAuthContext,
+    _ai_config: &InternalEffectiveAiConfig,
+    _auth: &InternalAuthContext,
     tools: Vec<ToolCallInfoResponse>,
     retrieval_sources: Vec<QuerySource>,
+    trace_deltas: Vec<ConversationTraceDeltaResponse>,
 ) -> Option<ConversationTraceResponse> {
-    let actor_type = if auth.kind == "admin" {
-        "admin"
-    } else {
-        "user"
-    };
-    let key = if actor_type == "admin" {
-        "admin_trace_visibility"
-    } else {
-        "user_trace_visibility"
-    };
-    let default_visibility = if actor_type == "admin" {
-        "detailed"
-    } else {
-        "minimal"
-    };
-    let visibility = value_as_string(ai_config.defaults.get(key), default_visibility)
-        .trim()
-        .to_ascii_lowercase();
-
-    if visibility == "off" {
-        return None;
-    }
-
     let detailed_tools = tools
         .into_iter()
         .map(|tool| {
@@ -4821,38 +5752,17 @@ fn build_conversation_trace(
         "Sage answered from the conversation context and configured instructions."
     };
 
-    let (tools, retrieval) = match visibility.as_str() {
-        "minimal" => (
-            detailed_tools
-                .into_iter()
-                .map(|tool| ToolTraceResponse {
-                    input_summary: None,
-                    output_summary: None,
-                    warnings: Vec::new(),
-                    metadata: json!({}),
-                    ..tool
-                })
-                .collect(),
-            detailed_retrieval
-                .into_iter()
-                .map(|item| RetrievalTraceResponse {
-                    summary: None,
-                    score: None,
-                    ..item
-                })
-                .collect(),
-        ),
-        "summary" => (Vec::new(), Vec::new()),
-        _ => (detailed_tools, detailed_retrieval),
-    };
+    let tools = detailed_tools;
+    let retrieval = detailed_retrieval;
 
     let activity_steps = conversation_activity_steps_from_tool_traces(&tools);
 
     Some(ConversationTraceResponse {
-        visibility,
+        visibility: "detailed".to_string(),
         reasoning: ReasoningTraceResponse {
             summary: summary.to_string(),
         },
+        trace_deltas,
         tools,
         retrieval,
         activity_steps,
@@ -4943,6 +5853,7 @@ fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
     let tool_name = match tool_id {
         "admin-config" => "Admin Config",
         "web-search" => "Web Search",
+        "curated-resources" => "Curated Resources",
         "db-query" => "Database Query",
         other => other,
     };
@@ -4954,12 +5865,6 @@ fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
         warnings: Vec::new(),
         guarded: false,
     }
-}
-
-fn value_as_string(value: Option<&Value>, default: &str) -> String {
-    value
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| default.to_string())
 }
 
 fn value_as_f64(value: Option<&Value>, default: f64) -> f64 {
@@ -5316,6 +6221,7 @@ mod tests {
                 "test-token".to_string(),
             ),
             jurisdiction: Some("Mexico".to_string()),
+            traces: Arc::new(Mutex::new(Vec::new())),
         };
         let args = HashMap::from([
             ("help_type".to_string(), "legal".to_string()),
@@ -5338,6 +6244,15 @@ mod tests {
             .output
             .contains("secure_channel: Signal: +52-555-0100"));
         assert!(result.output.contains("never invent contact details"));
+
+        let traces = tool.traces.lock().expect("trace sink should lock");
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].tool_id, "curated-resources");
+        assert_eq!(traces[0].tool_name, "Curated Resources");
+        assert_eq!(
+            traces[0].output_summary.as_deref(),
+            Some("Found vetted curated resources for the answer.")
+        );
 
         let (token, payload) = seen_rx
             .await
@@ -5399,7 +6314,7 @@ mod tests {
 
     #[test]
     fn enclave_web_instruction_uses_runtime_profile_boundary() {
-        let instruction = build_agent_instruction("PROFILE: custom instance", false);
+        let instruction = build_agent_instruction("PROFILE: custom instance", false, false);
 
         assert!(instruction.contains("Runtime profile: enclave_web"));
         assert!(instruction.contains("Agent Settings profile:"));
@@ -5431,6 +6346,364 @@ mod tests {
         assert!(rendered.contains(r#""summary":"Database results were redacted from the trace.""#));
         assert!(!rendered.contains("SELECT encrypted_value"));
         assert!(!rendered.contains("decrypted secret"));
+    }
+
+    #[test]
+    fn chat_stream_trace_delta_payloads_preserve_guarded_redacted_events() {
+        let mut payload = ChatStreamEventPayload::new(
+            "msg_test",
+            Some("11111111-1111-1111-1111-111111111111".to_string()),
+        );
+        payload.trace_delta = Some(ConversationTraceDeltaResponse {
+            id: "trace-admin-config-secret".to_string(),
+            kind: "tool_result".to_string(),
+            title: Some("Admin Config".to_string()),
+            content: Some("API_TOKEN=sk-test-secret".to_string()),
+            tool_name: Some("read_deployment_settings".to_string()),
+            status: Some("succeeded".to_string()),
+            metadata: json!({ "phase": "tool_loop" }),
+            created_at: Some("2026-06-18T12:00:00Z".to_string()),
+        });
+
+        payload.guard_trace_delta();
+        let rendered = chat_stream_event_payload_json(&payload);
+
+        assert!(rendered.contains(r#""trace_delta""#));
+        assert!(rendered.contains(r#""kind":"tool_result""#));
+        assert!(rendered.contains(r#""content":"[redacted]""#));
+        assert!(rendered.contains(r#""status":"guarded""#));
+        assert!(!rendered.contains("sk-test-secret"));
+    }
+
+    struct TestTraceTool {
+        name: &'static str,
+        result: ToolResult,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for TestTraceTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Test trace tool"
+        }
+
+        fn args_schema(&self) -> &str {
+            r#"{"query":"test"}"#
+        }
+
+        async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+            Ok(self.result.clone())
+        }
+    }
+
+    struct FailingTraceTool {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for FailingTraceTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Failing test trace tool"
+        }
+
+        fn args_schema(&self) -> &str {
+            r#"{"query":"test"}"#
+        }
+
+        async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+            Err(anyhow::anyhow!("network failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn traced_tool_emits_call_and_result_trace_deltas() {
+        let sink = ConversationTraceDeltaSink::new(None);
+        let tool = traced_tool(
+            Arc::new(TestTraceTool {
+                name: "read_instance_settings",
+                result: ToolResult::success("raw tool output should not enter trace"),
+            }),
+            &sink,
+        );
+
+        let result = tool.execute(&HashMap::new()).await.expect("tool runs");
+
+        assert!(result.success);
+        let deltas = sink.deltas.lock().expect("trace deltas should lock");
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].kind, "tool_call");
+        assert_eq!(deltas[0].title.as_deref(), Some("Admin Config"));
+        assert_eq!(
+            deltas[0].tool_name.as_deref(),
+            Some("read_instance_settings")
+        );
+        assert_eq!(deltas[0].status.as_deref(), Some("running"));
+        assert_eq!(deltas[1].kind, "tool_result");
+        assert_eq!(deltas[1].content.as_deref(), Some("Tool completed."));
+        assert_eq!(deltas[1].status.as_deref(), Some("succeeded"));
+        assert!(!serde_json::to_string(&*deltas)
+            .expect("trace deltas serialize")
+            .contains("raw tool output"));
+    }
+
+    #[tokio::test]
+    async fn traced_tool_emits_failed_guarded_and_timed_result_deltas() {
+        let failed_sink = ConversationTraceDeltaSink::new(None);
+        let failing_tool = traced_tool(
+            Arc::new(FailingTraceTool { name: "web_search" }),
+            &failed_sink,
+        );
+
+        let error = failing_tool
+            .execute(&HashMap::new())
+            .await
+            .expect_err("tool should fail");
+
+        assert!(error.to_string().contains("network failure"));
+        let failed_deltas = failed_sink
+            .deltas
+            .lock()
+            .expect("failed trace deltas should lock");
+        assert_eq!(failed_deltas.len(), 2);
+        assert_eq!(failed_deltas[1].kind, "tool_result");
+        assert_eq!(failed_deltas[1].title.as_deref(), Some("Web Search"));
+        assert_eq!(failed_deltas[1].status.as_deref(), Some("failed"));
+        assert!(failed_deltas[1].metadata["duration_ms"].is_number());
+
+        let guarded_sink = ConversationTraceDeltaSink::new(None);
+        let guarded_tool = traced_tool(
+            Arc::new(TestTraceTool {
+                name: "db_query",
+                result: ToolResult::error("Query guard blocked api_key=sk-test-secret"),
+            }),
+            &guarded_sink,
+        );
+
+        let result = guarded_tool
+            .execute(&HashMap::new())
+            .await
+            .expect("guarded tool returns a ToolResult");
+
+        assert!(!result.success);
+        let guarded_deltas = guarded_sink
+            .deltas
+            .lock()
+            .expect("guarded trace deltas should lock");
+        assert_eq!(guarded_deltas.len(), 2);
+        assert_eq!(guarded_deltas[1].kind, "tool_result");
+        assert_eq!(guarded_deltas[1].title.as_deref(), Some("Database Query"));
+        assert_eq!(guarded_deltas[1].status.as_deref(), Some("guarded"));
+        assert_eq!(guarded_deltas[1].content.as_deref(), Some("[redacted]"));
+        assert!(guarded_deltas[1].metadata["duration_ms"].is_number());
+        assert!(!serde_json::to_string(&*guarded_deltas)
+            .expect("guarded trace deltas serialize")
+            .contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn agent_trace_events_map_to_model_retry_correction_and_timing_deltas() {
+        let started = agent_trace_event_delta(AgentTraceEvent::ModelStepStarted {
+            step: 0,
+            attempt: 1,
+        });
+        let reasoning = agent_trace_event_delta(AgentTraceEvent::ProviderReasoning {
+            step: 0,
+            content: "Provider exposed reasoning, not model-synthesized narration.".to_string(),
+        });
+        let retry = agent_trace_event_delta(AgentTraceEvent::RetryScheduled {
+            step: 0,
+            attempt: 1,
+        });
+        let correction = agent_trace_event_delta(AgentTraceEvent::CorrectionStarted {
+            step: 0,
+            attempt: 1,
+            error: "Parse error: malformed response".to_string(),
+        });
+        let timing = turn_timing_trace_delta(1234);
+
+        assert_eq!(started.kind, "model_step");
+        assert_eq!(started.status.as_deref(), Some("running"));
+        assert_eq!(reasoning.kind, "reasoning");
+        assert_eq!(reasoning.metadata["source"], json!("provider"));
+        assert_eq!(
+            reasoning.content.as_deref(),
+            Some("Provider exposed reasoning, not model-synthesized narration.")
+        );
+        assert_eq!(retry.kind, "retry");
+        assert_eq!(
+            retry.content.as_deref(),
+            Some("Retrying model step 1 after attempt 1.")
+        );
+        assert_eq!(correction.kind, "correction");
+        assert_eq!(correction.status.as_deref(), Some("running"));
+        assert_eq!(timing.kind, "timing");
+        assert_eq!(timing.metadata["duration_ms"], json!(1234));
+    }
+
+    #[test]
+    fn final_conversation_trace_accumulates_trace_deltas_without_faking_reasoning() {
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "admin_trace_visibility".to_string(),
+            Value::String("detailed".to_string()),
+        );
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults,
+            compiled_prompt: "Help the admin.".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let trace_deltas = vec![
+            agent_trace_event_delta(AgentTraceEvent::ModelStepStarted {
+                step: 0,
+                attempt: 1,
+            }),
+            agent_trace_event_delta(AgentTraceEvent::ProviderReasoning {
+                step: 0,
+                content: "Provider reasoning content.".to_string(),
+            }),
+            turn_timing_trace_delta(42),
+        ];
+
+        let trace = build_conversation_trace(
+            &ai_config,
+            &auth,
+            Vec::new(),
+            Vec::new(),
+            trace_deltas.clone(),
+        )
+        .expect("admin trace should be visible");
+
+        assert_eq!(trace.trace_deltas, trace_deltas);
+        assert_eq!(
+            trace.reasoning.summary,
+            "Sage answered from the conversation context and configured instructions."
+        );
+        assert!(trace
+            .trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "reasoning"));
+    }
+
+    #[test]
+    fn conversation_trace_ignores_legacy_actor_visibility_defaults() {
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "admin_trace_visibility".to_string(),
+            Value::String("off".to_string()),
+        );
+        defaults.insert(
+            "user_trace_visibility".to_string(),
+            Value::String("minimal".to_string()),
+        );
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults,
+            compiled_prompt: "Help transparently.".to_string(),
+        };
+        let admin_auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let user_auth = InternalAuthContext {
+            id: 2,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: Some("user-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let tool = ToolCallInfoResponse {
+            output_summary: Some("Read the current admin configuration.".to_string()),
+            ..tool_call_info_for_id("admin-config", "Check setup status.".to_string())
+        };
+
+        let admin_trace = build_conversation_trace(
+            &ai_config,
+            &admin_auth,
+            vec![tool.clone()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("legacy admin visibility must not suppress traces");
+        let user_trace =
+            build_conversation_trace(&ai_config, &user_auth, vec![tool], Vec::new(), Vec::new())
+                .expect("legacy user visibility must not thin traces");
+
+        for trace in [admin_trace, user_trace] {
+            assert_eq!(trace.visibility, "detailed");
+            assert_eq!(trace.tools.len(), 1);
+            assert_eq!(
+                trace.tools[0].output_summary.as_deref(),
+                Some("Read the current admin configuration.")
+            );
+            assert_eq!(
+                trace.activity_steps[0].summary.as_deref(),
+                Some("Read the current admin configuration.")
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_assistant_trace_metadata_round_trips_sanitized_trace_deltas() {
+        let trace = ConversationTraceResponse {
+            visibility: "detailed".to_string(),
+            reasoning: ReasoningTraceResponse {
+                summary: "Sage used enabled tools before answering.".to_string(),
+            },
+            trace_deltas: vec![guard_trace_delta(ConversationTraceDeltaResponse {
+                id: "trace-secret".to_string(),
+                kind: "tool_result".to_string(),
+                title: Some("Admin Config".to_string()),
+                content: Some("api_key=sk-test-secret".to_string()),
+                tool_name: Some("read_deployment_settings".to_string()),
+                status: Some("succeeded".to_string()),
+                metadata: json!({}),
+                created_at: None,
+            })],
+            tools: Vec::new(),
+            retrieval: Vec::new(),
+            activity_steps: Vec::new(),
+            suppressed: false,
+        };
+
+        let metadata = assistant_trace_metadata(&trace);
+        let hydrated = conversation_trace_from_message_metadata(Some(&metadata))
+            .expect("trace metadata should hydrate");
+
+        assert_eq!(hydrated.trace_deltas.len(), 1);
+        assert_eq!(
+            hydrated.trace_deltas[0].content.as_deref(),
+            Some("[redacted]")
+        );
+        assert_eq!(hydrated.trace_deltas[0].status.as_deref(), Some("guarded"));
+        assert!(!metadata.to_string().contains("sk-test-secret"));
     }
 
     #[test]
@@ -5470,6 +6743,7 @@ mod tests {
                     guarded: false,
                 },
             ],
+            Vec::new(),
             Vec::new(),
         )
         .expect("admin trace should be visible");
@@ -5532,6 +6806,7 @@ mod tests {
                 ..tool_call_info_for_id("db-query", "Which users are active?".to_string())
             }],
             Vec::new(),
+            Vec::new(),
         )
         .expect("admin trace should be visible");
         let rendered = serde_json::to_string(&trace).expect("trace should serialize");
@@ -5577,6 +6852,7 @@ mod tests {
                 warnings: vec!["db_query_rejected".to_string()],
                 guarded: true,
             }],
+            Vec::new(),
             Vec::new(),
         )
         .expect("admin trace should be visible");
@@ -5630,6 +6906,7 @@ mod tests {
                 warnings: vec!["optional_tool_failed".to_string()],
                 guarded: true,
             }],
+            Vec::new(),
             Vec::new(),
         )
         .expect("admin trace should be visible");
@@ -5692,6 +6969,7 @@ mod tests {
                 hydrated: true,
                 hydration_status: "hydrated".to_string(),
             }],
+            Vec::new(),
         )
         .expect("admin trace should be visible");
 
@@ -5756,6 +7034,46 @@ mod tests {
     }
 
     #[test]
+    fn conversation_turn_input_includes_admin_config_apply_summary_events() {
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "what did you do?".to_string(),
+            session_id: Some("session-123".to_string()),
+            tools: vec!["admin-config".to_string()],
+            conversation_history: vec![
+                ChatHistoryMessage {
+                    role: "user".to_string(),
+                    content: "stale client-only turn".to_string(),
+                },
+                ChatHistoryMessage {
+                    role: "assistant".to_string(),
+                    content:
+                        "Applied 1/1 change(s). Config validation: valid. Restart required: no."
+                            .to_string(),
+                },
+            ],
+            job_ids: None,
+            conversation_channel: None,
+        };
+        let profile = HashMap::new();
+
+        let input = build_conversation_turn_input(&auth, &profile, &request, None);
+
+        assert!(input.contains("=== CLIENT CONFIRMATION EVENTS ==="));
+        assert!(input.contains("Applied 1/1 change(s). Config validation: valid."));
+        assert!(!input.contains("stale client-only turn"));
+    }
+
+    #[test]
     fn admin_config_memory_sanitizer_summarizes_change_set_json() {
         let auth = InternalAuthContext {
             id: 1,
@@ -5812,6 +7130,37 @@ mod tests {
         assert!(!sanitized.contains("super-secret-provider-token"));
         assert!(!sanitized.contains("sk-live-secret-value"));
         assert!(!sanitized.contains("\"requests\""));
+    }
+
+    #[test]
+    fn admin_config_tool_memory_content_omits_raw_change_set_requests() {
+        let executed = crate::sage_agent::ExecutedTool {
+            tool_call: crate::sage_agent::ToolCall {
+                name: "propose_config_change_set".to_string(),
+                args: HashMap::from([
+                    (
+                        "summary".to_string(),
+                        "Add a legal-disclaimer behavior rule".to_string(),
+                    ),
+                    (
+                        "requests_json".to_string(),
+                        r#"[{"method":"PUT","path":"/admin/ai-config/prompt_rules","body":{"value":"[\"secret raw body\"]"}}"#
+                            .to_string(),
+                    ),
+                ]),
+            },
+            result: ToolResult::success(
+                "I prepared these changes for review. Use Apply to confirm.",
+            ),
+        };
+
+        let content = admin_config_tool_memory_content(&executed)
+            .expect("successful Admin Config proposal should be persisted");
+
+        assert!(content.contains("propose_config_change_set"));
+        assert!(content.contains("Add a legal-disclaimer behavior rule"));
+        assert!(!content.contains("requests_json"));
+        assert!(!content.contains("secret raw body"));
     }
 
     #[test]
@@ -6024,6 +7373,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sage_agent_settings_tool_data_groups_sage_ai_config_rows() {
+        let global = AIConfigResponseBody {
+            prompt_sections: vec![AIConfigItemResponse {
+                key: "prompt_rules".to_string(),
+                value: "[\"Do not over-disclaim legal advice.\"]".to_string(),
+                value_type: "json".to_string(),
+                category: "prompt_section".to_string(),
+                description: Some("Array of behavioral rules".to_string()),
+                updated_at: Some("2026-06-21T12:00:00+00:00".to_string()),
+            }],
+            parameters: vec![AIConfigItemResponse {
+                key: "temperature".to_string(),
+                value: "0.1".to_string(),
+                value_type: "float".to_string(),
+                category: "parameter".to_string(),
+                description: None,
+                updated_at: None,
+            }],
+            defaults: Vec::new(),
+        };
+        let per_user_type = vec![AIConfigUserTypeResponseBody {
+            user_type_id: 7,
+            user_type_name: Some("Advocate".to_string()),
+            prompt_sections: vec![AIConfigWithInheritanceResponse {
+                key: "prompt_rules".to_string(),
+                value: "[\"Keep legal caveats targeted.\"]".to_string(),
+                value_type: "json".to_string(),
+                category: "prompt_section".to_string(),
+                description: Some("Array of behavioral rules".to_string()),
+                updated_at: Some("2026-06-21T12:05:00+00:00".to_string()),
+                is_override: true,
+                override_user_type_id: Some(7),
+            }],
+            parameters: Vec::new(),
+            defaults: Vec::new(),
+        }];
+
+        let data = sage_agent_settings_tool_data_from_responses(global, per_user_type);
+
+        assert_eq!(
+            data["global"]["prompt_sections"]["prompt_rules"]["value"],
+            "[\"Do not over-disclaim legal advice.\"]"
+        );
+        assert_eq!(
+            data["per_user_type"][0]["overrides"]["prompt_rules"]["value"],
+            "[\"Keep legal caveats targeted.\"]"
+        );
+        assert_eq!(
+            data["per_user_type"][0]["effective_values"]["prompt_sections"]["prompt_rules"]
+                ["is_override"],
+            true
+        );
+        assert_eq!(data["limits"]["user_types_returned"], 1);
+    }
+
     #[tokio::test]
     async fn admin_config_proposal_tool_stages_valid_change_set_without_mutating() {
         let traces = Arc::new(Mutex::new(Vec::new()));
@@ -6231,6 +7636,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_config_proposal_tool_stages_prompt_rules_agent_setting() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        assert!(tool.description().contains("/admin/ai-config/prompt_rules"));
+        assert!(tool.args_schema().contains("/admin/ai-config/prompt_rules"));
+        let requested_rules =
+            json!(["Ask users where they are from before giving location-specific guidance."])
+                .to_string();
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Ask users where they are from".to_string(),
+            ),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/ai-config/prompt_rules",
+                        "body": { "value": requested_rules }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("prompt_rules proposal should execute");
+
+        assert!(result.success);
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("prompt_rules proposal should be staged");
+        assert_eq!(staged.requests.len(), 1);
+        assert_eq!(staged.requests[0].method, "PUT");
+        assert_eq!(staged.requests[0].path, "/admin/ai-config/prompt_rules");
+        assert_eq!(
+            staged.requests[0].body,
+            Some(json!({ "value": requested_rules }))
+        );
+    }
+
+    #[test]
+    fn failed_admin_config_proposal_step_messages_are_suppressed() {
+        let result = StepResult {
+            messages: vec!["I prepared these changes for review. Use Apply to confirm.".to_string()],
+            tool_calls: Vec::new(),
+            executed_tools: vec![crate::sage_agent::ExecutedTool {
+                tool_call: crate::sage_agent::ToolCall {
+                    name: "propose_config_change_set".to_string(),
+                    args: HashMap::new(),
+                },
+                result: ToolResult::error(
+                    "Invalid change set proposal: Unsupported instance setting key: prompt_rules",
+                ),
+            }],
+            done: false,
+        };
+
+        assert!(!should_include_step_messages(&result));
+    }
+
+    #[test]
+    fn successful_admin_config_proposal_step_messages_are_kept() {
+        let result = StepResult {
+            messages: vec!["I prepared these changes for review. Use Apply to confirm.".to_string()],
+            tool_calls: Vec::new(),
+            executed_tools: vec![crate::sage_agent::ExecutedTool {
+                tool_call: crate::sage_agent::ToolCall {
+                    name: "propose_config_change_set".to_string(),
+                    args: HashMap::new(),
+                },
+                result: ToolResult::success(
+                    "I prepared these changes for review. Use Apply to confirm.",
+                ),
+            }],
+            done: false,
+        };
+
+        assert!(should_include_step_messages(&result));
+    }
+
+    #[tokio::test]
     async fn admin_config_proposal_tool_rejects_unknown_setting_keys() {
         let proposal = Arc::new(Mutex::new(Some(AdminChangeSetResponse {
             version: 1,
@@ -6310,6 +7805,90 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("body.value must be a string"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_invalid_prompt_rules_value() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Invalid behavior rule payload".to_string(),
+            ),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/ai-config/prompt_rules",
+                        "body": { "value": "Ask users where they are from." }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("invalid prompt_rules proposal should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("body.value must be a JSON array of strings"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_legacy_trace_visibility_settings() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Change legacy trace visibility".to_string(),
+            ),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/ai-config/user_trace_visibility",
+                        "body": { "value": "summary" }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("legacy trace visibility rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("legacy trace visibility"));
         assert!(proposal
             .lock()
             .expect("proposal sink should lock")
@@ -6628,10 +8207,11 @@ mod tests {
             dev_mode: false,
         };
         let request = ChatRequest {
-            message: "What still needs setup?".to_string(),
+            message: "SELECT 1 AS one".to_string(),
             session_id: None,
             tools: vec![
                 "knowledge-search".to_string(),
+                "curated-resources".to_string(),
                 "web-search".to_string(),
                 "db-query".to_string(),
                 "admin-config".to_string(),
@@ -6648,9 +8228,11 @@ mod tests {
             &admin,
             4,
             "http://searxng:8080",
+            None,
         );
 
         assert!(registry.has("knowledge_search"));
+        assert!(registry.has("find_resources"));
         assert!(registry.has("web_search"));
         assert!(registry.has("db_query"));
         assert!(registry.has("read_instance_settings"));
@@ -6680,9 +8262,11 @@ mod tests {
             &user,
             4,
             "http://searxng:8080",
+            None,
         );
 
         assert!(user_registry.has("knowledge_search"));
+        assert!(user_registry.has("find_resources"));
         assert!(user_registry.has("web_search"));
         assert!(!user_registry.has("db_query"));
         assert!(!user_registry.has("read_instance_settings"));
@@ -6699,13 +8283,111 @@ mod tests {
             &admin,
             4,
             "http://searxng:8080",
+            None,
         );
         assert!(!disabled_registry.has("knowledge_search"));
+        assert!(!disabled_registry.has("find_resources"));
         assert!(!disabled_registry.has("web_search"));
         assert!(!disabled_registry.has("db_query"));
         assert!(!disabled_registry.has("read_instance_settings"));
         assert!(!disabled_registry.has("propose_config_change_set"));
         assert!(disabled_registry.has("done"));
+    }
+
+    #[test]
+    fn database_tool_turn_guards_natural_language_without_exposing_db_contract() {
+        let http = Client::builder().build().expect("http client should build");
+        let internal = InternalAgentClient::new(
+            http.clone(),
+            "http://127.0.0.1:9".to_string(),
+            "test-token".to_string(),
+        );
+        let admin = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "Which users are active?".to_string(),
+            session_id: None,
+            tools: vec!["db-query".to_string()],
+            conversation_history: Vec::new(),
+            job_ids: None,
+            conversation_channel: None,
+        };
+
+        let (registry, sinks) = build_conversation_tool_registry(
+            &internal,
+            &http,
+            &request,
+            &admin,
+            4,
+            "http://searxng:8080",
+            None,
+        );
+
+        assert!(!registry.has("db_query"));
+        let traces = sinks.traces.lock().expect("trace sink should lock");
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].tool_id, "db-query");
+        assert!(traces[0].guarded);
+        assert_eq!(traces[0].warnings, vec!["direct_select_required"]);
+        let trace_deltas = sinks.trace_deltas.snapshot();
+        assert_eq!(trace_deltas.len(), 1);
+        assert_eq!(trace_deltas[0].kind, "tool_result");
+        assert_eq!(trace_deltas[0].status.as_deref(), Some("guarded"));
+        assert_eq!(trace_deltas[0].title.as_deref(), Some("Database Query"));
+    }
+
+    #[test]
+    fn database_tool_turn_exposes_db_contract_for_direct_select() {
+        let http = Client::builder().build().expect("http client should build");
+        let internal = InternalAgentClient::new(
+            http.clone(),
+            "http://127.0.0.1:9".to_string(),
+            "test-token".to_string(),
+        );
+        let admin = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "SELECT 1 AS one".to_string(),
+            session_id: None,
+            tools: vec!["db-query".to_string()],
+            conversation_history: Vec::new(),
+            job_ids: None,
+            conversation_channel: None,
+        };
+
+        let (registry, sinks) = build_conversation_tool_registry(
+            &internal,
+            &http,
+            &request,
+            &admin,
+            4,
+            "http://searxng:8080",
+            None,
+        );
+
+        assert!(registry.has("db_query"));
+        assert!(sinks
+            .traces
+            .lock()
+            .expect("trace sink should lock")
+            .is_empty());
+        assert!(sinks.trace_deltas.snapshot().is_empty());
     }
 
     #[test]
@@ -6767,7 +8449,7 @@ mod tests {
 
         let input = build_query_conversation_turn_input(&auth, &HashMap::new(), &request, None);
 
-        assert!(input.contains("enabled_tool_sets: knowledge-search"));
+        assert!(input.contains("enabled_tool_sets: curated-resources, knowledge-search"));
         assert!(input.contains("selected_document_ids: large-doc"));
         assert!(!input.contains("=== INITIAL DOCUMENT CONTEXT ==="));
         assert!(input.contains("=== USER QUESTION ==="));
@@ -6805,7 +8487,7 @@ mod tests {
         tool.warnings
             .push("no_relevant_uploaded_document_context".to_string());
 
-        let trace = build_conversation_trace(&ai_config, &auth, vec![tool], Vec::new())
+        let trace = build_conversation_trace(&ai_config, &auth, vec![tool], Vec::new(), Vec::new())
             .expect("admin trace should be visible");
 
         assert_eq!(

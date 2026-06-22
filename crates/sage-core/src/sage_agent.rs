@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 #[cfg(unix)]
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::memory::MemoryManager;
@@ -531,6 +532,51 @@ pub struct StepResult {
     pub done: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum AgentTraceEvent {
+    ModelStepStarted {
+        step: usize,
+        attempt: u32,
+    },
+    ModelStepCompleted {
+        step: usize,
+        attempt: u32,
+        elapsed_ms: u128,
+    },
+    ProviderReasoning {
+        step: usize,
+        content: String,
+    },
+    ModelStepFailed {
+        step: usize,
+        attempt: u32,
+        elapsed_ms: u128,
+        error: String,
+    },
+    RetryScheduled {
+        step: usize,
+        attempt: u32,
+    },
+    CorrectionStarted {
+        step: usize,
+        attempt: u32,
+        error: String,
+    },
+    CorrectionCompleted {
+        step: usize,
+        attempt: u32,
+        elapsed_ms: u128,
+    },
+    CorrectionFailed {
+        step: usize,
+        attempt: u32,
+        elapsed_ms: u128,
+        error: String,
+    },
+}
+
+pub type AgentTraceHook = Arc<dyn Fn(AgentTraceEvent) + Send + Sync>;
+
 #[allow(dead_code)]
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
@@ -568,6 +614,8 @@ pub struct SageAgent {
     /// The messages Vec contains the actual message content sent
     previous_step_summary: Option<(Vec<String>, Vec<String>)>,
     max_steps: usize,
+    turn_step_index: usize,
+    trace_hook: Option<AgentTraceHook>,
 }
 
 #[allow(dead_code)]
@@ -591,6 +639,8 @@ impl SageAgent {
             current_tool_results: Vec::new(),
             previous_step_summary: None,
             max_steps: 10,
+            turn_step_index: 0,
+            trace_hook: None,
         }
     }
 
@@ -900,6 +950,17 @@ impl SageAgent {
     pub fn clear_tool_results(&mut self) {
         self.current_tool_results.clear();
         self.previous_step_summary = None;
+        self.turn_step_index = 0;
+    }
+
+    pub fn set_trace_hook(&mut self, trace_hook: AgentTraceHook) {
+        self.trace_hook = Some(trace_hook);
+    }
+
+    fn emit_trace(&self, event: AgentTraceEvent) {
+        if let Some(hook) = &self.trace_hook {
+            hook(event);
+        }
     }
 
     /// Attempt to correct a malformed LLM response using the correction agent
@@ -963,7 +1024,10 @@ impl SageAgent {
         // Clear tool results at start of new request
         if is_first_step {
             self.current_tool_results.clear();
+            self.turn_step_index = 0;
         }
+        let step_index = self.turn_step_index;
+        self.turn_step_index += 1;
 
         tracing::debug!("Agent step (first={})", is_first_step);
 
@@ -1080,12 +1144,28 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         let mut response: Option<AgentResponse> = None;
 
         for attempt in 1..=MAX_LLM_RETRIES {
+            self.emit_trace(AgentTraceEvent::ModelStepStarted {
+                step: step_index,
+                attempt,
+            });
+            let attempt_started_at = Instant::now();
             match predictor.call(input.clone()).await {
                 Ok(r) => {
+                    self.emit_trace(AgentTraceEvent::ModelStepCompleted {
+                        step: step_index,
+                        attempt,
+                        elapsed_ms: attempt_started_at.elapsed().as_millis(),
+                    });
                     response = Some(r);
                     break;
                 }
                 Err(e) => {
+                    self.emit_trace(AgentTraceEvent::ModelStepFailed {
+                        step: step_index,
+                        attempt,
+                        elapsed_ms: attempt_started_at.elapsed().as_millis(),
+                        error: format!("{:?}", e),
+                    });
                     tracing::warn!(
                         "LLM call failed (attempt {}/{}): {:?}",
                         attempt,
@@ -1101,6 +1181,12 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
                     } = &e
                     {
                         let error_message = format!("Parse error: {}", source);
+                        self.emit_trace(AgentTraceEvent::CorrectionStarted {
+                            step: step_index,
+                            attempt,
+                            error: error_message.clone(),
+                        });
+                        let correction_started_at = Instant::now();
                         match self
                             .attempt_correction(
                                 &input_content,
@@ -1111,10 +1197,21 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
                             .await
                         {
                             Ok(corrected) => {
+                                self.emit_trace(AgentTraceEvent::CorrectionCompleted {
+                                    step: step_index,
+                                    attempt,
+                                    elapsed_ms: correction_started_at.elapsed().as_millis(),
+                                });
                                 response = Some(corrected);
                                 break;
                             }
                             Err(correction_err) => {
+                                self.emit_trace(AgentTraceEvent::CorrectionFailed {
+                                    step: step_index,
+                                    attempt,
+                                    elapsed_ms: correction_started_at.elapsed().as_millis(),
+                                    error: correction_err.to_string(),
+                                });
                                 tracing::warn!(
                                     "Correction failed (attempt {}/{}): {:?}",
                                     attempt,
@@ -1129,6 +1226,10 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
 
                     // Add a small delay before retry (except on last attempt)
                     if attempt < MAX_LLM_RETRIES {
+                        self.emit_trace(AgentTraceEvent::RetryScheduled {
+                            step: step_index,
+                            attempt,
+                        });
                         tracing::info!("Retrying LLM call in 1 second...");
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
