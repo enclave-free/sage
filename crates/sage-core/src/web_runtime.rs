@@ -2324,7 +2324,7 @@ impl Tool for AdminConfigBootstrapProposalTool {
     }
 
     fn args_schema(&self) -> &str {
-        r##"{"summary":"One-sentence review summary","instance_name":"Public instance/product name, for example FreeThem","assistant_name":"Assistant display name, for example Political Prisoner Support Team","public_tagline":"Short public tagline/header copy","public_description":"Public description of who the instance helps and what it does","primary_color":"Primary brand color as #RRGGBB","theme":"Visual theme: light, dark, or system","language":"Default language as a language code or supported language label, for example en or English","access_policy":"Product access policy: open registration/auto approval or manual approval/review required","visual_defaults_json":"Optional JSON object with product visual defaults such as chat_bubble_style, chat_bubble_shadow, surface_style, status_icon_set, typography_preset","user_types_json":"Optional JSON array of user type objects with name, description, icon, and display_order","behavior_rules_json":"Optional JSON array of initial assistant behavior rules as plain strings","forbidden_topics_json":"Optional JSON array of initial forbidden topic rules as plain strings"}"##
+        r##"{"summary":"One-sentence review summary","instance_name":"Public instance/product name, for example FreeThem","assistant_name":"Assistant display name, for example Political Prisoner Support Team","public_tagline":"Short public tagline/header copy","public_description":"Public description of who the instance helps and what it does","primary_color":"Primary brand color as #RRGGBB","theme":"Visual theme: light, dark, or system","language":"Default language as a language code or supported language label, for example en or English","access_policy":"Product access policy: open registration/auto approval or manual approval/review required","visual_chat_bubble_style":"Optional chat bubble style","visual_chat_bubble_shadow":"Optional chat bubble shadow","visual_surface_style":"Optional surface style","visual_status_icon_set":"Optional status icon set","visual_typography_preset":"Optional typography preset","user_type_1_name":"Optional user type 1 name; repeat user_type_2_name through user_type_5_name as needed","user_type_1_description":"Optional user type 1 description","user_type_1_icon":"Optional user type 1 icon","user_type_1_display_order":"Optional integer display order","onboarding_question_1_text":"Optional onboarding question 1 text; repeat onboarding_question_2_text through onboarding_question_10_text as needed","onboarding_question_1_field_type":"Field type: text, textarea, number, boolean, email, url, select, multi_select, or date","onboarding_question_1_required":"Optional boolean","onboarding_question_1_user_type":"Optional global, user_type_1, numeric id, or @type:<slug> created by this proposal","onboarding_question_1_placeholder":"Optional placeholder copy","onboarding_question_1_options":"Optional select options separated by |","onboarding_question_1_encryption_enabled":"Optional boolean","onboarding_question_1_include_in_chat":"Optional boolean","behavior_rule_1":"Optional assistant behavior rule; repeat behavior_rule_2 through behavior_rule_8 as needed","forbidden_topic_1":"Optional forbidden topic rule; repeat forbidden_topic_2 through forbidden_topic_8 as needed"}"##
     }
 
     async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
@@ -2436,14 +2436,19 @@ fn build_admin_config_bootstrap_change_set(
         body: Some(Value::Object(settings)),
     }];
 
-    requests.extend(parse_bootstrap_user_type_requests(args)?);
+    let user_type_plan = parse_bootstrap_user_type_requests(args)?;
+    requests.extend(user_type_plan.requests);
+    requests.extend(parse_bootstrap_onboarding_question_requests(
+        args,
+        &user_type_plan.reference_slugs,
+    )?);
     if let Some(request) =
-        parse_bootstrap_agent_rules_request(args, "behavior_rules_json", "prompt_rules")?
+        parse_bootstrap_agent_rules_request(args, "behavior_rule", "prompt_rules")?
     {
         requests.push(request);
     }
     if let Some(request) =
-        parse_bootstrap_agent_rules_request(args, "forbidden_topics_json", "prompt_forbidden")?
+        parse_bootstrap_agent_rules_request(args, "forbidden_topic", "prompt_forbidden")?
     {
         requests.push(request);
     }
@@ -2457,36 +2462,101 @@ fn build_admin_config_bootstrap_change_set(
     })
 }
 
+const BOOTSTRAP_MAX_USER_TYPES: usize = 5;
+const BOOTSTRAP_MAX_ONBOARDING_QUESTIONS: usize = 10;
+const BOOTSTRAP_MAX_AGENT_RULES: usize = 8;
+
+struct BootstrapUserTypePlan {
+    requests: Vec<AdminChangeSetRequest>,
+    reference_slugs: HashMap<String, String>,
+}
+
 fn reject_unsupported_bootstrap_args(
     args: &HashMap<String, String>,
 ) -> std::result::Result<(), String> {
     for key in args.keys() {
-        if matches!(key.as_str(), "requests_json" | "method" | "path" | "body") {
+        if matches!(key.as_str(), "requests_json" | "method" | "path" | "body")
+            || key.ends_with("_json")
+        {
             return Err(
-                "propose_admin_config_bootstrap accepts product setup fields, not raw request objects."
+                "propose_admin_config_bootstrap accepts typed product setup fields, not raw request objects or nested JSON fields."
                     .to_string(),
             );
         }
-        if !matches!(
-            key.as_str(),
-            "summary"
-                | "instance_name"
-                | "assistant_name"
-                | "public_tagline"
-                | "public_description"
-                | "primary_color"
-                | "theme"
-                | "language"
-                | "access_policy"
-                | "visual_defaults_json"
-                | "user_types_json"
-                | "behavior_rules_json"
-                | "forbidden_topics_json"
-        ) {
+        if !is_supported_bootstrap_arg(key) {
             return Err(format!("Unsupported bootstrap setup field: {}", key));
         }
     }
     Ok(())
+}
+
+fn is_supported_bootstrap_arg(key: &str) -> bool {
+    matches!(
+        key,
+        "summary"
+            | "instance_name"
+            | "assistant_name"
+            | "public_tagline"
+            | "public_description"
+            | "primary_color"
+            | "theme"
+            | "language"
+            | "access_policy"
+            | "visual_chat_bubble_style"
+            | "visual_chat_bubble_shadow"
+            | "visual_surface_style"
+            | "visual_status_icon_set"
+            | "visual_typography_preset"
+    ) || is_supported_indexed_bootstrap_arg(
+        key,
+        "user_type",
+        BOOTSTRAP_MAX_USER_TYPES,
+        &["name", "description", "icon", "display_order"],
+    ) || is_supported_indexed_bootstrap_arg(
+        key,
+        "onboarding_question",
+        BOOTSTRAP_MAX_ONBOARDING_QUESTIONS,
+        &[
+            "text",
+            "field_type",
+            "required",
+            "display_order",
+            "user_type",
+            "placeholder",
+            "options",
+            "encryption_enabled",
+            "include_in_chat",
+        ],
+    ) || is_supported_indexed_bootstrap_arg(key, "behavior_rule", BOOTSTRAP_MAX_AGENT_RULES, &[""])
+        || is_supported_indexed_bootstrap_arg(
+            key,
+            "forbidden_topic",
+            BOOTSTRAP_MAX_AGENT_RULES,
+            &[""],
+        )
+}
+
+fn is_supported_indexed_bootstrap_arg(
+    key: &str,
+    prefix: &str,
+    max_index: usize,
+    allowed_suffixes: &[&str],
+) -> bool {
+    let Some((index, suffix)) = parse_indexed_bootstrap_key(key, prefix) else {
+        return false;
+    };
+    index > 0 && index <= max_index && allowed_suffixes.contains(&suffix)
+}
+
+fn parse_indexed_bootstrap_key<'a>(key: &'a str, prefix: &str) -> Option<(usize, &'a str)> {
+    let rest = key.strip_prefix(prefix)?.strip_prefix('_')?;
+    if let Some((index, suffix)) = rest.split_once('_') {
+        let index = index.parse().ok()?;
+        Some((index, suffix))
+    } else {
+        let index = rest.parse().ok()?;
+        Some((index, ""))
+    }
 }
 
 fn optional_trimmed_arg(args: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -2567,94 +2637,141 @@ fn append_bootstrap_visual_defaults(
     args: &HashMap<String, String>,
     settings: &mut serde_json::Map<String, Value>,
 ) -> std::result::Result<(), String> {
-    let Some(raw) = optional_trimmed_arg(args, "visual_defaults_json") else {
-        return Ok(());
-    };
-    let value: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("visual_defaults_json must be a JSON object: {}", error))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| "visual_defaults_json must be a JSON object.".to_string())?;
-    for (key, value) in object {
-        if !matches!(
-            key.as_str(),
-            "chat_bubble_style"
-                | "chat_bubble_shadow"
-                | "surface_style"
-                | "status_icon_set"
-                | "typography_preset"
-        ) {
-            return Err(format!("Unsupported visual default field: {}", key));
+    for (arg_key, setting_key) in [
+        ("visual_chat_bubble_style", "chat_bubble_style"),
+        ("visual_chat_bubble_shadow", "chat_bubble_shadow"),
+        ("visual_surface_style", "surface_style"),
+        ("visual_status_icon_set", "status_icon_set"),
+        ("visual_typography_preset", "typography_preset"),
+    ] {
+        if let Some(value) = optional_trimmed_arg(args, arg_key) {
+            settings.insert(setting_key.to_string(), Value::String(value));
         }
-        let Some(value) = value
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return Err(format!("{} must be a non-empty string.", key));
-        };
-        settings.insert(key.clone(), Value::String(value.to_string()));
     }
     Ok(())
 }
 
 fn parse_bootstrap_user_type_requests(
     args: &HashMap<String, String>,
-) -> std::result::Result<Vec<AdminChangeSetRequest>, String> {
-    let Some(raw) = optional_trimmed_arg(args, "user_types_json") else {
-        return Ok(Vec::new());
-    };
-    let value: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("user_types_json must be a JSON array: {}", error))?;
-    let items = value
-        .as_array()
-        .ok_or_else(|| "user_types_json must be a JSON array.".to_string())?;
+) -> std::result::Result<BootstrapUserTypePlan, String> {
     let mut requests = Vec::new();
-    for (index, item) in items.iter().enumerate() {
-        let object = item
-            .as_object()
-            .ok_or_else(|| format!("user_types_json item {} must be an object.", index + 1))?;
-        for key in object.keys() {
-            if !matches!(
-                key.as_str(),
-                "name" | "description" | "icon" | "display_order"
-            ) {
-                return Err(format!("Unsupported user type field: {}", key));
-            }
+    let mut reference_slugs = HashMap::new();
+    let mut seen_slugs = HashSet::new();
+    for index in 1..=BOOTSTRAP_MAX_USER_TYPES {
+        if !has_indexed_bootstrap_args(args, "user_type", index) {
+            continue;
         }
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("user_types_json item {} requires name.", index + 1))?;
+        let name = required_indexed_bootstrap_arg(args, "user_type", index, "name")?;
+        let slug = bootstrap_user_type_slug(&name, &format!("user_type_{}", index));
+        if !seen_slugs.insert(slug.clone()) {
+            return Err(format!(
+                "user_type_{} name creates duplicate placeholder @type:{}.",
+                index, slug
+            ));
+        }
         let mut body = serde_json::Map::new();
-        body.insert("name".to_string(), Value::String(name.to_string()));
+        body.insert("name".to_string(), Value::String(name));
         for key in ["description", "icon"] {
-            if let Some(value) = object
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
+            if let Some(value) = indexed_bootstrap_arg(args, "user_type", index, key) {
                 body.insert(key.to_string(), Value::String(value.to_string()));
             }
         }
-        if let Some(value) = object.get("display_order") {
-            let order = value
-                .as_i64()
-                .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
-                .ok_or_else(|| {
-                    format!(
-                        "user_types_json item {} display_order must be an integer.",
-                        index + 1
-                    )
-                })?;
+        if let Some(value) = indexed_bootstrap_arg(args, "user_type", index, "display_order") {
+            let field_name = indexed_bootstrap_field_name("user_type", index, "display_order");
+            let order = parse_bootstrap_i64_arg(&value, &field_name)?;
             body.insert("display_order".to_string(), json!(order));
         }
         requests.push(AdminChangeSetRequest {
             method: "POST".to_string(),
             path: "/admin/user-types".to_string(),
+            body: Some(Value::Object(body)),
+        });
+        reference_slugs.insert(format!("user_type_{}", index), slug.clone());
+        reference_slugs.insert(slug.clone(), slug);
+    }
+    Ok(BootstrapUserTypePlan {
+        requests,
+        reference_slugs,
+    })
+}
+
+fn parse_bootstrap_onboarding_question_requests(
+    args: &HashMap<String, String>,
+    user_type_slugs: &HashMap<String, String>,
+) -> std::result::Result<Vec<AdminChangeSetRequest>, String> {
+    let mut requests = Vec::new();
+    for index in 1..=BOOTSTRAP_MAX_ONBOARDING_QUESTIONS {
+        if !has_indexed_bootstrap_args(args, "onboarding_question", index) {
+            continue;
+        }
+        let text = required_indexed_bootstrap_arg(args, "onboarding_question", index, "text")?;
+        let raw_field_type =
+            required_indexed_bootstrap_arg(args, "onboarding_question", index, "field_type")?;
+        let field_type = normalize_bootstrap_field_type(&raw_field_type)?;
+        let mut body = serde_json::Map::new();
+        body.insert("field_name".to_string(), Value::String(text));
+        body.insert("field_type".to_string(), Value::String(field_type.clone()));
+        body.insert(
+            "display_order".to_string(),
+            json!(
+                indexed_bootstrap_arg(args, "onboarding_question", index, "display_order")
+                    .map(|value| {
+                        let field_name = indexed_bootstrap_field_name(
+                            "onboarding_question",
+                            index,
+                            "display_order",
+                        );
+                        parse_bootstrap_i64_arg(&value, &field_name)
+                    })
+                    .transpose()?
+                    .unwrap_or(index as i64)
+            ),
+        );
+        for key in ["required", "encryption_enabled", "include_in_chat"] {
+            if let Some(value) = indexed_bootstrap_arg(args, "onboarding_question", index, key) {
+                let field_name = indexed_bootstrap_field_name("onboarding_question", index, key);
+                body.insert(
+                    key.to_string(),
+                    Value::Bool(parse_bootstrap_bool_arg(&value, &field_name)?),
+                );
+            }
+        }
+        if let Some(value) = indexed_bootstrap_arg(args, "onboarding_question", index, "user_type")
+        {
+            if let Some(user_type_id) = parse_bootstrap_user_type_reference(
+                &value,
+                user_type_slugs,
+                &indexed_bootstrap_field_name("onboarding_question", index, "user_type"),
+            )? {
+                body.insert("user_type_id".to_string(), user_type_id);
+            }
+        }
+        if let Some(value) =
+            indexed_bootstrap_arg(args, "onboarding_question", index, "placeholder")
+        {
+            body.insert("placeholder".to_string(), Value::String(value));
+        }
+        if let Some(value) = indexed_bootstrap_arg(args, "onboarding_question", index, "options") {
+            if !matches!(field_type.as_str(), "select" | "multi_select") {
+                return Err(format!(
+                    "{} is only supported for select or multi_select fields.",
+                    indexed_bootstrap_field_name("onboarding_question", index, "options")
+                ));
+            }
+            let field_name = indexed_bootstrap_field_name("onboarding_question", index, "options");
+            body.insert(
+                "options".to_string(),
+                Value::Array(
+                    parse_bootstrap_field_options(&value, &field_name)?
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        requests.push(AdminChangeSetRequest {
+            method: "POST".to_string(),
+            path: "/admin/user-fields".to_string(),
             body: Some(Value::Object(body)),
         });
     }
@@ -2663,42 +2780,177 @@ fn parse_bootstrap_user_type_requests(
 
 fn parse_bootstrap_agent_rules_request(
     args: &HashMap<String, String>,
-    arg_name: &str,
+    arg_prefix: &str,
     ai_config_key: &str,
 ) -> std::result::Result<Option<AdminChangeSetRequest>, String> {
-    let Some(raw) = optional_trimmed_arg(args, arg_name) else {
-        return Ok(None);
-    };
-    let value: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("{} must be a JSON array of strings: {}", arg_name, error))?;
-    let items = value
-        .as_array()
-        .ok_or_else(|| format!("{} must be a JSON array of strings.", arg_name))?;
     let mut strings = Vec::new();
-    for (index, item) in items.iter().enumerate() {
-        let item = item
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "{} item {} must be a non-empty string.",
-                    arg_name,
-                    index + 1
-                )
-            })?;
-        strings.push(item.to_string());
+    for index in 1..=BOOTSTRAP_MAX_AGENT_RULES {
+        if let Some(value) = indexed_bootstrap_arg(args, arg_prefix, index, "") {
+            strings.push(value);
+        }
     }
     if strings.is_empty() {
         return Ok(None);
     }
     let encoded = serde_json::to_string(&strings)
-        .map_err(|error| format!("{} could not be encoded: {}", arg_name, error))?;
+        .map_err(|error| format!("{} values could not be encoded: {}", arg_prefix, error))?;
     Ok(Some(AdminChangeSetRequest {
         method: "PUT".to_string(),
         path: format!("/admin/ai-config/{}", ai_config_key),
         body: Some(json!({ "value": encoded })),
     }))
+}
+
+fn has_indexed_bootstrap_args(args: &HashMap<String, String>, prefix: &str, index: usize) -> bool {
+    let exact = format!("{}_{}", prefix, index);
+    let nested_prefix = format!("{}_", exact);
+    args.contains_key(&exact) || args.keys().any(|key| key.starts_with(&nested_prefix))
+}
+
+fn indexed_bootstrap_arg(
+    args: &HashMap<String, String>,
+    prefix: &str,
+    index: usize,
+    suffix: &str,
+) -> Option<String> {
+    optional_trimmed_arg(args, &indexed_bootstrap_field_name(prefix, index, suffix))
+}
+
+fn required_indexed_bootstrap_arg(
+    args: &HashMap<String, String>,
+    prefix: &str,
+    index: usize,
+    suffix: &str,
+) -> std::result::Result<String, String> {
+    indexed_bootstrap_arg(args, prefix, index, suffix).ok_or_else(|| {
+        format!(
+            "propose_admin_config_bootstrap requires {} when any {}_{} field is supplied.",
+            indexed_bootstrap_field_name(prefix, index, suffix),
+            prefix,
+            index
+        )
+    })
+}
+
+fn indexed_bootstrap_field_name(prefix: &str, index: usize, suffix: &str) -> String {
+    if suffix.is_empty() {
+        format!("{}_{}", prefix, index)
+    } else {
+        format!("{}_{}_{}", prefix, index, suffix)
+    }
+}
+
+fn parse_bootstrap_i64_arg(raw: &str, field_name: &str) -> std::result::Result<i64, String> {
+    raw.trim()
+        .parse()
+        .map_err(|_| format!("{} must be an integer.", field_name))
+}
+
+fn parse_bootstrap_bool_arg(raw: &str, field_name: &str) -> std::result::Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "required" | "enabled" => Ok(true),
+        "false" | "0" | "no" | "off" | "optional" | "disabled" => Ok(false),
+        _ => Err(format!("{} must be a boolean.", field_name)),
+    }
+}
+
+fn normalize_bootstrap_field_type(raw: &str) -> std::result::Result<String, String> {
+    let normalized = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    let field_type = match normalized.as_str() {
+        "text" | "short_text" | "string" => "text",
+        "textarea" | "long_text" | "paragraph" | "multi_line_text" => "textarea",
+        "number" | "numeric" => "number",
+        "boolean" | "bool" | "yes_no" => "boolean",
+        "email" => "email",
+        "url" | "link" => "url",
+        "select" | "single_select" | "multiple_choice" => "select",
+        "multi_select" | "multiselect" | "checkboxes" | "multi_choice" => "multi_select",
+        "date" => "date",
+        _ => {
+            return Err(format!(
+                "field_type must be text, textarea, number, boolean, email, url, select, multi_select, or date; got {}.",
+                raw.trim()
+            ))
+        }
+    };
+    Ok(field_type.to_string())
+}
+
+fn parse_bootstrap_field_options(
+    raw: &str,
+    field_name: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let separator = if raw.contains('|') { '|' } else { ',' };
+    let options: Vec<String> = raw
+        .split(separator)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if options.is_empty() {
+        return Err(format!("{} must include at least one option.", field_name));
+    }
+    Ok(options)
+}
+
+fn parse_bootstrap_user_type_reference(
+    raw: &str,
+    user_type_slugs: &HashMap<String, String>,
+    field_name: &str,
+) -> std::result::Result<Option<Value>, String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("global")
+        || trimmed.eq_ignore_ascii_case("all")
+        || trimmed.eq_ignore_ascii_case("none")
+    {
+        return Ok(None);
+    }
+    if is_numeric_id(trimmed) {
+        return Ok(Some(Value::String(trimmed.to_string())));
+    }
+    if trimmed.starts_with("@type:") {
+        let Some(slug) = trimmed.strip_prefix("@type:") else {
+            return Err(format!("{} must use @type:<slug>.", field_name));
+        };
+        if is_user_type_segment(trimmed) && user_type_slugs.values().any(|known| known == slug) {
+            return Ok(Some(Value::String(trimmed.to_string())));
+        }
+        return Err(format!(
+            "{} must reference a user type created in this proposal or a numeric id.",
+            field_name
+        ));
+    }
+    if let Some(slug) = user_type_slugs.get(trimmed) {
+        return Ok(Some(Value::String(format!("@type:{}", slug))));
+    }
+    let slug = bootstrap_user_type_slug(trimmed, "");
+    if !slug.is_empty() && user_type_slugs.values().any(|known| known == &slug) {
+        return Ok(Some(Value::String(format!("@type:{}", slug))));
+    }
+    Err(format!(
+        "{} must be global, user_type_1 through user_type_5, a numeric id, or @type:<slug>.",
+        field_name
+    ))
+}
+
+fn bootstrap_user_type_slug(raw: &str, fallback: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_separator = true;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            slug.push('_');
+            last_was_separator = true;
+        }
+    }
+    let slug = slug.trim_matches('_');
+    if slug.is_empty() {
+        fallback.to_string()
+    } else {
+        slug.to_string()
+    }
 }
 
 fn parse_admin_change_set_requests(
@@ -2917,6 +3169,74 @@ fn validate_admin_change_request_body(
         }
     }
 
+    if request.method == "POST" && request.path == "/admin/user-fields" {
+        let body = request
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| "POST /admin/user-fields requires an object body.".to_string())?;
+        let field_name = body
+            .get("field_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if field_name.is_none() {
+            return Err("POST /admin/user-fields requires body.field_name.".to_string());
+        }
+        let field_type = body
+            .get("field_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "POST /admin/user-fields requires body.field_type.".to_string())?;
+        if !is_supported_user_field_type(field_type) {
+            return Err(format!("Unsupported user field type: {}", field_type));
+        }
+        for (key, value) in body {
+            match key.as_str() {
+                "field_name" | "field_type" | "placeholder" => {
+                    if !value.is_string() {
+                        return Err(format!("{} must be a string.", key));
+                    }
+                }
+                "required" | "encryption_enabled" | "include_in_chat" => {
+                    if !value.is_boolean() {
+                        return Err(format!("{} must be a boolean.", key));
+                    }
+                }
+                "display_order" => {
+                    if !value.as_i64().is_some() {
+                        return Err("display_order must be an integer.".to_string());
+                    }
+                }
+                "user_type_id" => {
+                    let valid = value.as_i64().is_some_and(|id| id > 0)
+                        || value
+                            .as_str()
+                            .is_some_and(|segment| is_user_type_segment(segment));
+                    if !valid {
+                        return Err(
+                            "user_type_id must be a positive id or @type:<slug>.".to_string()
+                        );
+                    }
+                }
+                "options" => {
+                    let Some(options) = value.as_array() else {
+                        return Err("options must be an array of strings.".to_string());
+                    };
+                    if !options.iter().all(|item| {
+                        item.as_str()
+                            .map(str::trim)
+                            .is_some_and(|item| !item.is_empty())
+                    }) {
+                        return Err("options must be an array of non-empty strings.".to_string());
+                    }
+                }
+                _ => return Err(format!("Unsupported user field body key: {}", key)),
+            }
+        }
+    }
+
     if request.method == "PUT" && request.path.starts_with("/admin/ai-config/") {
         let body = request
             .body
@@ -3026,6 +3346,21 @@ fn is_supported_default_language(language: &str) -> bool {
             | "vi"
             | "zh-Hans"
             | "zh-Hant"
+    )
+}
+
+fn is_supported_user_field_type(field_type: &str) -> bool {
+    matches!(
+        field_type,
+        "text"
+            | "textarea"
+            | "number"
+            | "boolean"
+            | "email"
+            | "url"
+            | "select"
+            | "multi_select"
+            | "date"
     )
 }
 
@@ -8452,42 +8787,73 @@ mod tests {
             ("theme".to_string(), "Dark mode".to_string()),
             ("language".to_string(), "English".to_string()),
             ("access_policy".to_string(), "manual approval".to_string()),
+            ("visual_chat_bubble_style".to_string(), "solid".to_string()),
+            ("visual_chat_bubble_shadow".to_string(), "soft".to_string()),
+            ("visual_surface_style".to_string(), "panel".to_string()),
+            ("visual_status_icon_set".to_string(), "classic".to_string()),
             (
-                "visual_defaults_json".to_string(),
-                json!({
-                    "chat_bubble_style": "solid",
-                    "chat_bubble_shadow": "soft",
-                    "surface_style": "panel",
-                    "status_icon_set": "classic",
-                    "typography_preset": "humanist"
-                })
-                .to_string(),
+                "visual_typography_preset".to_string(),
+                "humanist".to_string(),
             ),
             (
-                "user_types_json".to_string(),
-                json!([
-                    {
-                        "name": "Current Support",
-                        "description": "Family and friends of current political prisoners",
-                        "display_order": 1
-                    },
-                    {
-                        "name": "Post-Release Support",
-                        "description": "Former political prisoners seeking post-release support",
-                        "icon": "liberty",
-                        "display_order": 2
-                    }
-                ])
-                .to_string(),
+                "user_type_1_name".to_string(),
+                "Current Support".to_string(),
             ),
             (
-                "behavior_rules_json".to_string(),
-                json!(["Ask users where they are from before giving location-specific guidance."])
+                "user_type_1_description".to_string(),
+                "Family and friends of current political prisoners".to_string(),
+            ),
+            ("user_type_1_display_order".to_string(), "1".to_string()),
+            (
+                "user_type_2_name".to_string(),
+                "Post-Release Support".to_string(),
+            ),
+            (
+                "user_type_2_description".to_string(),
+                "Former political prisoners seeking post-release support".to_string(),
+            ),
+            ("user_type_2_icon".to_string(), "liberty".to_string()),
+            ("user_type_2_display_order".to_string(), "2".to_string()),
+            (
+                "onboarding_question_1_text".to_string(),
+                "What type of support are you seeking?".to_string(),
+            ),
+            (
+                "onboarding_question_1_field_type".to_string(),
+                "select".to_string(),
+            ),
+            (
+                "onboarding_question_1_required".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "onboarding_question_1_options".to_string(),
+                "Current Support|Post-Release Support".to_string(),
+            ),
+            (
+                "onboarding_question_1_include_in_chat".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "onboarding_question_2_text".to_string(),
+                "What country are you in?".to_string(),
+            ),
+            (
+                "onboarding_question_2_field_type".to_string(),
+                "short text".to_string(),
+            ),
+            (
+                "onboarding_question_2_user_type".to_string(),
+                "user_type_1".to_string(),
+            ),
+            (
+                "behavior_rule_1".to_string(),
+                "Ask users where they are from before giving location-specific guidance."
                     .to_string(),
             ),
             (
-                "forbidden_topics_json".to_string(),
-                json!(["Do not provide legal advice."]).to_string(),
+                "forbidden_topic_1".to_string(),
+                "Do not provide legal advice.".to_string(),
             ),
         ]);
 
@@ -8499,7 +8865,7 @@ mod tests {
             change_set.summary.as_deref(),
             Some("Bootstrap FreeThem guided setup")
         );
-        assert_eq!(change_set.requests.len(), 5);
+        assert_eq!(change_set.requests.len(), 7);
         assert_eq!(change_set.requests[0].method, "PUT");
         assert_eq!(change_set.requests[0].path, "/admin/settings");
         let settings = change_set.requests[0]
@@ -8519,21 +8885,39 @@ mod tests {
         assert_eq!(settings["default_theme"], "dark");
         assert_eq!(settings["auto_approve_users"], false);
         assert_eq!(settings["chat_bubble_shadow"], "soft");
+        assert_eq!(settings["surface_style"], "panel");
         assert_eq!(change_set.requests[1].path, "/admin/user-types");
         assert_eq!(change_set.requests[2].path, "/admin/user-types");
         assert_eq!(
             change_set.requests[1].body.as_ref().unwrap()["display_order"],
             1
         );
-        assert_eq!(change_set.requests[3].path, "/admin/ai-config/prompt_rules");
+        assert_eq!(change_set.requests[3].path, "/admin/user-fields");
         assert_eq!(
             change_set.requests[3].body,
+            Some(json!({
+                "field_name": "What type of support are you seeking?",
+                "field_type": "select",
+                "display_order": 1,
+                "required": true,
+                "include_in_chat": true,
+                "options": ["Current Support", "Post-Release Support"]
+            }))
+        );
+        assert_eq!(change_set.requests[4].path, "/admin/user-fields");
+        assert_eq!(
+            change_set.requests[4].body.as_ref().unwrap()["user_type_id"],
+            "@type:current_support"
+        );
+        assert_eq!(change_set.requests[5].path, "/admin/ai-config/prompt_rules");
+        assert_eq!(
+            change_set.requests[5].body,
             Some(json!({
                 "value": json!(["Ask users where they are from before giving location-specific guidance."]).to_string()
             }))
         );
         assert_eq!(
-            change_set.requests[4].path,
+            change_set.requests[6].path,
             "/admin/ai-config/prompt_forbidden"
         );
     }
@@ -8569,8 +8953,8 @@ mod tests {
             ("language".to_string(), "en".to_string()),
             ("access_policy".to_string(), "open registration".to_string()),
             (
-                "user_types_json".to_string(),
-                json!([{ "name": "Current Support" }]).to_string(),
+                "user_type_1_name".to_string(),
+                "Current Support".to_string(),
             ),
         ]);
 
@@ -8643,6 +9027,72 @@ mod tests {
         assert!(error.contains("theme must be light, dark, or system"));
     }
 
+    #[test]
+    fn admin_config_bootstrap_builder_rejects_invalid_language() {
+        let args = complete_bootstrap_tool_args_with("language", "Klingon");
+
+        let error = build_admin_config_bootstrap_change_set(&args)
+            .expect_err("unsupported language should fail safely");
+
+        assert!(error.contains("language must be a supported language"));
+    }
+
+    #[test]
+    fn admin_config_bootstrap_builder_rejects_invalid_access_policy() {
+        let args = complete_bootstrap_tool_args_with("access_policy", "invite waterfall");
+
+        let error = build_admin_config_bootstrap_change_set(&args)
+            .expect_err("unsupported access policy should fail safely");
+
+        assert!(error.contains("access_policy must be open registration"));
+    }
+
+    #[test]
+    fn admin_config_bootstrap_builder_rejects_malformed_user_type() {
+        let mut args = complete_bootstrap_tool_args();
+        args.insert(
+            "user_type_1_description".to_string(),
+            "Missing the required name.".to_string(),
+        );
+
+        let error = build_admin_config_bootstrap_change_set(&args)
+            .expect_err("user type detail without name should fail safely");
+
+        assert!(error.contains("user_type_1_name"));
+    }
+
+    #[test]
+    fn admin_config_bootstrap_builder_rejects_invalid_onboarding_field_type() {
+        let mut args = complete_bootstrap_tool_args();
+        args.insert(
+            "onboarding_question_1_text".to_string(),
+            "What is your chapter?".to_string(),
+        );
+        args.insert(
+            "onboarding_question_1_field_type".to_string(),
+            "telepathy".to_string(),
+        );
+
+        let error = build_admin_config_bootstrap_change_set(&args)
+            .expect_err("unsupported onboarding field type should fail safely");
+
+        assert!(error.contains("field_type must be text"));
+    }
+
+    #[test]
+    fn admin_config_bootstrap_builder_rejects_nested_json_arguments() {
+        let mut args = complete_bootstrap_tool_args();
+        args.insert(
+            "user_types_json".to_string(),
+            json!([{ "name": "Current Support" }]).to_string(),
+        );
+
+        let error = build_admin_config_bootstrap_change_set(&args)
+            .expect_err("typed bootstrap should reject nested JSON fields");
+
+        assert!(error.contains("nested JSON fields"));
+    }
+
     #[tokio::test]
     async fn admin_config_bootstrap_tool_rejects_raw_request_arguments() {
         let traces = Arc::new(Mutex::new(Vec::new()));
@@ -8675,7 +9125,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("product setup fields, not raw request objects"));
+            .contains("typed product setup fields, not raw request objects"));
         assert!(proposal
             .lock()
             .expect("proposal sink should lock")
