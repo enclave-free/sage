@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -4208,11 +4208,19 @@ async fn persist_user_session_log(
         user_type_id: auth.user_type_id,
         title: Some(session_log_title(auth)),
     };
-    if let Err(error) = internal.log_user_session(&payload).await {
-        warn!(
-            "failed to persist encrypted beta user session log for session {}: {}",
-            session_id, error
-        );
+    match internal.log_user_session(&payload).await {
+        Ok(response) => {
+            debug!(
+                "persisted encrypted beta user session log {} for session {} (status={}, turns={})",
+                response.log_id, session_id, response.status, response.turn_count
+            );
+        }
+        Err(error) => {
+            warn!(
+                "failed to persist encrypted beta user session log for session {}: {}",
+                session_id, error
+            );
+        }
     }
 }
 
@@ -5968,6 +5976,7 @@ fn conversation_activity_step_from_tool(
     }
 }
 
+#[cfg(test)]
 fn guarded_database_activity_step(tool: &ToolCallInfoResponse) -> ConversationActivityStepResponse {
     conversation_activity_step_from_tool(
         tool,
@@ -5999,6 +6008,7 @@ fn conversation_activity_step_from_tool_trace(
     }
 }
 
+#[cfg(test)]
 fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
     let tool_name = match tool_id {
         "admin-config" => "Admin Config",
