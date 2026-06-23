@@ -2612,13 +2612,28 @@ fn normalize_bootstrap_access_policy(raw: &str) -> std::result::Result<bool, Str
         | "auto approval"
         | "automatic approval"
         | "approve automatically"
+        | "immediate access"
+        | "immediate approval"
+        | "let new users in"
+        | "let new users in right away"
+        | "let users in"
+        | "let users in right away"
+        | "no approval required"
+        | "no review required"
+        | "public"
+        | "self serve"
+        | "self service"
         | "true"
         | "yes" => Ok(true),
         "manual"
         | "manual approval"
         | "manual review"
+        | "admin approval"
         | "approval required"
+        | "invite only"
         | "review required"
+        | "requires approval"
+        | "requires review"
         | "false"
         | "no" => Ok(false),
         _ => Err(
@@ -9051,6 +9066,21 @@ mod tests {
             .expect_err("unsupported access policy should fail safely");
 
         assert!(error.contains("access_policy must be open registration"));
+    }
+
+    #[test]
+    fn admin_config_bootstrap_builder_accepts_plain_language_access_policy() {
+        let args =
+            complete_bootstrap_tool_args_with("access_policy", "let new users in right away");
+
+        let change_set = build_admin_config_bootstrap_change_set(&args)
+            .expect("plain-language open access policy should build");
+        let settings = change_set.requests[0]
+            .body
+            .as_ref()
+            .expect("settings request should include body");
+
+        assert_eq!(settings["auto_approve_users"], true);
     }
 
     #[test]
