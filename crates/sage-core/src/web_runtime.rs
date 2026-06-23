@@ -2613,10 +2613,24 @@ fn normalize_bootstrap_language(raw: &str) -> std::result::Result<String, String
 }
 
 fn normalize_bootstrap_theme(raw: &str) -> std::result::Result<String, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
+    let normalized = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    match normalized.as_str() {
         "light" | "light mode" | "light theme" => Ok("light".to_string()),
         "dark" | "dark mode" | "dark theme" => Ok("dark".to_string()),
         "system" | "system default" | "system theme" | "auto" => Ok("system".to_string()),
+        _ if normalized.contains("light") => Ok("light".to_string()),
+        _ if normalized.contains("dark") => Ok("dark".to_string()),
+        _ if normalized.contains("system") || normalized.contains("device") => {
+            Ok("system".to_string())
+        }
         _ => Err("theme must be light, dark, or system.".to_string()),
     }
 }
@@ -2633,6 +2647,12 @@ fn normalize_bootstrap_access_policy(raw: &str) -> std::result::Result<bool, Str
         .join(" ");
     if normalized.contains("let new users in")
         || normalized.contains("let users in")
+        || normalized.contains("let them in")
+        || normalized.contains("don t block access")
+        || normalized.contains("dont block access")
+        || normalized.contains("do not block access")
+        || normalized.contains("don t gate access")
+        || normalized.contains("dont gate access")
         || normalized.contains("no approval required")
         || normalized.contains("no review required")
         || normalized.contains("open registration")
@@ -2747,48 +2767,56 @@ fn parse_bootstrap_setup_notes(raw: &str) -> std::result::Result<HashMap<String,
         setup_scalar_answer(&answers, 7)?,
     );
 
+    let mut user_types = Vec::new();
     if let Some(answer) = answers.get(&8) {
         args.insert("access_policy".to_string(), answer.clone());
-        for (index, user_type) in infer_setup_user_types(answer)
-            .into_iter()
-            .take(BOOTSTRAP_MAX_USER_TYPES)
-            .enumerate()
-        {
-            let n = index + 1;
-            args.insert(format!("user_type_{}_name", n), user_type.name);
-            args.insert(
-                format!("user_type_{}_description", n),
-                user_type.description,
-            );
-            args.insert(format!("user_type_{}_display_order", n), n.to_string());
-        }
+        user_types.extend(infer_setup_user_types(answer));
     }
 
     if let Some(answer) = answers.get(&9) {
-        for (index, question) in infer_setup_onboarding_questions(answer)
-            .into_iter()
-            .take(BOOTSTRAP_MAX_ONBOARDING_QUESTIONS)
-            .enumerate()
-        {
-            let n = index + 1;
-            args.insert(format!("onboarding_question_{}_text", n), question.text);
-            args.insert(
-                format!("onboarding_question_{}_field_type", n),
-                question.field_type,
-            );
-            args.insert(
-                format!("onboarding_question_{}_display_order", n),
-                n.to_string(),
-            );
-            args.insert(
-                format!("onboarding_question_{}_required", n),
-                question.required.to_string(),
-            );
-            args.insert(
-                format!("onboarding_question_{}_include_in_chat", n),
-                question.include_in_chat.to_string(),
-            );
+        let answer_user_types = infer_setup_user_types(answer);
+        if answer_user_types.is_empty() {
+            for (index, question) in infer_setup_onboarding_questions(answer)
+                .into_iter()
+                .take(BOOTSTRAP_MAX_ONBOARDING_QUESTIONS)
+                .enumerate()
+            {
+                let n = index + 1;
+                args.insert(format!("onboarding_question_{}_text", n), question.text);
+                args.insert(
+                    format!("onboarding_question_{}_field_type", n),
+                    question.field_type,
+                );
+                args.insert(
+                    format!("onboarding_question_{}_display_order", n),
+                    n.to_string(),
+                );
+                args.insert(
+                    format!("onboarding_question_{}_required", n),
+                    question.required.to_string(),
+                );
+                args.insert(
+                    format!("onboarding_question_{}_include_in_chat", n),
+                    question.include_in_chat.to_string(),
+                );
+            }
+        } else {
+            user_types.extend(answer_user_types);
         }
+    }
+
+    for (index, user_type) in user_types
+        .into_iter()
+        .take(BOOTSTRAP_MAX_USER_TYPES)
+        .enumerate()
+    {
+        let n = index + 1;
+        args.insert(format!("user_type_{}_name", n), user_type.name);
+        args.insert(
+            format!("user_type_{}_description", n),
+            user_type.description,
+        );
+        args.insert(format!("user_type_{}_display_order", n), n.to_string());
     }
 
     if let Some(answer) = answers.get(&10) {
@@ -2839,6 +2867,10 @@ fn parse_numbered_setup_answers(raw: &str) -> BTreeMap<usize, String> {
 }
 
 fn parse_numbered_setup_line(line: &str) -> Option<(usize, &str)> {
+    let line = line
+        .trim_start_matches(|ch: char| ch.is_whitespace())
+        .trim_start_matches(|ch: char| matches!(ch, '-' | '*' | '•'))
+        .trim_start();
     let digit_end = line
         .char_indices()
         .take_while(|(_, ch)| ch.is_ascii_digit())
@@ -2848,7 +2880,8 @@ fn parse_numbered_setup_line(line: &str) -> Option<(usize, &str)> {
     let rest = rest.trim_start();
     let answer = rest
         .strip_prefix('.')
-        .or_else(|| rest.strip_prefix(')'))?
+        .or_else(|| rest.strip_prefix(')'))
+        .or_else(|| rest.strip_prefix(':'))?
         .trim_start();
     let index = digits.parse().ok()?;
     Some((index, answer))
@@ -2881,7 +2914,12 @@ fn infer_setup_assistant_name(raw: &str, public_description: &str) -> String {
     if !(normalized.contains("choose")
         || normalized.contains("pick")
         || normalized.contains("select")
-        || normalized.contains("simple assistant name"))
+        || normalized.contains("simple assistant name")
+        || normalized.contains("your call")
+        || normalized.contains("up to you")
+        || normalized.contains("you decide")
+        || normalized.contains("you choose")
+        || normalized.contains("your choice"))
     {
         return raw.trim().to_string();
     }
@@ -2917,10 +2955,14 @@ fn infer_setup_user_types(raw: &str) -> Vec<SetupUserType> {
     let Some(raw_types) = split_after_ascii_case_insensitive(raw, "user types:")
         .or_else(|| split_after_ascii_case_insensitive(raw, "user types -"))
         .or_else(|| split_after_ascii_case_insensitive(raw, "user types"))
+        .or_else(|| split_after_ascii_case_insensitive(raw, "kinds of users."))
+        .or_else(|| split_after_ascii_case_insensitive(raw, "kinds of users:"))
+        .or_else(|| split_after_ascii_case_insensitive(raw, "kinds of users"))
     else {
         return Vec::new();
     };
     raw_types
+        .replace(") and ", ")|")
         .replace(", and ", "|")
         .replace(" and former ", "|former ")
         .split('|')
@@ -2929,11 +2971,28 @@ fn infer_setup_user_types(raw: &str) -> Vec<SetupUserType> {
                 .trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';')
         })
         .filter(|item| !item.is_empty())
-        .map(|description| SetupUserType {
-            name: title_case_setup_phrase(description),
-            description: capitalize_setup_sentence(description),
-        })
+        .map(setup_user_type_from_raw)
         .collect()
+}
+
+fn setup_user_type_from_raw(raw: &str) -> SetupUserType {
+    let (name, description) = split_parenthetical_setup_description(raw)
+        .unwrap_or_else(|| (raw.trim().to_string(), raw.trim().to_string()));
+    SetupUserType {
+        name: title_case_setup_phrase(&name),
+        description: capitalize_setup_sentence(&description),
+    }
+}
+
+fn split_parenthetical_setup_description(raw: &str) -> Option<(String, String)> {
+    let start = raw.find('(')?;
+    let end = raw[start + 1..].find(')')? + start + 1;
+    let name = raw[..start].trim();
+    let description = raw[start + 1..end].trim();
+    if name.is_empty() || description.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), description.to_string()))
 }
 
 fn split_after_ascii_case_insensitive<'a>(raw: &'a str, needle: &str) -> Option<&'a str> {
@@ -2994,26 +3053,37 @@ fn title_case_setup_phrase(raw: &str) -> String {
     raw.split_whitespace()
         .map(|word| {
             let trimmed = word.trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.');
-            if trimmed.eq_ignore_ascii_case("and")
-                || trimmed.eq_ignore_ascii_case("of")
-                || trimmed.eq_ignore_ascii_case("with")
-                || trimmed.eq_ignore_ascii_case("their")
-            {
-                return trimmed.to_ascii_lowercase();
+            if trimmed.contains('/') {
+                return trimmed
+                    .split('/')
+                    .map(title_case_setup_word)
+                    .collect::<Vec<_>>()
+                    .join("/");
             }
-            let mut chars = trimmed.chars();
-            match chars.next() {
-                Some(first) => {
-                    let mut output = first.to_uppercase().collect::<String>();
-                    output.push_str(&chars.as_str().to_ascii_lowercase());
-                    output
-                }
-                None => String::new(),
-            }
+            title_case_setup_word(trimmed)
         })
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn title_case_setup_word(trimmed: &str) -> String {
+    if trimmed.eq_ignore_ascii_case("and")
+        || trimmed.eq_ignore_ascii_case("of")
+        || trimmed.eq_ignore_ascii_case("with")
+        || trimmed.eq_ignore_ascii_case("their")
+    {
+        return trimmed.to_ascii_lowercase();
+    }
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut output = first.to_uppercase().collect::<String>();
+            output.push_str(&chars.as_str().to_ascii_lowercase());
+            output
+        }
+        None => String::new(),
+    }
 }
 
 fn capitalize_setup_sentence(raw: &str) -> String {
@@ -9236,6 +9306,51 @@ mod tests {
     }
 
     #[test]
+    fn admin_config_bootstrap_builder_accepts_live_onboarding_markdown_answers() {
+        let args = HashMap::from([(
+            "setup_notes".to_string(),
+            live_onboarding_setup_notes_with_markdown_bullet(),
+        )]);
+
+        let change_set = build_admin_config_bootstrap_change_set(&args)
+            .expect("live onboarding answer format should build");
+
+        assert_eq!(
+            change_set.summary.as_deref(),
+            Some("Bootstrap FreeThem guided setup")
+        );
+        assert_eq!(change_set.requests.len(), 3);
+        let settings = change_set.requests[0]
+            .body
+            .as_ref()
+            .expect("settings request should include body");
+        assert_eq!(settings["instance_name"], "FreeThem");
+        assert_eq!(settings["assistant_name"], "Support Team");
+        assert_eq!(settings["primary_color"], "#1E40AF");
+        assert_eq!(settings["default_theme"], "dark");
+        assert_eq!(settings["default_language"], "en");
+        assert_eq!(settings["auto_approve_users"], true);
+        assert_eq!(change_set.requests[1].path, "/admin/user-types");
+        assert_eq!(
+            change_set.requests[1].body.as_ref().expect("body")["name"],
+            "Families and Friends of Current Political Prisoners"
+        );
+        assert_eq!(
+            change_set.requests[1].body.as_ref().expect("body")["description"],
+            "Support those in the situation."
+        );
+        assert_eq!(change_set.requests[2].path, "/admin/user-types");
+        assert_eq!(
+            change_set.requests[2].body.as_ref().expect("body")["name"],
+            "Friends/Family/Former Political Prisoners"
+        );
+        assert_eq!(
+            change_set.requests[2].body.as_ref().expect("body")["description"],
+            "Support for those after the situation."
+        );
+    }
+
+    #[test]
     fn admin_config_bootstrap_builder_parses_user_type_marker_case_insensitively() {
         let args = HashMap::from([(
             "setup_notes".to_string(),
@@ -9824,6 +9939,21 @@ mod tests {
             "8. Let new users in right away. Create two simple user types: family and friends of current political prisoners, and former political prisoners with their family and friends.",
             "9. Add onboarding questions for what country the user is in and what kind of support they need. Include those answers in chat context.",
             "10. Add a behavior rule to ask where users are before giving location-specific guidance.",
+        ]
+        .join("\n")
+    }
+
+    fn live_onboarding_setup_notes_with_markdown_bullet() -> String {
+        [
+            "- 1. FreeThem",
+            "2. We are the political prisoners support team an arm of the World Liberty Congress",
+            "3. Your call",
+            "4. Your call",
+            "5. dark please",
+            "6. english",
+            "7. political prisoners support team",
+            "8. Yes don’t block access",
+            "9. there are two kinds of users. families and friends of current political prisoners (support those in the situation) and friends/family/former political prisoners (support for those after the situation)",
         ]
         .join("\n")
     }
