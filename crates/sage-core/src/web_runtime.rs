@@ -52,11 +52,15 @@ const CURATED_RESOURCES_TOOL_SET_ID: &str = "curated-resources";
 const KNOWLEDGE_SEARCH_TOOL_SET_ID: &str = "knowledge-search";
 const DEFAULT_PROMPT_RULES: [&str; 6] = [
     "For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.",
-    "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.",
-    "Admin Config proposals must use canonical paths and keys: POST /admin/user-types, PUT /admin/settings, PUT /admin/ai-config/prompt_rules, header_tagline, default_language codes such as en. If propose_config_change_set succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If propose_config_change_set rejects a supported change, correct the request and call the tool again instead of telling the admin to configure it manually.",
+    "For Admin Conversation guided setup or bootstrap write intent, call propose_admin_config_bootstrap instead of hand-authoring requests_json for instance identity, public copy, visual defaults, access policy, user types, onboarding questions, or behavior rules; confirmed Apply remains an admin UI action.",
+    "Use propose_config_change_set only for supported Admin Config writes that do not yet have a typed proposal Tool. Generic change sets must use canonical paths and keys: POST /admin/user-types, POST /admin/user-fields, PUT /admin/settings, PUT /admin/ai-config/prompt_rules, header_tagline, default_language codes such as en. If a proposal Tool succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If a proposal Tool rejects a supported change, correct the request and call the best matching proposal Tool again instead of telling the admin to configure it manually.",
     "Use curated resources as priority admin-vetted referrals when the user needs real-world help, contacts, or organizations; do not surface them merely because a topic matches if the right next step is ordinary explanation, triage, or a clarifying question.",
     "NEVER invent sources, organization names, or contact information",
     "If asked about topics outside your knowledge base, acknowledge limitations",
+];
+const OBSOLETE_DEFAULT_PROMPT_RULES: [&str; 2] = [
+    "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.",
+    "Admin Config proposals must use canonical paths and keys: POST /admin/user-types, PUT /admin/settings, PUT /admin/ai-config/prompt_rules, header_tagline, default_language codes such as en. If propose_config_change_set succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If propose_config_change_set rejects a supported change, correct the request and call the tool again instead of telling the admin to configure it manually.",
 ];
 const USER_SESSION_SALT: &str = "session";
 const USER_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
@@ -5459,8 +5463,10 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
 fn merge_prompt_rules(existing_raw: &str, required_raw: &str) -> Option<String> {
     let mut existing_rules: Vec<String> = serde_json::from_str(existing_raw).ok()?;
     let required_rules: Vec<String> = serde_json::from_str(required_raw).ok()?;
+    let original_len = existing_rules.len();
+    existing_rules.retain(|rule| !OBSOLETE_DEFAULT_PROMPT_RULES.contains(&rule.as_str()));
     let mut seen: HashSet<String> = existing_rules.iter().cloned().collect();
-    let mut changed = false;
+    let mut changed = existing_rules.len() != original_len;
 
     for rule in required_rules {
         if seen.insert(rule.clone()) {
@@ -9443,15 +9449,15 @@ mod tests {
     }
 
     #[test]
-    fn merge_prompt_rules_preserves_custom_rules_and_appends_missing_defaults() {
+    fn merge_prompt_rules_preserves_custom_rules_and_replaces_obsolete_defaults() {
         let existing = serde_json::to_string(&vec![
             "Custom operator rule".to_string(),
-            "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.".to_string(),
+            OBSOLETE_DEFAULT_PROMPT_RULES[0].to_string(),
         ])
         .expect("existing rules should serialize");
         let required = serde_json::to_string(&vec![
-            "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.".to_string(),
-            "Admin Config proposals must use canonical paths and keys.".to_string(),
+            DEFAULT_PROMPT_RULES[1].to_string(),
+            DEFAULT_PROMPT_RULES[2].to_string(),
         ])
         .expect("required rules should serialize");
 
@@ -9460,27 +9466,30 @@ mod tests {
         let rules: Vec<String> = serde_json::from_str(&merged).expect("merged rules should parse");
 
         assert_eq!(rules[0], "Custom operator rule");
-        assert_eq!(
-            rules[1],
-            "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action."
-        );
-        assert_eq!(
-            rules[2],
-            "Admin Config proposals must use canonical paths and keys."
-        );
+        assert_eq!(rules[1], DEFAULT_PROMPT_RULES[1]);
+        assert_eq!(rules[2], DEFAULT_PROMPT_RULES[2]);
+        assert!(!rules
+            .iter()
+            .any(|rule| OBSOLETE_DEFAULT_PROMPT_RULES.contains(&rule.as_str())));
     }
 
     #[test]
     fn default_prompt_rules_reflect_current_tool_contracts() {
         assert!(DEFAULT_PROMPT_RULES
             .iter()
-            .any(|rule| rule.contains("propose_config_change_set")));
+            .any(|rule| rule.contains("propose_admin_config_bootstrap")));
+        assert!(DEFAULT_PROMPT_RULES
+            .iter()
+            .any(|rule| rule.contains("Use propose_config_change_set only")));
         assert!(DEFAULT_PROMPT_RULES
             .iter()
             .any(|rule| rule.contains("PUT /admin/ai-config/prompt_rules")));
         assert!(DEFAULT_PROMPT_RULES
             .iter()
             .any(|rule| rule.contains("do not surface them merely because a topic matches")));
+        assert!(!DEFAULT_PROMPT_RULES
+            .iter()
+            .any(|rule| OBSOLETE_DEFAULT_PROMPT_RULES.contains(rule)));
     }
 
     #[tokio::test]
