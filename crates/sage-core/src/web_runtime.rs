@@ -1229,6 +1229,12 @@ struct AdminConfigProposalTool {
 }
 
 #[derive(Clone)]
+struct AdminConfigBootstrapProposalTool {
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+    proposal: Arc<Mutex<Option<AdminChangeSetResponse>>>,
+}
+
+#[derive(Clone)]
 struct ConversationTraceDeltaSink {
     deltas: Arc<Mutex<Vec<ConversationTraceDeltaResponse>>>,
     sender: Option<mpsc::UnboundedSender<ConversationTraceDeltaResponse>>,
@@ -1342,6 +1348,7 @@ fn tool_trace_title(tool_name: &str) -> String {
         "web_search" => "Web Search",
         "db_query" => "Database Query",
         "propose_config_change_set"
+        | "propose_admin_config_bootstrap"
         | "read_instance_settings"
         | "read_deployment_settings"
         | "read_deployment_readiness"
@@ -1378,7 +1385,10 @@ fn tool_result_trace_delta(
 ) -> ConversationTraceDeltaResponse {
     let status = if result.success {
         "succeeded"
-    } else if tool_name == "db_query" || tool_name == "propose_config_change_set" {
+    } else if tool_name == "db_query"
+        || tool_name == "propose_config_change_set"
+        || tool_name == "propose_admin_config_bootstrap"
+    {
         "guarded"
     } else {
         "failed"
@@ -1728,6 +1738,13 @@ fn build_conversation_tool_registry_with_context(
         }
         registry.register(traced_tool(
             Arc::new(AdminConfigProposalTool {
+                traces: sinks.traces.clone(),
+                proposal: sinks.admin_change_set.clone(),
+            }),
+            &sinks.trace_deltas,
+        ));
+        registry.register(traced_tool(
+            Arc::new(AdminConfigBootstrapProposalTool {
                 traces: sinks.traces.clone(),
                 proposal: sinks.admin_change_set.clone(),
             }),
@@ -2294,6 +2311,394 @@ impl AdminConfigProposalTool {
             reason
         )))
     }
+}
+
+#[async_trait::async_trait]
+impl Tool for AdminConfigBootstrapProposalTool {
+    fn name(&self) -> &str {
+        "propose_admin_config_bootstrap"
+    }
+
+    fn description(&self) -> &str {
+        "Stage a non-mutating typed Admin Config bootstrap proposal for UI Change Confirmation. Use this for guided setup or initial instance setup when the Admin has provided product-level intent such as instance identity, assistant identity, public copy, visual defaults, language, access policy, user types, and behavior rules. This tool builds canonical Admin Config requests deterministically; do not pass raw HTTP method/path/body request objects. The admin must still click Apply before any changes are written."
+    }
+
+    fn args_schema(&self) -> &str {
+        r##"{"summary":"One-sentence review summary","instance_name":"Public instance/product name, for example FreeThem","assistant_name":"Assistant display name, for example Political Prisoner Support Team","public_tagline":"Short public tagline/header copy","public_description":"Public description of who the instance helps and what it does","primary_color":"Primary brand color as #RRGGBB","theme":"Visual theme: light, dark, or system","language":"Default language as a language code or supported language label, for example en or English","access_policy":"Product access policy: open registration/auto approval or manual approval/review required","visual_defaults_json":"Optional JSON object with product visual defaults such as chat_bubble_style, chat_bubble_shadow, surface_style, status_icon_set, typography_preset","user_types_json":"Optional JSON array of user type objects with name, description, icon, and display_order","behavior_rules_json":"Optional JSON array of initial assistant behavior rules as plain strings","forbidden_topics_json":"Optional JSON array of initial forbidden topic rules as plain strings"}"##
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
+        let change_set = match build_admin_config_bootstrap_change_set(args) {
+            Ok(change_set) => change_set,
+            Err(error) => return self.reject(&error),
+        };
+        let summary = change_set
+            .summary
+            .clone()
+            .unwrap_or_else(|| "Admin configuration bootstrap".to_string());
+
+        if let Ok(mut proposal) = self.proposal.lock() {
+            *proposal = Some(change_set);
+        }
+        if let Ok(mut traces) = self.traces.lock() {
+            traces.push(ToolCallInfoResponse {
+                tool_id: "admin-config:propose_admin_config_bootstrap".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: Some("propose_admin_config_bootstrap_success".to_string()),
+                output_summary: Some(format!(
+                    "Prepared bootstrap change set: {}",
+                    truncate_chars(&summary, 160)
+                )),
+                warnings: Vec::new(),
+                guarded: false,
+            });
+        }
+
+        Ok(ToolResult::success(
+            "I prepared these changes for review. Use Apply to confirm.".to_string(),
+        ))
+    }
+}
+
+impl AdminConfigBootstrapProposalTool {
+    fn reject(&self, reason: &str) -> Result<ToolResult> {
+        if let Ok(mut proposal) = self.proposal.lock() {
+            *proposal = None;
+        }
+        if let Ok(mut traces) = self.traces.lock() {
+            traces.push(ToolCallInfoResponse {
+                tool_id: "admin-config:propose_admin_config_bootstrap".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: Some("propose_admin_config_bootstrap_rejected".to_string()),
+                output_summary: Some(format!(
+                    "Invalid bootstrap proposal: {}",
+                    truncate_chars(reason, 160)
+                )),
+                warnings: vec!["invalid_admin_config_bootstrap".to_string()],
+                guarded: true,
+            });
+        }
+        Ok(ToolResult::error(format!(
+            "Invalid Admin Config bootstrap proposal: {}",
+            reason
+        )))
+    }
+}
+
+fn build_admin_config_bootstrap_change_set(
+    args: &HashMap<String, String>,
+) -> std::result::Result<AdminChangeSetResponse, String> {
+    reject_unsupported_bootstrap_args(args)?;
+
+    let summary = optional_trimmed_arg(args, "summary")
+        .unwrap_or_else(|| "Admin configuration bootstrap".to_string());
+    let language = normalize_bootstrap_language(&required_bootstrap_arg(args, "language")?)?;
+    let theme = normalize_bootstrap_theme(&required_bootstrap_arg(args, "theme")?)?;
+    let auto_approve_users =
+        normalize_bootstrap_access_policy(&required_bootstrap_arg(args, "access_policy")?)?;
+
+    let mut settings = serde_json::Map::new();
+    settings.insert(
+        "instance_name".to_string(),
+        Value::String(required_bootstrap_arg(args, "instance_name")?),
+    );
+    settings.insert(
+        "assistant_name".to_string(),
+        Value::String(required_bootstrap_arg(args, "assistant_name")?),
+    );
+    settings.insert(
+        "header_tagline".to_string(),
+        Value::String(required_bootstrap_arg(args, "public_tagline")?),
+    );
+    settings.insert(
+        "description".to_string(),
+        Value::String(required_bootstrap_arg(args, "public_description")?),
+    );
+    settings.insert(
+        "primary_color".to_string(),
+        Value::String(normalize_bootstrap_primary_color(&required_bootstrap_arg(
+            args,
+            "primary_color",
+        )?)?),
+    );
+    settings.insert("default_theme".to_string(), Value::String(theme));
+    settings.insert("default_language".to_string(), Value::String(language));
+    settings.insert(
+        "auto_approve_users".to_string(),
+        Value::Bool(auto_approve_users),
+    );
+
+    append_bootstrap_visual_defaults(args, &mut settings)?;
+
+    let mut requests = vec![AdminChangeSetRequest {
+        method: "PUT".to_string(),
+        path: "/admin/settings".to_string(),
+        body: Some(Value::Object(settings)),
+    }];
+
+    requests.extend(parse_bootstrap_user_type_requests(args)?);
+    if let Some(request) =
+        parse_bootstrap_agent_rules_request(args, "behavior_rules_json", "prompt_rules")?
+    {
+        requests.push(request);
+    }
+    if let Some(request) =
+        parse_bootstrap_agent_rules_request(args, "forbidden_topics_json", "prompt_forbidden")?
+    {
+        requests.push(request);
+    }
+
+    validate_admin_change_set_requests(&requests)?;
+
+    Ok(AdminChangeSetResponse {
+        version: 1,
+        summary: Some(summary),
+        requests,
+    })
+}
+
+fn reject_unsupported_bootstrap_args(
+    args: &HashMap<String, String>,
+) -> std::result::Result<(), String> {
+    for key in args.keys() {
+        if matches!(key.as_str(), "requests_json" | "method" | "path" | "body") {
+            return Err(
+                "propose_admin_config_bootstrap accepts product setup fields, not raw request objects."
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            key.as_str(),
+            "summary"
+                | "instance_name"
+                | "assistant_name"
+                | "public_tagline"
+                | "public_description"
+                | "primary_color"
+                | "theme"
+                | "language"
+                | "access_policy"
+                | "visual_defaults_json"
+                | "user_types_json"
+                | "behavior_rules_json"
+                | "forbidden_topics_json"
+        ) {
+            return Err(format!("Unsupported bootstrap setup field: {}", key));
+        }
+    }
+    Ok(())
+}
+
+fn optional_trimmed_arg(args: &HashMap<String, String>, key: &str) -> Option<String> {
+    args.get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn required_bootstrap_arg(
+    args: &HashMap<String, String>,
+    key: &str,
+) -> std::result::Result<String, String> {
+    optional_trimmed_arg(args, key)
+        .ok_or_else(|| format!("propose_admin_config_bootstrap requires {}.", key))
+}
+
+fn normalize_bootstrap_language(raw: &str) -> std::result::Result<String, String> {
+    let value = Value::String(raw.trim().to_string());
+    normalize_default_language_value(&value)
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .ok_or_else(|| {
+            format!(
+                "language must be a supported language code or label; got {}.",
+                raw.trim()
+            )
+        })
+}
+
+fn normalize_bootstrap_theme(raw: &str) -> std::result::Result<String, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "light" | "light mode" => Ok("light".to_string()),
+        "dark" | "dark mode" => Ok("dark".to_string()),
+        "system" | "system default" | "system theme" | "auto" => Ok("system".to_string()),
+        _ => Err("theme must be light, dark, or system.".to_string()),
+    }
+}
+
+fn normalize_bootstrap_access_policy(raw: &str) -> std::result::Result<bool, String> {
+    match raw
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], " ")
+        .as_str()
+    {
+        "open"
+        | "open registration"
+        | "auto approve"
+        | "auto approval"
+        | "automatic approval"
+        | "approve automatically"
+        | "true"
+        | "yes" => Ok(true),
+        "manual"
+        | "manual approval"
+        | "manual review"
+        | "approval required"
+        | "review required"
+        | "false"
+        | "no" => Ok(false),
+        _ => Err(
+            "access_policy must be open registration/auto approval or manual approval/review required."
+                .to_string(),
+        ),
+    }
+}
+
+fn normalize_bootstrap_primary_color(raw: &str) -> std::result::Result<String, String> {
+    let value = raw.trim();
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() == 6 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Ok(format!("#{}", hex.to_ascii_uppercase()));
+    }
+    Err("primary_color must be a #RRGGBB hex color.".to_string())
+}
+
+fn append_bootstrap_visual_defaults(
+    args: &HashMap<String, String>,
+    settings: &mut serde_json::Map<String, Value>,
+) -> std::result::Result<(), String> {
+    let Some(raw) = optional_trimmed_arg(args, "visual_defaults_json") else {
+        return Ok(());
+    };
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("visual_defaults_json must be a JSON object: {}", error))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "visual_defaults_json must be a JSON object.".to_string())?;
+    for (key, value) in object {
+        if !matches!(
+            key.as_str(),
+            "chat_bubble_style"
+                | "chat_bubble_shadow"
+                | "surface_style"
+                | "status_icon_set"
+                | "typography_preset"
+        ) {
+            return Err(format!("Unsupported visual default field: {}", key));
+        }
+        let Some(value) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Err(format!("{} must be a non-empty string.", key));
+        };
+        settings.insert(key.clone(), Value::String(value.to_string()));
+    }
+    Ok(())
+}
+
+fn parse_bootstrap_user_type_requests(
+    args: &HashMap<String, String>,
+) -> std::result::Result<Vec<AdminChangeSetRequest>, String> {
+    let Some(raw) = optional_trimmed_arg(args, "user_types_json") else {
+        return Ok(Vec::new());
+    };
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("user_types_json must be a JSON array: {}", error))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| "user_types_json must be a JSON array.".to_string())?;
+    let mut requests = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let object = item
+            .as_object()
+            .ok_or_else(|| format!("user_types_json item {} must be an object.", index + 1))?;
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "name" | "description" | "icon" | "display_order"
+            ) {
+                return Err(format!("Unsupported user type field: {}", key));
+            }
+        }
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("user_types_json item {} requires name.", index + 1))?;
+        let mut body = serde_json::Map::new();
+        body.insert("name".to_string(), Value::String(name.to_string()));
+        for key in ["description", "icon"] {
+            if let Some(value) = object
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                body.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+        if let Some(value) = object.get("display_order") {
+            let order = value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+                .ok_or_else(|| {
+                    format!(
+                        "user_types_json item {} display_order must be an integer.",
+                        index + 1
+                    )
+                })?;
+            body.insert("display_order".to_string(), json!(order));
+        }
+        requests.push(AdminChangeSetRequest {
+            method: "POST".to_string(),
+            path: "/admin/user-types".to_string(),
+            body: Some(Value::Object(body)),
+        });
+    }
+    Ok(requests)
+}
+
+fn parse_bootstrap_agent_rules_request(
+    args: &HashMap<String, String>,
+    arg_name: &str,
+    ai_config_key: &str,
+) -> std::result::Result<Option<AdminChangeSetRequest>, String> {
+    let Some(raw) = optional_trimmed_arg(args, arg_name) else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("{} must be a JSON array of strings: {}", arg_name, error))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{} must be a JSON array of strings.", arg_name))?;
+    let mut strings = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let item = item
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "{} item {} must be a non-empty string.",
+                    arg_name,
+                    index + 1
+                )
+            })?;
+        strings.push(item.to_string());
+    }
+    if strings.is_empty() {
+        return Ok(None);
+    }
+    let encoded = serde_json::to_string(&strings)
+        .map_err(|error| format!("{} could not be encoded: {}", arg_name, error))?;
+    Ok(Some(AdminChangeSetRequest {
+        method: "PUT".to_string(),
+        path: format!("/admin/ai-config/{}", ai_config_key),
+        body: Some(json!({ "value": encoded })),
+    }))
 }
 
 fn parse_admin_change_set_requests(
@@ -3105,6 +3510,19 @@ fn admin_config_tool_memory_content(executed: &ExecutedTool) -> Option<String> {
             truncate_chars(summary, 240)
         ));
     }
+    if executed.tool_call.name == "propose_admin_config_bootstrap" {
+        let summary = executed
+            .tool_call
+            .args
+            .get("summary")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Admin configuration bootstrap");
+        return Some(format!(
+            "Admin Config tool completed: propose_admin_config_bootstrap. Prepared bootstrap change set: {}",
+            truncate_chars(summary, 240)
+        ));
+    }
 
     Some(format!(
         "Admin Config tool completed: {}.",
@@ -3123,6 +3541,7 @@ fn is_admin_config_tool_name(name: &str) -> bool {
             | "read_document_access"
             | "read_onboarding_status"
             | "propose_config_change_set"
+            | "propose_admin_config_bootstrap"
     )
 }
 
@@ -5711,7 +6130,10 @@ async fn persist_successful_admin_config_tools(
 
 fn should_include_step_messages(result: &StepResult) -> bool {
     !result.executed_tools.iter().any(|executed| {
-        executed.tool_call.name == "propose_config_change_set" && !executed.result.success
+        matches!(
+            executed.tool_call.name.as_str(),
+            "propose_config_change_set" | "propose_admin_config_bootstrap"
+        ) && !executed.result.success
     })
 }
 
@@ -7457,6 +7879,31 @@ mod tests {
         assert!(content.contains("Add a legal-disclaimer behavior rule"));
         assert!(!content.contains("requests_json"));
         assert!(!content.contains("secret raw body"));
+
+        let executed = crate::sage_agent::ExecutedTool {
+            tool_call: crate::sage_agent::ToolCall {
+                name: "propose_admin_config_bootstrap".to_string(),
+                args: HashMap::from([
+                    (
+                        "summary".to_string(),
+                        "Bootstrap FreeThem guided setup".to_string(),
+                    ),
+                    ("instance_name".to_string(), "FreeThem".to_string()),
+                    ("primary_color".to_string(), "#1E40AF".to_string()),
+                ]),
+            },
+            result: ToolResult::success(
+                "I prepared these changes for review. Use Apply to confirm.",
+            ),
+        };
+
+        let content = admin_config_tool_memory_content(&executed)
+            .expect("successful typed Admin Config proposal should be persisted");
+
+        assert!(content.contains("propose_admin_config_bootstrap"));
+        assert!(content.contains("Bootstrap FreeThem guided setup"));
+        assert!(!content.contains("instance_name"));
+        assert!(!content.contains("#1E40AF"));
     }
 
     #[test]
@@ -7982,6 +8429,281 @@ mod tests {
     }
 
     #[test]
+    fn admin_config_bootstrap_builder_creates_canonical_change_set() {
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Bootstrap FreeThem guided setup".to_string(),
+            ),
+            ("instance_name".to_string(), "FreeThem".to_string()),
+            (
+                "assistant_name".to_string(),
+                "Political Prisoner Support Team".to_string(),
+            ),
+            (
+                "public_tagline".to_string(),
+                "Political prisoner support team.".to_string(),
+            ),
+            (
+                "public_description".to_string(),
+                "Support for former political prisoners and their families.".to_string(),
+            ),
+            ("primary_color".to_string(), "#1E40AF".to_string()),
+            ("theme".to_string(), "Dark mode".to_string()),
+            ("language".to_string(), "English".to_string()),
+            ("access_policy".to_string(), "manual approval".to_string()),
+            (
+                "visual_defaults_json".to_string(),
+                json!({
+                    "chat_bubble_style": "solid",
+                    "chat_bubble_shadow": "soft",
+                    "surface_style": "panel",
+                    "status_icon_set": "classic",
+                    "typography_preset": "humanist"
+                })
+                .to_string(),
+            ),
+            (
+                "user_types_json".to_string(),
+                json!([
+                    {
+                        "name": "Current Support",
+                        "description": "Family and friends of current political prisoners",
+                        "display_order": 1
+                    },
+                    {
+                        "name": "Post-Release Support",
+                        "description": "Former political prisoners seeking post-release support",
+                        "icon": "liberty",
+                        "display_order": 2
+                    }
+                ])
+                .to_string(),
+            ),
+            (
+                "behavior_rules_json".to_string(),
+                json!(["Ask users where they are from before giving location-specific guidance."])
+                    .to_string(),
+            ),
+            (
+                "forbidden_topics_json".to_string(),
+                json!(["Do not provide legal advice."]).to_string(),
+            ),
+        ]);
+
+        let change_set = build_admin_config_bootstrap_change_set(&args)
+            .expect("complete bootstrap setup intent should build");
+
+        assert_eq!(change_set.version, 1);
+        assert_eq!(
+            change_set.summary.as_deref(),
+            Some("Bootstrap FreeThem guided setup")
+        );
+        assert_eq!(change_set.requests.len(), 5);
+        assert_eq!(change_set.requests[0].method, "PUT");
+        assert_eq!(change_set.requests[0].path, "/admin/settings");
+        let settings = change_set.requests[0]
+            .body
+            .as_ref()
+            .expect("settings request should include body");
+        assert_eq!(settings["instance_name"], "FreeThem");
+        assert_eq!(
+            settings["assistant_name"],
+            "Political Prisoner Support Team"
+        );
+        assert_eq!(
+            settings["header_tagline"],
+            "Political prisoner support team."
+        );
+        assert_eq!(settings["default_language"], "en");
+        assert_eq!(settings["default_theme"], "dark");
+        assert_eq!(settings["auto_approve_users"], false);
+        assert_eq!(settings["chat_bubble_shadow"], "soft");
+        assert_eq!(change_set.requests[1].path, "/admin/user-types");
+        assert_eq!(change_set.requests[2].path, "/admin/user-types");
+        assert_eq!(
+            change_set.requests[1].body.as_ref().unwrap()["display_order"],
+            1
+        );
+        assert_eq!(change_set.requests[3].path, "/admin/ai-config/prompt_rules");
+        assert_eq!(
+            change_set.requests[3].body,
+            Some(json!({
+                "value": json!(["Ask users where they are from before giving location-specific guidance."]).to_string()
+            }))
+        );
+        assert_eq!(
+            change_set.requests[4].path,
+            "/admin/ai-config/prompt_forbidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_config_bootstrap_tool_stages_change_set_and_records_admin_trace() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigBootstrapProposalTool {
+            traces: traces.clone(),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Bootstrap FreeThem guided setup".to_string(),
+            ),
+            ("instance_name".to_string(), "FreeThem".to_string()),
+            (
+                "assistant_name".to_string(),
+                "Political Prisoner Support Team".to_string(),
+            ),
+            (
+                "public_tagline".to_string(),
+                "Political prisoner support team.".to_string(),
+            ),
+            (
+                "public_description".to_string(),
+                "Support for former political prisoners and their families.".to_string(),
+            ),
+            ("primary_color".to_string(), "#1E40AF".to_string()),
+            ("theme".to_string(), "dark".to_string()),
+            ("language".to_string(), "en".to_string()),
+            ("access_policy".to_string(), "open registration".to_string()),
+            (
+                "user_types_json".to_string(),
+                json!([{ "name": "Current Support" }]).to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("bootstrap proposal tool should execute");
+
+        assert!(result.success);
+        assert_eq!(
+            result.output,
+            "I prepared these changes for review. Use Apply to confirm."
+        );
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("typed bootstrap proposal should be staged");
+        assert_eq!(staged.requests[0].path, "/admin/settings");
+        assert_eq!(staged.requests[1].path, "/admin/user-types");
+        let traces = traces.lock().expect("trace sink should lock");
+        assert_eq!(
+            traces[0].tool_id,
+            "admin-config:propose_admin_config_bootstrap"
+        );
+        assert_eq!(traces[0].tool_name, "Admin Config");
+        assert_eq!(
+            traces[0].query.as_deref(),
+            Some("propose_admin_config_bootstrap_success")
+        );
+        assert_eq!(
+            traces[0].output_summary.as_deref(),
+            Some("Prepared bootstrap change set: Bootstrap FreeThem guided setup")
+        );
+        assert!(!traces[0]
+            .output_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("/admin/settings"));
+    }
+
+    #[test]
+    fn admin_config_bootstrap_builder_rejects_incomplete_input() {
+        let args = HashMap::from([
+            ("instance_name".to_string(), "FreeThem".to_string()),
+            ("assistant_name".to_string(), "Support Team".to_string()),
+            ("public_tagline".to_string(), "Support team.".to_string()),
+            (
+                "public_description".to_string(),
+                "Support for families.".to_string(),
+            ),
+            ("primary_color".to_string(), "#1E40AF".to_string()),
+            ("theme".to_string(), "dark".to_string()),
+            ("language".to_string(), "en".to_string()),
+        ]);
+
+        let error = build_admin_config_bootstrap_change_set(&args)
+            .expect_err("missing access_policy should be actionable");
+
+        assert!(error.contains("access_policy"));
+    }
+
+    #[test]
+    fn admin_config_bootstrap_builder_rejects_invalid_theme() {
+        let args = complete_bootstrap_tool_args_with("theme", "neon");
+
+        let error = build_admin_config_bootstrap_change_set(&args)
+            .expect_err("unsupported theme should fail safely");
+
+        assert!(error.contains("theme must be light, dark, or system"));
+    }
+
+    #[tokio::test]
+    async fn admin_config_bootstrap_tool_rejects_raw_request_arguments() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(Some(AdminChangeSetResponse {
+            version: 1,
+            summary: Some("Old proposal".to_string()),
+            requests: vec![AdminChangeSetRequest {
+                method: "PUT".to_string(),
+                path: "/admin/settings".to_string(),
+                body: Some(json!({ "instance_name": "Old" })),
+            }],
+        })));
+        let tool = AdminConfigBootstrapProposalTool {
+            traces: traces.clone(),
+            proposal: proposal.clone(),
+        };
+        let mut args = complete_bootstrap_tool_args();
+        args.insert(
+            "requests_json".to_string(),
+            json!([{ "method": "PUT", "path": "/admin/settings" }]).to_string(),
+        );
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("raw request rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("product setup fields, not raw request objects"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+        let traces = traces.lock().expect("trace sink should lock");
+        assert!(traces[0].guarded);
+        assert_eq!(
+            traces[0].query.as_deref(),
+            Some("propose_admin_config_bootstrap_rejected")
+        );
+    }
+
+    #[test]
+    fn typed_bootstrap_tool_trace_is_admin_config_without_raw_values() {
+        let args = complete_bootstrap_tool_args();
+
+        let delta = tool_call_trace_delta("propose_admin_config_bootstrap", &args);
+
+        assert_eq!(delta.title.as_deref(), Some("Admin Config"));
+        assert_eq!(
+            delta.tool_name.as_deref(),
+            Some("propose_admin_config_bootstrap")
+        );
+        assert_eq!(delta.metadata["args"].as_array().unwrap().len(), args.len());
+        assert!(!delta.metadata.to_string().contains("FreeThem"));
+    }
+
+    #[test]
     fn failed_admin_config_proposal_step_messages_are_suppressed() {
         let result = StepResult {
             messages: vec!["I prepared these changes for review. Use Apply to confirm.".to_string()],
@@ -8019,6 +8741,38 @@ mod tests {
         };
 
         assert!(should_include_step_messages(&result));
+    }
+
+    fn complete_bootstrap_tool_args() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "summary".to_string(),
+                "Bootstrap FreeThem guided setup".to_string(),
+            ),
+            ("instance_name".to_string(), "FreeThem".to_string()),
+            (
+                "assistant_name".to_string(),
+                "Political Prisoner Support Team".to_string(),
+            ),
+            (
+                "public_tagline".to_string(),
+                "Political prisoner support team.".to_string(),
+            ),
+            (
+                "public_description".to_string(),
+                "Support for former political prisoners and their families.".to_string(),
+            ),
+            ("primary_color".to_string(), "#1E40AF".to_string()),
+            ("theme".to_string(), "dark".to_string()),
+            ("language".to_string(), "en".to_string()),
+            ("access_policy".to_string(), "open registration".to_string()),
+        ])
+    }
+
+    fn complete_bootstrap_tool_args_with(key: &str, value: &str) -> HashMap<String, String> {
+        let mut args = complete_bootstrap_tool_args();
+        args.insert(key.to_string(), value.to_string());
+        args
     }
 
     #[tokio::test]
@@ -8552,6 +9306,7 @@ mod tests {
         assert!(registry.has("read_document_access"));
         assert!(registry.has("read_onboarding_status"));
         assert!(registry.has("propose_config_change_set"));
+        assert!(registry.has("propose_admin_config_bootstrap"));
         assert!(registry.has("done"));
 
         let user = InternalAuthContext {
@@ -8580,6 +9335,7 @@ mod tests {
         assert!(!user_registry.has("db_query"));
         assert!(!user_registry.has("read_instance_settings"));
         assert!(!user_registry.has("propose_config_change_set"));
+        assert!(!user_registry.has("propose_admin_config_bootstrap"));
 
         let disabled_request = ChatRequest {
             tools: Vec::new(),
@@ -8600,6 +9356,7 @@ mod tests {
         assert!(!disabled_registry.has("db_query"));
         assert!(!disabled_registry.has("read_instance_settings"));
         assert!(!disabled_registry.has("propose_config_change_set"));
+        assert!(!disabled_registry.has("propose_admin_config_bootstrap"));
         assert!(disabled_registry.has("done"));
     }
 
