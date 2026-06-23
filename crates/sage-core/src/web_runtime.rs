@@ -50,6 +50,14 @@ use crate::schema::{
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
 const CURATED_RESOURCES_TOOL_SET_ID: &str = "curated-resources";
 const KNOWLEDGE_SEARCH_TOOL_SET_ID: &str = "knowledge-search";
+const DEFAULT_PROMPT_RULES: [&str; 6] = [
+    "For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.",
+    "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.",
+    "Admin Config proposals must use canonical paths and keys: POST /admin/user-types, PUT /admin/settings, PUT /admin/ai-config/prompt_rules, header_tagline, default_language codes such as en. If propose_config_change_set succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If propose_config_change_set rejects a supported change, correct the request and call the tool again instead of telling the admin to configure it manually.",
+    "Use curated resources as priority admin-vetted referrals when the user needs real-world help, contacts, or organizations; do not surface them merely because a topic matches if the right next step is ordinary explanation, triage, or a clarifying question.",
+    "NEVER invent sources, organization names, or contact information",
+    "If asked about topics outside your knowledge base, acknowledge limitations",
+];
 const USER_SESSION_SALT: &str = "session";
 const USER_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const ADMIN_SESSION_SALT: &str = "admin-session";
@@ -4585,6 +4593,8 @@ fn build_cors_layer(config: &EnclaveWebConfig) -> Result<CorsLayer> {
 }
 
 fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
+    let prompt_rules =
+        serde_json::to_string(&DEFAULT_PROMPT_RULES).expect("default prompt rules serialize");
     let defaults = [
         (
             "prompt_tone",
@@ -4595,7 +4605,7 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
         ),
         (
             "prompt_rules",
-            "[\"For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.\", \"For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.\", \"Admin Config proposals must use canonical paths and keys: POST /admin/user-types, PUT /admin/settings, header_tagline, default_language codes such as en. If propose_config_change_set succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If propose_config_change_set rejects a supported change, correct the request and call the tool again instead of telling the admin to configure it manually.\", \"NEVER invent sources, organization names, or contact information\", \"If asked about topics outside your knowledge base, acknowledge limitations\"]",
+            prompt_rules.as_str(),
             "json",
             "prompt_section",
             Some("Array of behavioral rules"),
@@ -8254,6 +8264,19 @@ mod tests {
             rules[2],
             "Admin Config proposals must use canonical paths and keys."
         );
+    }
+
+    #[test]
+    fn default_prompt_rules_reflect_current_tool_contracts() {
+        assert!(DEFAULT_PROMPT_RULES
+            .iter()
+            .any(|rule| rule.contains("propose_config_change_set")));
+        assert!(DEFAULT_PROMPT_RULES
+            .iter()
+            .any(|rule| rule.contains("PUT /admin/ai-config/prompt_rules")));
+        assert!(DEFAULT_PROMPT_RULES
+            .iter()
+            .any(|rule| rule.contains("do not surface them merely because a topic matches")));
     }
 
     #[tokio::test]
