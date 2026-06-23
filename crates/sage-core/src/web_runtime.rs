@@ -27,7 +27,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -52,15 +52,16 @@ const CURATED_RESOURCES_TOOL_SET_ID: &str = "curated-resources";
 const KNOWLEDGE_SEARCH_TOOL_SET_ID: &str = "knowledge-search";
 const DEFAULT_PROMPT_RULES: [&str; 6] = [
     "For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.",
-    "For Admin Conversation guided setup or bootstrap write intent, call propose_admin_config_bootstrap instead of hand-authoring requests_json for instance identity, public copy, visual defaults, access policy, user types, onboarding questions, or behavior rules; confirmed Apply remains an admin UI action.",
+    "For Admin Conversation guided setup or bootstrap write intent, call propose_admin_config_bootstrap directly with empty args or a short summary instead of calling read tools first, copying setup answers, hand-authoring requests_json, or decomposing every field yourself; confirmed Apply remains an admin UI action.",
     "Use propose_config_change_set only for supported Admin Config writes that do not yet have a typed proposal Tool. Generic change sets must use canonical paths and keys: POST /admin/user-types, POST /admin/user-fields, PUT /admin/settings, PUT /admin/ai-config/prompt_rules, header_tagline, default_language codes such as en. If a proposal Tool succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If a proposal Tool rejects a supported change, correct the request and call the best matching proposal Tool again instead of telling the admin to configure it manually.",
     "Use curated resources as priority admin-vetted referrals when the user needs real-world help, contacts, or organizations; do not surface them merely because a topic matches if the right next step is ordinary explanation, triage, or a clarifying question.",
     "NEVER invent sources, organization names, or contact information",
     "If asked about topics outside your knowledge base, acknowledge limitations",
 ];
-const OBSOLETE_DEFAULT_PROMPT_RULES: [&str; 2] = [
+const OBSOLETE_DEFAULT_PROMPT_RULES: [&str; 3] = [
     "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.",
     "Admin Config proposals must use canonical paths and keys: POST /admin/user-types, PUT /admin/settings, PUT /admin/ai-config/prompt_rules, header_tagline, default_language codes such as en. If propose_config_change_set succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If propose_config_change_set rejects a supported change, correct the request and call the tool again instead of telling the admin to configure it manually.",
+    "For Admin Conversation guided setup or bootstrap write intent, call propose_admin_config_bootstrap directly with setup_notes copied from the Admin's guided answers instead of calling read tools first, hand-authoring requests_json, or decomposing every field yourself; confirmed Apply remains an admin UI action.",
 ];
 const USER_SESSION_SALT: &str = "session";
 const USER_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
@@ -1236,6 +1237,7 @@ struct AdminConfigProposalTool {
 struct AdminConfigBootstrapProposalTool {
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
     proposal: Arc<Mutex<Option<AdminChangeSetResponse>>>,
+    setup_notes_fallback: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1751,6 +1753,7 @@ fn build_conversation_tool_registry_with_context(
             Arc::new(AdminConfigBootstrapProposalTool {
                 traces: sinks.traces.clone(),
                 proposal: sinks.admin_change_set.clone(),
+                setup_notes_fallback: Some(request.message.clone()),
             }),
             &sinks.trace_deltas,
         ));
@@ -2237,11 +2240,11 @@ impl Tool for AdminConfigProposalTool {
     }
 
     fn description(&self) -> &str {
-        "Stage a non-mutating Admin Config change set for UI Change Confirmation. Use this for admin write intent instead of putting raw JSON in messages. Canonical paths include PUT /admin/settings for Instance Settings, PUT /admin/ai-config/prompt_rules for Agent Settings behavior rules, PUT /admin/ai-config/{key} for other Agent Settings, and POST /admin/user-types. Use header_tagline, default_language codes like en, default_theme light|dark|system, and auto_approve_users for Instance Settings. Behavior rules use /admin/ai-config/prompt_rules with body.value set to a JSON string array, for example {\"value\":\"[\\\"Ask users where they are from before giving location-specific guidance.\\\"]\"}. The admin must still click Apply before any changes are written. If this tool succeeds, keep the final answer short: \"I prepared these changes for review. Use Apply to confirm.\" If a proposal is rejected, correct the request and call this tool again; do not tell the admin to edit supported settings manually."
+        "Stage a non-mutating Admin Config change set for UI Change Confirmation. Use this only for supported Admin Config writes that do not have a typed proposal tool; use propose_admin_config_bootstrap for guided setup/bootstrap. Canonical paths include PUT /admin/settings for Instance Settings, PUT /admin/ai-config/prompt_rules for Agent Settings behavior rules, PUT /admin/ai-config/{key} for other Agent Settings, POST /admin/user-types, and POST /admin/user-fields. Use header_tagline, default_language codes like en, default_theme light|dark|system, and auto_approve_users for Instance Settings. Behavior rules use /admin/ai-config/prompt_rules with body.value set to a JSON string array. The admin must still click Apply before any changes are written. If this tool succeeds, keep the final answer short: \"I prepared these changes for review. Use Apply to confirm.\" If a proposal is rejected, correct the request and call this tool again; do not tell the admin to edit supported settings manually."
     }
 
     fn args_schema(&self) -> &str {
-        r##"{"summary": "One-sentence summary of the proposed configuration changes", "requests_json": "JSON array of requests. Guided bootstrap example: [{\"method\":\"PUT\",\"path\":\"/admin/settings\",\"body\":{\"instance_name\":\"FreeThem\",\"assistant_name\":\"Political Prisoner Support Team\",\"header_tagline\":\"Political prisoner support team.\",\"description\":\"...\",\"primary_color\":\"#1E40AF\",\"default_theme\":\"dark\",\"default_language\":\"en\",\"auto_approve_users\":true}},{\"method\":\"POST\",\"path\":\"/admin/user-types\",\"body\":{\"name\":\"Current Support\",\"description\":\"Family and friends of currently imprisoned political prisoners\"}}]. Agent Settings behavior-rule example: [{\"method\":\"PUT\",\"path\":\"/admin/ai-config/prompt_rules\",\"body\":{\"value\":\"[\\\"Ask users where they are from before giving location-specific guidance.\\\"]\"}}]. Use /admin/user-types with hyphen, never /admin/user_types. Use /admin/ai-config/prompt_rules for Sage behavior rules; never put prompt_rules in /admin/settings."}"##
+        r##"{"summary":"One-sentence summary of the proposed configuration changes","requests_json":"JSON array of canonical Admin Config requests. Examples: [{\"method\":\"PUT\",\"path\":\"/admin/settings\",\"body\":{\"header_tagline\":\"Support for political prisoners\",\"default_language\":\"en\"}}] or [{\"method\":\"PUT\",\"path\":\"/admin/ai-config/prompt_rules\",\"body\":{\"value\":\"[\\\"Ask users where they are from before giving location-specific guidance.\\\"]\"}}]. Use /admin/user-types with hyphen, never /admin/user_types. Use /admin/ai-config/prompt_rules for Sage behavior rules; never put prompt_rules in /admin/settings. Do not use this for guided bootstrap when propose_admin_config_bootstrap fits."}"##
     }
 
     async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
@@ -2324,15 +2327,31 @@ impl Tool for AdminConfigBootstrapProposalTool {
     }
 
     fn description(&self) -> &str {
-        "Stage a non-mutating typed Admin Config bootstrap proposal for UI Change Confirmation. Use this for guided setup or initial instance setup when the Admin has provided product-level intent such as instance identity, assistant identity, public copy, visual defaults, language, access policy, user types, and behavior rules. This tool builds canonical Admin Config requests deterministically; do not pass raw HTTP method/path/body request objects. The admin must still click Apply before any changes are written."
+        "Stage a non-mutating Admin Config bootstrap proposal for UI Change Confirmation. Use this directly for guided setup or initial instance setup. Call with empty args or a short summary; Sage uses the current Admin message as setup notes and builds canonical Admin Config requests deterministically. Do not call read tools first for guided bootstrap, do not copy setup answers into args, do not decompose setup answers into separate fields, and do not pass raw HTTP method/path/body request objects. The admin must still click Apply before any changes are written."
     }
 
     fn args_schema(&self) -> &str {
-        r##"{"summary":"One-sentence review summary","instance_name":"Public instance/product name, for example FreeThem","assistant_name":"Assistant display name, for example Political Prisoner Support Team","public_tagline":"Short public tagline/header copy","public_description":"Public description of who the instance helps and what it does","primary_color":"Primary brand color as #RRGGBB","theme":"Visual theme: light, dark, or system","language":"Default language as a language code or supported language label, for example en or English","access_policy":"Product access policy: open registration/auto approval or manual approval/review required","visual_chat_bubble_style":"Optional chat bubble style","visual_chat_bubble_shadow":"Optional chat bubble shadow","visual_surface_style":"Optional surface style","visual_status_icon_set":"Optional status icon set","visual_typography_preset":"Optional typography preset","user_type_1_name":"Optional user type 1 name; repeat user_type_2_name through user_type_5_name as needed","user_type_1_description":"Optional user type 1 description","user_type_1_icon":"Optional user type 1 icon","user_type_1_display_order":"Optional integer display order","onboarding_question_1_text":"Optional onboarding question 1 text; repeat onboarding_question_2_text through onboarding_question_10_text as needed","onboarding_question_1_field_type":"Field type: text, textarea, number, boolean, email, url, select, multi_select, or date","onboarding_question_1_required":"Optional boolean","onboarding_question_1_user_type":"Optional global, user_type_1, numeric id, or @type:<slug> created by this proposal","onboarding_question_1_placeholder":"Optional placeholder copy","onboarding_question_1_options":"Optional select options separated by |","onboarding_question_1_encryption_enabled":"Optional boolean","onboarding_question_1_include_in_chat":"Optional boolean","behavior_rule_1":"Optional assistant behavior rule; repeat behavior_rule_2 through behavior_rule_8 as needed","forbidden_topic_1":"Optional forbidden topic rule; repeat forbidden_topic_2 through forbidden_topic_8 as needed"}"##
+        r##"{"summary":"Optional one-sentence review summary"}"##
     }
 
     async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let change_set = match build_admin_config_bootstrap_change_set(args) {
+        let mut effective_args = args.clone();
+        let has_typed_bootstrap_args = effective_args
+            .keys()
+            .any(|key| key != "summary" && key != "setup_notes");
+        if !has_typed_bootstrap_args
+            && optional_trimmed_arg(&effective_args, "setup_notes").is_none()
+        {
+            if let Some(setup_notes) = self
+                .setup_notes_fallback
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                effective_args.insert("setup_notes".to_string(), setup_notes.to_string());
+            }
+        }
+        let change_set = match build_admin_config_bootstrap_change_set(&effective_args) {
             Ok(change_set) => change_set,
             Err(error) => return self.reject(&error),
         };
@@ -2393,6 +2412,8 @@ fn build_admin_config_bootstrap_change_set(
     args: &HashMap<String, String>,
 ) -> std::result::Result<AdminChangeSetResponse, String> {
     reject_unsupported_bootstrap_args(args)?;
+    let expanded_args = bootstrap_args_with_setup_notes(args)?;
+    let args = &expanded_args;
 
     let summary = optional_trimmed_arg(args, "summary")
         .unwrap_or_else(|| "Admin configuration bootstrap".to_string());
@@ -2498,6 +2519,7 @@ fn is_supported_bootstrap_arg(key: &str) -> bool {
     matches!(
         key,
         "summary"
+            | "setup_notes"
             | "instance_name"
             | "assistant_name"
             | "public_tagline"
@@ -2592,8 +2614,8 @@ fn normalize_bootstrap_language(raw: &str) -> std::result::Result<String, String
 
 fn normalize_bootstrap_theme(raw: &str) -> std::result::Result<String, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "light" | "light mode" => Ok("light".to_string()),
-        "dark" | "dark mode" => Ok("dark".to_string()),
+        "light" | "light mode" | "light theme" => Ok("light".to_string()),
+        "dark" | "dark mode" | "dark theme" => Ok("dark".to_string()),
         "system" | "system default" | "system theme" | "auto" => Ok("system".to_string()),
         _ => Err("theme must be light, dark, or system.".to_string()),
     }
@@ -2676,6 +2698,337 @@ fn append_bootstrap_visual_defaults(
         }
     }
     Ok(())
+}
+
+fn bootstrap_args_with_setup_notes(
+    args: &HashMap<String, String>,
+) -> std::result::Result<HashMap<String, String>, String> {
+    let mut expanded = if let Some(notes) = optional_trimmed_arg(args, "setup_notes") {
+        parse_bootstrap_setup_notes(&notes)?
+    } else {
+        HashMap::new()
+    };
+    for (key, value) in args {
+        if key != "setup_notes" {
+            expanded.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(expanded)
+}
+
+fn parse_bootstrap_setup_notes(raw: &str) -> std::result::Result<HashMap<String, String>, String> {
+    let answers = parse_numbered_setup_answers(raw);
+    for required in 1..=7 {
+        if !answers.contains_key(&required) {
+            return Err(format!(
+                "setup_notes must include numbered setup answer {}.",
+                required
+            ));
+        }
+    }
+
+    let mut args = HashMap::new();
+    let instance_name = setup_scalar_answer(&answers, 1)?;
+    let public_description = setup_answer(&answers, 2)?;
+    args.insert("instance_name".to_string(), instance_name.clone());
+    args.insert("public_description".to_string(), public_description.clone());
+    args.insert(
+        "assistant_name".to_string(),
+        infer_setup_assistant_name(&setup_scalar_answer(&answers, 3)?, &public_description),
+    );
+    args.insert(
+        "primary_color".to_string(),
+        infer_setup_primary_color(&setup_scalar_answer(&answers, 4)?),
+    );
+    args.insert("theme".to_string(), setup_scalar_answer(&answers, 5)?);
+    args.insert("language".to_string(), setup_scalar_answer(&answers, 6)?);
+    args.insert(
+        "public_tagline".to_string(),
+        setup_scalar_answer(&answers, 7)?,
+    );
+
+    if let Some(answer) = answers.get(&8) {
+        args.insert("access_policy".to_string(), answer.clone());
+        for (index, user_type) in infer_setup_user_types(answer)
+            .into_iter()
+            .take(BOOTSTRAP_MAX_USER_TYPES)
+            .enumerate()
+        {
+            let n = index + 1;
+            args.insert(format!("user_type_{}_name", n), user_type.name);
+            args.insert(
+                format!("user_type_{}_description", n),
+                user_type.description,
+            );
+            args.insert(format!("user_type_{}_display_order", n), n.to_string());
+        }
+    }
+
+    if let Some(answer) = answers.get(&9) {
+        for (index, question) in infer_setup_onboarding_questions(answer)
+            .into_iter()
+            .take(BOOTSTRAP_MAX_ONBOARDING_QUESTIONS)
+            .enumerate()
+        {
+            let n = index + 1;
+            args.insert(format!("onboarding_question_{}_text", n), question.text);
+            args.insert(
+                format!("onboarding_question_{}_field_type", n),
+                question.field_type,
+            );
+            args.insert(
+                format!("onboarding_question_{}_display_order", n),
+                n.to_string(),
+            );
+            args.insert(
+                format!("onboarding_question_{}_required", n),
+                question.required.to_string(),
+            );
+            args.insert(
+                format!("onboarding_question_{}_include_in_chat", n),
+                question.include_in_chat.to_string(),
+            );
+        }
+    }
+
+    if let Some(answer) = answers.get(&10) {
+        args.insert(
+            "behavior_rule_1".to_string(),
+            infer_setup_behavior_rule(answer),
+        );
+    }
+
+    args.entry("summary".to_string())
+        .or_insert_with(|| format!("Bootstrap {} guided setup", instance_name.trim()));
+    Ok(args)
+}
+
+fn parse_numbered_setup_answers(raw: &str) -> BTreeMap<usize, String> {
+    let mut answers = BTreeMap::new();
+    let mut current_index: Option<usize> = None;
+    let mut current = String::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((index, answer)) = parse_numbered_setup_line(trimmed) {
+            if let Some(previous_index) = current_index.take() {
+                let value = current.trim();
+                if !value.is_empty() {
+                    answers.insert(previous_index, value.to_string());
+                }
+            }
+            current_index = Some(index);
+            current.clear();
+            current.push_str(answer.trim());
+        } else if current_index.is_some() {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(trimmed);
+        }
+    }
+    if let Some(previous_index) = current_index {
+        let value = current.trim();
+        if !value.is_empty() {
+            answers.insert(previous_index, value.to_string());
+        }
+    }
+    answers
+}
+
+fn parse_numbered_setup_line(line: &str) -> Option<(usize, &str)> {
+    let digit_end = line
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .last()
+        .map(|(index, ch)| index + ch.len_utf8())?;
+    let (digits, rest) = line.split_at(digit_end);
+    let rest = rest.trim_start();
+    let answer = rest
+        .strip_prefix('.')
+        .or_else(|| rest.strip_prefix(')'))?
+        .trim_start();
+    let index = digits.parse().ok()?;
+    Some((index, answer))
+}
+
+fn setup_answer(
+    answers: &BTreeMap<usize, String>,
+    index: usize,
+) -> std::result::Result<String, String> {
+    answers
+        .get(&index)
+        .map(|answer| answer.trim())
+        .filter(|answer| !answer.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("setup_notes must include numbered setup answer {}.", index))
+}
+
+fn setup_scalar_answer(
+    answers: &BTreeMap<usize, String>,
+    index: usize,
+) -> std::result::Result<String, String> {
+    Ok(setup_answer(answers, index)?
+        .trim_end_matches(|ch: char| ch == '.' || ch == ';')
+        .trim()
+        .to_string())
+}
+
+fn infer_setup_assistant_name(raw: &str, public_description: &str) -> String {
+    let normalized = raw.to_ascii_lowercase();
+    if !(normalized.contains("choose")
+        || normalized.contains("pick")
+        || normalized.contains("select")
+        || normalized.contains("simple assistant name"))
+    {
+        return raw.trim().to_string();
+    }
+    if public_description
+        .to_ascii_lowercase()
+        .contains("political prisoners support team")
+    {
+        return "Support Team".to_string();
+    }
+    "Support Team".to_string()
+}
+
+fn infer_setup_primary_color(raw: &str) -> String {
+    for token in raw.split_whitespace() {
+        let value = token.trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';');
+        if normalize_bootstrap_primary_color(value).is_ok() {
+            return value.to_string();
+        }
+    }
+    if raw.to_ascii_lowercase().contains("red") {
+        return "#DC2626".to_string();
+    }
+    "#1E40AF".to_string()
+}
+
+#[derive(Clone, Debug)]
+struct SetupUserType {
+    name: String,
+    description: String,
+}
+
+fn infer_setup_user_types(raw: &str) -> Vec<SetupUserType> {
+    let Some(raw_types) = split_after_ascii_case_insensitive(raw, "user types:")
+        .or_else(|| split_after_ascii_case_insensitive(raw, "user types -"))
+        .or_else(|| split_after_ascii_case_insensitive(raw, "user types"))
+    else {
+        return Vec::new();
+    };
+    raw_types
+        .replace(", and ", "|")
+        .replace(" and former ", "|former ")
+        .split('|')
+        .map(|item| {
+            item.trim()
+                .trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';')
+        })
+        .filter(|item| !item.is_empty())
+        .map(|description| SetupUserType {
+            name: title_case_setup_phrase(description),
+            description: capitalize_setup_sentence(description),
+        })
+        .collect()
+}
+
+fn split_after_ascii_case_insensitive<'a>(raw: &'a str, needle: &str) -> Option<&'a str> {
+    let index = raw
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())?;
+    Some(&raw[index + needle.len()..])
+}
+
+#[derive(Clone, Debug)]
+struct SetupOnboardingQuestion {
+    text: String,
+    field_type: String,
+    required: bool,
+    include_in_chat: bool,
+}
+
+fn infer_setup_onboarding_questions(raw: &str) -> Vec<SetupOnboardingQuestion> {
+    let normalized = raw.to_ascii_lowercase();
+    let include_in_chat = normalized.contains("include") && normalized.contains("chat context");
+    let mut questions = Vec::new();
+    if normalized.contains("country") {
+        questions.push(SetupOnboardingQuestion {
+            text: "What country are you in?".to_string(),
+            field_type: "text".to_string(),
+            required: true,
+            include_in_chat,
+        });
+    }
+    if normalized.contains("support") {
+        questions.push(SetupOnboardingQuestion {
+            text: "What kind of support do you need?".to_string(),
+            field_type: "textarea".to_string(),
+            required: true,
+            include_in_chat,
+        });
+    }
+    questions
+}
+
+fn infer_setup_behavior_rule(raw: &str) -> String {
+    let lowered = raw.to_ascii_lowercase();
+    let mut rule = raw.trim();
+    for marker in [
+        "add a behavior rule to ",
+        "behavior rule to ",
+        "add behavior rule to ",
+    ] {
+        if let Some(index) = lowered.find(marker) {
+            rule = raw[index + marker.len()..].trim();
+            break;
+        }
+    }
+    capitalize_setup_sentence(rule)
+}
+
+fn title_case_setup_phrase(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|word| {
+            let trimmed = word.trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.');
+            if trimmed.eq_ignore_ascii_case("and")
+                || trimmed.eq_ignore_ascii_case("of")
+                || trimmed.eq_ignore_ascii_case("with")
+                || trimmed.eq_ignore_ascii_case("their")
+            {
+                return trimmed.to_ascii_lowercase();
+            }
+            let mut chars = trimmed.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut output = first.to_uppercase().collect::<String>();
+                    output.push_str(&chars.as_str().to_ascii_lowercase());
+                    output
+                }
+                None => String::new(),
+            }
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalize_setup_sentence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut chars = trimmed.chars();
+    let first = chars.next().expect("trimmed string is not empty");
+    let mut sentence = first.to_uppercase().collect::<String>();
+    sentence.push_str(chars.as_str());
+    if !sentence.ends_with('.') && !sentence.ends_with('!') && !sentence.ends_with('?') {
+        sentence.push('.');
+    }
+    sentence
 }
 
 fn parse_bootstrap_user_type_requests(
@@ -6449,6 +6802,12 @@ async fn run_agent_turn(
             .await
             .map_err(model_provider_error)?;
         persist_successful_admin_config_tools(agent, memory_user_id, &result.executed_tools).await;
+        let proposal_success_message = successful_admin_config_proposal_message(&result);
+        if let Some(message) = proposal_success_message {
+            messages.clear();
+            messages.push(message.to_string());
+            break;
+        }
         if should_include_step_messages(&result) {
             messages.extend(result.messages);
         }
@@ -6497,8 +6856,18 @@ fn should_include_step_messages(result: &StepResult) -> bool {
         matches!(
             executed.tool_call.name.as_str(),
             "propose_config_change_set" | "propose_admin_config_bootstrap"
-        ) && !executed.result.success
+        )
     })
+}
+
+fn successful_admin_config_proposal_message(result: &StepResult) -> Option<&'static str> {
+    let succeeded = result.executed_tools.iter().any(|executed| {
+        matches!(
+            executed.tool_call.name.as_str(),
+            "propose_config_change_set" | "propose_admin_config_bootstrap"
+        ) && executed.result.success
+    });
+    succeeded.then_some("I prepared these changes for review. Use Apply to confirm.")
 }
 
 fn finalize_tool_loop_answer(
@@ -8793,6 +9162,102 @@ mod tests {
     }
 
     #[test]
+    fn admin_config_bootstrap_builder_plans_from_numbered_setup_notes() {
+        let args = HashMap::from([("setup_notes".to_string(), raw_bootstrap_setup_notes())]);
+
+        let change_set = build_admin_config_bootstrap_change_set(&args)
+            .expect("numbered guided setup notes should build");
+
+        assert_eq!(
+            change_set.summary.as_deref(),
+            Some("Bootstrap FreeThem guided setup")
+        );
+        assert_eq!(change_set.requests.len(), 6);
+        assert_eq!(change_set.requests[0].method, "PUT");
+        assert_eq!(change_set.requests[0].path, "/admin/settings");
+        let settings = change_set.requests[0]
+            .body
+            .as_ref()
+            .expect("settings request should include body");
+        assert_eq!(settings["instance_name"], "FreeThem");
+        assert_eq!(settings["assistant_name"], "Support Team");
+        assert_eq!(
+            settings["description"],
+            "We are the Political Prisoners Support Team, an arm of the World Liberty Congress organization that helps former political prisoners and families of political prisoners get support and information and resources."
+        );
+        assert_eq!(settings["primary_color"], "#1E40AF");
+        assert_eq!(settings["default_theme"], "dark");
+        assert_eq!(settings["default_language"], "en");
+        assert_eq!(settings["auto_approve_users"], true);
+        assert_eq!(change_set.requests[1].path, "/admin/user-types");
+        assert_eq!(change_set.requests[2].path, "/admin/user-types");
+        assert_eq!(change_set.requests[3].path, "/admin/user-fields");
+        assert_eq!(
+            change_set.requests[3].body,
+            Some(json!({
+                "field_name": "What country are you in?",
+                "field_type": "text",
+                "display_order": 1,
+                "required": true,
+                "include_in_chat": true
+            }))
+        );
+        assert_eq!(change_set.requests[4].path, "/admin/user-fields");
+        assert_eq!(
+            change_set.requests[4].body,
+            Some(json!({
+                "field_name": "What kind of support do you need?",
+                "field_type": "textarea",
+                "display_order": 2,
+                "required": true,
+                "include_in_chat": true
+            }))
+        );
+        assert_eq!(change_set.requests[5].path, "/admin/ai-config/prompt_rules");
+        assert_eq!(
+            change_set.requests[5].body,
+            Some(json!({
+                "value": json!(["Ask where users are before giving location-specific guidance."]).to_string()
+            }))
+        );
+    }
+
+    #[test]
+    fn admin_config_bootstrap_builder_rejects_incomplete_setup_notes() {
+        let args = HashMap::from([(
+            "setup_notes".to_string(),
+            "1. FreeThem\n2. Support political prisoners.".to_string(),
+        )]);
+
+        let error = build_admin_config_bootstrap_change_set(&args)
+            .expect_err("incomplete setup notes should fail safely");
+
+        assert!(error.contains("setup answer 3"));
+    }
+
+    #[test]
+    fn admin_config_bootstrap_builder_parses_user_type_marker_case_insensitively() {
+        let args = HashMap::from([(
+            "setup_notes".to_string(),
+            raw_bootstrap_setup_notes().replace("user types:", "User Types:"),
+        )]);
+
+        let change_set = build_admin_config_bootstrap_change_set(&args)
+            .expect("case variation in setup notes should build");
+
+        assert_eq!(change_set.requests[1].path, "/admin/user-types");
+        assert_eq!(
+            change_set.requests[1].body.as_ref().expect("body")["name"],
+            "Family and Friends of Current Political Prisoners"
+        );
+        assert_eq!(change_set.requests[2].path, "/admin/user-types");
+        assert_eq!(
+            change_set.requests[2].body.as_ref().expect("body")["name"],
+            "Former Political Prisoners with their Family and Friends"
+        );
+    }
+
+    #[test]
     fn admin_config_bootstrap_builder_creates_canonical_change_set() {
         let args = HashMap::from([
             (
@@ -8958,6 +9423,7 @@ mod tests {
         let tool = AdminConfigBootstrapProposalTool {
             traces: traces.clone(),
             proposal: proposal.clone(),
+            setup_notes_fallback: None,
         };
         let args = HashMap::from([
             (
@@ -9023,6 +9489,64 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("/admin/settings"));
+    }
+
+    #[tokio::test]
+    async fn admin_config_bootstrap_tool_uses_current_message_fallback_setup_notes() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigBootstrapProposalTool {
+            traces,
+            proposal: proposal.clone(),
+            setup_notes_fallback: Some(raw_bootstrap_setup_notes()),
+        };
+        let args = HashMap::from([(
+            "summary".to_string(),
+            "Bootstrap FreeThem guided setup".to_string(),
+        )]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("bootstrap proposal tool should execute");
+
+        assert!(result.success);
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("fallback bootstrap proposal should be staged");
+        assert_eq!(staged.requests.len(), 6);
+        assert_eq!(staged.requests[0].path, "/admin/settings");
+        assert_eq!(staged.requests[5].path, "/admin/ai-config/prompt_rules");
+    }
+
+    #[tokio::test]
+    async fn admin_config_bootstrap_tool_keeps_complete_typed_args_without_fallback_notes() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigBootstrapProposalTool {
+            traces,
+            proposal: proposal.clone(),
+            setup_notes_fallback: Some("Set up FreeThem from the typed fields.".to_string()),
+        };
+
+        let result = tool
+            .execute(&complete_bootstrap_tool_args())
+            .await
+            .expect("complete typed payload should not parse fallback notes");
+
+        assert!(result.success);
+        let staged = proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .clone()
+            .expect("typed bootstrap proposal should be staged");
+        assert_eq!(
+            staged.summary.as_deref(),
+            Some("Bootstrap FreeThem guided setup")
+        );
+        assert_eq!(staged.requests[0].path, "/admin/settings");
     }
 
     #[test]
@@ -9154,6 +9678,7 @@ mod tests {
         let tool = AdminConfigBootstrapProposalTool {
             traces: traces.clone(),
             proposal: proposal.clone(),
+            setup_notes_fallback: None,
         };
         let mut args = complete_bootstrap_tool_args();
         args.insert(
@@ -9220,9 +9745,11 @@ mod tests {
     }
 
     #[test]
-    fn successful_admin_config_proposal_step_messages_are_kept() {
+    fn successful_admin_config_proposal_step_messages_are_suppressed() {
         let result = StepResult {
-            messages: vec!["I prepared these changes for review. Use Apply to confirm.".to_string()],
+            messages: vec![
+                "The model tried to add extra prose after staging the proposal.".to_string(),
+            ],
             tool_calls: Vec::new(),
             executed_tools: vec![crate::sage_agent::ExecutedTool {
                 tool_call: crate::sage_agent::ToolCall {
@@ -9236,7 +9763,69 @@ mod tests {
             done: false,
         };
 
-        assert!(should_include_step_messages(&result));
+        assert!(!should_include_step_messages(&result));
+        assert_eq!(
+            successful_admin_config_proposal_message(&result),
+            Some("I prepared these changes for review. Use Apply to confirm.")
+        );
+    }
+
+    #[test]
+    fn successful_admin_config_proposal_step_ends_turn_with_deterministic_message() {
+        let result = StepResult {
+            messages: Vec::new(),
+            tool_calls: Vec::new(),
+            executed_tools: vec![crate::sage_agent::ExecutedTool {
+                tool_call: crate::sage_agent::ToolCall {
+                    name: "propose_admin_config_bootstrap".to_string(),
+                    args: HashMap::new(),
+                },
+                result: ToolResult::success(
+                    "I prepared these changes for review. Use Apply to confirm.",
+                ),
+            }],
+            done: false,
+        };
+
+        assert_eq!(
+            successful_admin_config_proposal_message(&result),
+            Some("I prepared these changes for review. Use Apply to confirm.")
+        );
+    }
+
+    #[test]
+    fn failed_admin_config_proposal_step_does_not_end_turn() {
+        let result = StepResult {
+            messages: Vec::new(),
+            tool_calls: Vec::new(),
+            executed_tools: vec![crate::sage_agent::ExecutedTool {
+                tool_call: crate::sage_agent::ToolCall {
+                    name: "propose_admin_config_bootstrap".to_string(),
+                    args: HashMap::new(),
+                },
+                result: ToolResult::error("Invalid proposal"),
+            }],
+            done: false,
+        };
+
+        assert_eq!(successful_admin_config_proposal_message(&result), None);
+    }
+
+    fn raw_bootstrap_setup_notes() -> String {
+        [
+            "Set up the instance with these onboarding answers:",
+            "1. FreeThem",
+            "2. We are the Political Prisoners Support Team, an arm of the World Liberty Congress organization that helps former political prisoners and families of political prisoners get support and information and resources.",
+            "3. Choose a simple assistant name.",
+            "4. Choose the accent color.",
+            "5. Dark theme.",
+            "6. English.",
+            "7. political prisoner support team.",
+            "8. Let new users in right away. Create two simple user types: family and friends of current political prisoners, and former political prisoners with their family and friends.",
+            "9. Add onboarding questions for what country the user is in and what kind of support they need. Include those answers in chat context.",
+            "10. Add a behavior rule to ask where users are before giving location-specific guidance.",
+        ]
+        .join("\n")
     }
 
     fn complete_bootstrap_tool_args() -> HashMap<String, String> {
@@ -9518,6 +10107,9 @@ mod tests {
         assert!(DEFAULT_PROMPT_RULES
             .iter()
             .any(|rule| rule.contains("propose_admin_config_bootstrap")));
+        assert!(DEFAULT_PROMPT_RULES
+            .iter()
+            .any(|rule| rule.contains("empty args")));
         assert!(DEFAULT_PROMPT_RULES
             .iter()
             .any(|rule| rule.contains("Use propose_config_change_set only")));
@@ -9806,6 +10398,22 @@ mod tests {
         assert!(registry.has("read_onboarding_status"));
         assert!(registry.has("propose_config_change_set"));
         assert!(registry.has("propose_admin_config_bootstrap"));
+        let bootstrap_schema = registry
+            .get("propose_admin_config_bootstrap")
+            .expect("bootstrap proposal tool should be registered")
+            .args_schema();
+        assert!(!bootstrap_schema.contains("setup_notes"));
+        assert!(!bootstrap_schema.contains("user_type_1_name"));
+        assert!(!bootstrap_schema.contains("onboarding_question_1_text"));
+        let raw_change_set_tool = registry
+            .get("propose_config_change_set")
+            .expect("generic proposal tool should be registered");
+        assert!(raw_change_set_tool
+            .description()
+            .contains("do not have a typed proposal tool"));
+        assert!(!raw_change_set_tool
+            .args_schema()
+            .contains("Guided bootstrap example"));
         assert!(registry.has("done"));
 
         let user = InternalAuthContext {
