@@ -2600,40 +2600,48 @@ fn normalize_bootstrap_theme(raw: &str) -> std::result::Result<String, String> {
 }
 
 fn normalize_bootstrap_access_policy(raw: &str) -> std::result::Result<bool, String> {
-    match raw
+    let normalized = raw
         .trim()
         .to_ascii_lowercase()
-        .replace(['-', '_'], " ")
-        .as_str()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.contains("let new users in")
+        || normalized.contains("let users in")
+        || normalized.contains("no approval required")
+        || normalized.contains("no review required")
+        || normalized.contains("open registration")
+        || normalized.contains("auto approval")
+        || normalized.contains("auto approve")
+        || normalized.contains("automatic approval")
+        || normalized.contains("immediate access")
+        || normalized.contains("immediate approval")
     {
+        return Ok(true);
+    }
+    if normalized.contains("manual approval")
+        || normalized.contains("manual review")
+        || normalized.contains("admin approval")
+        || normalized.contains("approval required")
+        || normalized.contains("review required")
+        || normalized.contains("requires approval")
+        || normalized.contains("requires review")
+        || normalized.contains("invite only")
+    {
+        return Ok(false);
+    }
+    match normalized.as_str() {
         "open"
-        | "open registration"
-        | "auto approve"
-        | "auto approval"
-        | "automatic approval"
         | "approve automatically"
-        | "immediate access"
-        | "immediate approval"
-        | "let new users in"
-        | "let new users in right away"
-        | "let users in"
-        | "let users in right away"
-        | "no approval required"
-        | "no review required"
         | "public"
         | "self serve"
         | "self service"
         | "true"
         | "yes" => Ok(true),
         "manual"
-        | "manual approval"
-        | "manual review"
-        | "admin approval"
-        | "approval required"
-        | "invite only"
-        | "review required"
-        | "requires approval"
-        | "requires review"
         | "false"
         | "no" => Ok(false),
         _ => Err(
@@ -9070,8 +9078,10 @@ mod tests {
 
     #[test]
     fn admin_config_bootstrap_builder_accepts_plain_language_access_policy() {
-        let args =
-            complete_bootstrap_tool_args_with("access_policy", "let new users in right away");
+        let args = complete_bootstrap_tool_args_with(
+            "access_policy",
+            "Let new users in right away. Create two simple user types.",
+        );
 
         let change_set = build_admin_config_bootstrap_change_set(&args)
             .expect("plain-language open access policy should build");
