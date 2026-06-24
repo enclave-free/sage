@@ -2812,10 +2812,7 @@ fn normalize_bootstrap_access_policy(raw: &str) -> std::result::Result<bool, Str
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    if normalized.contains("let new users in")
-        || normalized.contains("let users in")
-        || normalized.contains("let them in")
-        || normalized.contains("don t block access")
+    if normalized.contains("don t block access")
         || normalized.contains("dont block access")
         || normalized.contains("do not block access")
         || normalized.contains("don t gate access")
@@ -2831,9 +2828,17 @@ fn normalize_bootstrap_access_policy(raw: &str) -> std::result::Result<bool, Str
     {
         return Ok(true);
     }
-    if normalized.contains("manual approval")
+    if ((normalized.contains("don t let")
+        || normalized.contains("dont let")
+        || normalized.contains("do not let"))
+        && normalized.contains("approval"))
+        || normalized.contains("manual approval")
         || normalized.contains("manual review")
         || normalized.contains("admin approval")
+        || normalized.contains("after approval")
+        || normalized.contains("with approval")
+        || normalized.contains("needs approval")
+        || normalized.contains("need approval")
         || normalized.contains("approval required")
         || normalized.contains("review required")
         || normalized.contains("requires approval")
@@ -2841,6 +2846,12 @@ fn normalize_bootstrap_access_policy(raw: &str) -> std::result::Result<bool, Str
         || normalized.contains("invite only")
     {
         return Ok(false);
+    }
+    if normalized.contains("let new users in")
+        || normalized.contains("let users in")
+        || normalized.contains("let them in")
+    {
+        return Ok(true);
     }
     match normalized.as_str() {
         "open"
@@ -3742,6 +3753,9 @@ fn validate_admin_change_request_body(
         for (key, value) in body {
             if !is_supported_instance_setting_key(key) {
                 return Err(format!("Unsupported instance setting key: {}", key));
+            }
+            if key == "auto_approve_users" && value.as_bool().is_none() {
+                return Err("auto_approve_users must be a boolean.".to_string());
             }
             if key == "default_language" {
                 let Some(language) = value.as_str() else {
@@ -7430,13 +7444,16 @@ fn should_include_step_messages(result: &StepResult) -> bool {
 }
 
 fn successful_admin_config_proposal_message(result: &StepResult) -> Option<&'static str> {
-    let succeeded = result.executed_tools.iter().any(|executed| {
+    let final_proposal = result.executed_tools.iter().rev().find(|executed| {
         matches!(
             executed.tool_call.name.as_str(),
             "propose_config_change_set" | "propose_admin_config_bootstrap"
-        ) && executed.result.success
-    });
-    succeeded.then_some("I prepared these changes for review. Use Apply to confirm.")
+        )
+    })?;
+    final_proposal
+        .result
+        .success
+        .then_some("I prepared these changes for review. Use Apply to confirm.")
 }
 
 fn finalize_tool_loop_answer(
@@ -10517,6 +10534,30 @@ mod tests {
     }
 
     #[test]
+    fn admin_config_bootstrap_access_policy_handles_negated_open_phrases() {
+        assert_eq!(
+            normalize_bootstrap_access_policy("Don't let new users in without approval")
+                .expect("approval-gated access should parse"),
+            false
+        );
+        assert_eq!(
+            normalize_bootstrap_access_policy("don't block access")
+                .expect("open access should parse"),
+            true
+        );
+        assert_eq!(
+            normalize_bootstrap_access_policy("no approval required")
+                .expect("explicit no-approval access should parse"),
+            true
+        );
+        assert_eq!(
+            normalize_bootstrap_access_policy("let new users in right away")
+                .expect("open access should parse"),
+            true
+        );
+    }
+
+    #[test]
     fn admin_config_bootstrap_builder_accepts_plain_language_access_policy() {
         let args = complete_bootstrap_tool_args_with(
             "access_policy",
@@ -10727,6 +10768,35 @@ mod tests {
         assert_eq!(successful_admin_config_proposal_message(&result), None);
     }
 
+    #[test]
+    fn admin_config_proposal_message_uses_final_proposal_result() {
+        let result = StepResult {
+            messages: Vec::new(),
+            tool_calls: Vec::new(),
+            executed_tools: vec![
+                crate::sage_agent::ExecutedTool {
+                    tool_call: crate::sage_agent::ToolCall {
+                        name: "propose_config_change_set".to_string(),
+                        args: HashMap::new(),
+                    },
+                    result: ToolResult::success(
+                        "I prepared these changes for review. Use Apply to confirm.",
+                    ),
+                },
+                crate::sage_agent::ExecutedTool {
+                    tool_call: crate::sage_agent::ToolCall {
+                        name: "propose_admin_config_bootstrap".to_string(),
+                        args: HashMap::new(),
+                    },
+                    result: ToolResult::error("Invalid proposal"),
+                },
+            ],
+            done: false,
+        };
+
+        assert_eq!(successful_admin_config_proposal_message(&result), None);
+    }
+
     fn raw_bootstrap_setup_notes() -> String {
         [
             "Set up the instance with these onboarding answers:",
@@ -10832,6 +10902,48 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("Unsupported instance setting key"));
+        assert!(proposal
+            .lock()
+            .expect("proposal sink should lock")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_config_proposal_tool_rejects_non_boolean_auto_approve_users() {
+        let proposal = Arc::new(Mutex::new(None));
+        let tool = AdminConfigProposalTool {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            proposal: proposal.clone(),
+        };
+        let args = HashMap::from([
+            (
+                "summary".to_string(),
+                "Invalid auto approval setting".to_string(),
+            ),
+            (
+                "requests_json".to_string(),
+                json!([
+                    {
+                        "method": "PUT",
+                        "path": "/admin/settings",
+                        "body": { "auto_approve_users": "yes" }
+                    }
+                ])
+                .to_string(),
+            ),
+        ]);
+
+        let result = tool
+            .execute(&args)
+            .await
+            .expect("proposal rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("auto_approve_users must be a boolean"));
         assert!(proposal
             .lock()
             .expect("proposal sink should lock")
