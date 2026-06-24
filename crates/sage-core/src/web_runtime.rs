@@ -50,10 +50,11 @@ use crate::schema::{
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
 const CURATED_RESOURCES_TOOL_SET_ID: &str = "curated-resources";
 const KNOWLEDGE_SEARCH_TOOL_SET_ID: &str = "knowledge-search";
-const DEFAULT_PROMPT_RULES: [&str; 6] = [
+const DEFAULT_PROMPT_RULES: [&str; 7] = [
     "For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.",
+    "For broad Admin Config setup, status, or readiness questions, call read_admin_setup_summary first. It already includes deployment readiness, missing setup, and next actions; use low-level read Tools only for narrow follow-up inspection.",
     "For Admin Conversation guided setup or bootstrap write intent, call propose_admin_config_bootstrap directly with empty args or a short summary instead of calling read tools first, copying setup answers, hand-authoring requests_json, or decomposing every field yourself; confirmed Apply remains an admin UI action.",
-    "Use propose_config_change_set only for supported Admin Config writes that do not yet have a typed proposal Tool. Generic change sets must use canonical paths and keys: POST /admin/user-types, POST /admin/user-fields, PUT /admin/settings, PUT /admin/ai-config/prompt_rules, header_tagline, default_language codes such as en. If a proposal Tool succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If a proposal Tool rejects a supported change, correct the request and call the best matching proposal Tool again instead of telling the admin to configure it manually.",
+    "Use propose_config_change_set only for supported Admin Config writes that do not yet have a typed proposal Tool. Generic change sets must use canonical request paths: POST /admin/user-types, POST /admin/user-fields, PUT /admin/settings, or PUT /admin/ai-config/{key} such as PUT /admin/ai-config/prompt_rules. For PUT /admin/settings, setting keys belong in the request body, not the path; supported keys include instance_name, assistant_name, header_tagline, description, primary_color, default_theme, default_language using codes such as en, and auto_approve_users. If a proposal Tool succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If a proposal Tool rejects a supported change, correct the request and call the best matching proposal Tool again instead of telling the admin to configure it manually.",
     "Use curated resources as priority admin-vetted referrals when the user needs real-world help, contacts, or organizations; do not surface them merely because a topic matches if the right next step is ordinary explanation, triage, or a clarifying question.",
     "NEVER invent sources, organization names, or contact information",
     "If asked about topics outside your knowledge base, acknowledge limitations",
@@ -1221,6 +1222,14 @@ struct AdminConfigReadTool {
 }
 
 #[derive(Clone)]
+struct AdminConfigSetupSummaryTool {
+    internal: InternalAgentClient,
+    state: Option<WebAppState>,
+    auth: InternalAuthContext,
+    traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+}
+
+#[derive(Clone)]
 struct AdminAgentSettingsReadTool {
     state: WebAppState,
     auth: InternalAuthContext,
@@ -1355,6 +1364,7 @@ fn tool_trace_title(tool_name: &str) -> String {
         "db_query" => "Database Query",
         "propose_config_change_set"
         | "propose_admin_config_bootstrap"
+        | "read_admin_setup_summary"
         | "read_instance_settings"
         | "read_deployment_settings"
         | "read_deployment_readiness"
@@ -1680,6 +1690,15 @@ fn build_conversation_tool_registry_with_context(
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "admin-config") {
+        registry.register(traced_tool(
+            Arc::new(AdminConfigSetupSummaryTool {
+                internal: internal.clone(),
+                state: state.cloned(),
+                auth: auth.clone(),
+                traces: sinks.traces.clone(),
+            }),
+            &sinks.trace_deltas,
+        ));
         for (name, endpoint, description) in [
             (
                 "read_instance_settings",
@@ -2134,6 +2153,154 @@ impl Tool for AdminConfigReadTool {
             "data": response.data,
         }))?;
         Ok(ToolResult::success(output))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for AdminConfigSetupSummaryTool {
+    fn name(&self) -> &str {
+        "read_admin_setup_summary"
+    }
+
+    fn description(&self) -> &str {
+        "Read a compact Admin Config setup summary, including deployment readiness, missing setup, and next actions. Use first for broad setup, status, readiness, or missing-configuration questions; use low-level read Tools only for narrow follow-up inspection."
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{}"#
+    }
+
+    async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+        let instance_settings = match self.read_control_plane("instance-settings").await {
+            Ok(response) => response,
+            Err(error) => return Ok(ToolResult::error(error)),
+        };
+        let deployment_settings = match self.read_control_plane("deployment-settings").await {
+            Ok(response) => response,
+            Err(error) => return Ok(ToolResult::error(error)),
+        };
+        let onboarding_status = match self.read_control_plane("onboarding-status").await {
+            Ok(response) => response,
+            Err(error) => return Ok(ToolResult::error(error)),
+        };
+        let user_types = match self.read_control_plane("user-types").await {
+            Ok(response) => response,
+            Err(error) => return Ok(ToolResult::error(error)),
+        };
+        let document_access = match self.read_control_plane("document-access").await {
+            Ok(response) => response,
+            Err(error) => return Ok(ToolResult::error(error)),
+        };
+        let deployment_readiness = match self.read_control_plane("deployment-readiness").await {
+            Ok(response) => response,
+            Err(error) => return Ok(ToolResult::error(error)),
+        };
+        let agent_settings = match self.agent_settings_data(&user_types).await {
+            Ok(data) => data,
+            Err(error) => return Ok(ToolResult::error(error)),
+        };
+
+        let data = build_admin_setup_summary_tool_data(
+            &instance_settings.data,
+            &deployment_settings.data,
+            &onboarding_status.data,
+            &user_types.data,
+            &document_access.data,
+            &deployment_readiness.data,
+            &agent_settings,
+        );
+        let mut warnings = Vec::new();
+        extend_unique_warnings(&mut warnings, &instance_settings.warnings);
+        extend_unique_warnings(&mut warnings, &deployment_settings.warnings);
+        extend_unique_warnings(&mut warnings, &onboarding_status.warnings);
+        extend_unique_warnings(&mut warnings, &user_types.warnings);
+        extend_unique_warnings(&mut warnings, &document_access.warnings);
+        extend_unique_warnings(&mut warnings, &deployment_readiness.warnings);
+
+        if let Ok(mut sink) = self.traces.lock() {
+            let status = data
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let missing_count = data
+                .get("missing")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            sink.push(ToolCallInfoResponse {
+                tool_id: "admin-config:read_admin_setup_summary".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: Some("read_admin_setup_summary".to_string()),
+                output_summary: Some(format!(
+                    "Read Admin Config setup summary: {}, {} item(s) need attention.",
+                    status, missing_count
+                )),
+                warnings: warnings.clone(),
+                guarded: false,
+            });
+        }
+
+        let output = serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "tool": "read_admin_setup_summary",
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "secret_policy": { "mode": "summary_only" },
+            "warnings": warnings,
+            "data": data,
+        }))?;
+        Ok(ToolResult::success(output))
+    }
+}
+
+impl AdminConfigSetupSummaryTool {
+    async fn read_control_plane(
+        &self,
+        endpoint: &str,
+    ) -> std::result::Result<InternalAdminConfigToolResponse, String> {
+        self.internal
+            .admin_config_tool(endpoint, &self.auth)
+            .await
+            .map_err(|error| match error {
+                AdminConfigToolError::Unauthorized => {
+                    "Admin Config setup summary requires an approved admin actor.".to_string()
+                }
+                AdminConfigToolError::Failed(error) => {
+                    format!("Admin Config setup summary failed: {}", error)
+                }
+            })
+    }
+
+    async fn agent_settings_data(
+        &self,
+        user_types_response: &InternalAdminConfigToolResponse,
+    ) -> std::result::Result<Value, String> {
+        let Some(state) = self.state.as_ref() else {
+            return self
+                .read_control_plane("agent-settings")
+                .await
+                .map(|response| response.data);
+        };
+
+        let global = load_ai_config_response(state).map_err(|error| error.message)?;
+        let user_types: Vec<InternalUserTypeResponse> = serde_json::from_value(
+            user_types_response
+                .data
+                .get("user_types")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(|error| format!("invalid user type payload: {}", error))?;
+        let mut per_user_type = Vec::new();
+        for user_type in user_types {
+            let response = load_ai_config_user_type_response(state, &user_type)
+                .map_err(|error| error.message)?;
+            per_user_type.push(response);
+        }
+
+        Ok(sage_agent_settings_tool_data_from_responses(
+            global,
+            per_user_type,
+        ))
     }
 }
 
@@ -4318,7 +4485,8 @@ fn admin_config_tool_memory_content(executed: &ExecutedTool) -> Option<String> {
 fn is_admin_config_tool_name(name: &str) -> bool {
     matches!(
         name,
-        "read_instance_settings"
+        "read_admin_setup_summary"
+            | "read_instance_settings"
             | "read_deployment_settings"
             | "read_deployment_readiness"
             | "read_agent_settings"
@@ -6144,6 +6312,337 @@ fn sage_agent_settings_tool_data_from_responses(
             "user_types_returned": user_type_count,
         },
     })
+}
+
+fn build_admin_setup_summary_tool_data(
+    instance_settings: &Value,
+    deployment_settings: &Value,
+    onboarding_status: &Value,
+    user_types: &Value,
+    document_access: &Value,
+    deployment_readiness: &Value,
+    agent_settings: &Value,
+) -> Value {
+    let missing_required_keys = string_array_at(
+        onboarding_status,
+        &["guided_bootstrap", "missing_required_keys"],
+    );
+    let configured_required_count = i64_at(
+        onboarding_status,
+        &["guided_bootstrap", "configured_required_count"],
+    );
+    let required_count = i64_at(onboarding_status, &["guided_bootstrap", "required_count"]);
+    let user_type_count = i64_at(onboarding_status, &["user_types_setup", "count"]);
+    let required_user_type_minimum =
+        i64_at(onboarding_status, &["user_types_setup", "required_minimum"]);
+    let onboarding_question_count =
+        i64_at(user_types, &["limits", "onboarding_questions_returned"]);
+    let document_count = i64_at(document_access, &["limits", "documents_returned"]);
+    let default_document_count =
+        array_len_at(document_access, &["global", "default_document_ids"]) as i64;
+    let deployment_summary = value_at(deployment_readiness, &["summary"])
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "blockers": 0,
+                "warnings": 0,
+                "ready": 0,
+                "total": 0,
+            })
+        });
+    let deployment_status = string_at(deployment_readiness, &["status"]).unwrap_or("unknown");
+    let deployment_setting_counts = deployment_setting_counts(deployment_settings);
+    let agent_setting_counts = agent_setting_counts(agent_settings);
+    let non_ready_deployment_items = deployment_readiness_items(deployment_readiness);
+
+    let mut missing = Vec::new();
+    if !missing_required_keys.is_empty() {
+        let labels = missing_required_keys
+            .iter()
+            .map(|key| instance_setting_label(instance_settings, key))
+            .collect::<Vec<_>>();
+        missing.push(json!({
+            "area": "instance_settings",
+            "severity": "warning",
+            "summary": format!(
+                "{} guided setup setting(s) are not explicitly configured.",
+                missing_required_keys.len()
+            ),
+            "details": labels,
+            "next_action": "Finish guided setup or stage an Admin Config bootstrap proposal.",
+        }));
+    }
+    if user_type_count < required_user_type_minimum {
+        missing.push(json!({
+            "area": "user_types",
+            "severity": "warning",
+            "summary": "No User Types are configured.",
+            "next_action": "Create at least one User Type before opening user onboarding.",
+        }));
+    }
+    if user_type_count > 0 && onboarding_question_count == 0 {
+        missing.push(json!({
+            "area": "onboarding_questions",
+            "severity": "warning",
+            "summary": "User Types exist but no Onboarding Questions are configured.",
+            "next_action": "Add Onboarding Questions that collect the profile context Sage needs.",
+        }));
+    }
+    for item in &non_ready_deployment_items {
+        missing.push(item.clone());
+    }
+
+    let mut next_actions = missing
+        .iter()
+        .filter_map(|item| {
+            item.get("next_action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .take(5)
+        .collect::<Vec<_>>();
+    if next_actions.is_empty() {
+        next_actions.push("No immediate Admin Config setup action is required.".to_string());
+    }
+
+    let status = if deployment_status == "blocked" {
+        "blocked"
+    } else if deployment_status == "warnings" || !missing.is_empty() {
+        "warnings"
+    } else {
+        "ready"
+    };
+
+    json!({
+        "status": status,
+        "headline": admin_setup_summary_headline(status, missing.len()),
+        "configured": {
+            "guided_bootstrap": {
+                "configured_required_count": configured_required_count,
+                "required_count": required_count,
+                "missing_required_count": missing_required_keys.len(),
+            },
+            "user_types": {
+                "count": user_type_count,
+                "names": string_array_at(onboarding_status, &["user_types_setup", "names"])
+                    .into_iter()
+                    .take(5)
+                    .collect::<Vec<_>>(),
+            },
+            "onboarding_questions": {
+                "count": onboarding_question_count,
+            },
+            "document_access": {
+                "documents_returned": document_count,
+                "default_document_count": default_document_count,
+                "user_type_overrides_returned": array_len_at(document_access, &["per_user_type"]),
+            },
+            "agent_settings": agent_setting_counts,
+            "deployment_settings": deployment_setting_counts,
+        },
+        "deployment_readiness": {
+            "status": deployment_status,
+            "summary": deployment_summary,
+        },
+        "missing": missing,
+        "next_actions": next_actions,
+        "read_sources": [
+            "instance_settings",
+            "deployment_settings",
+            "onboarding_status",
+            "user_types",
+            "document_access",
+            "agent_settings",
+            "deployment_readiness",
+        ],
+    })
+}
+
+fn extend_unique_warnings(target: &mut Vec<String>, warnings: &[String]) {
+    for warning in warnings {
+        if !target.iter().any(|existing| existing == warning) {
+            target.push(warning.clone());
+        }
+    }
+}
+
+fn admin_setup_summary_headline(status: &str, missing_count: usize) -> String {
+    match (status, missing_count) {
+        ("ready", 0) => "Admin setup looks ready.".to_string(),
+        ("blocked", count) => format!(
+            "Admin setup is blocked with {} item(s) needing attention.",
+            count
+        ),
+        (_, count) => format!("Admin setup has {} item(s) needing attention.", count),
+    }
+}
+
+fn value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn string_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    value_at(value, path).and_then(Value::as_str)
+}
+
+fn i64_at(value: &Value, path: &[&str]) -> i64 {
+    value_at(value, path).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn array_len_at(value: &Value, path: &[&str]) -> usize {
+    value_at(value, path)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn object_len_at(value: &Value, path: &[&str]) -> usize {
+    value_at(value, path)
+        .and_then(Value::as_object)
+        .map(serde_json::Map::len)
+        .unwrap_or(0)
+}
+
+fn string_array_at(value: &Value, path: &[&str]) -> Vec<String> {
+    value_at(value, path)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn instance_setting_label(instance_settings: &Value, key: &str) -> String {
+    value_at(instance_settings, &["fields"])
+        .and_then(Value::as_array)
+        .and_then(|fields| {
+            fields.iter().find_map(|field| {
+                (field.get("key").and_then(Value::as_str) == Some(key))
+                    .then(|| field.get("label").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| humanize_summary_key(key))
+}
+
+fn humanize_summary_key(key: &str) -> String {
+    key.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn deployment_setting_counts(deployment_settings: &Value) -> Value {
+    let settings = value_at(deployment_settings, &["settings"])
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let configured = settings
+        .values()
+        .filter(|setting| {
+            setting
+                .get("configured")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    let secret_configured = settings
+        .values()
+        .filter(|setting| {
+            setting
+                .get("secret")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && setting
+                    .get("configured")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .count();
+    let requires_restart = settings
+        .values()
+        .filter(|setting| {
+            setting
+                .get("requires_restart")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+
+    json!({
+        "settings_returned": settings.len(),
+        "configured_count": configured,
+        "unconfigured_count": settings.len().saturating_sub(configured),
+        "secret_configured_count": secret_configured,
+        "requires_restart_count": requires_restart,
+        "categories_returned": object_len_at(deployment_settings, &["categories"]),
+    })
+}
+
+fn agent_setting_counts(agent_settings: &Value) -> Value {
+    let user_type_override_count = value_at(agent_settings, &["per_user_type"])
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| object_len_at(item, &["overrides"]))
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let prompt_rules_configured = value_at(
+        agent_settings,
+        &["global", "prompt_sections", "prompt_rules"],
+    )
+    .is_some();
+
+    json!({
+        "global_prompt_sections_returned": object_len_at(agent_settings, &["global", "prompt_sections"]),
+        "global_parameters_returned": object_len_at(agent_settings, &["global", "parameters"]),
+        "global_defaults_returned": object_len_at(agent_settings, &["global", "defaults"]),
+        "per_user_type_settings_returned": array_len_at(agent_settings, &["per_user_type"]),
+        "user_type_override_count": user_type_override_count,
+        "prompt_rules_configured": prompt_rules_configured,
+    })
+}
+
+fn deployment_readiness_items(deployment_readiness: &Value) -> Vec<Value> {
+    value_at(deployment_readiness, &["items"])
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("severity").and_then(Value::as_str) != Some("ready")
+                })
+                .take(8)
+                .map(|item| {
+                    json!({
+                        "area": item.get("key").and_then(Value::as_str).unwrap_or("deployment_readiness"),
+                        "label": item.get("label").and_then(Value::as_str).unwrap_or("Deployment Readiness"),
+                        "severity": item.get("severity").and_then(Value::as_str).unwrap_or("warning"),
+                        "summary": item.get("summary").and_then(Value::as_str).unwrap_or("Deployment readiness item needs attention."),
+                        "next_action": item.get("next_action").and_then(Value::as_str).unwrap_or("Review deployment readiness."),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn ai_config_items_by_key(items: Vec<AIConfigItemResponse>) -> Value {
@@ -8919,6 +9418,308 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn admin_config_setup_summary_tool_executes_compact_contract() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new().route(
+            "/internal/agent/admin-config/{endpoint}",
+            post({
+                let seen = seen.clone();
+                move |headers: HeaderMap,
+                      Path(endpoint): Path<String>,
+                      Json(payload): Json<Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("x-internal-agent-token")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("test-token")
+                        );
+                        assert_eq!(payload["actor"]["type"], "admin");
+                        seen.lock()
+                            .expect("request recorder should lock")
+                            .push(endpoint.clone());
+                        Json(admin_config_summary_test_response(&endpoint))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let internal = InternalAgentClient::new(
+            Client::builder().build().expect("http client should build"),
+            format!("http://{}", addr),
+            "test-token".to_string(),
+        );
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let tool = AdminConfigSetupSummaryTool {
+            internal,
+            state: None,
+            auth: InternalAuthContext {
+                id: 1,
+                kind: "admin".to_string(),
+                approved: true,
+                pubkey: Some("admin-pubkey".to_string()),
+                email: None,
+                name: None,
+                user_type_id: None,
+                dev_mode: false,
+            },
+            traces: traces.clone(),
+        };
+
+        let result = tool
+            .execute(&HashMap::new())
+            .await
+            .expect("Admin Config setup summary tool should execute");
+        server.abort();
+
+        assert!(result.success);
+        let output: Value = serde_json::from_str(&result.output).expect("output should be JSON");
+        assert_eq!(output["tool"], "read_admin_setup_summary");
+        assert_eq!(output["secret_policy"]["mode"], "summary_only");
+        assert_eq!(output["data"]["status"], "warnings");
+        assert_eq!(
+            output["data"]["configured"]["user_types"]["count"],
+            Value::from(1)
+        );
+        assert_eq!(
+            output["data"]["configured"]["agent_settings"]["prompt_rules_configured"],
+            Value::from(true)
+        );
+        let rendered = serde_json::to_string(&output).expect("output should render");
+        assert!(!rendered.contains("super-secret"));
+        let seen = seen.lock().expect("request recorder should lock");
+        assert!(seen.iter().any(|endpoint| endpoint == "instance-settings"));
+        assert!(seen
+            .iter()
+            .any(|endpoint| endpoint == "deployment-settings"));
+        assert!(seen.iter().any(|endpoint| endpoint == "onboarding-status"));
+        assert!(seen.iter().any(|endpoint| endpoint == "user-types"));
+        assert!(seen.iter().any(|endpoint| endpoint == "document-access"));
+        assert!(seen
+            .iter()
+            .any(|endpoint| endpoint == "deployment-readiness"));
+        assert!(seen.iter().any(|endpoint| endpoint == "agent-settings"));
+        let traces = traces.lock().expect("trace sink should lock");
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].tool_id, "admin-config:read_admin_setup_summary");
+        assert_eq!(traces[0].tool_name, "Admin Config");
+        assert_eq!(traces[0].query.as_deref(), Some("read_admin_setup_summary"));
+        assert!(traces[0]
+            .output_summary
+            .as_deref()
+            .unwrap_or("")
+            .contains("warnings"));
+    }
+
+    #[test]
+    fn admin_config_setup_summary_data_compacts_control_plane_state() {
+        let data = build_admin_setup_summary_tool_data(
+            &admin_config_summary_test_response("instance-settings")["data"],
+            &admin_config_summary_test_response("deployment-settings")["data"],
+            &admin_config_summary_test_response("onboarding-status")["data"],
+            &admin_config_summary_test_response("user-types")["data"],
+            &admin_config_summary_test_response("document-access")["data"],
+            &admin_config_summary_test_response("deployment-readiness")["data"],
+            &admin_config_summary_test_response("agent-settings")["data"],
+        );
+
+        assert_eq!(data["status"], "warnings");
+        assert_eq!(
+            data["configured"]["guided_bootstrap"]["missing_required_count"],
+            Value::from(1)
+        );
+        assert_eq!(
+            data["configured"]["deployment_settings"]["secret_configured_count"],
+            Value::from(1)
+        );
+        assert_eq!(data["missing"][0]["area"], "instance_settings");
+        assert_eq!(
+            data["next_actions"][0],
+            "Finish guided setup or stage an Admin Config bootstrap proposal."
+        );
+        assert_eq!(
+            data["read_sources"]
+                .as_array()
+                .expect("read sources should be an array")
+                .len(),
+            7
+        );
+    }
+
+    fn admin_config_summary_test_response(endpoint: &str) -> Value {
+        let data = match endpoint {
+            "instance-settings" => json!({
+                "settings": {
+                    "instance_name": "Enclave",
+                    "assistant_name": "Sage",
+                    "default_language": "en",
+                },
+                "explicitly_set_keys": ["instance_name", "assistant_name"],
+                "fields": [
+                    {"key": "instance_name", "label": "Instance name", "value": "Enclave", "source": "operator"},
+                    {"key": "assistant_name", "label": "Assistant name", "value": "Sage", "source": "operator"},
+                    {"key": "default_language", "label": "Default language", "value": "en", "source": "default"}
+                ],
+            }),
+            "deployment-settings" => json!({
+                "settings": {
+                    "TINFOIL_API_KEY": {
+                        "value": "********",
+                        "configured": true,
+                        "secret": true,
+                        "requires_restart": false,
+                        "category": "llm"
+                    },
+                    "PUBLIC_URL": {
+                        "value": "",
+                        "configured": false,
+                        "secret": false,
+                        "requires_restart": false,
+                        "category": "deployment"
+                    }
+                },
+                "categories": {
+                    "llm": ["TINFOIL_API_KEY"],
+                    "deployment": ["PUBLIC_URL"]
+                }
+            }),
+            "onboarding-status" => json!({
+                "instance": {
+                    "admin_exists": true,
+                    "admin_initialized": true,
+                    "setup_complete": false,
+                    "ready_for_users": false,
+                    "admin_count": 1
+                },
+                "guided_bootstrap": {
+                    "required_keys": ["instance_name", "assistant_name", "default_language"],
+                    "configured_keys": ["instance_name", "assistant_name"],
+                    "missing_required_keys": ["default_language"],
+                    "complete": false,
+                    "required_count": 3,
+                    "configured_required_count": 2
+                },
+                "user_types_setup": {
+                    "required_minimum": 1,
+                    "count": 1,
+                    "names": ["Family"],
+                    "complete": true
+                },
+                "user_types": [
+                    {"id": 7, "name": "Family", "description": "Family members", "icon": null, "display_order": 0, "created_at": null}
+                ],
+                "onboarding_questions": [
+                    {"id": 1, "user_type_id": 7, "name": "country", "field_type": "text", "required": true}
+                ],
+                "limits": {
+                    "user_types_returned": 1,
+                    "onboarding_questions_returned": 1
+                }
+            }),
+            "user-types" => json!({
+                "user_types": [
+                    {"id": 7, "name": "Family", "description": "Family members", "icon": null, "display_order": 0, "created_at": null}
+                ],
+                "onboarding_questions": [
+                    {"id": 1, "user_type_id": 7, "name": "country", "field_type": "text", "required": true}
+                ],
+                "limits": {
+                    "user_types_returned": 1,
+                    "onboarding_questions_returned": 1
+                }
+            }),
+            "document-access" => json!({
+                "global": {
+                    "available_document_ids": ["doc-1"],
+                    "default_document_ids": ["doc-1"],
+                    "documents": [{"job_id": "doc-1", "filename": "Guide.pdf", "status": "completed"}]
+                },
+                "documents": [{"job_id": "doc-1", "filename": "Guide.pdf", "status": "completed"}],
+                "per_user_type": [],
+                "limits": {
+                    "documents_returned": 1,
+                    "user_types_returned": 0
+                }
+            }),
+            "deployment-readiness" => json!({
+                "status": "warnings",
+                "summary": {
+                    "blockers": 0,
+                    "warnings": 1,
+                    "ready": 1,
+                    "total": 2
+                },
+                "items": [
+                    {
+                        "key": "backup_restore_drill",
+                        "label": "Backup and restore drill",
+                        "source": "deployment_readiness",
+                        "severity": "warning",
+                        "status": "not_recorded",
+                        "summary": "No restore drill has been recorded.",
+                        "next_action": "Run and record a restore drill.",
+                        "conversation_blocking": false
+                    },
+                    {
+                        "key": "inference",
+                        "label": "Inference",
+                        "severity": "ready",
+                        "summary": "Inference is configured.",
+                        "next_action": "No action required."
+                    }
+                ]
+            }),
+            "agent-settings" => json!({
+                "global": {
+                    "prompt_sections": {
+                        "prompt_rules": {
+                            "value": "[\"Use concise answers.\"]",
+                            "value_type": "json",
+                            "category": "prompt_section"
+                        }
+                    },
+                    "parameters": {
+                        "temperature": {"value": "0.1"}
+                    },
+                    "defaults": {}
+                },
+                "per_user_type": [
+                    {
+                        "user_type_id": 7,
+                        "user_type_name": "Family",
+                        "overrides": {},
+                        "effective_values": {}
+                    }
+                ],
+                "limits": {
+                    "user_types_returned": 1
+                }
+            }),
+            other => panic!("unexpected endpoint: {}", other),
+        };
+
+        json!({
+            "version": 1,
+            "tool": format!("read_{}", endpoint.replace('-', "_")),
+            "data": data,
+            "warnings": [],
+            "generated_at": "2026-06-24T00:00:00+00:00",
+            "secret_policy": { "mode": "masked" }
+        })
+    }
+
     #[test]
     fn sage_agent_settings_tool_data_groups_sage_ai_config_rows() {
         let global = AIConfigResponseBody {
@@ -10519,6 +11320,7 @@ mod tests {
         assert!(registry.has("find_resources"));
         assert!(registry.has("web_search"));
         assert!(registry.has("db_query"));
+        assert!(registry.has("read_admin_setup_summary"));
         assert!(registry.has("read_instance_settings"));
         assert!(registry.has("read_deployment_settings"));
         assert!(registry.has("read_deployment_readiness"));
@@ -10570,6 +11372,7 @@ mod tests {
         assert!(user_registry.has("find_resources"));
         assert!(user_registry.has("web_search"));
         assert!(!user_registry.has("db_query"));
+        assert!(!user_registry.has("read_admin_setup_summary"));
         assert!(!user_registry.has("read_instance_settings"));
         assert!(!user_registry.has("propose_config_change_set"));
         assert!(!user_registry.has("propose_admin_config_bootstrap"));
@@ -10591,6 +11394,7 @@ mod tests {
         assert!(!disabled_registry.has("find_resources"));
         assert!(!disabled_registry.has("web_search"));
         assert!(!disabled_registry.has("db_query"));
+        assert!(!disabled_registry.has("read_admin_setup_summary"));
         assert!(!disabled_registry.has("read_instance_settings"));
         assert!(!disabled_registry.has("propose_config_change_set"));
         assert!(!disabled_registry.has("propose_admin_config_bootstrap"));
