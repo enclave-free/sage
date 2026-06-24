@@ -59,10 +59,12 @@ const DEFAULT_PROMPT_RULES: [&str; 7] = [
     "NEVER invent sources, organization names, or contact information",
     "If asked about topics outside your knowledge base, acknowledge limitations",
 ];
-const OBSOLETE_DEFAULT_PROMPT_RULES: [&str; 3] = [
+const OBSOLETE_DEFAULT_PROMPT_RULES: [&str; 5] = [
     "For Admin Conversation write intent, call propose_config_change_set instead of putting raw JSON in messages; confirmed Apply remains an admin UI action.",
     "Admin Config proposals must use canonical paths and keys: POST /admin/user-types, PUT /admin/settings, PUT /admin/ai-config/prompt_rules, header_tagline, default_language codes such as en. If propose_config_change_set succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If propose_config_change_set rejects a supported change, correct the request and call the tool again instead of telling the admin to configure it manually.",
     "For Admin Conversation guided setup or bootstrap write intent, call propose_admin_config_bootstrap directly with setup_notes copied from the Admin's guided answers instead of calling read tools first, hand-authoring requests_json, or decomposing every field yourself; confirmed Apply remains an admin UI action.",
+    "For broad Admin Config setup, status, or readiness questions, call read_admin_setup_summary first instead of manually fanning out across low-level Admin Config read Tools; use low-level read Tools only for narrow follow-up inspection.",
+    "Use propose_config_change_set only for supported Admin Config writes that do not yet have a typed proposal Tool. Generic change sets must use canonical paths and keys: POST /admin/user-types, POST /admin/user-fields, PUT /admin/settings, PUT /admin/ai-config/prompt_rules, header_tagline, default_language codes such as en. If a proposal Tool succeeds, answer only: I prepared these changes for review. Use Apply to confirm. If a proposal Tool rejects a supported change, correct the request and call the best matching proposal Tool again instead of telling the admin to configure it manually.",
 ];
 const USER_SESSION_SALT: &str = "session";
 const USER_SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
@@ -11122,11 +11124,14 @@ mod tests {
 
     #[test]
     fn merge_prompt_rules_preserves_custom_rules_and_replaces_obsolete_defaults() {
-        let existing = serde_json::to_string(&vec![
-            "Custom operator rule".to_string(),
-            OBSOLETE_DEFAULT_PROMPT_RULES[0].to_string(),
-        ])
-        .expect("existing rules should serialize");
+        let mut existing_rules = vec!["Custom operator rule".to_string()];
+        existing_rules.extend(
+            OBSOLETE_DEFAULT_PROMPT_RULES
+                .iter()
+                .map(|rule| rule.to_string()),
+        );
+        let existing =
+            serde_json::to_string(&existing_rules).expect("existing rules should serialize");
         let required = serde_json::to_string(&vec![
             DEFAULT_PROMPT_RULES[1].to_string(),
             DEFAULT_PROMPT_RULES[2].to_string(),
