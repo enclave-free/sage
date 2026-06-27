@@ -2887,7 +2887,8 @@ async fn chat(
 
     let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
-    configure_request_lm(&state.config, temperature).await?;
+    let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
+    lm_settings.configure_primary().await?;
 
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.message)?;
@@ -2951,8 +2952,14 @@ async fn chat(
 
     let input =
         build_conversation_turn_input(&auth, &profile, &request, persisted_context.as_ref());
-    let tool_loop =
-        run_conversation_tool_loop(&mut agent, &input, &tool_sinks, Some(&memory_user_id)).await?;
+    let tool_loop = run_conversation_tool_loop(
+        &mut agent,
+        &input,
+        &tool_sinks,
+        Some(&memory_user_id),
+        &lm_settings,
+    )
+    .await?;
     let response_text = tool_loop.answer;
     let tools_used = tool_loop.tools_used;
     let trace = build_conversation_trace(
@@ -3292,7 +3299,8 @@ async fn chat_stream(
     let auth = resolve_public_actor(&state, &headers).await?;
     let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
-    configure_request_lm(&state.config, temperature).await?;
+    let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
+    lm_settings.configure_primary().await?;
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.message)?;
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
@@ -3402,8 +3410,13 @@ async fn chat_stream(
             persisted_context.as_ref(),
         );
         let tool_loop = {
-            let tool_loop_future =
-                run_conversation_tool_loop(&mut agent, &input, &tool_sinks, Some(&memory_user_id));
+            let tool_loop_future = run_conversation_tool_loop(
+                &mut agent,
+                &input,
+                &tool_sinks,
+                Some(&memory_user_id),
+                &lm_settings,
+            );
             tokio::pin!(tool_loop_future);
             let tool_loop = loop {
                 tokio::select! {
@@ -3521,7 +3534,8 @@ async fn query(
         .top_k
         .unwrap_or_else(|| value_as_i32(ai_config.parameters.get("top_k"), 8));
 
-    configure_request_lm(&state.config, temperature).await?;
+    let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
+    lm_settings.configure_primary().await?;
 
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.question)?;
@@ -3606,8 +3620,14 @@ async fn query(
     }));
 
     let input = build_query_conversation_turn_input(&auth, &profile, &request, None);
-    let tool_loop =
-        run_conversation_tool_loop(&mut agent, &input, &tool_sinks, Some(&memory_user_id)).await?;
+    let tool_loop = run_conversation_tool_loop(
+        &mut agent,
+        &input,
+        &tool_sinks,
+        Some(&memory_user_id),
+        &lm_settings,
+    )
+    .await?;
     let answer = tool_loop.answer;
     let sources = tool_loop.retrieval_sources;
     let trace = build_conversation_trace(
@@ -5654,17 +5674,38 @@ fn build_query_conversation_turn_input(
     input
 }
 
-async fn run_agent_turn(
+/// Failure from a single agent turn attempt.
+///
+/// `progressed` is true once at least one agent step has completed, which means
+/// the turn already has side effects (tool calls, partial messages) and must NOT
+/// be retried on a different model. We only fail over on a clean first-step
+/// failure — exactly the shape of a "configured model is unavailable" error.
+struct AgentTurnFailure {
+    error: AppError,
+    progressed: bool,
+}
+
+/// Run one agent turn (up to 8 tool steps) against the currently-configured LM.
+async fn run_agent_steps(
     agent: &mut SageAgent,
     input: &str,
     memory_user_id: Option<&str>,
-) -> AppResult<String> {
+) -> Result<String, AgentTurnFailure> {
     let mut messages = Vec::new();
     for step in 0..8 {
-        let result = agent
-            .step(input, step == 0)
-            .await
-            .map_err(model_provider_error)?;
+        let result = match agent.step(input, step == 0).await {
+            Ok(result) => result,
+            Err(error) => {
+                // Use the alternate formatter so the full anyhow source chain is
+                // classified — the upstream status (e.g. "503 Service Unavailable")
+                // lives in a nested source, not the top-level "LLM call failed"
+                // message.
+                return Err(AgentTurnFailure {
+                    error: model_provider_error(format!("{error:#}")),
+                    progressed: step > 0,
+                });
+            }
+        };
         persist_successful_admin_config_tools(agent, memory_user_id, &result.executed_tools).await;
         if should_include_step_messages(&result) {
             messages.extend(result.messages);
@@ -5685,6 +5726,48 @@ async fn run_agent_turn(
         return Ok(EMPTY_AGENT_RESPONSE_FALLBACK.to_string());
     }
     Ok(output)
+}
+
+/// Run an agent turn, falling back through the configured chat model chain when
+/// the primary model is unavailable upstream (e.g. Tinfoil 502). Each model is
+/// tried once, in order; fallback only happens before any step has succeeded.
+async fn run_agent_turn(
+    agent: &mut SageAgent,
+    input: &str,
+    memory_user_id: Option<&str>,
+    lm: &RequestLmSettings,
+) -> AppResult<String> {
+    let chain = &lm.model_chain;
+    let mut last_error: Option<AppError> = None;
+
+    for (idx, model) in chain.iter().enumerate() {
+        // Point the global LM at this model before the attempt. The primary
+        // (idx 0) was already configured by the handler for any intermediate
+        // memory work, so only reconfigure when switching to a fallback.
+        if idx > 0 {
+            lm.configure(model).await?;
+        }
+
+        match run_agent_steps(agent, input, memory_user_id).await {
+            Ok(answer) => return Ok(answer),
+            Err(AgentTurnFailure { error, progressed }) => {
+                let more_models = idx + 1 < chain.len();
+                if !progressed && more_models && is_model_fallback_eligible(&error) {
+                    warn!(
+                        "chat model '{}' unavailable ({}); falling back to '{}'",
+                        model,
+                        error.message,
+                        chain[idx + 1]
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| AppError::internal("no chat model configured")))
 }
 
 async fn persist_successful_admin_config_tools(
@@ -5741,9 +5824,10 @@ async fn run_conversation_tool_loop(
     input: &str,
     sinks: &ConversationToolLoopSinks,
     memory_user_id: Option<&str>,
+    lm: &RequestLmSettings,
 ) -> AppResult<ConversationToolLoopOutput> {
     let turn_started_at = Instant::now();
-    let raw_answer = run_agent_turn(agent, input, memory_user_id).await?;
+    let raw_answer = run_agent_turn(agent, input, memory_user_id, lm).await?;
     sinks.trace_deltas.emit(turn_timing_trace_delta(
         turn_started_at.elapsed().as_millis(),
     ));
@@ -6068,19 +6152,72 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-async fn configure_request_lm(config: &Config, temperature: f64) -> AppResult<()> {
-    let api_key = config
-        .tinfoil_api_key
-        .as_deref()
-        .ok_or_else(|| AppError::internal("TINFOIL_API_KEY not configured"))?;
-    SageAgent::configure_lm_with_temperature(
-        &config.tinfoil_api_url,
-        api_key,
-        &config.tinfoil_model,
-        temperature,
+/// Per-request LM configuration: the ordered chat model chain (primary first,
+/// then fallbacks) plus the endpoint and temperature used to (re)configure the
+/// global LM as the request fails over between models.
+struct RequestLmSettings {
+    api_url: String,
+    api_key: String,
+    model_chain: Vec<String>,
+    temperature: f64,
+}
+
+impl RequestLmSettings {
+    /// Build the model chain and endpoint settings for a request, deduping any
+    /// fallback that repeats the primary model.
+    fn from_config(config: &Config, temperature: f64) -> AppResult<Self> {
+        let api_key = config
+            .tinfoil_api_key
+            .as_deref()
+            .ok_or_else(|| AppError::internal("TINFOIL_API_KEY not configured"))?;
+
+        let mut model_chain = Vec::with_capacity(1 + config.tinfoil_model_fallbacks.len());
+        model_chain.push(config.tinfoil_model.clone());
+        for fallback in &config.tinfoil_model_fallbacks {
+            if !model_chain.iter().any(|existing| existing == fallback) {
+                model_chain.push(fallback.clone());
+            }
+        }
+
+        Ok(Self {
+            api_url: config.tinfoil_api_url.clone(),
+            api_key: api_key.to_string(),
+            model_chain,
+            temperature,
+        })
+    }
+
+    /// Point the global LM at `model`.
+    async fn configure(&self, model: &str) -> AppResult<()> {
+        SageAgent::configure_lm_with_temperature(
+            &self.api_url,
+            &self.api_key,
+            model,
+            self.temperature,
+        )
+        .await
+        .map_err(internal_error)
+    }
+
+    /// Configure the primary model — used by handlers before any intermediate
+    /// memory work so it runs against the same model the turn starts on.
+    async fn configure_primary(&self) -> AppResult<()> {
+        let primary = self
+            .model_chain
+            .first()
+            .ok_or_else(|| AppError::internal("no chat model configured"))?;
+        self.configure(primary).await
+    }
+}
+
+/// Whether a failed turn should fall over to the next model. Upstream model
+/// outages and missing-model errors surface as 502 via [`model_provider_error`];
+/// everything else (bad request, auth, app bugs) is returned unchanged.
+fn is_model_fallback_eligible(error: &AppError) -> bool {
+    matches!(
+        error.status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
     )
-    .await
-    .map_err(internal_error)
 }
 
 fn enforce_csrf(config: &EnclaveWebConfig, method: &Method, headers: &HeaderMap) -> AppResult<()> {
@@ -6203,7 +6340,7 @@ fn internal_error(error: impl std::fmt::Display) -> AppError {
 
 fn model_provider_error(error: impl std::fmt::Display) -> AppError {
     let message = error.to_string();
-    if message.contains("The model does not exist") {
+    if is_upstream_model_failure(&message) {
         AppError::new(
             StatusCode::BAD_GATEWAY,
             "Configured Tinfoil model is unavailable. Check TINFOIL_MODEL and restart Sage.",
@@ -6211,6 +6348,31 @@ fn model_provider_error(error: impl std::fmt::Display) -> AppError {
     } else {
         AppError::internal(message)
     }
+}
+
+/// Detect errors that mean the chat model itself is unreachable/unavailable
+/// upstream (vs. a request or application error). These are the failures worth
+/// failing over to a different model for.
+fn is_upstream_model_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "the model does not exist",
+        "model not found",
+        "model_not_found",
+        "502",
+        "bad gateway",
+        "503",
+        "service unavailable",
+        "504",
+        "gateway timeout",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "error sending request",
+        "timed out",
+        "dns error",
+    ];
+    MARKERS.iter().any(|marker| message.contains(marker))
 }
 
 fn auth_error(error: anyhow::Error) -> AppError {
@@ -8734,6 +8896,68 @@ mod tests {
     }
 
     #[test]
+    fn lm_settings_chain_puts_primary_first_and_dedupes() {
+        let mut config = test_config_with_tinfoil_key("secret");
+        config.tinfoil_model = "kimi-k2-6".to_string();
+        // Fallback that repeats the primary should be dropped.
+        config.tinfoil_model_fallbacks = vec![
+            "kimi-k2-6".to_string(),
+            "glm-5-2".to_string(),
+            "gpt-oss-120b".to_string(),
+        ];
+
+        let settings = RequestLmSettings::from_config(&config, 0.1).expect("settings");
+        assert_eq!(
+            settings.model_chain,
+            vec![
+                "kimi-k2-6".to_string(),
+                "glm-5-2".to_string(),
+                "gpt-oss-120b".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn lm_settings_requires_api_key() {
+        let mut config = test_config_with_tinfoil_key("secret");
+        config.tinfoil_api_key = None;
+        assert!(RequestLmSettings::from_config(&config, 0.1).is_err());
+    }
+
+    #[test]
+    fn upstream_model_failures_are_fallback_eligible() {
+        for message in [
+            "The model does not exist",
+            "upstream returned 502 Bad Gateway",
+            "503 Service Unavailable",
+            "error sending request for url",
+            "connection refused",
+            // Realistic anyhow chain ({:#}) surfaced by run_agent_steps: the
+            // status lives in a nested source, not the top-level message.
+            "LLM call failed after 3 attempts: HttpError: Invalid status code \
+             503 Service Unavailable with message: Workload proxy is not ready.",
+        ] {
+            let error = model_provider_error(message);
+            assert!(
+                is_model_fallback_eligible(&error),
+                "expected fallback for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_and_app_errors_are_not_fallback_eligible() {
+        // A 400-class provider error (e.g. malformed request) must not fail over.
+        assert!(!is_model_fallback_eligible(&model_provider_error(
+            "400 Bad Request: invalid 'messages'"
+        )));
+        assert!(!is_model_fallback_eligible(&AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "nope"
+        )));
+    }
+
+    #[test]
     fn query_input_uses_knowledge_tool_constraints_without_initial_document_context() {
         let auth = InternalAuthContext {
             id: 2,
@@ -8871,6 +9095,7 @@ mod tests {
             tinfoil_api_url: "http://tinfoil-proxy:8089/v1".to_string(),
             tinfoil_api_key: Some(secret.to_string()),
             tinfoil_model: "kimi-k2-6".to_string(),
+            tinfoil_model_fallbacks: vec!["glm-5-2".to_string(), "gpt-oss-120b".to_string()],
             tinfoil_embedding_model: "nomic-embed-text".to_string(),
             tinfoil_vision_model: "qwen3-vl-30b".to_string(),
             database_url: "postgres://sage:sage@localhost:5434/sage".to_string(),

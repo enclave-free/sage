@@ -14,6 +14,9 @@ pub struct Config {
     pub tinfoil_api_url: String,
     pub tinfoil_api_key: Option<String>,
     pub tinfoil_model: String,
+    /// Ordered chat models to fall back to when `tinfoil_model` is unavailable
+    /// (e.g. upstream 502). Tried left to right after the primary model.
+    pub tinfoil_model_fallbacks: Vec<String>,
     pub tinfoil_embedding_model: String,
     pub tinfoil_vision_model: String,
 
@@ -44,6 +47,30 @@ pub struct Config {
     pub http_port: u16,
 }
 
+/// Default chat fallback chain used when `TINFOIL_MODEL_FALLBACKS` is unset.
+/// Tried in order after the primary `TINFOIL_MODEL`.
+const DEFAULT_MODEL_FALLBACKS: &[&str] = &["glm-5-2", "gpt-oss-120b"];
+
+/// Parse a comma-separated `TINFOIL_MODEL_FALLBACKS` value into an ordered list.
+///
+/// - Unset (`None`)         -> the built-in [`DEFAULT_MODEL_FALLBACKS`] chain.
+/// - Set but empty/blank    -> no fallbacks (operator opted out).
+/// - Otherwise              -> trimmed, non-empty entries in order.
+fn parse_model_fallbacks(raw: Option<&str>) -> Vec<String> {
+    match raw {
+        None => DEFAULT_MODEL_FALLBACKS
+            .iter()
+            .map(|model| model.to_string())
+            .collect(),
+        Some(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
@@ -52,6 +79,9 @@ impl Config {
             tinfoil_api_key: std::env::var("TINFOIL_API_KEY").ok(),
             tinfoil_model: std::env::var("TINFOIL_MODEL")
                 .unwrap_or_else(|_| "gemma4-31b".to_string()),
+            tinfoil_model_fallbacks: parse_model_fallbacks(
+                std::env::var("TINFOIL_MODEL_FALLBACKS").ok().as_deref(),
+            ),
             tinfoil_embedding_model: std::env::var("TINFOIL_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string()),
             tinfoil_vision_model: std::env::var("TINFOIL_VISION_MODEL").unwrap_or_else(|_| {
@@ -152,6 +182,32 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn model_fallbacks_default_when_unset() {
+        assert_eq!(
+            parse_model_fallbacks(None),
+            vec!["glm-5-2".to_string(), "gpt-oss-120b".to_string()],
+        );
+    }
+
+    #[test]
+    fn model_fallbacks_parse_and_trim_csv() {
+        assert_eq!(
+            parse_model_fallbacks(Some(" glm-5-2 , gpt-oss-120b ,, llama3-3-70b ")),
+            vec![
+                "glm-5-2".to_string(),
+                "gpt-oss-120b".to_string(),
+                "llama3-3-70b".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn model_fallbacks_empty_string_opts_out() {
+        assert!(parse_model_fallbacks(Some("")).is_empty());
+        assert!(parse_model_fallbacks(Some("  ")).is_empty());
     }
 
     #[test]

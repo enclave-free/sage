@@ -1246,8 +1246,12 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
                     MAX_LLM_RETRIES,
                     err
                 );
+                // Use Debug ({:?}) so the underlying provider status (e.g. the
+                // upstream "503 Service Unavailable") is preserved in the error
+                // message. The provider error's Display is only "LLM call failed",
+                // which hides the status that model-fallback classification needs.
                 return Err(anyhow::anyhow!(
-                    "LLM error after {} retries: {}",
+                    "LLM error after {} retries: {:?}",
                     MAX_LLM_RETRIES,
                     err
                 ));
