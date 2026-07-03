@@ -725,7 +725,8 @@ struct InternalDocumentSearchResponse {
 
 #[derive(Clone, Debug, Serialize)]
 struct InternalResourceSearchRequest {
-    help_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    help_type: Option<String>,
     jurisdiction: Option<String>,
     language: Option<String>,
     limit: i32,
@@ -758,7 +759,7 @@ struct InternalResourceSearchResponse {
     #[serde(default)]
     resolved_country_code: Option<String>,
     #[serde(default)]
-    help_type: String,
+    help_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1895,25 +1896,28 @@ impl Tool for FindResourcesTool {
     fn description(&self) -> &str {
         "Look up trusted, vetted real-world resources to connect a person with help: \
          lawyers, NGOs, UN bodies, clinics, shelters, food, financial aid. Use this when a \
-         conversation escalates from information to action — when someone needs to be put in \
-         touch with a real organization or person who can help. Results are filtered by region \
-         and the type of help needed and ranked from most-local to global."
+         conversation escalates from information to action - when someone needs to be put in \
+         touch with a real organization or person who can help. Also use this for inventory \
+         questions like 'what resources do you have?' or 'list available resources'; omit \
+         help_type in that case. Referral results are filtered by region and the type of help \
+         needed and ranked from most-local to global."
     }
 
     fn args_schema(&self) -> &str {
-        r#"{"help_type":"required: one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es"}"#
+        r#"{"help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es"}"#
     }
 
     async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
         let help_type = args
             .get("help_type")
-            .cloned()
-            .ok_or_else(|| anyhow!("find_resources requires help_type"))?;
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let region = args
             .get("region")
             .cloned()
             .or_else(|| self.jurisdiction.clone());
         let language = args.get("language").cloned();
+        let is_inventory_lookup = help_type.is_none();
 
         let response = self
             .internal
@@ -1921,30 +1925,54 @@ impl Tool for FindResourcesTool {
                 help_type: help_type.clone(),
                 jurisdiction: region.clone(),
                 language,
-                limit: 5,
+                limit: if is_inventory_lookup { 10 } else { 5 },
             })
             .await?;
-        let response_help_type = fallback_text(&response.help_type, &help_type);
+        let response_help_type = response
+            .help_type
+            .as_deref()
+            .map(|value| fallback_text(value, "curated"))
+            .or(help_type.as_deref())
+            .unwrap_or("curated");
         let response_region = response
             .resolved_country_code
             .as_deref()
             .or(region.as_deref());
-        let trace_query = match response_region {
-            Some(region) => format!("{} resources for {}", response_help_type, region),
-            None => format!("{} resources", response_help_type),
+        let trace_query = if is_inventory_lookup {
+            match response_region {
+                Some(region) => format!("curated resources inventory for {}", region),
+                None => "curated resources inventory".to_string(),
+            }
+        } else {
+            match response_region {
+                Some(region) => format!("{} resources for {}", response_help_type, region),
+                None => format!("{} resources", response_help_type),
+            }
         };
 
         if response.resources.is_empty() {
             let where_label = response_region.unwrap_or("the requested region");
+            let empty_summary = if is_inventory_lookup {
+                "No ready curated resources were found."
+            } else {
+                "No matching curated resources were found."
+            };
             if let Ok(mut sink) = self.traces.lock() {
                 sink.push(ToolCallInfoResponse {
                     tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                     tool_name: "Curated Resources".to_string(),
                     query: Some(trace_query),
-                    output_summary: Some("No matching curated resources were found.".to_string()),
+                    output_summary: Some(empty_summary.to_string()),
                     warnings: vec!["no_curated_resources".to_string()],
                     guarded: false,
                 });
+            }
+            if is_inventory_lookup {
+                return Ok(ToolResult::success(
+                    "No ready curated resources are currently listed. Do not invent referrals; \
+                     say that the curated resource directory is empty or still being configured."
+                        .to_string(),
+                ));
             }
             return Ok(ToolResult::success(format!(
                 "No vetted {} resources are currently listed for {}. Do not invent referrals; \
@@ -1958,17 +1986,29 @@ impl Tool for FindResourcesTool {
                 tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                 tool_name: "Curated Resources".to_string(),
                 query: Some(trace_query),
-                output_summary: Some("Found vetted curated resources for the answer.".to_string()),
+                output_summary: Some(if is_inventory_lookup {
+                    "Listed ready curated resources for the answer.".to_string()
+                } else {
+                    "Found vetted curated resources for the answer.".to_string()
+                }),
                 warnings: Vec::new(),
                 guarded: false,
             });
         }
 
-        let mut output = format!("Trusted {} resources", response_help_type);
+        let mut output = if is_inventory_lookup {
+            "Available curated resources".to_string()
+        } else {
+            format!("Trusted {} resources", response_help_type)
+        };
         if let Some(region) = response_region {
             output.push_str(&format!(" for {}", region));
         }
-        output.push_str(" (most local first):\n\n");
+        if is_inventory_lookup {
+            output.push_str(" (ready resources only):\n\n");
+        } else {
+            output.push_str(" (most local first):\n\n");
+        }
         for (idx, r) in response.resources.iter().enumerate() {
             let name = r.name.clone().unwrap_or_else(|| r.resource_id.clone());
             let rtype = r.resource_type.clone().unwrap_or_default();
@@ -7331,7 +7371,7 @@ impl<'a> EnclaveWebRuntimeProfile<'a> {
         }
         if self.include_curated_resources_tool {
             instruction.push_str(
-                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Only share contact details returned by find_resources.\n",
+                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Only share contact details returned by find_resources.\n",
             );
         }
         instruction.push_str("\nAgent Settings profile:\n");
@@ -8488,6 +8528,110 @@ mod tests {
         assert_eq!(payload["jurisdiction"], "Mexico");
         assert_eq!(payload["language"], "es");
         assert_eq!(payload["limit"], 5);
+    }
+
+    #[tokio::test]
+    async fn find_resources_tool_without_help_type_lists_ready_inventory() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/resources/search",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let token = headers
+                            .get("x-internal-agent-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(sender) = seen_tx
+                            .lock()
+                            .expect("request recorder should lock")
+                            .take()
+                        {
+                            let _ = sender.send((token, payload));
+                        }
+                        Json(json!({
+                            "resources": [
+                                {
+                                    "resource_id": "demo-test-resource",
+                                    "name": "Demo Test Resource",
+                                    "resource_type": "ngo",
+                                    "description": "Synthetic resource used to verify inventory questions.",
+                                    "contact": {
+                                        "email": "demo-test@example.test",
+                                        "url": "https://demo-test.example.test"
+                                    },
+                                    "languages": ["en"],
+                                    "coverage": "Global",
+                                    "help_types": ["legal", "humanitarian"],
+                                    "verified_at": "2026-07-03T20:00:00Z"
+                                }
+                            ],
+                            "resolved_country_code": null,
+                            "help_type": null
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+
+        let tool = FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::builder().build().expect("http client should build"),
+                format!("http://{}", addr),
+                "test-token".to_string(),
+            ),
+            jurisdiction: None,
+            traces: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = tool
+            .execute(&HashMap::new())
+            .await
+            .expect("resource inventory should succeed");
+        server.abort();
+
+        assert!(result.success);
+        assert!(result.output.contains("Available curated resources"));
+        assert!(result.output.contains("Demo Test Resource (ngo)"));
+        assert!(result
+            .output
+            .contains("Synthetic resource used to verify inventory questions."));
+        assert!(result.output.contains("Helps with: legal, humanitarian"));
+        assert!(result.output.contains("email: demo-test@example.test"));
+        assert!(result.output.contains("never invent contact details"));
+
+        let traces = tool.traces.lock().expect("trace sink should lock");
+        assert_eq!(traces.len(), 1);
+        assert_eq!(
+            traces[0].query.as_deref(),
+            Some("curated resources inventory")
+        );
+        assert_eq!(
+            traces[0].output_summary.as_deref(),
+            Some("Listed ready curated resources for the answer.")
+        );
+
+        let (token, payload) = seen_rx
+            .await
+            .expect("test backend should record the resource request");
+        assert_eq!(token.as_deref(), Some("test-token"));
+        assert!(payload.get("help_type").is_none());
+        assert_eq!(payload["jurisdiction"], Value::Null);
+        assert_eq!(payload["limit"], 10);
     }
 
     #[test]
@@ -11657,6 +11801,13 @@ mod tests {
             .args_schema()
             .contains("Guided bootstrap example"));
         assert!(registry.has("done"));
+        let resources_tool = registry
+            .get("find_resources")
+            .expect("curated resources tool should be registered");
+        assert!(resources_tool
+            .description()
+            .contains("what resources do you have?"));
+        assert!(resources_tool.args_schema().contains("omit for inventory"));
 
         let user = InternalAuthContext {
             id: 2,
