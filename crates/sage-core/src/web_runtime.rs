@@ -4402,6 +4402,11 @@ fn build_conversation_turn_input(
             request.tools.join(", ")
         ));
     }
+    if let Some(guidance) = guarded_database_turn_guidance(auth, request) {
+        input.push_str("\n=== TOOL GUARDRAILS ===\n");
+        input.push_str(guidance);
+        input.push('\n');
+    }
     if let Some(job_ids) = request
         .job_ids
         .as_ref()
@@ -4442,6 +4447,25 @@ fn build_conversation_turn_input(
     input.push_str("\n=== USER MESSAGE ===\n");
     input.push_str(&request.message);
     input
+}
+
+fn guarded_database_turn_guidance(
+    auth: &InternalAuthContext,
+    request: &ChatRequest,
+) -> Option<&'static str> {
+    if auth.kind != "admin"
+        || !request.tools.iter().any(|tool| tool == "db-query")
+        || is_direct_database_select(&request.message)
+    {
+        return None;
+    }
+
+    Some(
+        "db-query is enabled for this Admin turn, but the submitted message is not a direct read-only SELECT, so the executable db_query tool is intentionally withheld for this turn.\n\
+Do not tell the Admin that Database Query is unavailable, misconfigured, disconnected, or missing.\n\
+Explain that natural-language database requests are guarded before text-to-SQL. Ask the Admin to submit a reviewed direct read-only SELECT to run Database Query.\n\
+If the Admin is asking about user types, onboarding fields, or other Admin Config state and admin-config is enabled, use the Admin Config read tools instead of Database Query. If admin-config is not enabled, say Config can inspect those settings when enabled.",
+    )
 }
 
 fn client_confirmation_events_for_turn_input(
@@ -11735,6 +11759,36 @@ mod tests {
         assert_eq!(trace_deltas[0].kind, "tool_result");
         assert_eq!(trace_deltas[0].status.as_deref(), Some("guarded"));
         assert_eq!(trace_deltas[0].title.as_deref(), Some("Database Query"));
+    }
+
+    #[test]
+    fn guarded_database_turn_input_explains_direct_select_policy() {
+        let admin = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "Do we have anyone from the database registered from any organizations?"
+                .to_string(),
+            session_id: None,
+            tools: vec!["db-query".to_string()],
+            conversation_history: Vec::new(),
+            job_ids: None,
+            conversation_channel: None,
+        };
+
+        let input = build_conversation_turn_input(&admin, &HashMap::new(), &request, None);
+
+        assert!(input.contains("=== TOOL GUARDRAILS ==="));
+        assert!(input.contains("db-query is enabled"));
+        assert!(input.contains("direct read-only SELECT"));
+        assert!(input.contains("Do not tell the Admin that Database Query is unavailable"));
     }
 
     #[test]
