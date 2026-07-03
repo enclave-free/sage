@@ -50,6 +50,12 @@ use crate::schema::{
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
 const CURATED_RESOURCES_TOOL_SET_ID: &str = "curated-resources";
 const KNOWLEDGE_SEARCH_TOOL_SET_ID: &str = "knowledge-search";
+const WEB_SEARCH_TOOL_SET_ID: &str = "web-search";
+const USER_DEFAULT_TOOL_IDS_KEY: &str = "user_default_tool_ids";
+const KNOWLEDGE_SOURCE_DEFAULT_KEY: &str = "knowledge_source_default";
+const KNOWLEDGE_SOURCE_SCOPE_NONE: &str = "none";
+const KNOWLEDGE_SOURCE_SCOPE_SELECTED: &str = "selected";
+const KNOWLEDGE_SOURCE_SCOPE_ALL: &str = "all";
 const DEFAULT_PROMPT_RULES: [&str; 7] = [
     "For ordinary step-by-step guidance, keep actions focused; for delegated Admin Conversation configuration tasks, group related settings into one executable change set for Change Confirmation.",
     "For broad Admin Config setup, status, or readiness questions, call read_admin_setup_summary first. It already includes deployment readiness, missing setup, and next actions; use low-level read Tools only for narrow follow-up inspection.",
@@ -669,6 +675,15 @@ struct SessionDefaultsQuery {
 struct SessionDefaultsResponse {
     web_search_enabled: bool,
     default_document_ids: Vec<String>,
+    default_tool_ids: Vec<String>,
+    knowledge_source_scope: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConversationDefaultPolicy {
+    tools: Vec<String>,
+    job_ids: Option<Vec<String>>,
+    knowledge_source_scope: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2722,6 +2737,7 @@ fn reject_unsupported_bootstrap_args(
             return Err(format!("Unsupported bootstrap setup field: {}", key));
         }
     }
+
     Ok(())
 }
 
@@ -3944,6 +3960,24 @@ fn validate_admin_change_request_body(
                 ));
             }
         }
+        if key == USER_DEFAULT_TOOL_IDS_KEY {
+            let parsed: Value = serde_json::from_str(value).map_err(|error| {
+                format!(
+                    "{} body.value must be a JSON array of Tool Set IDs: {}",
+                    request.path, error
+                )
+            })?;
+            validate_user_default_tool_ids_value(&parsed)
+                .map_err(|message| format!("{} body.value invalid: {}", request.path, message))?;
+        }
+        if key == KNOWLEDGE_SOURCE_DEFAULT_KEY
+            && !is_valid_knowledge_source_scope(&value.trim().to_ascii_lowercase())
+        {
+            return Err(format!(
+                "{} body.value must be one of: none, selected, all.",
+                request.path
+            ));
+        }
     }
 
     Ok(())
@@ -4274,6 +4308,96 @@ fn chat_stream_status_payload(
     payload
 }
 
+fn push_unique_tool_id(tools: &mut Vec<String>, tool_id: &str) {
+    if !tools.iter().any(|existing| existing == tool_id) {
+        tools.push(tool_id.to_string());
+    }
+}
+
+fn configured_user_default_tool_ids(ai_config: &InternalEffectiveAiConfig) -> Vec<String> {
+    let mut tools = Vec::new();
+    if let Some(value) = ai_config.defaults.get(USER_DEFAULT_TOOL_IDS_KEY) {
+        if let Some(items) = value.as_array() {
+            for item in items.iter().filter_map(Value::as_str) {
+                if is_allowed_user_conversation_tool_set(item) {
+                    push_unique_tool_id(&mut tools, item);
+                }
+            }
+        }
+    } else if value_as_bool(ai_config.defaults.get("web_search_default"), false) {
+        push_unique_tool_id(&mut tools, WEB_SEARCH_TOOL_SET_ID);
+    }
+    tools
+}
+
+fn effective_knowledge_source_scope(ai_config: &InternalEffectiveAiConfig) -> String {
+    ai_config
+        .defaults
+        .get(KNOWLEDGE_SOURCE_DEFAULT_KEY)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .filter(|scope| is_valid_knowledge_source_scope(scope))
+        .unwrap_or_else(|| KNOWLEDGE_SOURCE_SCOPE_NONE.to_string())
+}
+
+fn effective_user_conversation_default_policy(
+    ai_config: &InternalEffectiveAiConfig,
+    document_access: &InternalDocumentAccessResponse,
+) -> ConversationDefaultPolicy {
+    let scope = effective_knowledge_source_scope(ai_config);
+    let mut tools = configured_user_default_tool_ids(ai_config);
+    tools.retain(|tool| tool != KNOWLEDGE_SEARCH_TOOL_SET_ID);
+
+    let job_ids = match scope.as_str() {
+        KNOWLEDGE_SOURCE_SCOPE_SELECTED => {
+            if document_access.default_document_ids.is_empty() {
+                None
+            } else {
+                push_unique_tool_id(&mut tools, KNOWLEDGE_SEARCH_TOOL_SET_ID);
+                Some(document_access.default_document_ids.clone())
+            }
+        }
+        KNOWLEDGE_SOURCE_SCOPE_ALL => {
+            if !document_access.available_document_ids.is_empty() {
+                push_unique_tool_id(&mut tools, KNOWLEDGE_SEARCH_TOOL_SET_ID);
+            }
+            None
+        }
+        _ => None,
+    };
+
+    ConversationDefaultPolicy {
+        tools,
+        job_ids,
+        knowledge_source_scope: scope,
+    }
+}
+
+async fn apply_conversation_default_policy(
+    state: &WebAppState,
+    ai_config: &InternalEffectiveAiConfig,
+    auth: &InternalAuthContext,
+    request: ChatRequest,
+) -> AppResult<ChatRequest> {
+    if auth.kind == "admin" {
+        return Ok(request);
+    }
+
+    let document_access = state
+        .internal
+        .document_access(auth.user_type_id)
+        .await
+        .map_err(internal_error)?;
+    let policy = effective_user_conversation_default_policy(ai_config, &document_access);
+
+    Ok(ChatRequest {
+        tools: policy.tools,
+        job_ids: policy.job_ids,
+        ..request
+    })
+}
+
 async fn session_defaults(
     State(state): State<WebAppState>,
     Query(query): Query<SessionDefaultsQuery>,
@@ -4284,10 +4408,16 @@ async fn session_defaults(
         .document_access(query.user_type_id)
         .await
         .map_err(internal_error)?;
+    let policy = effective_user_conversation_default_policy(&ai_config, &document_access);
 
     Ok(Json(SessionDefaultsResponse {
-        web_search_enabled: value_as_bool(ai_config.defaults.get("web_search_default"), false),
-        default_document_ids: document_access.default_document_ids,
+        web_search_enabled: policy
+            .tools
+            .iter()
+            .any(|tool| tool == WEB_SEARCH_TOOL_SET_ID),
+        default_document_ids: policy.job_ids.clone().unwrap_or_default(),
+        default_tool_ids: policy.tools,
+        knowledge_source_scope: policy.knowledge_source_scope,
     }))
 }
 
@@ -4300,6 +4430,7 @@ async fn chat(
     let auth = resolve_public_actor(&state, &headers).await?;
 
     let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
+    let request = apply_conversation_default_policy(&state, &ai_config, &auth, request).await?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
     lm_settings.configure_primary().await?;
@@ -4751,6 +4882,7 @@ async fn chat_stream(
     enforce_csrf(&state.web_config, &Method::POST, &headers)?;
     let auth = resolve_public_actor(&state, &headers).await?;
     let ai_config = load_effective_ai_config(&state, auth.user_type_id)?;
+    let request = apply_conversation_default_policy(&state, &ai_config, &auth, request).await?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
     lm_settings.configure_primary().await?;
@@ -5043,6 +5175,8 @@ async fn query(
         job_ids: request.job_ids.clone(),
         conversation_channel: None,
     };
+    let chat_request =
+        apply_conversation_default_policy(&state, &ai_config, &auth, chat_request).await?;
     let (registry, tool_sinks) = build_conversation_tool_registry_with_context(
         &state.internal,
         &state.http,
@@ -5060,7 +5194,10 @@ async fn query(
         Some(memory),
         build_agent_instruction(
             &ai_config.compiled_prompt,
-            true,
+            chat_request
+                .tools
+                .iter()
+                .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
             chat_request
                 .tools
                 .iter()
@@ -5072,7 +5209,7 @@ async fn query(
         agent_trace_sink.emit(agent_trace_event_delta(event));
     }));
 
-    let input = build_query_conversation_turn_input(&auth, &profile, &request, None);
+    let input = build_query_conversation_turn_input(&auth, &profile, &request, &chat_request, None);
     let tool_loop = run_conversation_tool_loop(
         &mut agent,
         &input,
@@ -6172,6 +6309,52 @@ fn seed_default_ai_config(state: &WebAppState) -> AppResult<()> {
             .map_err(internal_error)?;
         }
     }
+
+    let legacy_web_search_enabled = diesel::sql_query(
+        "SELECT key, value, value_type, category, description, updated_at \
+         FROM ai_config WHERE key = $1",
+    )
+    .bind::<Varchar, _>("web_search_default")
+    .load::<AiConfigRow>(&mut *conn)
+    .map_err(internal_error)?
+    .into_iter()
+    .next()
+    .is_some_and(|row| row.value.trim().eq_ignore_ascii_case("true"));
+    let user_default_tool_ids = if legacy_web_search_enabled {
+        serde_json::to_string(&[WEB_SEARCH_TOOL_SET_ID])
+    } else {
+        serde_json::to_string(&Vec::<String>::new())
+    }
+    .expect("default tool ids serialize");
+    for (key, value, value_type, category, description) in [
+        (
+            USER_DEFAULT_TOOL_IDS_KEY,
+            user_default_tool_ids.as_str(),
+            "json",
+            "default",
+            Some("Tool Sets active by default for User Conversations"),
+        ),
+        (
+            KNOWLEDGE_SOURCE_DEFAULT_KEY,
+            KNOWLEDGE_SOURCE_SCOPE_NONE,
+            "string",
+            "default",
+            Some("Knowledge Source scope active by default for User Conversations: none, selected, or all"),
+        ),
+    ] {
+        diesel::sql_query(
+            "INSERT INTO ai_config (key, value, value_type, category, description, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, NOW()) \
+             ON CONFLICT (key) DO NOTHING",
+        )
+        .bind::<Varchar, _>(key)
+        .bind::<Text, _>(value)
+        .bind::<Varchar, _>(value_type)
+        .bind::<Varchar, _>(category)
+        .bind::<Nullable<Text>, _>(description)
+        .execute(&mut *conn)
+        .map_err(internal_error)?;
+    }
     Ok(())
 }
 
@@ -6986,8 +7169,22 @@ fn validate_ai_config_value(
                     ));
                 }
             }
+            if key == USER_DEFAULT_TOOL_IDS_KEY {
+                validate_user_default_tool_ids_value(&parsed)
+                    .map_err(|message| AppError::new(StatusCode::BAD_REQUEST, message))?;
+            }
         }
         _ => {}
+    }
+
+    if key == KNOWLEDGE_SOURCE_DEFAULT_KEY {
+        let normalized = value.trim().to_ascii_lowercase();
+        if !is_valid_knowledge_source_scope(&normalized) {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "knowledge_source_default must be one of: none, selected, all",
+            ));
+        }
     }
 
     if category == "prompt_section" && value.len() > 5000 {
@@ -6998,6 +7195,36 @@ fn validate_ai_config_value(
     }
 
     Ok(())
+}
+
+fn validate_user_default_tool_ids_value(value: &Value) -> Result<(), String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| "user_default_tool_ids must be a JSON array".to_string())?;
+    if !items.iter().all(|item| {
+        item.as_str()
+            .is_some_and(is_allowed_user_conversation_tool_set)
+    }) {
+        return Err(
+            "user_default_tool_ids may only include: curated-resources, knowledge-search, web-search"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn is_allowed_user_conversation_tool_set(tool_id: &str) -> bool {
+    matches!(
+        tool_id,
+        CURATED_RESOURCES_TOOL_SET_ID | KNOWLEDGE_SEARCH_TOOL_SET_ID | WEB_SEARCH_TOOL_SET_ID
+    )
+}
+
+fn is_valid_knowledge_source_scope(scope: &str) -> bool {
+    matches!(
+        scope,
+        KNOWLEDGE_SOURCE_SCOPE_NONE | KNOWLEDGE_SOURCE_SCOPE_SELECTED | KNOWLEDGE_SOURCE_SCOPE_ALL
+    )
 }
 
 fn parse_ai_config_value(value_type: &str, value: &str) -> Value {
@@ -7414,20 +7641,24 @@ fn build_query_conversation_turn_input(
     auth: &InternalAuthContext,
     profile: &HashMap<String, String>,
     request: &QueryRequest,
+    effective_chat_request: &ChatRequest,
     persisted_context: Option<&PersistedConversationContext>,
 ) -> String {
-    let enabled_tools = query_enabled_tool_sets(request);
     let mut input = String::new();
     input.push_str("=== REQUEST CONTEXT ===\n");
     input.push_str(&format!("auth_type: {}\n", auth.kind));
     if let Some(user_type_id) = auth.user_type_id {
         input.push_str(&format!("user_type_id: {}\n", user_type_id));
     }
-    input.push_str(&format!(
-        "enabled_tool_sets: {}\n",
-        enabled_tools.join(", ")
-    ));
-    if let Some(job_ids) = request
+    if effective_chat_request.tools.is_empty() {
+        input.push_str("enabled_tool_sets: none\n");
+    } else {
+        input.push_str(&format!(
+            "enabled_tool_sets: {}\n",
+            effective_chat_request.tools.join(", ")
+        ));
+    }
+    if let Some(job_ids) = effective_chat_request
         .job_ids
         .as_ref()
         .filter(|job_ids| !job_ids.is_empty())
@@ -12085,6 +12316,67 @@ mod tests {
     }
 
     #[test]
+    fn user_conversation_default_policy_applies_tool_and_knowledge_scope() {
+        let document_access = InternalDocumentAccessResponse {
+            user_type_id: Some(3),
+            available_document_ids: vec!["doc-a".to_string(), "doc-b".to_string()],
+            default_document_ids: vec!["doc-a".to_string()],
+        };
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::from([
+                (
+                    USER_DEFAULT_TOOL_IDS_KEY.to_string(),
+                    json!(["curated-resources", "web-search", "admin-config"]),
+                ),
+                (
+                    KNOWLEDGE_SOURCE_DEFAULT_KEY.to_string(),
+                    Value::String(KNOWLEDGE_SOURCE_SCOPE_SELECTED.to_string()),
+                ),
+            ]),
+            compiled_prompt: String::new(),
+        };
+
+        let policy = effective_user_conversation_default_policy(&ai_config, &document_access);
+
+        assert_eq!(
+            policy.tools,
+            vec![
+                CURATED_RESOURCES_TOOL_SET_ID.to_string(),
+                WEB_SEARCH_TOOL_SET_ID.to_string(),
+                KNOWLEDGE_SEARCH_TOOL_SET_ID.to_string(),
+            ]
+        );
+        assert_eq!(policy.job_ids, Some(vec!["doc-a".to_string()]));
+
+        let all_scope_config = InternalEffectiveAiConfig {
+            defaults: HashMap::from([(
+                KNOWLEDGE_SOURCE_DEFAULT_KEY.to_string(),
+                Value::String(KNOWLEDGE_SOURCE_SCOPE_ALL.to_string()),
+            )]),
+            ..ai_config.clone()
+        };
+        let all_policy =
+            effective_user_conversation_default_policy(&all_scope_config, &document_access);
+        assert_eq!(
+            all_policy.tools,
+            vec![KNOWLEDGE_SEARCH_TOOL_SET_ID.to_string()]
+        );
+        assert_eq!(all_policy.job_ids, None);
+
+        let none_policy = effective_user_conversation_default_policy(
+            &InternalEffectiveAiConfig {
+                defaults: HashMap::new(),
+                ..ai_config
+            },
+            &document_access,
+        );
+        assert!(none_policy.tools.is_empty());
+        assert_eq!(none_policy.job_ids, None);
+    }
+
+    #[test]
     fn query_input_uses_knowledge_tool_constraints_without_initial_document_context() {
         let auth = InternalAuthContext {
             id: 2,
@@ -12106,8 +12398,25 @@ mod tests {
             tools: Vec::new(),
             job_ids: Some(vec!["large-doc".to_string()]),
         };
+        let effective_request = ChatRequest {
+            message: request.question.clone(),
+            session_id: None,
+            tools: vec![
+                CURATED_RESOURCES_TOOL_SET_ID.to_string(),
+                KNOWLEDGE_SEARCH_TOOL_SET_ID.to_string(),
+            ],
+            conversation_history: Vec::new(),
+            job_ids: request.job_ids.clone(),
+            conversation_channel: None,
+        };
 
-        let input = build_query_conversation_turn_input(&auth, &HashMap::new(), &request, None);
+        let input = build_query_conversation_turn_input(
+            &auth,
+            &HashMap::new(),
+            &request,
+            &effective_request,
+            None,
+        );
 
         assert!(input.contains("enabled_tool_sets: curated-resources, knowledge-search"));
         assert!(input.contains("selected_document_ids: large-doc"));
