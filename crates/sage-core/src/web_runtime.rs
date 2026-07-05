@@ -411,6 +411,8 @@ pub struct ChatRequest {
     pub job_ids: Option<Vec<String>>,
     #[serde(default)]
     pub conversation_channel: Option<ConversationChannelRequest>,
+    #[serde(default)]
+    pub client_decrypted_context: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4548,6 +4550,14 @@ fn build_conversation_turn_input(
             input.push_str(&format!("channel_delivery: {}\n", delivery));
         }
     }
+    if let Some(context) = admin_signer_decrypted_context_for_turn_input(auth, request) {
+        input.push_str("\n=== ADMIN SIGNER-DECRYPTED CONTEXT ===\n");
+        input.push_str(
+            "The Admin browser signer produced this signer-delegated plaintext for this Admin Database turn. Use it only to interpret encrypted User data alongside db_query results.\n",
+        );
+        input.push_str(&context);
+        input.push('\n');
+    }
     if !profile.is_empty() {
         input.push_str("\nUSER PROFILE\n");
         for (key, value) in profile {
@@ -4575,6 +4585,21 @@ fn build_conversation_turn_input(
     input.push_str("\n=== USER MESSAGE ===\n");
     input.push_str(&request.message);
     input
+}
+
+fn admin_signer_decrypted_context_for_turn_input(
+    auth: &InternalAuthContext,
+    request: &ChatRequest,
+) -> Option<String> {
+    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "db-query") {
+        return None;
+    }
+    let context = request.client_decrypted_context.as_ref()?;
+    if context.is_null() || is_empty_json_object(context) {
+        return None;
+    }
+    let rendered = serde_json::to_string_pretty(context).unwrap_or_else(|_| context.to_string());
+    Some(truncate_chars(&rendered, 12_000))
 }
 
 fn database_tool_turn_guidance(
@@ -5127,6 +5152,7 @@ async fn query(
         conversation_history: Vec::new(),
         job_ids: request.job_ids.clone(),
         conversation_channel: None,
+        client_decrypted_context: None,
     };
     let chat_request =
         apply_conversation_default_policy(&state, &ai_config, &auth, chat_request).await?;
@@ -9485,6 +9511,7 @@ mod tests {
                 kind: "signal".to_string(),
                 delivery: Some("short_messages".to_string()),
             }),
+            client_decrypted_context: None,
         };
         let persisted = PersistedConversationContext {
             summary: Some("Persisted summary from Sage Session Memory.".to_string()),
@@ -9532,6 +9559,7 @@ mod tests {
             ],
             job_ids: None,
             conversation_channel: None,
+            client_decrypted_context: None,
         };
         let profile = HashMap::new();
 
@@ -9583,6 +9611,7 @@ mod tests {
             conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
+            client_decrypted_context: None,
         };
         let content = format!(
             "Here is the change.\n\n```json\n{}\n```",
@@ -11857,6 +11886,7 @@ mod tests {
             conversation_history: Vec::new(),
             job_ids: Some(vec!["doc-handbook".to_string()]),
             conversation_channel: None,
+            client_decrypted_context: None,
         };
 
         let (registry, _) = build_conversation_tool_registry(
@@ -11986,6 +12016,14 @@ mod tests {
             conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
+            client_decrypted_context: Some(json!({
+                "source": "admin-signer-user-roster",
+                "users": [{
+                    "id": 7,
+                    "name": "Marisol Rivera",
+                    "email": "marisol@example.test"
+                }]
+            })),
         };
 
         let (registry, sinks) = build_conversation_tool_registry(
@@ -12008,6 +12046,105 @@ mod tests {
     }
 
     #[test]
+    fn database_tool_turn_input_includes_admin_signer_decrypted_context() {
+        let admin = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "Tell me about the users in our db".to_string(),
+            session_id: None,
+            tools: vec!["db-query".to_string()],
+            conversation_history: Vec::new(),
+            job_ids: None,
+            conversation_channel: None,
+            client_decrypted_context: Some(json!({
+                "source": "admin-signer-user-roster",
+                "users": [{
+                    "id": 7,
+                    "name": "Marisol Rivera",
+                    "email": "marisol@example.test"
+                }]
+            })),
+        };
+
+        let input = build_conversation_turn_input(&admin, &HashMap::new(), &request, None);
+
+        assert!(input.contains("=== ADMIN SIGNER-DECRYPTED CONTEXT ==="));
+        assert!(input.contains("Marisol Rivera"));
+        assert!(input.contains("marisol@example.test"));
+        assert!(input.contains("signer-delegated plaintext"));
+    }
+
+    #[test]
+    fn client_decrypted_context_is_ignored_without_admin_database_tool() {
+        let user = InternalAuthContext {
+            id: 2,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: None,
+            email: Some("user@example.test".to_string()),
+            name: None,
+            user_type_id: Some(7),
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "Can you use this?".to_string(),
+            session_id: None,
+            tools: Vec::new(),
+            conversation_history: Vec::new(),
+            job_ids: None,
+            conversation_channel: None,
+            client_decrypted_context: Some(json!({
+                "source": "admin-signer-user-roster",
+                "users": [{ "id": 7, "email": "should-not-appear@example.test" }]
+            })),
+        };
+
+        let input = build_conversation_turn_input(&user, &HashMap::new(), &request, None);
+
+        assert!(!input.contains("=== ADMIN SIGNER-DECRYPTED CONTEXT ==="));
+        assert!(!input.contains("should-not-appear@example.test"));
+    }
+
+    #[test]
+    fn client_decrypted_context_is_ignored_for_non_admin_database_tool() {
+        let user = InternalAuthContext {
+            id: 2,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: None,
+            email: Some("user@example.test".to_string()),
+            name: None,
+            user_type_id: Some(7),
+            dev_mode: false,
+        };
+        let request = ChatRequest {
+            message: "Can you use this?".to_string(),
+            session_id: None,
+            tools: vec!["db-query".to_string()],
+            conversation_history: Vec::new(),
+            job_ids: None,
+            conversation_channel: None,
+            client_decrypted_context: Some(json!({
+                "source": "admin-signer-user-roster",
+                "users": [{ "id": 7, "email": "should-not-appear@example.test" }]
+            })),
+        };
+
+        let input = build_conversation_turn_input(&user, &HashMap::new(), &request, None);
+
+        assert!(!input.contains("=== ADMIN SIGNER-DECRYPTED CONTEXT ==="));
+        assert!(!input.contains("should-not-appear@example.test"));
+    }
+
+    #[test]
     fn database_tool_turn_input_encourages_model_chosen_read_only_query() {
         let admin = InternalAuthContext {
             id: 1,
@@ -12027,6 +12164,7 @@ mod tests {
             conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
+            client_decrypted_context: None,
         };
 
         let input = build_conversation_turn_input(&admin, &HashMap::new(), &request, None);
@@ -12065,6 +12203,7 @@ mod tests {
             conversation_history: Vec::new(),
             job_ids: None,
             conversation_channel: None,
+            client_decrypted_context: None,
         };
 
         let (registry, sinks) = build_conversation_tool_registry(
@@ -12105,6 +12244,7 @@ mod tests {
             conversation_history: Vec::new(),
             job_ids: Some(vec!["doc-handbook".to_string()]),
             conversation_channel: None,
+            client_decrypted_context: None,
         };
         let input = build_conversation_turn_input(&auth, &HashMap::new(), &request, None);
 
@@ -12275,6 +12415,7 @@ mod tests {
             conversation_history: Vec::new(),
             job_ids: request.job_ids.clone(),
             conversation_channel: None,
+            client_decrypted_context: None,
         };
 
         let input = build_query_conversation_turn_input(
