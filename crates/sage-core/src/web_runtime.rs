@@ -1466,22 +1466,6 @@ fn tool_error_trace_delta(
     }
 }
 
-fn guarded_database_trace_delta() -> ConversationTraceDeltaResponse {
-    ConversationTraceDeltaResponse {
-        id: trace_delta_id("tool-result", "db_query_guarded"),
-        kind: "tool_result".to_string(),
-        title: Some("Database Query".to_string()),
-        content: Some(
-            "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
-                .to_string(),
-        ),
-        tool_name: Some("db_query".to_string()),
-        status: Some("guarded".to_string()),
-        metadata: json!({ "guarded": true, "executed": false }),
-        created_at: Some(chrono::Utc::now().to_rfc3339()),
-    }
-}
-
 fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResponse {
     match event {
         AgentTraceEvent::ModelStepStarted { step, attempt } => ConversationTraceDeltaResponse {
@@ -1695,17 +1679,13 @@ fn build_conversation_tool_registry_with_context(
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "db-query") {
-        if is_direct_database_select(&request.message) {
-            registry.register(traced_tool(
-                Arc::new(AdminDbQueryTool {
-                    internal: internal.clone(),
-                    traces: sinks.traces.clone(),
-                }),
-                &sinks.trace_deltas,
-            ));
-        } else {
-            record_guarded_database_selection(&sinks, &request.message);
-        }
+        registry.register(traced_tool(
+            Arc::new(AdminDbQueryTool {
+                internal: internal.clone(),
+                traces: sinks.traces.clone(),
+            }),
+            &sinks.trace_deltas,
+        ));
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "admin-config") {
@@ -1799,29 +1779,6 @@ fn build_conversation_tool_registry_with_context(
 
     registry.register(Arc::new(crate::tools::DoneTool));
     (registry, sinks)
-}
-
-fn is_direct_database_select(message: &str) -> bool {
-    let trimmed = message.trim_start();
-    let upper = trimmed.to_ascii_uppercase();
-    upper == "SELECT" || upper.starts_with("SELECT ")
-}
-
-fn record_guarded_database_selection(sinks: &ConversationToolLoopSinks, message: &str) {
-    if let Ok(mut sink) = sinks.traces.lock() {
-        sink.push(ToolCallInfoResponse {
-            tool_id: "db-query".to_string(),
-            tool_name: "Database Query".to_string(),
-            query: Some(truncate_chars(message, 160)),
-            output_summary: Some(
-                "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
-                    .to_string(),
-            ),
-            warnings: vec!["direct_select_required".to_string()],
-            guarded: true,
-        });
-    }
-    sinks.trace_deltas.emit(guarded_database_trace_delta());
 }
 
 #[async_trait::async_trait]
@@ -4180,7 +4137,7 @@ impl Tool for AdminDbQueryTool {
     }
 
     fn description(&self) -> &str {
-        "Run a read-only SQL query against enclave.free's SQLite admin data."
+        "Inspect enclave.free's SQLite admin data. Use this for Admin database questions when live database facts would improve the answer. Generate one read-only SQLite SELECT query; the safe executor enforces read-only validation, table allowlists, truncation, and trace redaction."
     }
 
     fn args_schema(&self) -> &str {
@@ -4573,8 +4530,8 @@ fn build_conversation_turn_input(
             request.tools.join(", ")
         ));
     }
-    if let Some(guidance) = guarded_database_turn_guidance(auth, request) {
-        input.push_str("\n=== TOOL GUARDRAILS ===\n");
+    if let Some(guidance) = database_tool_turn_guidance(auth, request) {
+        input.push_str("\n=== TOOL GUIDANCE ===\n");
         input.push_str(guidance);
         input.push('\n');
     }
@@ -4620,22 +4577,18 @@ fn build_conversation_turn_input(
     input
 }
 
-fn guarded_database_turn_guidance(
+fn database_tool_turn_guidance(
     auth: &InternalAuthContext,
     request: &ChatRequest,
 ) -> Option<&'static str> {
-    if auth.kind != "admin"
-        || !request.tools.iter().any(|tool| tool == "db-query")
-        || is_direct_database_select(&request.message)
-    {
+    if auth.kind != "admin" || !request.tools.iter().any(|tool| tool == "db-query") {
         return None;
     }
 
     Some(
-        "db-query is enabled for this Admin turn, but the submitted message is not a direct read-only SELECT, so the executable db_query tool is intentionally withheld for this turn.\n\
-Do not tell the Admin that Database Query is unavailable, misconfigured, disconnected, or missing.\n\
-Explain that natural-language database requests are guarded before text-to-SQL. Ask the Admin to submit a reviewed direct read-only SELECT to run Database Query.\n\
-If the Admin is asking about user types, onboarding fields, or other Admin Config state and admin-config is enabled, use the Admin Config read tools instead of Database Query. If admin-config is not enabled, say Config can inspect those settings when enabled.",
+        "db-query is enabled for this Admin turn. When live SQLite data would answer better than guessing or asking the Admin to check manually, call db_query with one read-only SQLite SELECT query.\n\
+You may translate the Admin's natural-language database question into a safe SELECT yourself. Do not ask the Admin to resubmit SQL solely because the request is natural language.\n\
+The Python safe SQL executor enforces SELECT-only validation, blocked mutation keywords, table allowlists, truncation, and trace redaction. Direct database mutation is not supported.",
     )
 }
 
@@ -7954,18 +7907,8 @@ fn build_conversation_trace(
         .map(|tool| {
             let is_db_query = tool.tool_id == "db-query";
             let is_guarded = tool.guarded;
-            let is_guarded_db_query = is_db_query && is_guarded;
             let tool_output_summary = tool.output_summary.clone();
             let tool_warnings = tool.warnings.clone();
-            let guarded_db_output_summary = tool_output_summary.clone().unwrap_or_else(|| {
-                "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
-                    .to_string()
-            });
-            let guarded_db_warnings = if tool_warnings.is_empty() {
-                vec!["direct_select_required".to_string()]
-            } else {
-                tool_warnings.clone()
-            };
             ToolTraceResponse {
                 id: tool.tool_id,
                 name: tool.tool_name,
@@ -7975,22 +7918,20 @@ fn build_conversation_trace(
                     "completed".to_string()
                 },
                 execution: "server".to_string(),
-                input_summary: if is_guarded_db_query {
-                    Some("Database selected for a natural-language question.".to_string())
-                } else if is_db_query {
+                input_summary: if is_db_query {
                     Some("Read-only database query.".to_string())
                 } else {
                     tool.query.map(|query| truncate_chars(&query, 160))
                 },
-                output_summary: if is_guarded_db_query {
-                    Some(guarded_db_output_summary)
+                output_summary: if is_db_query && is_guarded {
+                    tool_output_summary
                 } else if is_db_query {
                     Some("Database results were redacted from the trace.".to_string())
                 } else {
                     tool_output_summary
                 },
-                warnings: if is_guarded_db_query {
-                    guarded_db_warnings
+                warnings: if is_db_query && is_guarded {
+                    tool_warnings
                 } else if is_db_query {
                     vec!["raw_results_redacted".to_string()]
                 } else {
@@ -8107,18 +8048,6 @@ fn conversation_activity_step_from_tool(
             warnings
         },
     }
-}
-
-#[cfg(test)]
-fn guarded_database_activity_step(tool: &ToolCallInfoResponse) -> ConversationActivityStepResponse {
-    conversation_activity_step_from_tool(
-        tool,
-        Some(
-            "Database Query was selected but not executed. Submit a direct read-only SELECT to run it."
-                .to_string(),
-        ),
-        vec!["direct_select_required".to_string()],
-    )
 }
 
 fn conversation_activity_step_from_tool_trace(
@@ -9356,67 +9285,6 @@ mod tests {
         assert!(rendered.contains("raw_results_redacted"));
         assert!(!rendered.contains("decrypted secret"));
         assert!(!rendered.contains("encrypted_value"));
-    }
-
-    #[test]
-    fn guarded_database_activity_warns_when_natural_language_does_not_execute() {
-        let tool = ToolCallInfoResponse {
-            guarded: true,
-            ..tool_call_info_for_id("db-query", "Which users are active?".to_string())
-        };
-
-        let step = guarded_database_activity_step(&tool);
-
-        assert_eq!(step.title, "Database Query");
-        assert_eq!(step.status, "guarded");
-        assert_eq!(
-            step.summary,
-            Some("Database Query was selected but not executed. Submit a direct read-only SELECT to run it.".to_string())
-        );
-        assert_eq!(step.warnings, vec!["direct_select_required".to_string()]);
-    }
-
-    #[test]
-    fn guarded_database_trace_does_not_claim_results_were_redacted() {
-        let mut defaults = HashMap::new();
-        defaults.insert(
-            "admin_trace_visibility".to_string(),
-            Value::String("detailed".to_string()),
-        );
-        let ai_config = InternalEffectiveAiConfig {
-            prompt_sections: HashMap::new(),
-            parameters: HashMap::new(),
-            defaults,
-            compiled_prompt: "Help the admin.".to_string(),
-        };
-        let auth = InternalAuthContext {
-            id: 1,
-            kind: "admin".to_string(),
-            approved: true,
-            pubkey: Some("admin-pubkey".to_string()),
-            email: None,
-            name: None,
-            user_type_id: None,
-            dev_mode: false,
-        };
-        let trace = build_conversation_trace(
-            &ai_config,
-            &auth,
-            vec![ToolCallInfoResponse {
-                guarded: true,
-                ..tool_call_info_for_id("db-query", "Which users are active?".to_string())
-            }],
-            Vec::new(),
-            Vec::new(),
-        )
-        .expect("admin trace should be visible");
-        let rendered = serde_json::to_string(&trace).expect("trace should serialize");
-
-        assert!(rendered.contains("direct_select_required"));
-        assert!(rendered.contains(r#""executed":false"#));
-        assert!(rendered.contains("Database Query was selected but not executed"));
-        assert!(!rendered.contains("Database results were redacted from the trace."));
-        assert!(!rendered.contains("raw_results_redacted"));
     }
 
     #[test]
@@ -12094,7 +11962,7 @@ mod tests {
     }
 
     #[test]
-    fn database_tool_turn_guards_natural_language_without_exposing_db_contract() {
+    fn database_tool_turn_exposes_db_contract_for_natural_language_admin_question() {
         let http = Client::builder().build().expect("http client should build");
         let internal = InternalAgentClient::new(
             http.clone(),
@@ -12130,21 +11998,17 @@ mod tests {
             None,
         );
 
-        assert!(!registry.has("db_query"));
-        let traces = sinks.traces.lock().expect("trace sink should lock");
-        assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0].tool_id, "db-query");
-        assert!(traces[0].guarded);
-        assert_eq!(traces[0].warnings, vec!["direct_select_required"]);
-        let trace_deltas = sinks.trace_deltas.snapshot();
-        assert_eq!(trace_deltas.len(), 1);
-        assert_eq!(trace_deltas[0].kind, "tool_result");
-        assert_eq!(trace_deltas[0].status.as_deref(), Some("guarded"));
-        assert_eq!(trace_deltas[0].title.as_deref(), Some("Database Query"));
+        assert!(registry.has("db_query"));
+        assert!(sinks
+            .traces
+            .lock()
+            .expect("trace sink should lock")
+            .is_empty());
+        assert!(sinks.trace_deltas.snapshot().is_empty());
     }
 
     #[test]
-    fn guarded_database_turn_input_explains_direct_select_policy() {
+    fn database_tool_turn_input_encourages_model_chosen_read_only_query() {
         let admin = InternalAuthContext {
             id: 1,
             kind: "admin".to_string(),
@@ -12167,10 +12031,13 @@ mod tests {
 
         let input = build_conversation_turn_input(&admin, &HashMap::new(), &request, None);
 
-        assert!(input.contains("=== TOOL GUARDRAILS ==="));
+        assert!(input.contains("=== TOOL GUIDANCE ==="));
         assert!(input.contains("db-query is enabled"));
-        assert!(input.contains("direct read-only SELECT"));
-        assert!(input.contains("Do not tell the Admin that Database Query is unavailable"));
+        assert!(input.contains("call db_query with one read-only SQLite SELECT"));
+        assert!(input.contains("natural-language database question"));
+        assert!(input.contains("Do not ask the Admin to resubmit SQL"));
+        assert!(!input.contains("intentionally withheld"));
+        assert!(!input.contains("Submit a direct read-only SELECT"));
     }
 
     #[test]
