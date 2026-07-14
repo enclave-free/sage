@@ -704,74 +704,6 @@ pub enum AgentTraceEvent {
 
 pub type AgentTraceHook = Arc<dyn Fn(AgentTraceEvent) + Send + Sync>;
 
-/// Recover a useful terminal answer from a typed planning response that the
-/// provider emitted as plain prose. Structured fragments are deliberately
-/// rejected: malformed Tool intent must remain on the bounded planner retry
-/// path and must never become user-visible text.
-pub fn recover_terminal_prose(raw_response: &str) -> Option<String> {
-    let candidate = raw_response.trim();
-    if candidate.is_empty() {
-        return None;
-    }
-
-    if let Some(messages) = recover_legacy_json_messages(candidate) {
-        return (!has_syntactic_tool_intent(&messages)).then_some(messages);
-    }
-    if let Some(messages) = recover_legacy_baml_messages(candidate) {
-        return (!has_syntactic_tool_intent(&messages)).then_some(messages);
-    }
-    if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
-        return None;
-    }
-    if has_syntactic_tool_intent(candidate) {
-        return None;
-    }
-    Some(candidate.to_string())
-}
-
-fn recover_legacy_json_messages(candidate: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(candidate).ok()?;
-    let object = value.as_object()?;
-    let tool_calls = object.get("tool_calls")?.as_array()?;
-    if !tool_calls.is_empty() || object.contains_key("function_call") {
-        return None;
-    }
-    let messages = object.get("messages")?;
-    collect_message_text(messages)
-}
-
-fn recover_legacy_baml_messages(candidate: &str) -> Option<String> {
-    const MESSAGES_MARKER: &str = "[[ ## messages ## ]]";
-    const TOOLS_MARKER: &str = "[[ ## tool_calls ## ]]";
-    let messages_start = candidate.find(MESSAGES_MARKER)? + MESSAGES_MARKER.len();
-    let tools_start = candidate[messages_start..].find(TOOLS_MARKER)? + messages_start;
-    let tool_value = candidate[tools_start + TOOLS_MARKER.len()..].trim();
-    let tool_calls = serde_json::from_str::<Vec<serde_json::Value>>(tool_value).ok()?;
-    if !tool_calls.is_empty() {
-        return None;
-    }
-    let message_value = candidate[messages_start..tools_start].trim();
-    let messages = serde_json::from_str::<serde_json::Value>(message_value).ok()?;
-    collect_message_text(&messages)
-}
-
-fn collect_message_text(value: &serde_json::Value) -> Option<String> {
-    let messages = match value {
-        serde_json::Value::String(message) => vec![message.trim().to_string()],
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(|value| value.as_str().map(str::trim).map(str::to_string))
-            .collect::<Option<Vec<_>>>()?,
-        _ => return None,
-    };
-    let joined = messages
-        .into_iter()
-        .filter(|message| !message.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    (!joined.is_empty()).then_some(joined)
-}
-
 pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
     let candidate = candidate.trim();
     if candidate.is_empty() {
@@ -1379,11 +1311,11 @@ impl SageAgent {
                         elapsed_ms: started_at.elapsed().as_millis(),
                         error: format!("{:?}", error),
                     });
-                    if let dspy_rs::PredictError::Parse { raw_response, .. } = &error {
-                        if let Some(prose) = recover_terminal_prose(raw_response) {
-                            return Ok(ToolPlanningOutcome::RecoveredTerminalProse(prose));
-                        }
-                    }
+                    // This planner is only entered when actionable tools are available.
+                    // A bare-prose parse failure is therefore not a trustworthy terminal
+                    // answer: accepting it would let the model bypass the required tool
+                    // decision and fabricate an unverified admin response. Keep retrying
+                    // the typed contract instead.
                     last_error = Some(error);
                     if attempt < MAX_TOOL_PLAN_ATTEMPTS {
                         self.emit_trace(AgentTraceEvent::RetryScheduled {
@@ -1864,73 +1796,6 @@ impl ToolPlanner for SageAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn malformed_typed_response_recovers_only_terminal_plain_prose() {
-        let recovered = recover_terminal_prose(
-            "The instance is configured correctly. No further action is required.",
-        );
-
-        assert_eq!(
-            recovered.as_deref(),
-            Some("The instance is configured correctly. No further action is required.")
-        );
-        assert_eq!(
-            recover_terminal_prose(
-                "The `tool_calls` and function_call fields are provider protocol concepts."
-            )
-            .as_deref(),
-            Some("The `tool_calls` and function_call fields are provider protocol concepts.")
-        );
-        assert_eq!(
-            recover_terminal_prose(
-                r#"{"tool_calls":[{"name":"db_query","args":{"sql":"SELECT 1"}}]}"#
-            ),
-            None
-        );
-        assert_eq!(
-            recover_terminal_prose(
-                "[[ ## tool_calls ## ]]\n[{\"name\":\"knowledge_search\",\"args\":{}}]"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn terminal_prose_recovery_handles_legacy_messages_but_rejects_partial_tool_shapes() {
-        assert_eq!(
-            recover_terminal_prose(r#"{"messages":["Configuration is ready."],"tool_calls":[]}"#)
-                .as_deref(),
-            Some("Configuration is ready.")
-        );
-        assert_eq!(
-            recover_terminal_prose(
-                "[[ ## messages ## ]]\n[\"Configuration is ready.\"]\n[[ ## tool_calls ## ]]\n[]"
-            )
-            .as_deref(),
-            Some("Configuration is ready.")
-        );
-
-        for malformed_tool_intent in [
-            "```json\n{\"name\":\"db_query\",\"arguments\":{\"sql\":\"SELECT 1\"}}\n```",
-            r#"{"name":"db_query","args":{"sql":"SELECT 1"}"#,
-            r#"{"tool_call":{"name":"knowledge_search","arguments":{}}}"#,
-            "[[ ## tool_call ## ]]\n{\"name\":\"knowledge_search\",\"args\":{}}",
-            r#"{"messages":["Missing an explicit empty Tool decision."]}"#,
-            r#"{"unexpected":"structured output"}"#,
-            "[[ ## messages ## ]]\n[\"Missing the Tool field.\"]",
-            r#"{"messages":["{\"name\":\"db_query\",\"args\":{\"sql\":\"SELECT 1\"}}"],"tool_calls":[]}"#,
-            "[[ ## messages ## ]]\n[\"function_call: db_query\"]\n[[ ## tool_calls ## ]]\n[]",
-            "{'name':'db_query','args':{'sql':'SELECT 1'}}",
-            "name: db_query\nargs: sql=SELECT 1",
-        ] {
-            assert_eq!(
-                recover_terminal_prose(malformed_tool_intent),
-                None,
-                "Tool-shaped output must not become user-visible: {malformed_tool_intent}"
-            );
-        }
-    }
 
     #[test]
     fn done_does_not_make_a_registry_actionable() {

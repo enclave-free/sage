@@ -7902,6 +7902,14 @@ where
                 first_plan = false;
                 match outcome {
                     ToolPlanningOutcome::RecoveredTerminalProse(answer) => {
+                        if planner.has_actionable_tools() {
+                            return Err(AdapterTurnFailure {
+                                error: model_provider_error(
+                                    "Tool planning returned unstructured prose while actionable tools are available",
+                                ),
+                                progressed: !executed_tools.is_empty(),
+                            });
+                        }
                         if let Some(sender) = &delta_sender {
                             let _ = sender.send(ConversationStreamSignal::Answer(answer.clone()));
                         }
@@ -9681,6 +9689,57 @@ mod tests {
                 user: "hello".to_string(),
             }
         }
+    }
+
+    struct UnstructuredActionablePlanner;
+
+    #[async_trait::async_trait]
+    impl ToolPlanner for UnstructuredActionablePlanner {
+        fn has_actionable_tools(&self) -> bool {
+            true
+        }
+
+        async fn plan_tools(
+            &mut self,
+            _user_message: &str,
+            _is_first_plan: bool,
+        ) -> Result<ToolPlanningOutcome> {
+            Ok(ToolPlanningOutcome::RecoveredTerminalProse(
+                "The database has 42 users.".to_string(),
+            ))
+        }
+
+        async fn execute_tool_decision(&mut self, _decision: &ToolDecision) -> StepResult {
+            panic!("unstructured prose must never execute a Tool")
+        }
+
+        fn plain_answer_prompt(&self, _user_message: &str) -> PlainAnswerPrompt {
+            panic!("unstructured prose must never reach answer generation")
+        }
+    }
+
+    #[tokio::test]
+    async fn actionable_turn_rejects_recovered_terminal_prose() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let failure = match run_turn_with_adapters(
+            &mut UnstructuredActionablePlanner,
+            &TwoChunkAnswerGenerator,
+            "How many users are in the database?",
+            "test-model",
+            Some(delta_tx),
+        )
+        .await
+        {
+            Ok(_) => panic!("actionable turns must require a typed tool decision"),
+            Err(failure) => failure,
+        };
+
+        assert!(failure
+            .error
+            .message
+            .contains("unstructured prose while actionable tools are available"));
+        assert!(!failure.progressed);
+        assert!(delta_rx.try_recv().is_err());
     }
 
     #[tokio::test]
