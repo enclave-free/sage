@@ -32,7 +32,11 @@ pub use tools::{
 };
 
 use anyhow::Result;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
+};
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
@@ -51,6 +55,143 @@ pub const DEFAULT_CONTEXT_WINDOW: usize = 100_000;
 pub const COMPACTION_THRESHOLD: f32 = 0.80; // 80% threshold (80k tokens triggers compaction)
 pub const MIN_MESSAGES_IN_CONTEXT: usize = 20; // Always show at least 20 messages after compaction
 
+#[async_trait::async_trait]
+trait DeferredMessageBackend: Clone + Send + Sync + 'static {
+    fn insert_pending_message(&self, user_id: &str, role: &str, content: &str) -> Result<Uuid>;
+
+    async fn update_message_embedding(&self, message_id: Uuid, content: &str) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl DeferredMessageBackend for RecallManager {
+    fn insert_pending_message(&self, user_id: &str, role: &str, content: &str) -> Result<Uuid> {
+        self.add_message_sync(user_id, role, content)
+    }
+
+    async fn update_message_embedding(&self, message_id: Uuid, content: &str) -> Result<()> {
+        self.update_embedding(message_id, content).await
+    }
+}
+
+/// Persists a durable message row first, then fills its remote embedding in a
+/// detached task. A failed embedding intentionally leaves the row with a NULL
+/// embedding so a repair worker can find and retry it later.
+struct DeferredMessageStore<B> {
+    backend: B,
+}
+
+/// Serializes threshold compactions and rejects a stale threshold observation
+/// after another task has already advanced the summary boundary.
+#[derive(Clone)]
+struct CompactionCoordinator {
+    lock: Arc<TokioMutex<()>>,
+}
+
+impl CompactionCoordinator {
+    fn for_agent(agent_id: Uuid) -> Self {
+        static REGISTRY: OnceLock<StdMutex<HashMap<Uuid, Weak<TokioMutex<()>>>>> = OnceLock::new();
+
+        let registry = REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut coordinators = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        coordinators.retain(|_, coordinator| coordinator.strong_count() > 0);
+
+        if let Some(lock) = coordinators.get(&agent_id).and_then(Weak::upgrade) {
+            return Self { lock };
+        }
+
+        let lock = Arc::new(TokioMutex::new(()));
+        coordinators.insert(agent_id, Arc::downgrade(&lock));
+        Self { lock }
+    }
+
+    async fn run_if_unchanged_and_needed<Check, Compact, CompactFuture>(
+        &self,
+        observed_generation: i64,
+        check: Check,
+        compact: Compact,
+    ) -> Result<bool>
+    where
+        Check: FnOnce() -> Result<(i64, bool)>,
+        Compact: FnOnce() -> CompactFuture,
+        CompactFuture: Future<Output = Result<()>>,
+    {
+        let _guard = self.lock.lock().await;
+        let (current_generation, still_needed) = check()?;
+        if current_generation != observed_generation || !still_needed {
+            return Ok(false);
+        }
+
+        compact().await?;
+        Ok(true)
+    }
+}
+
+async fn finish_persisted_message<CompactionFuture>(
+    message_id: Uuid,
+    compaction: CompactionFuture,
+) -> (Uuid, bool)
+where
+    CompactionFuture: Future<Output = Result<bool>>,
+{
+    let compacted = match compaction.await {
+        Ok(compacted) => compacted,
+        Err(error) => {
+            tracing::warn!(
+                message_id = %message_id,
+                error = %error,
+                "message persisted, but Session Memory compaction maintenance failed"
+            );
+            false
+        }
+    };
+    (message_id, compacted)
+}
+
+impl<B> DeferredMessageStore<B>
+where
+    B: DeferredMessageBackend,
+{
+    fn new(backend: B) -> Self {
+        Self { backend }
+    }
+
+    fn store(&self, user_id: &str, role: &str, content: &str) -> Result<Uuid> {
+        let message_id = self
+            .backend
+            .insert_pending_message(user_id, role, content)?;
+        let backend = self.backend.clone();
+        let embedding_content = content.to_string();
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = backend
+                        .update_message_embedding(message_id, &embedding_content)
+                        .await
+                    {
+                        tracing::warn!(
+                            message_id = %message_id,
+                            error = %error,
+                            "failed to update deferred message embedding; row remains pending"
+                        );
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    message_id = %message_id,
+                    error = %error,
+                    "could not schedule deferred message embedding; row remains pending"
+                );
+            }
+        }
+
+        Ok(message_id)
+    }
+}
+
 /// Main memory manager that coordinates all memory tiers
 #[allow(dead_code)]
 pub struct MemoryManager {
@@ -59,11 +200,12 @@ pub struct MemoryManager {
     embedding: EmbeddingService,
     blocks: BlockManager,
     recall: RecallManager,
+    deferred_messages: DeferredMessageStore<RecallManager>,
     archival: ArchivalManager,
     compaction: CompactionManager,
     context: ContextManager,
-    /// Mutex for compaction operations (prevents concurrent compaction)
-    compaction_lock: Arc<TokioMutex<()>>,
+    /// Coordinates compaction and rejects stale concurrent threshold checks.
+    compaction_coordinator: CompactionCoordinator,
 }
 
 #[allow(dead_code)]
@@ -89,6 +231,7 @@ impl MemoryManager {
         // Initialize memory tiers - BlockManager now uses database
         let blocks = BlockManager::new(agent_id, db.clone())?;
         let recall = RecallManager::new(agent_id, db.clone(), embedding.clone());
+        let deferred_messages = DeferredMessageStore::new(recall.clone());
         let archival = ArchivalManager::new(agent_id, db.clone(), embedding.clone());
         let compaction = CompactionManager::new();
         let context = ContextManager::new(DEFAULT_CONTEXT_WINDOW);
@@ -99,10 +242,11 @@ impl MemoryManager {
             embedding,
             blocks,
             recall,
+            deferred_messages,
             archival,
             compaction,
             context,
-            compaction_lock: Arc::new(TokioMutex::new(())),
+            compaction_coordinator: CompactionCoordinator::for_agent(agent_id),
         })
     }
 
@@ -120,6 +264,12 @@ impl MemoryManager {
     /// Use update_message_embedding() in background to add embedding later
     pub fn store_message_sync(&self, user_id: &str, role: &str, content: &str) -> Result<Uuid> {
         self.recall.add_message_sync(user_id, role, content)
+    }
+
+    /// Store a durable message immediately and populate its embedding outside
+    /// the caller's response critical path.
+    pub fn store_message_deferred(&self, user_id: &str, role: &str, content: &str) -> Result<Uuid> {
+        self.deferred_messages.store(user_id, role, content)
     }
 
     /// Store a message with optional image attachment description (fast, synchronous)
@@ -261,38 +411,59 @@ impl MemoryManager {
         role: &str,
         content: &str,
     ) -> Result<(Uuid, bool)> {
-        // Store the message first
-        let message_id = self.recall.add_message(user_id, role, content).await?;
+        // The durable row is committed before any remote embedding or
+        // compaction work. Embedding completion is deliberately detached.
+        let message_id = self.store_message_deferred(user_id, role, content)?;
+        Ok(finish_persisted_message(message_id, self.compact_if_needed()).await)
+    }
 
-        // Check if compaction is needed (estimate tokens)
+    fn compaction_state(&self) -> Result<(i64, bool, usize)> {
         let (summary, messages) = self.get_context_messages()?;
+        let generation = summary
+            .as_ref()
+            .map(|summary| summary.to_sequence_id)
+            .unwrap_or(0);
         let current_tokens = self.estimate_context_tokens(&summary, &messages);
-
-        let compacted = if self.compaction.should_compact(
+        let needed = self.compaction.should_compact(
             current_tokens,
             DEFAULT_CONTEXT_WINDOW,
             COMPACTION_THRESHOLD,
-        ) {
-            tracing::info!(
-                "Context tokens ({}) exceed threshold ({}), triggering compaction",
-                current_tokens,
-                (DEFAULT_CONTEXT_WINDOW as f32 * COMPACTION_THRESHOLD) as usize
-            );
-            self.run_compaction().await?;
-            true
-        } else {
-            false
-        };
+        );
+        Ok((generation, needed, current_tokens))
+    }
 
-        Ok((message_id, compacted))
+    async fn compact_if_needed(&self) -> Result<bool> {
+        let (observed_generation, needed, current_tokens) = self.compaction_state()?;
+        if !needed {
+            return Ok(false);
+        }
+
+        tracing::info!(
+            "Context tokens ({}) exceed threshold ({}), checking compaction generation",
+            current_tokens,
+            (DEFAULT_CONTEXT_WINDOW as f32 * COMPACTION_THRESHOLD) as usize
+        );
+
+        self.compaction_coordinator
+            .run_if_unchanged_and_needed(
+                observed_generation,
+                || {
+                    let (generation, needed, _) = self.compaction_state()?;
+                    Ok((generation, needed))
+                },
+                || async { self.run_compaction_unlocked().await.map(|_| ()) },
+            )
+            .await
     }
 
     /// Run compaction with mutex lock to prevent concurrent compaction
     pub async fn run_compaction(&self) -> Result<SummaryResult> {
-        // Acquire compaction lock
-        let _lock = self.compaction_lock.lock().await;
+        let _lock = self.compaction_coordinator.lock.lock().await;
         tracing::info!("Acquired compaction lock, starting compaction");
+        self.run_compaction_unlocked().await
+    }
 
+    async fn run_compaction_unlocked(&self) -> Result<SummaryResult> {
         // Get current state
         let current_summary = self.get_latest_summary()?;
         let summary_boundary = current_summary
@@ -432,5 +603,285 @@ impl MemoryManager {
     /// Get a reference to the database
     pub fn db(&self) -> &MemoryDb {
         &self.db
+    }
+}
+
+#[cfg(test)]
+mod deferred_message_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicI64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Default)]
+    struct TestMessageBackend {
+        inserted: Arc<Mutex<Vec<(Uuid, String)>>>,
+        embedding_started: Arc<Notify>,
+        release_embedding: Arc<Notify>,
+        embedded: Arc<Mutex<Vec<Uuid>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FailingMessageBackend {
+        inserted: Arc<Mutex<Vec<Uuid>>>,
+        embedding_attempted: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeferredMessageBackend for FailingMessageBackend {
+        fn insert_pending_message(
+            &self,
+            _user_id: &str,
+            _role: &str,
+            _content: &str,
+        ) -> Result<Uuid> {
+            let id = Uuid::new_v4();
+            self.inserted
+                .lock()
+                .expect("inserted messages should lock")
+                .push(id);
+            Ok(id)
+        }
+
+        async fn update_message_embedding(&self, _message_id: Uuid, _content: &str) -> Result<()> {
+            self.embedding_attempted.notify_one();
+            anyhow::bail!("embedding service unavailable")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct OutOfOrderMessageBackend {
+        inserted: Arc<Mutex<Vec<(Uuid, String)>>>,
+        release_first: Arc<Notify>,
+        second_embedded: Arc<Notify>,
+        embedded: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeferredMessageBackend for OutOfOrderMessageBackend {
+        fn insert_pending_message(
+            &self,
+            _user_id: &str,
+            _role: &str,
+            content: &str,
+        ) -> Result<Uuid> {
+            let id = Uuid::new_v4();
+            self.inserted
+                .lock()
+                .expect("inserted messages should lock")
+                .push((id, content.to_string()));
+            Ok(id)
+        }
+
+        async fn update_message_embedding(&self, _message_id: Uuid, content: &str) -> Result<()> {
+            if content == "first" {
+                self.release_first.notified().await;
+            }
+            self.embedded
+                .lock()
+                .expect("embedded messages should lock")
+                .push(content.to_string());
+            if content == "second" {
+                self.second_embedded.notify_one();
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DeferredMessageBackend for TestMessageBackend {
+        fn insert_pending_message(
+            &self,
+            _user_id: &str,
+            _role: &str,
+            content: &str,
+        ) -> Result<Uuid> {
+            let id = Uuid::new_v4();
+            self.inserted
+                .lock()
+                .expect("inserted messages should lock")
+                .push((id, content.to_string()));
+            Ok(id)
+        }
+
+        async fn update_message_embedding(&self, message_id: Uuid, _content: &str) -> Result<()> {
+            self.embedding_started.notify_one();
+            self.release_embedding.notified().await;
+            self.embedded
+                .lock()
+                .expect("embedded messages should lock")
+                .push(message_id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_store_returns_durable_id_before_embedding_and_eventually_updates_it() {
+        let backend = TestMessageBackend::default();
+        let store = DeferredMessageStore::new(backend.clone());
+
+        let message_id = store
+            .store("admin:1", "user", "Show the current deployment config")
+            .expect("pending message should be inserted");
+
+        assert_eq!(
+            backend
+                .inserted
+                .lock()
+                .expect("inserted messages should lock")
+                .as_slice(),
+            &[(message_id, "Show the current deployment config".to_string())]
+        );
+        assert!(backend
+            .embedded
+            .lock()
+            .expect("embedded messages should lock")
+            .is_empty());
+
+        backend.embedding_started.notified().await;
+        backend.release_embedding.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if backend
+                    .embedded
+                    .lock()
+                    .expect("embedded messages should lock")
+                    .as_slice()
+                    == [message_id]
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("embedding should eventually update the inserted row");
+    }
+
+    #[tokio::test]
+    async fn embedding_failure_does_not_fail_or_remove_the_pending_message() {
+        let backend = FailingMessageBackend::default();
+        let store = DeferredMessageStore::new(backend.clone());
+
+        let message_id = store
+            .store("admin:1", "assistant", "The deployment is ready")
+            .expect("durable insertion should not depend on embedding success");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            backend.embedding_attempted.notified(),
+        )
+        .await
+        .expect("background embedding should be attempted");
+
+        assert_eq!(
+            backend
+                .inserted
+                .lock()
+                .expect("inserted messages should lock")
+                .as_slice(),
+            &[message_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_message_order_does_not_depend_on_embedding_completion_order() {
+        let backend = OutOfOrderMessageBackend::default();
+        let store = DeferredMessageStore::new(backend.clone());
+
+        let first_id = store
+            .store("admin:1", "user", "first")
+            .expect("first message should persist");
+        let second_id = store
+            .store("admin:1", "assistant", "second")
+            .expect("second message should persist");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            backend.second_embedded.notified(),
+        )
+        .await
+        .expect("second embedding should finish while first is pending");
+
+        assert_eq!(
+            backend
+                .inserted
+                .lock()
+                .expect("inserted messages should lock")
+                .as_slice(),
+            &[
+                (first_id, "first".to_string()),
+                (second_id, "second".to_string()),
+            ]
+        );
+        assert_eq!(
+            backend
+                .embedded
+                .lock()
+                .expect("embedded messages should lock")
+                .as_slice(),
+            &["second".to_string()]
+        );
+
+        backend.release_first.notify_one();
+    }
+
+    #[tokio::test]
+    async fn separate_managers_for_one_agent_compact_once_for_the_observed_summary_generation() {
+        let agent_id = Uuid::new_v4();
+        let first_coordinator = CompactionCoordinator::for_agent(agent_id);
+        let second_coordinator = CompactionCoordinator::for_agent(agent_id);
+        let summary_generation = Arc::new(AtomicI64::new(0));
+        let compaction_count = Arc::new(AtomicUsize::new(0));
+
+        let compact = |coordinator: CompactionCoordinator| {
+            let summary_generation = summary_generation.clone();
+            let compaction_count = compaction_count.clone();
+            async move {
+                coordinator
+                    .run_if_unchanged_and_needed(
+                        0,
+                        || {
+                            Ok::<_, anyhow::Error>((
+                                summary_generation.load(Ordering::SeqCst),
+                                true,
+                            ))
+                        },
+                        || async {
+                            tokio::task::yield_now().await;
+                            compaction_count.fetch_add(1, Ordering::SeqCst);
+                            summary_generation.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, anyhow::Error>(())
+                        },
+                    )
+                    .await
+            }
+        };
+
+        let (first, second) = tokio::join!(compact(first_coordinator), compact(second_coordinator));
+        let compacted = [
+            first.expect("first threshold check should succeed"),
+            second.expect("second threshold check should succeed"),
+        ];
+
+        assert_eq!(
+            compacted.iter().filter(|&&did_compact| did_compact).count(),
+            1
+        );
+        assert_eq!(compaction_count.load(Ordering::SeqCst), 1);
+        assert_eq!(summary_generation.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_after_insert_preserves_durable_id_for_trace_attachment() {
+        let message_id = Uuid::new_v4();
+
+        let (returned_id, compacted) = finish_persisted_message(message_id, async {
+            anyhow::bail!("summary provider unavailable")
+        })
+        .await;
+
+        assert_eq!(returned_id, message_id);
+        assert!(!compacted);
     }
 }

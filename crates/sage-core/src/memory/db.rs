@@ -778,11 +778,18 @@ impl MessageDb {
                 .join(",")
         );
 
-        diesel::sql_query(format!(
+        let updated = diesel::sql_query(format!(
             "UPDATE messages SET embedding = '{}' WHERE id = '{}'",
             embedding_str, message_id,
         ))
         .execute(&mut *conn)?;
+
+        if updated == 0 {
+            tracing::debug!(
+                message_id = %message_id,
+                "message was deleted before its deferred embedding completed"
+            );
+        }
 
         Ok(())
     }

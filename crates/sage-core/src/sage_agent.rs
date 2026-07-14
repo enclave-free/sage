@@ -952,6 +952,15 @@ impl SageAgent {
         }
     }
 
+    /// Store a durable message immediately and defer its remote embedding.
+    pub fn store_message_deferred(&self, user_id: &str, role: &str, content: &str) -> Result<Uuid> {
+        if let Some(memory) = &self.memory {
+            memory.store_message_deferred(user_id, role, content)
+        } else {
+            Err(anyhow::anyhow!("No memory system configured"))
+        }
+    }
+
     /// Store a message and check whether Session Memory compaction should run.
     pub async fn store_message_with_compaction_check(
         &self,

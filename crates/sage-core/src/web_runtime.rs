@@ -4540,7 +4540,7 @@ async fn chat(
     };
     let memory_user_id = memory_user_id(&auth);
     memory
-        .store_message_sync(&memory_user_id, "user", &request.message)
+        .store_message_deferred(&memory_user_id, "user", &request.message)
         .map_err(internal_error)?;
 
     let top_k = value_as_i32(ai_config.parameters.get("top_k"), 4);
@@ -4595,7 +4595,7 @@ async fn chat(
     );
     let assistant_memory_content =
         sanitize_admin_config_message_for_memory(&auth, &request, &response_text);
-    match agent.store_message_sync(&memory_user_id, "assistant", &assistant_memory_content) {
+    match agent.store_message_deferred(&memory_user_id, "assistant", &assistant_memory_content) {
         Ok(message_id) => {
             if let Some(trace) = &trace {
                 if let Err(err) = persist_assistant_trace_metadata(&state, message_id, trace) {
@@ -5265,8 +5265,7 @@ async fn query(
 
     let memory_user_id = format!("{}:{}", auth.kind, auth.id);
     memory
-        .store_message(&memory_user_id, "user", &request.question)
-        .await
+        .store_message_deferred(&memory_user_id, "user", &request.question)
         .map_err(internal_error)?;
 
     let enabled_tools = query_enabled_tool_sets(&request);
@@ -5334,10 +5333,7 @@ async fn query(
     );
 
     let assistant_user_id = format!("{}:{}", auth.kind, auth.id);
-    match agent
-        .store_message(&assistant_user_id, "assistant", &answer)
-        .await
-    {
+    match agent.store_message_deferred(&assistant_user_id, "assistant", &answer) {
         Ok(message_id) => {
             if let Some(trace) = &trace {
                 if let Err(err) = persist_assistant_trace_metadata(&state, message_id, trace) {
@@ -6043,16 +6039,28 @@ fn persist_assistant_trace_metadata(
     message_id: Uuid,
     trace: &ConversationTraceResponse,
 ) -> AppResult<()> {
-    let metadata = assistant_trace_metadata(trace);
-    let mut conn = state
-        .db
-        .lock()
-        .map_err(|_| AppError::internal("failed to acquire database lock"))?;
-    diesel::update(messages::table.filter(messages::id.eq(message_id)))
-        .set(messages::tool_results.eq(Some(metadata)))
-        .execute(&mut *conn)
-        .map_err(internal_error)?;
-    Ok(())
+    persist_assistant_trace_metadata_with(message_id, trace, |message_id, metadata| {
+        let mut conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::internal("failed to acquire database lock"))?;
+        diesel::update(messages::table.filter(messages::id.eq(message_id)))
+            .set(messages::tool_results.eq(Some(metadata)))
+            .execute(&mut *conn)
+            .map_err(internal_error)?;
+        Ok(())
+    })
+}
+
+fn persist_assistant_trace_metadata_with<Persist>(
+    message_id: Uuid,
+    trace: &ConversationTraceResponse,
+    persist: Persist,
+) -> AppResult<()>
+where
+    Persist: FnOnce(Uuid, Value) -> AppResult<()>,
+{
+    persist(message_id, assistant_trace_metadata(trace))
 }
 
 fn count_session_messages(state: &WebAppState, agent_id: Uuid) -> AppResult<i64> {
@@ -10909,6 +10917,47 @@ mod tests {
         );
         assert_eq!(hydrated.trace_deltas[0].status.as_deref(), Some("guarded"));
         assert!(!metadata.to_string().contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn assistant_trace_attachment_targets_the_already_persisted_message_id() {
+        let durable_message_id = Uuid::new_v4();
+        let trace = ConversationTraceResponse {
+            visibility: "detailed".to_string(),
+            reasoning: ReasoningTraceResponse {
+                summary: "Sage answered after inspecting configuration.".to_string(),
+            },
+            trace_deltas: Vec::new(),
+            tools: Vec::new(),
+            retrieval: Vec::new(),
+            activity_steps: Vec::new(),
+            suppressed: false,
+        };
+        let attached = std::sync::Mutex::new(None);
+
+        let result = persist_assistant_trace_metadata_with(
+            durable_message_id,
+            &trace,
+            |message_id, metadata| {
+                *attached.lock().expect("trace attachment should lock") =
+                    Some((message_id, metadata));
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        let attached = attached
+            .into_inner()
+            .expect("trace attachment should unlock")
+            .expect("trace should attach");
+        assert_eq!(attached.0, durable_message_id);
+        assert_eq!(
+            conversation_trace_from_message_metadata(Some(&attached.1))
+                .expect("attached trace should hydrate")
+                .reasoning
+                .summary,
+            "Sage answered after inspecting configuration."
+        );
     }
 
     #[test]
