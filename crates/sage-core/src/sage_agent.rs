@@ -120,6 +120,126 @@ pub struct AgentResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// Typed model contract used only to decide which Tools should run.
+/// User-visible prose intentionally has no output field here.
+#[derive(dspy_rs::Signature, Clone, Debug)]
+struct ToolDecisionResponse {
+    #[input(desc = "The user request or Tool results to plan against")]
+    pub input: String,
+
+    #[input(desc = "Current date and time in user's timezone")]
+    pub current_time: String,
+
+    #[input(desc = "Your persona and Agent Settings profile")]
+    pub persona_block: String,
+
+    #[input(desc = "What you know about this human")]
+    pub human_block: String,
+
+    #[input(desc = "Session Memory statistics")]
+    pub memory_metadata: String,
+
+    #[input(desc = "Summary of older conversation; ignore when empty")]
+    pub previous_context_summary: String,
+
+    #[input(desc = "Recent conversation and any completed Tool results")]
+    pub recent_conversation: String,
+
+    #[input(desc = "Enabled Tools and their argument contracts")]
+    pub available_tools: String,
+
+    #[input(desc = "Whether this is the first conversation with this user")]
+    pub is_first_time_user: bool,
+
+    #[output(desc = "All immediately useful Tool calls; never include user messages")]
+    pub tool_calls: Vec<ToolCall>,
+
+    #[output(
+        desc = "True only when Tool results are needed to decide whether another Tool round is required"
+    )]
+    pub replan_after_results: bool,
+}
+
+/// Provider-neutral Tool plan returned to the web conversation state machine.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct ToolDecision {
+    pub tool_calls: Vec<ToolCall>,
+    pub replan_after_results: bool,
+}
+
+impl ToolDecision {
+    pub fn new(tool_calls: Vec<ToolCall>, replan_after_results: bool) -> Self {
+        Self {
+            tool_calls: tool_calls
+                .into_iter()
+                .filter(|tool_call| tool_call.name != "done")
+                .collect(),
+            replan_after_results,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum ToolPlanningOutcome {
+    Decision(ToolDecision),
+    RecoveredTerminalProse(String),
+}
+
+/// Provider-neutral seam for the bounded, typed Tool-planning phase.
+#[async_trait::async_trait]
+#[allow(dead_code)]
+pub trait ToolPlanner: Send {
+    fn has_actionable_tools(&self) -> bool;
+
+    async fn plan_tools(
+        &mut self,
+        user_message: &str,
+        is_first_plan: bool,
+    ) -> Result<ToolPlanningOutcome>;
+
+    async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult;
+
+    fn plain_answer_prompt(&self, user_message: &str) -> PlainAnswerPrompt;
+
+    fn plain_answer_trace_started(&mut self) -> usize {
+        0
+    }
+
+    fn plain_answer_trace_completed(&self, _step: usize, _elapsed_ms: u128) {}
+
+    fn plain_answer_trace_failed(&self, _step: usize, _elapsed_ms: u128, _error: &str) {}
+}
+
+/// Provider-neutral prompt passed to plain answer generation.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct PlainAnswerPrompt {
+    pub system: String,
+    pub user: String,
+}
+
+const TOOL_PLANNING_INSTRUCTION: &str = r#"
+
+=== TOOL PLANNING MODE ===
+You are deciding Tools, not writing the answer.
+- Never emit user-visible prose or messages.
+- Request every immediately useful enabled Tool in this planning round.
+- Do not call `done`; an empty tool_calls array means no Tool is needed.
+- Set replan_after_results=true only when the results are required to decide whether another Tool call is needed.
+- Otherwise set replan_after_results=false so the runtime can write the final answer directly.
+- Follow every Tool's authorization, argument, and safety contract exactly.
+"#;
+
+const PLAIN_ANSWER_INSTRUCTION: &str = r#"
+
+=== FINAL ANSWER MODE ===
+Write only the final user-visible answer as plain text.
+Do not emit JSON, schema field markers, tool_calls, function calls, or internal reasoning.
+The Tool phase is complete. Use the supplied Tool results as facts, respect their warnings and failures, and do not claim that a failed Tool succeeded.
+"#;
+
 /// Correction agent signature for fixing malformed responses
 ///
 /// This agent takes a malformed response and reshapes it into the correct format.
@@ -384,6 +504,13 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
+    /// Whether planning can produce a Tool call with an observable effect.
+    /// `done` is only the legacy loop terminator and must not force a planning
+    /// model call for an otherwise tool-free conversation.
+    pub fn has_actionable_tools(&self) -> bool {
+        self.tools.keys().any(|name| name != "done")
+    }
+
     #[allow(dead_code)]
     pub fn has(&self, name: &str) -> bool {
         self.tools.contains_key(name)
@@ -576,6 +703,163 @@ pub enum AgentTraceEvent {
 }
 
 pub type AgentTraceHook = Arc<dyn Fn(AgentTraceEvent) + Send + Sync>;
+
+/// Recover a useful terminal answer from a typed planning response that the
+/// provider emitted as plain prose. Structured fragments are deliberately
+/// rejected: malformed Tool intent must remain on the bounded planner retry
+/// path and must never become user-visible text.
+pub fn recover_terminal_prose(raw_response: &str) -> Option<String> {
+    let candidate = raw_response.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+
+    if let Some(messages) = recover_legacy_json_messages(candidate) {
+        return (!has_syntactic_tool_intent(&messages)).then_some(messages);
+    }
+    if let Some(messages) = recover_legacy_baml_messages(candidate) {
+        return (!has_syntactic_tool_intent(&messages)).then_some(messages);
+    }
+    if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+        return None;
+    }
+    if has_syntactic_tool_intent(candidate) {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+fn recover_legacy_json_messages(candidate: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(candidate).ok()?;
+    let object = value.as_object()?;
+    let tool_calls = object.get("tool_calls")?.as_array()?;
+    if !tool_calls.is_empty() || object.contains_key("function_call") {
+        return None;
+    }
+    let messages = object.get("messages")?;
+    collect_message_text(messages)
+}
+
+fn recover_legacy_baml_messages(candidate: &str) -> Option<String> {
+    const MESSAGES_MARKER: &str = "[[ ## messages ## ]]";
+    const TOOLS_MARKER: &str = "[[ ## tool_calls ## ]]";
+    let messages_start = candidate.find(MESSAGES_MARKER)? + MESSAGES_MARKER.len();
+    let tools_start = candidate[messages_start..].find(TOOLS_MARKER)? + messages_start;
+    let tool_value = candidate[tools_start + TOOLS_MARKER.len()..].trim();
+    let tool_calls = serde_json::from_str::<Vec<serde_json::Value>>(tool_value).ok()?;
+    if !tool_calls.is_empty() {
+        return None;
+    }
+    let message_value = candidate[messages_start..tools_start].trim();
+    let messages = serde_json::from_str::<serde_json::Value>(message_value).ok()?;
+    collect_message_text(&messages)
+}
+
+fn collect_message_text(value: &serde_json::Value) -> Option<String> {
+    let messages = match value {
+        serde_json::Value::String(message) => vec![message.trim().to_string()],
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| value.as_str().map(str::trim).map(str::to_string))
+            .collect::<Option<Vec<_>>>()?,
+        _ => return None,
+    };
+    let joined = messages
+        .into_iter()
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!joined.is_empty()).then_some(joined)
+}
+
+pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+    if serde_json::from_str::<serde_json::Value>(candidate)
+        .ok()
+        .is_some_and(|value| json_has_tool_intent(&value))
+    {
+        return true;
+    }
+
+    let lowercase = candidate.to_ascii_lowercase();
+    if lowercase.starts_with("```") {
+        let after_open = candidate.strip_prefix("```").unwrap_or(candidate);
+        let fenced = after_open
+            .split_once('\n')
+            .map(|(_, body)| body)
+            .unwrap_or(after_open)
+            .strip_suffix("```")
+            .unwrap_or(after_open);
+        return has_syntactic_tool_intent(fenced);
+    }
+
+    if lowercase.starts_with("[[ ##")
+        || lowercase.starts_with("<tool_call")
+        || lowercase.starts_with("</tool_call")
+        || lowercase.starts_with("<|tool_call")
+    {
+        return true;
+    }
+
+    let starts_structured = matches!(candidate.chars().next(), Some('{') | Some('['))
+        || [
+            "tool_calls:",
+            "function_call:",
+            "name:",
+            "args:",
+            "arguments:",
+        ]
+        .iter()
+        .any(|prefix| candidate.starts_with(prefix));
+    if !starts_structured {
+        return false;
+    }
+
+    if [
+        "\"tool_calls\"",
+        "'tool_calls'",
+        "tool_calls:",
+        "\"function_call\"",
+        "'function_call'",
+        "function_call:",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+    {
+        return true;
+    }
+
+    let has_name_field = lowercase.contains("\"name\"")
+        || lowercase.contains("'name'")
+        || lowercase.starts_with("name:")
+        || lowercase.contains("\nname:");
+    let has_args_field = lowercase.contains("\"args\"")
+        || lowercase.contains("\"arguments\"")
+        || lowercase.contains("'args'")
+        || lowercase.contains("'arguments'")
+        || lowercase.starts_with("args:")
+        || lowercase.starts_with("arguments:")
+        || lowercase.contains("\nargs:")
+        || lowercase.contains("\narguments:");
+    has_name_field && has_args_field
+}
+
+fn json_has_tool_intent(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(json_has_tool_intent),
+        serde_json::Value::Object(object) => {
+            object.contains_key("tool_calls")
+                || object.contains_key("function_call")
+                || (object.contains_key("name")
+                    && (object.contains_key("args") || object.contains_key("arguments")))
+                || object.values().any(json_has_tool_intent)
+        }
+        _ => false,
+    }
+}
 
 #[allow(dead_code)]
 impl Message {
@@ -961,6 +1245,153 @@ impl SageAgent {
         if let Some(hook) = &self.trace_hook {
             hook(event);
         }
+    }
+
+    /// Build the plain final-answer prompt after the bounded Tool phase.
+    pub fn plain_answer_prompt(&self, user_message: &str) -> PlainAnswerPrompt {
+        let context = self.build_context();
+        let system = format!("{}{}", self.instruction, PLAIN_ANSWER_INSTRUCTION);
+        let user = format!(
+            "CURRENT TIME\n{}\n\nPERSONA\n{}\n\nHUMAN\n{}\n\nMEMORY METADATA\n{}\n\nPREVIOUS CONTEXT SUMMARY\n{}\n\nRECENT CONVERSATION AND TOOL RESULTS\n{}\n\nCURRENT REQUEST\n{}",
+            context.current_time,
+            context.persona_block,
+            context.human_block,
+            context.memory_metadata,
+            context.previous_context_summary,
+            context.recent_conversation,
+            user_message,
+        );
+        PlainAnswerPrompt { system, user }
+    }
+
+    /// Execute one provider-neutral Tool decision and retain its results for
+    /// either an explicitly requested replan or plain final-answer generation.
+    pub async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
+        let mut executed_tools = Vec::new();
+        for tool_call in &decision.tool_calls {
+            tracing::info!(
+                "Executing planned tool: {} with args: {:?}",
+                tool_call.name,
+                tool_call.args
+            );
+            let result = if let Some(tool) = self.tools.get(&tool_call.name) {
+                match tool.execute(&tool_call.args).await {
+                    Ok(result) => result,
+                    Err(error) => ToolResult::error(error.to_string()),
+                }
+            } else {
+                ToolResult::error(format!("Unknown tool: {}", tool_call.name))
+            };
+            self.inject_tool_result(tool_call, &result);
+            executed_tools.push(ExecutedTool {
+                tool_call: tool_call.clone(),
+                result,
+            });
+        }
+
+        StepResult {
+            messages: Vec::new(),
+            tool_calls: decision.tool_calls.clone(),
+            executed_tools,
+            done: decision.tool_calls.is_empty(),
+        }
+    }
+
+    fn planning_input_content(&self, user_message: &str, is_first_plan: bool) -> String {
+        if is_first_plan || self.current_tool_results.is_empty() {
+            return user_message.to_string();
+        }
+
+        let results = self
+            .current_tool_results
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        format!(
+            "ORIGINAL REQUEST\n{}\n\nCOMPLETED TOOL RESULTS\n{}\n\nDecide only whether another Tool round is required.",
+            user_message, results
+        )
+    }
+
+    async fn plan_tools_with_dspy(
+        &mut self,
+        user_message: &str,
+        is_first_plan: bool,
+    ) -> Result<ToolPlanningOutcome> {
+        if is_first_plan {
+            self.clear_tool_results();
+        }
+        let step_index = self.turn_step_index;
+        self.turn_step_index += 1;
+        let input_content = self.planning_input_content(user_message, is_first_plan);
+        let context = self.build_context();
+        let available_tools = self.tools.generate_description();
+        let predictor = Predict::<ToolDecisionResponse>::builder()
+            .instruction(format!("{}{}", self.instruction, TOOL_PLANNING_INSTRUCTION))
+            .build();
+        let input = ToolDecisionResponseInput {
+            input: input_content,
+            current_time: context.current_time,
+            persona_block: context.persona_block,
+            human_block: context.human_block,
+            memory_metadata: context.memory_metadata,
+            previous_context_summary: context.previous_context_summary,
+            recent_conversation: context.recent_conversation,
+            available_tools,
+            is_first_time_user: context.is_first_time_user,
+        };
+
+        const MAX_TOOL_PLAN_ATTEMPTS: u32 = 3;
+        let mut last_error = None;
+        for attempt in 1..=MAX_TOOL_PLAN_ATTEMPTS {
+            self.emit_trace(AgentTraceEvent::ModelStepStarted {
+                step: step_index,
+                attempt,
+            });
+            let started_at = Instant::now();
+            match predictor.call(input.clone()).await {
+                Ok(response) => {
+                    self.emit_trace(AgentTraceEvent::ModelStepCompleted {
+                        step: step_index,
+                        attempt,
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                    });
+                    return Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
+                        response.tool_calls,
+                        response.replan_after_results,
+                    )));
+                }
+                Err(error) => {
+                    self.emit_trace(AgentTraceEvent::ModelStepFailed {
+                        step: step_index,
+                        attempt,
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                        error: format!("{:?}", error),
+                    });
+                    if let dspy_rs::PredictError::Parse { raw_response, .. } = &error {
+                        if let Some(prose) = recover_terminal_prose(raw_response) {
+                            return Ok(ToolPlanningOutcome::RecoveredTerminalProse(prose));
+                        }
+                    }
+                    last_error = Some(error);
+                    if attempt < MAX_TOOL_PLAN_ATTEMPTS {
+                        self.emit_trace(AgentTraceEvent::RetryScheduled {
+                            step: step_index,
+                            attempt,
+                        });
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Tool planning failed after {} attempts: {:?}",
+            MAX_TOOL_PLAN_ATTEMPTS,
+            last_error.expect("planner records every failed attempt")
+        ))
     }
 
     /// Attempt to correct a malformed LLM response using the correction agent
@@ -1374,9 +1805,155 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
     }
 }
 
+#[async_trait::async_trait]
+impl ToolPlanner for SageAgent {
+    fn has_actionable_tools(&self) -> bool {
+        self.tools.has_actionable_tools()
+    }
+
+    async fn plan_tools(
+        &mut self,
+        user_message: &str,
+        is_first_plan: bool,
+    ) -> Result<ToolPlanningOutcome> {
+        self.plan_tools_with_dspy(user_message, is_first_plan).await
+    }
+
+    async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
+        SageAgent::execute_tool_decision(self, decision).await
+    }
+
+    fn plain_answer_prompt(&self, user_message: &str) -> PlainAnswerPrompt {
+        SageAgent::plain_answer_prompt(self, user_message)
+    }
+
+    fn plain_answer_trace_started(&mut self) -> usize {
+        let step = self.turn_step_index;
+        self.turn_step_index += 1;
+        self.emit_trace(AgentTraceEvent::ModelStepStarted { step, attempt: 1 });
+        step
+    }
+
+    fn plain_answer_trace_completed(&self, step: usize, elapsed_ms: u128) {
+        self.emit_trace(AgentTraceEvent::ModelStepCompleted {
+            step,
+            attempt: 1,
+            elapsed_ms,
+        });
+    }
+
+    fn plain_answer_trace_failed(&self, step: usize, elapsed_ms: u128, error: &str) {
+        self.emit_trace(AgentTraceEvent::ModelStepFailed {
+            step,
+            attempt: 1,
+            elapsed_ms,
+            error: error.to_string(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_typed_response_recovers_only_terminal_plain_prose() {
+        let recovered = recover_terminal_prose(
+            "The instance is configured correctly. No further action is required.",
+        );
+
+        assert_eq!(
+            recovered.as_deref(),
+            Some("The instance is configured correctly. No further action is required.")
+        );
+        assert_eq!(
+            recover_terminal_prose(
+                "The `tool_calls` and function_call fields are provider protocol concepts."
+            )
+            .as_deref(),
+            Some("The `tool_calls` and function_call fields are provider protocol concepts.")
+        );
+        assert_eq!(
+            recover_terminal_prose(
+                r#"{"tool_calls":[{"name":"db_query","args":{"sql":"SELECT 1"}}]}"#
+            ),
+            None
+        );
+        assert_eq!(
+            recover_terminal_prose(
+                "[[ ## tool_calls ## ]]\n[{\"name\":\"knowledge_search\",\"args\":{}}]"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_prose_recovery_handles_legacy_messages_but_rejects_partial_tool_shapes() {
+        assert_eq!(
+            recover_terminal_prose(r#"{"messages":["Configuration is ready."],"tool_calls":[]}"#)
+                .as_deref(),
+            Some("Configuration is ready.")
+        );
+        assert_eq!(
+            recover_terminal_prose(
+                "[[ ## messages ## ]]\n[\"Configuration is ready.\"]\n[[ ## tool_calls ## ]]\n[]"
+            )
+            .as_deref(),
+            Some("Configuration is ready.")
+        );
+
+        for malformed_tool_intent in [
+            "```json\n{\"name\":\"db_query\",\"arguments\":{\"sql\":\"SELECT 1\"}}\n```",
+            r#"{"name":"db_query","args":{"sql":"SELECT 1"}"#,
+            r#"{"tool_call":{"name":"knowledge_search","arguments":{}}}"#,
+            "[[ ## tool_call ## ]]\n{\"name\":\"knowledge_search\",\"args\":{}}",
+            r#"{"messages":["Missing an explicit empty Tool decision."]}"#,
+            r#"{"unexpected":"structured output"}"#,
+            "[[ ## messages ## ]]\n[\"Missing the Tool field.\"]",
+            r#"{"messages":["{\"name\":\"db_query\",\"args\":{\"sql\":\"SELECT 1\"}}"],"tool_calls":[]}"#,
+            "[[ ## messages ## ]]\n[\"function_call: db_query\"]\n[[ ## tool_calls ## ]]\n[]",
+            "{'name':'db_query','args':{'sql':'SELECT 1'}}",
+            "name: db_query\nargs: sql=SELECT 1",
+        ] {
+            assert_eq!(
+                recover_terminal_prose(malformed_tool_intent),
+                None,
+                "Tool-shaped output must not become user-visible: {malformed_tool_intent}"
+            );
+        }
+    }
+
+    #[test]
+    fn done_does_not_make_a_registry_actionable() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::tools::DoneTool));
+
+        assert!(!registry.has_actionable_tools());
+
+        registry.register_descriptor("lookup", "Look up a fact", r#"{"query":"text"}"#);
+        assert!(registry.has_actionable_tools());
+    }
+
+    #[test]
+    fn tool_decision_ignores_done_when_actionable_calls_are_present() {
+        let decision = ToolDecision::new(
+            vec![
+                ToolCall {
+                    name: "done".to_string(),
+                    args: HashMap::new(),
+                },
+                ToolCall {
+                    name: "knowledge_search".to_string(),
+                    args: HashMap::from([("query".to_string(), "safety plan".to_string())]),
+                },
+            ],
+            true,
+        );
+
+        assert_eq!(decision.tool_calls.len(), 1);
+        assert_eq!(decision.tool_calls[0].name, "knowledge_search");
+        assert!(decision.replan_after_results);
+    }
 
     #[test]
     fn test_tool_registry() {

@@ -19,7 +19,7 @@ use base64::{
 use diesel::prelude::*;
 use diesel::sql_types::{Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid, Varchar};
 use flate2::read::ZlibDecoder;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use itsdangerous::{
     default_builder, timed_serializer_with_signer, Encoding, IntoTimestampSigner, TimedSerializer,
 };
@@ -40,7 +40,8 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::sage_agent::{
-    AgentTraceEvent, ExecutedTool, SageAgent, StepResult, Tool, ToolRegistry, ToolResult,
+    has_syntactic_tool_intent, AgentTraceEvent, ExecutedTool, PlainAnswerPrompt, SageAgent,
+    StepResult, Tool, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -94,10 +95,10 @@ Core behavior:
 - If you need clarification, ask concise follow-up questions. Put each clarifying question on its own line prefixed with "? ".
 
 Output style:
-- Produce the final user-facing answer in messages.
-- Keep messages concise unless the user asked for depth.
-- Use tools and then continue until you have the answer.
-- Use done only when there is nothing else to do this turn.
+- Keep answers concise unless the user asked for depth.
+- Follow the stage-specific output contract at the end of this instruction exactly.
+- Tool planning returns only the typed Tool decision requested by that stage.
+- Final-answer generation returns only plain user-visible prose, with no messages wrapper, Tool call, or done sentinel.
 "#;
 
 #[derive(Clone, Copy)]
@@ -397,6 +398,12 @@ pub struct ConversationTraceDeltaResponse {
     pub metadata: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum ConversationStreamSignal {
+    Trace(Box<ConversationTraceDeltaResponse>),
+    Answer(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1273,11 +1280,11 @@ struct AdminConfigBootstrapProposalTool {
 #[derive(Clone)]
 struct ConversationTraceDeltaSink {
     deltas: Arc<Mutex<Vec<ConversationTraceDeltaResponse>>>,
-    sender: Option<mpsc::UnboundedSender<ConversationTraceDeltaResponse>>,
+    sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 }
 
 impl ConversationTraceDeltaSink {
-    fn new(sender: Option<mpsc::UnboundedSender<ConversationTraceDeltaResponse>>) -> Self {
+    fn new(sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>) -> Self {
         Self {
             deltas: Arc::new(Mutex::new(Vec::new())),
             sender,
@@ -1290,7 +1297,7 @@ impl ConversationTraceDeltaSink {
             deltas.push(guarded.clone());
         }
         if let Some(sender) = &self.sender {
-            let _ = sender.send(guarded);
+            let _ = sender.send(ConversationStreamSignal::Trace(Box::new(guarded)));
         }
     }
 
@@ -1352,7 +1359,7 @@ struct ConversationToolLoopSinks {
 }
 
 impl ConversationToolLoopSinks {
-    fn new(sender: Option<mpsc::UnboundedSender<ConversationTraceDeltaResponse>>) -> Self {
+    fn new(sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>) -> Self {
         Self {
             sources: Arc::new(Mutex::new(Vec::new())),
             traces: Arc::new(Mutex::new(Vec::new())),
@@ -1629,7 +1636,7 @@ fn build_conversation_tool_registry_with_context(
     jurisdiction: Option<String>,
     situation_details: Option<String>,
     state: Option<&WebAppState>,
-    trace_sender: Option<mpsc::UnboundedSender<ConversationTraceDeltaResponse>>,
+    trace_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> (ToolRegistry, ConversationToolLoopSinks) {
     let sinks = ConversationToolLoopSinks::new(trace_sender);
     let mut registry = ToolRegistry::new();
@@ -4267,6 +4274,118 @@ fn chat_stream_status_payload(
     payload
 }
 
+fn chat_stream_answer_delta_payload(
+    message_id: String,
+    session_id: Option<String>,
+    delta: String,
+) -> ChatStreamEventPayload {
+    let mut payload = ChatStreamEventPayload::new(message_id, session_id);
+    payload.delta = Some(delta);
+    payload
+}
+
+struct ChatStreamEmission {
+    event: &'static str,
+    payload: ChatStreamEventPayload,
+}
+
+#[derive(Default)]
+struct ChatStreamAnswerEmissionState {
+    activity_steps_sent: bool,
+    writing_status_sent: bool,
+}
+
+impl ChatStreamAnswerEmissionState {
+    fn before_answer_delta(
+        &mut self,
+        message_id: &str,
+        session_id: &Option<String>,
+        activity_steps: Vec<ConversationActivityStepResponse>,
+        delta: String,
+        turn_started_at: Instant,
+        include_timing: bool,
+    ) -> Vec<ChatStreamEmission> {
+        let mut emissions = self.remaining_activity(message_id, session_id, activity_steps);
+        if !self.writing_status_sent {
+            emissions.push(ChatStreamEmission {
+                event: "trace_status",
+                payload: chat_stream_status_payload(
+                    message_id.to_string(),
+                    session_id.clone(),
+                    "Writing answer...",
+                    "writing_answer",
+                    turn_started_at,
+                    include_timing,
+                ),
+            });
+            self.writing_status_sent = true;
+        }
+        emissions.push(ChatStreamEmission {
+            event: "answer_delta",
+            payload: chat_stream_answer_delta_payload(
+                message_id.to_string(),
+                session_id.clone(),
+                delta,
+            ),
+        });
+        emissions
+    }
+
+    fn remaining_activity(
+        &mut self,
+        message_id: &str,
+        session_id: &Option<String>,
+        activity_steps: Vec<ConversationActivityStepResponse>,
+    ) -> Vec<ChatStreamEmission> {
+        if self.activity_steps_sent {
+            return Vec::new();
+        }
+        self.activity_steps_sent = true;
+        activity_steps
+            .into_iter()
+            .map(|activity_step| {
+                let mut payload =
+                    ChatStreamEventPayload::new(message_id.to_string(), session_id.clone());
+                payload.activity_step = Some(activity_step);
+                ChatStreamEmission {
+                    event: "activity_step",
+                    payload,
+                }
+            })
+            .collect()
+    }
+}
+
+fn chat_stream_emissions_for_signal(
+    answer_state: &mut ChatStreamAnswerEmissionState,
+    signal: ConversationStreamSignal,
+    message_id: &str,
+    session_id: &Option<String>,
+    activity_steps: Vec<ConversationActivityStepResponse>,
+    turn_started_at: Instant,
+    include_timing: bool,
+) -> Vec<ChatStreamEmission> {
+    match signal {
+        ConversationStreamSignal::Trace(trace_delta) => {
+            let mut payload =
+                ChatStreamEventPayload::new(message_id.to_string(), session_id.clone());
+            payload.trace_delta = Some(*trace_delta);
+            vec![ChatStreamEmission {
+                event: "trace_delta",
+                payload,
+            }]
+        }
+        ConversationStreamSignal::Answer(delta) => answer_state.before_answer_delta(
+            message_id,
+            session_id,
+            activity_steps,
+            delta,
+            turn_started_at,
+            include_timing,
+        ),
+    }
+}
+
 fn push_unique_tool_id(tools: &mut Vec<String>, tool_id: &str) {
     if !tools.iter().any(|existing| existing == tool_id) {
         tools.push(tool_id.to_string());
@@ -4462,6 +4581,7 @@ async fn chat(
         &tool_sinks,
         Some(&memory_user_id),
         &lm_settings,
+        None,
     )
     .await?;
     let response_text = tool_loop.answer;
@@ -4934,7 +5054,7 @@ async fn chat_stream(
         }
 
         let top_k = value_as_i32(ai_config.parameters.get("top_k"), 4);
-        let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
         let (registry, tool_sinks) = build_conversation_tool_registry_with_context(
             &state.internal,
             &state.http,
@@ -4945,7 +5065,7 @@ async fn chat_stream(
             None,
             None,
             Some(&state),
-            Some(trace_tx),
+            Some(stream_tx.clone()),
         );
         let mut agent = SageAgent::new_with_optional_memory(
             registry,
@@ -4979,24 +5099,49 @@ async fn chat_stream(
                 &tool_sinks,
                 Some(&memory_user_id),
                 &lm_settings,
+                Some(stream_tx),
             );
             tokio::pin!(tool_loop_future);
+            let mut answer_emission_state = ChatStreamAnswerEmissionState::default();
             let tool_loop = loop {
                 tokio::select! {
-                    Some(trace_delta) = trace_rx.recv() => {
-                        let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-                        payload.trace_delta = Some(trace_delta);
-                        yield Ok(chat_stream_sse_event("trace_delta", &payload));
+                    Some(signal) = stream_rx.recv() => {
+                        for emission in chat_stream_emissions_for_signal(
+                            &mut answer_emission_state,
+                            signal,
+                            &message_id,
+                            &session_id,
+                            conversation_activity_steps_from_sinks(&tool_sinks),
+                            turn_started_at,
+                            include_timing,
+                        ) {
+                            yield Ok(chat_stream_sse_event(emission.event, &emission.payload));
+                        }
                     }
                     result = &mut tool_loop_future => {
                         break result;
                     }
                 }
             };
-            while let Ok(trace_delta) = trace_rx.try_recv() {
-                let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-                payload.trace_delta = Some(trace_delta);
-                yield Ok(chat_stream_sse_event("trace_delta", &payload));
+            while let Ok(signal) = stream_rx.try_recv() {
+                for emission in chat_stream_emissions_for_signal(
+                    &mut answer_emission_state,
+                    signal,
+                    &message_id,
+                    &session_id,
+                    conversation_activity_steps_from_sinks(&tool_sinks),
+                    turn_started_at,
+                    include_timing,
+                ) {
+                    yield Ok(chat_stream_sse_event(emission.event, &emission.payload));
+                }
+            }
+            for emission in answer_emission_state.remaining_activity(
+                &message_id,
+                &session_id,
+                conversation_activity_steps_from_sinks(&tool_sinks),
+            ) {
+                yield Ok(chat_stream_sse_event(emission.event, &emission.payload));
             }
             tool_loop
         };
@@ -5010,22 +5155,6 @@ async fn chat_stream(
             }
         };
 
-        for activity_step in tool_loop.activity_steps.iter().cloned() {
-            let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-            payload.activity_step = Some(activity_step);
-            yield Ok(chat_stream_sse_event("activity_step", &payload));
-        }
-
-        let status = chat_stream_status_payload(
-            message_id.clone(),
-            session_id.clone(),
-            "Writing answer...",
-            "writing_answer",
-            turn_started_at,
-            include_timing,
-        );
-        yield Ok(chat_stream_sse_event("trace_status", &status));
-
         let trace = build_conversation_trace(
             &ai_config,
             &auth,
@@ -5036,10 +5165,6 @@ async fn chat_stream(
 
         let answer = tool_loop.answer.clone();
         if !answer.trim().is_empty() {
-            let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-            payload.delta = Some(answer.clone());
-            yield Ok(chat_stream_sse_event("answer_delta", &payload));
-
             let assistant_memory_content =
                 sanitize_admin_config_message_for_memory(&auth, &request, &answer);
             match agent.store_message_with_compaction_check(&memory_user_id, "assistant", &assistant_memory_content).await {
@@ -5195,6 +5320,7 @@ async fn query(
         &tool_sinks,
         Some(&memory_user_id),
         &lm_settings,
+        None,
     )
     .await?;
     let answer = tool_loop.answer;
@@ -7681,53 +7807,205 @@ struct AgentTurnFailure {
     progressed: bool,
 }
 
-/// Run one agent turn (up to 8 tool steps) against the currently-configured LM.
+const MAX_TOOL_REPLANS: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConversationTurnAction {
+    PlanTools,
+    ExecuteTools,
+    GeneratePlain,
+    FinishDeterministic,
+    ReplanLimitReached,
+}
+
+fn initial_turn_action(has_actionable_tools: bool) -> ConversationTurnAction {
+    if has_actionable_tools {
+        ConversationTurnAction::PlanTools
+    } else {
+        ConversationTurnAction::GeneratePlain
+    }
+}
+
+fn action_after_tool_plan(tool_call_count: usize) -> ConversationTurnAction {
+    if tool_call_count == 0 {
+        ConversationTurnAction::GeneratePlain
+    } else {
+        ConversationTurnAction::ExecuteTools
+    }
+}
+
+fn action_after_tool_execution(
+    replan_requested: bool,
+    any_tool_failed_or_guarded: bool,
+    deterministic_terminal: bool,
+    replans_used: usize,
+) -> ConversationTurnAction {
+    if deterministic_terminal {
+        return ConversationTurnAction::FinishDeterministic;
+    }
+    if replan_requested || any_tool_failed_or_guarded {
+        if replans_used >= MAX_TOOL_REPLANS {
+            ConversationTurnAction::ReplanLimitReached
+        } else {
+            ConversationTurnAction::PlanTools
+        }
+    } else {
+        ConversationTurnAction::GeneratePlain
+    }
+}
+
+struct AdapterTurnOutput {
+    answer: String,
+    executed_tools: Vec<ExecutedTool>,
+}
+
+#[derive(Debug)]
+struct AdapterTurnFailure {
+    error: AppError,
+    progressed: bool,
+}
+
+async fn run_turn_with_adapters<P, G>(
+    planner: &mut P,
+    answer_generator: &G,
+    input: &str,
+    model: &str,
+    delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) -> std::result::Result<AdapterTurnOutput, AdapterTurnFailure>
+where
+    P: ToolPlanner,
+    G: PlainAnswerGenerator,
+{
+    let mut action = initial_turn_action(planner.has_actionable_tools());
+    let mut first_plan = true;
+    let mut replans_used = 0;
+    let mut executed_tools = Vec::new();
+
+    loop {
+        match action {
+            ConversationTurnAction::PlanTools => {
+                let outcome = planner
+                    .plan_tools(input, first_plan)
+                    .await
+                    .map_err(|error| AdapterTurnFailure {
+                        error: model_provider_error(format!("{error:#}")),
+                        progressed: !executed_tools.is_empty(),
+                    })?;
+                first_plan = false;
+                match outcome {
+                    ToolPlanningOutcome::RecoveredTerminalProse(answer) => {
+                        if let Some(sender) = &delta_sender {
+                            let _ = sender.send(ConversationStreamSignal::Answer(answer.clone()));
+                        }
+                        return Ok(AdapterTurnOutput {
+                            answer,
+                            executed_tools,
+                        });
+                    }
+                    ToolPlanningOutcome::Decision(decision) => {
+                        action = action_after_tool_plan(decision.tool_calls.len());
+                        if action != ConversationTurnAction::ExecuteTools {
+                            continue;
+                        }
+
+                        let replan_requested = decision.replan_after_results;
+                        let result = planner.execute_tool_decision(&decision).await;
+                        let deterministic_answer =
+                            successful_admin_config_proposal_message(&result).map(str::to_string);
+                        let any_tool_failed_or_guarded = result
+                            .executed_tools
+                            .iter()
+                            .any(|executed| !executed.result.success);
+                        executed_tools.extend(result.executed_tools);
+                        action = action_after_tool_execution(
+                            replan_requested,
+                            any_tool_failed_or_guarded,
+                            deterministic_answer.is_some(),
+                            replans_used,
+                        );
+                        if action == ConversationTurnAction::FinishDeterministic {
+                            let answer = deterministic_answer
+                                .expect("deterministic terminal action requires an answer");
+                            if let Some(sender) = &delta_sender {
+                                let _ =
+                                    sender.send(ConversationStreamSignal::Answer(answer.clone()));
+                            }
+                            return Ok(AdapterTurnOutput {
+                                answer,
+                                executed_tools,
+                            });
+                        }
+                        if action == ConversationTurnAction::PlanTools {
+                            replans_used += 1;
+                        } else if action == ConversationTurnAction::ReplanLimitReached {
+                            warn!(
+                                "Tool replan limit reached; generating a plain answer from completed results"
+                            );
+                            action = ConversationTurnAction::GeneratePlain;
+                        }
+                    }
+                }
+            }
+            ConversationTurnAction::GeneratePlain => {
+                let prompt = planner.plain_answer_prompt(input);
+                let trace_step = planner.plain_answer_trace_started();
+                let started_at = Instant::now();
+                let generation = answer_generator
+                    .generate(&prompt, model, delta_sender.clone())
+                    .await;
+                let answer = generation.map_err(|error| {
+                    planner.plain_answer_trace_failed(
+                        trace_step,
+                        started_at.elapsed().as_millis(),
+                        &error.to_string(),
+                    );
+                    AdapterTurnFailure {
+                        progressed: !executed_tools.is_empty() || error.emitted_any,
+                        error: model_provider_error(error),
+                    }
+                })?;
+                planner.plain_answer_trace_completed(trace_step, started_at.elapsed().as_millis());
+                return Ok(AdapterTurnOutput {
+                    answer,
+                    executed_tools,
+                });
+            }
+            ConversationTurnAction::ExecuteTools
+            | ConversationTurnAction::FinishDeterministic
+            | ConversationTurnAction::ReplanLimitReached => {
+                return Err(AdapterTurnFailure {
+                    error: AppError::internal("invalid conversation turn transition"),
+                    progressed: !executed_tools.is_empty(),
+                });
+            }
+        }
+    }
+}
+
+/// Run one bounded Tool-planning phase followed by plain answer generation
+/// against the currently selected model.
 async fn run_agent_steps(
     agent: &mut SageAgent,
     input: &str,
     memory_user_id: Option<&str>,
+    lm: &RequestLmSettings,
+    model: &str,
+    delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> Result<String, AgentTurnFailure> {
-    let mut messages = Vec::new();
-    for step in 0..8 {
-        let result = match agent.step(input, step == 0).await {
-            Ok(result) => result,
-            Err(error) => {
-                // Use the alternate formatter so the full anyhow source chain is
-                // classified — the upstream status (e.g. "503 Service Unavailable")
-                // lives in a nested source, not the top-level "LLM call failed"
-                // message.
-                return Err(AgentTurnFailure {
-                    error: model_provider_error(format!("{error:#}")),
-                    progressed: step > 0,
-                });
-            }
-        };
-        persist_successful_admin_config_tools(agent, memory_user_id, &result.executed_tools).await;
-        let proposal_success_message = successful_admin_config_proposal_message(&result);
-        if let Some(message) = proposal_success_message {
-            messages.clear();
-            messages.push(message.to_string());
-            break;
-        }
-        if should_include_step_messages(&result) {
-            messages.extend(result.messages);
-        }
-        if result.done {
-            break;
-        }
-    }
-
-    let output = messages
-        .into_iter()
-        .map(|message| message.trim().to_string())
-        .filter(|message| !message.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    if output.is_empty() {
-        return Ok(EMPTY_AGENT_RESPONSE_FALLBACK.to_string());
-    }
-    Ok(output)
+    let generator = OpenAiPlainAnswerGenerator::new(
+        Client::new(),
+        lm.api_url.clone(),
+        lm.api_key.clone(),
+        lm.temperature,
+    );
+    let turn = run_turn_with_adapters(agent, &generator, input, model, delta_sender)
+        .await
+        .map_err(|failure| AgentTurnFailure {
+            error: failure.error,
+            progressed: failure.progressed,
+        })?;
+    persist_successful_admin_config_tools(agent, memory_user_id, &turn.executed_tools).await;
+    Ok(turn.answer)
 }
 
 /// Run an agent turn, falling back through the configured chat model chain when
@@ -7738,6 +8016,7 @@ async fn run_agent_turn(
     input: &str,
     memory_user_id: Option<&str>,
     lm: &RequestLmSettings,
+    delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> AppResult<String> {
     let chain = &lm.model_chain;
     let mut last_error: Option<AppError> = None;
@@ -7750,11 +8029,20 @@ async fn run_agent_turn(
             lm.configure(model).await?;
         }
 
-        match run_agent_steps(agent, input, memory_user_id).await {
+        match run_agent_steps(
+            agent,
+            input,
+            memory_user_id,
+            lm,
+            model,
+            delta_sender.clone(),
+        )
+        .await
+        {
             Ok(answer) => return Ok(answer),
             Err(AgentTurnFailure { error, progressed }) => {
                 let more_models = idx + 1 < chain.len();
-                if !progressed && more_models && is_model_fallback_eligible(&error) {
+                if should_fallback_agent_turn(&error, progressed, more_models) {
                     warn!(
                         "chat model '{}' unavailable ({}); falling back to '{}'",
                         model,
@@ -7770,6 +8058,10 @@ async fn run_agent_turn(
     }
 
     Err(last_error.unwrap_or_else(|| AppError::internal("no chat model configured")))
+}
+
+fn should_fallback_agent_turn(error: &AppError, progressed: bool, more_models: bool) -> bool {
+    !progressed && more_models && is_model_fallback_eligible(error)
 }
 
 async fn persist_successful_admin_config_tools(
@@ -7794,6 +8086,7 @@ async fn persist_successful_admin_config_tools(
     }
 }
 
+#[cfg(test)]
 fn should_include_step_messages(result: &StepResult) -> bool {
     !result.executed_tools.iter().any(|executed| {
         matches!(
@@ -7833,7 +8126,6 @@ struct ConversationToolLoopOutput {
     answer: String,
     tools_used: Vec<ToolCallInfoResponse>,
     retrieval_sources: Vec<QuerySource>,
-    activity_steps: Vec<ConversationActivityStepResponse>,
     admin_change_set: Option<AdminChangeSetResponse>,
 }
 
@@ -7843,9 +8135,10 @@ async fn run_conversation_tool_loop(
     sinks: &ConversationToolLoopSinks,
     memory_user_id: Option<&str>,
     lm: &RequestLmSettings,
+    answer_delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> AppResult<ConversationToolLoopOutput> {
     let turn_started_at = Instant::now();
-    let raw_answer = run_agent_turn(agent, input, memory_user_id, lm).await?;
+    let raw_answer = run_agent_turn(agent, input, memory_user_id, lm, answer_delta_sender).await?;
     sinks.trace_deltas.emit(turn_timing_trace_delta(
         turn_started_at.elapsed().as_millis(),
     ));
@@ -7864,14 +8157,12 @@ async fn run_conversation_tool_loop(
         .lock()
         .map(|change_set| change_set.clone())
         .unwrap_or_default();
-    let activity_steps = conversation_activity_steps_from_tools(&tools_used);
     let answer = finalize_tool_loop_answer(raw_answer, admin_change_set.as_ref());
 
     Ok(ConversationToolLoopOutput {
         answer,
         tools_used,
         retrieval_sources,
-        activity_steps,
         admin_change_set,
     })
 }
@@ -8037,6 +8328,17 @@ fn conversation_activity_steps_from_tools(
         .collect()
 }
 
+fn conversation_activity_steps_from_sinks(
+    sinks: &ConversationToolLoopSinks,
+) -> Vec<ConversationActivityStepResponse> {
+    let tools = sinks
+        .traces
+        .lock()
+        .map(|traces| dedupe_tool_calls(traces.clone()))
+        .unwrap_or_default();
+    conversation_activity_steps_from_tools(&tools)
+}
+
 fn conversation_activity_steps_from_tool_traces(
     tools: &[ToolTraceResponse],
 ) -> Vec<ConversationActivityStepResponse> {
@@ -8144,6 +8446,440 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
                 .or_else(|| value.as_str().map(|raw| raw.eq_ignore_ascii_case("true")))
         })
         .unwrap_or(default)
+}
+
+#[derive(Debug)]
+struct PlainAnswerGenerationError {
+    message: String,
+    emitted_any: bool,
+}
+
+impl std::fmt::Display for PlainAnswerGenerationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PlainAnswerGenerationError {}
+
+/// Provider-neutral boundary for final user-visible answer generation.
+#[async_trait::async_trait]
+trait PlainAnswerGenerator: Send + Sync {
+    async fn generate(
+        &self,
+        prompt: &PlainAnswerPrompt,
+        model: &str,
+        delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<String, PlainAnswerGenerationError>;
+}
+
+/// OpenAI-compatible Chat Completions adapter. Provider wire types remain
+/// confined here; the turn state machine sees only plain text deltas.
+struct OpenAiPlainAnswerGenerator {
+    client: Client,
+    api_url: String,
+    api_key: String,
+    temperature: f64,
+}
+
+const PLAIN_ANSWER_MAX_TOKENS: u32 = 8192;
+
+/// Streams ordinary prose immediately while retaining only ambiguous suffixes
+/// that could still become a textual Tool-call envelope on a later chunk.
+/// Structured-looking candidates are held until the provider terminates, so a
+/// malformed Tool shape can be rejected before any of that shape is public.
+#[derive(Default)]
+struct PlainAnswerStreamState {
+    answer: String,
+    pending: String,
+    emitted_any: bool,
+}
+
+impl PlainAnswerStreamState {
+    const STRUCTURAL_START_MARKERS: [&'static str; 18] = [
+        "[[ ##",
+        "<tool_call",
+        "</tool_call",
+        "<|tool_call",
+        "tool_calls:",
+        "function_call:",
+        "\"tool_calls\"",
+        "'tool_calls'",
+        "\"function_call\"",
+        "'function_call'",
+        "\"name\"",
+        "'name'",
+        "name:",
+        "\"args\"",
+        "'args'",
+        "args:",
+        "arguments:",
+        "```",
+    ];
+
+    fn push(
+        &mut self,
+        delta: &str,
+        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<(), String> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        self.answer.push_str(delta);
+        self.pending.push_str(delta);
+        self.flush_safe_candidates(delta_sender)
+    }
+
+    fn finish(
+        &mut self,
+        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<(), String> {
+        self.reject_tool_intent(&self.pending)?;
+        self.emit_pending_prefix(self.pending.len(), delta_sender);
+        Ok(())
+    }
+
+    fn reject_tool_intent(&self, candidate: &str) -> std::result::Result<(), String> {
+        if has_syntactic_tool_intent(candidate) {
+            return Err(
+                "final plain-answer stream contained textual Tool intent; refusing to expose it"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn flush_safe_candidates(
+        &mut self,
+        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<(), String> {
+        loop {
+            if self.pending.is_empty() {
+                return Ok(());
+            }
+            let suffix_start = self
+                .pending
+                .len()
+                .saturating_sub(Self::ambiguous_suffix_len(&self.pending));
+            let candidate_start = Self::structural_candidate_start(&self.pending);
+            let Some(candidate_start) = candidate_start.filter(|start| *start < suffix_start)
+            else {
+                self.emit_pending_prefix(suffix_start, delta_sender);
+                return Ok(());
+            };
+            if candidate_start > 0 {
+                self.emit_pending_prefix(candidate_start, delta_sender);
+            }
+            self.reject_tool_intent(&self.pending)?;
+            let Some(candidate_end) = Self::structural_candidate_end(&self.pending) else {
+                return Ok(());
+            };
+            self.reject_tool_intent(&self.pending[..candidate_end])?;
+            self.emit_pending_prefix(candidate_end, delta_sender);
+        }
+    }
+
+    fn ambiguous_suffix_len(value: &str) -> usize {
+        let lowercase = value.to_ascii_lowercase();
+        Self::STRUCTURAL_START_MARKERS
+            .iter()
+            .flat_map(|marker| 1..marker.len())
+            .filter(|prefix_len| {
+                Self::STRUCTURAL_START_MARKERS.iter().any(|marker| {
+                    *prefix_len < marker.len() && lowercase.ends_with(&marker[..*prefix_len])
+                })
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn structural_candidate_start(value: &str) -> Option<usize> {
+        let lowercase = value.to_ascii_lowercase();
+        let delimiter_start = value
+            .char_indices()
+            .find_map(|(index, ch)| matches!(ch, '{' | '[').then_some(index));
+        let marker_start = [
+            lowercase.find("```"),
+            lowercase.find("[[ ##"),
+            lowercase.find("<tool_call"),
+            lowercase.find("</tool_call"),
+            lowercase.find("<|tool_call"),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let line_start = Self::structural_line_start(value);
+        [delimiter_start, marker_start, line_start]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    fn structural_line_start(value: &str) -> Option<usize> {
+        let mut offset = 0;
+        for line in value.split_inclusive('\n') {
+            let trimmed = line.trim_start_matches(char::is_whitespace);
+            let indent = line.len() - trimmed.len();
+            if [
+                "tool_calls:",
+                "function_call:",
+                "\"tool_calls\"",
+                "'tool_calls'",
+                "\"function_call\"",
+                "'function_call'",
+                "name:",
+                "args:",
+                "arguments:",
+                "\"name\"",
+                "'name'",
+                "\"args\"",
+                "'args'",
+            ]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+            {
+                return Some(offset + indent);
+            }
+            offset += line.len();
+        }
+        None
+    }
+
+    fn structural_candidate_end(candidate: &str) -> Option<usize> {
+        if candidate.starts_with('{') || candidate.starts_with('[') {
+            return Self::balanced_structure_end(candidate);
+        }
+        if let Some(after_open) = candidate.strip_prefix("```") {
+            return after_open.find("```").map(|end| 3 + end + 3);
+        }
+        if candidate.starts_with("[[ ##")
+            || candidate.starts_with("<tool_call")
+            || candidate.starts_with("</tool_call")
+            || candidate.starts_with("<|tool_call")
+        {
+            return None;
+        }
+        let newline = candidate.find('\n')?;
+        let next_line = candidate[newline + 1..].trim_start_matches(char::is_whitespace);
+        if next_line.is_empty()
+            || Self::STRUCTURAL_START_MARKERS
+                .iter()
+                .any(|marker| marker.starts_with(&next_line.to_ascii_lowercase()))
+        {
+            return None;
+        }
+        Some(newline + 1)
+    }
+
+    fn balanced_structure_end(candidate: &str) -> Option<usize> {
+        let mut stack = Vec::new();
+        let mut quote = None;
+        let mut escaped = false;
+        for (index, ch) in candidate.char_indices() {
+            if let Some(active_quote) = quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == active_quote {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' if stack.last().copied() == Some(ch) => {
+                    stack.pop();
+                    if stack.is_empty() {
+                        return Some(index + ch.len_utf8());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn emit_pending_prefix(
+        &mut self,
+        end: usize,
+        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) {
+        if end == 0 {
+            return;
+        }
+        let delta: String = self.pending.drain(..end).collect();
+        if let Some(sender) = delta_sender {
+            self.emitted_any = true;
+            let _ = sender.send(ConversationStreamSignal::Answer(delta));
+        }
+    }
+}
+
+impl OpenAiPlainAnswerGenerator {
+    fn new(client: Client, api_url: String, api_key: String, temperature: f64) -> Self {
+        Self {
+            client,
+            api_url,
+            api_key,
+            temperature,
+        }
+    }
+
+    fn consume_sse_line(
+        line: &str,
+        state: &mut PlainAnswerStreamState,
+        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<bool, String> {
+        let line = line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(false);
+        };
+        let data = data.trim_start();
+        if data == "[DONE]" {
+            state.finish(delta_sender)?;
+            return Ok(true);
+        }
+        if data.is_empty() {
+            return Ok(false);
+        }
+        let value: Value = serde_json::from_str(data).map_err(|error| {
+            format!(
+                "invalid Chat Completions stream event: {error}; payload: {}",
+                truncate_chars(data, 160)
+            )
+        })?;
+        let has_native_tool_calls =
+            value
+                .pointer("/choices/0/delta/tool_calls")
+                .is_some_and(|tool_calls| {
+                    !tool_calls.is_null()
+                        && !tool_calls
+                            .as_array()
+                            .is_some_and(|tool_calls| tool_calls.is_empty())
+                });
+        let has_native_function_call = value
+            .pointer("/choices/0/delta/function_call")
+            .is_some_and(|function_call| !function_call.is_null());
+        if has_native_tool_calls || has_native_function_call {
+            return Err(
+                "final plain-answer stream contained Tool intent; refusing to expose it"
+                    .to_string(),
+            );
+        }
+        if let Some(delta) = value
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+        {
+            state.push(delta, delta_sender)?;
+        }
+        let finished = value
+            .pointer("/choices/0/finish_reason")
+            .is_some_and(|reason| !reason.is_null());
+        if finished {
+            state.finish(delta_sender)?;
+        }
+        Ok(finished)
+    }
+}
+
+#[async_trait::async_trait]
+impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
+    async fn generate(
+        &self,
+        prompt: &PlainAnswerPrompt,
+        model: &str,
+        delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<String, PlainAnswerGenerationError> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/chat/completions",
+                self.api_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.api_key)
+            .json(&json!({
+                "model": model,
+                "messages": [
+                    { "role": "system", "content": prompt.system },
+                    { "role": "user", "content": prompt.user }
+                ],
+                "temperature": self.temperature,
+                "max_tokens": PLAIN_ANSWER_MAX_TOKENS,
+                "stream": true
+            }))
+            .send()
+            .await
+            .map_err(|error| PlainAnswerGenerationError {
+                message: format!("plain answer request failed: {error}"),
+                emitted_any: false,
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(PlainAnswerGenerationError {
+                message: format!(
+                    "plain answer provider returned {}: {}",
+                    status,
+                    truncate_chars(&body, 500)
+                ),
+                emitted_any: false,
+            });
+        }
+
+        let mut answer_state = PlainAnswerStreamState::default();
+        let mut buffer = Vec::new();
+        let mut stream = response.bytes_stream();
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| PlainAnswerGenerationError {
+                message: format!("plain answer stream failed: {error}"),
+                emitted_any: answer_state.emitted_any,
+            })?;
+            buffer.extend_from_slice(&chunk);
+            while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = String::from_utf8_lossy(&buffer[..newline]).to_string();
+                buffer.drain(..=newline);
+                done = Self::consume_sse_line(&line, &mut answer_state, &delta_sender).map_err(
+                    |message| PlainAnswerGenerationError {
+                        message,
+                        emitted_any: answer_state.emitted_any,
+                    },
+                )?;
+                if done {
+                    break;
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        if !buffer.is_empty() && !done {
+            let line = String::from_utf8_lossy(&buffer).to_string();
+            done = Self::consume_sse_line(&line, &mut answer_state, &delta_sender).map_err(
+                |message| PlainAnswerGenerationError {
+                    message,
+                    emitted_any: answer_state.emitted_any,
+                },
+            )?;
+        }
+        if !done {
+            return Err(PlainAnswerGenerationError {
+                message: "plain answer stream ended without a finish terminator".to_string(),
+                emitted_any: answer_state.emitted_any,
+            });
+        }
+        if answer_state.answer.trim().is_empty() {
+            return Err(PlainAnswerGenerationError {
+                message: "plain answer provider returned no visible text".to_string(),
+                emitted_any: false,
+            });
+        }
+        Ok(answer_state.answer)
+    }
 }
 
 /// Per-request LM configuration: the ordered chat model chain (primary first,
@@ -8383,10 +9119,918 @@ fn auth_error(error: anyhow::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sage_agent::ToolDecision;
     use flate2::{write::ZlibEncoder, Compression};
     use itsdangerous::{default_builder, timed_serializer_with_signer, TimestampSigner};
     use serde_json::json;
     use std::io::Write;
+
+    fn answer_signal(signal: ConversationStreamSignal) -> String {
+        match signal {
+            ConversationStreamSignal::Answer(delta) => delta,
+            ConversationStreamSignal::Trace(delta) => {
+                panic!("expected answer signal, received trace {}", delta.id)
+            }
+        }
+    }
+
+    #[test]
+    fn conversation_turn_transitions_skip_planning_and_bound_replans() {
+        assert_eq!(
+            initial_turn_action(false),
+            ConversationTurnAction::GeneratePlain
+        );
+        assert_eq!(initial_turn_action(true), ConversationTurnAction::PlanTools);
+        assert_eq!(
+            action_after_tool_plan(0),
+            ConversationTurnAction::GeneratePlain
+        );
+        assert_eq!(
+            action_after_tool_plan(2),
+            ConversationTurnAction::ExecuteTools
+        );
+
+        assert_eq!(
+            action_after_tool_execution(false, false, false, 0),
+            ConversationTurnAction::GeneratePlain
+        );
+        assert_eq!(
+            action_after_tool_execution(true, false, false, 0),
+            ConversationTurnAction::PlanTools
+        );
+        assert_eq!(
+            action_after_tool_execution(false, true, false, 0),
+            ConversationTurnAction::PlanTools
+        );
+        assert_eq!(
+            action_after_tool_execution(true, false, true, 0),
+            ConversationTurnAction::FinishDeterministic
+        );
+        assert_eq!(
+            action_after_tool_execution(true, false, false, MAX_TOOL_REPLANS),
+            ConversationTurnAction::ReplanLimitReached
+        );
+    }
+
+    #[test]
+    fn model_fallback_is_allowed_only_before_side_effects_or_answer_chunks() {
+        let upstream = AppError::new(StatusCode::BAD_GATEWAY, "provider unavailable");
+
+        assert!(should_fallback_agent_turn(&upstream, false, true));
+        assert!(!should_fallback_agent_turn(&upstream, true, true));
+        assert!(!should_fallback_agent_turn(&upstream, false, false));
+        assert!(!should_fallback_agent_turn(
+            &AppError::new(StatusCode::BAD_REQUEST, "bad request"),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn public_answer_delta_events_preserve_ids_across_real_provider_chunks() {
+        let first = chat_stream_answer_delta_payload(
+            "msg_stable".to_string(),
+            Some("11111111-1111-1111-1111-111111111111".to_string()),
+            "first ".to_string(),
+        );
+        let second = chat_stream_answer_delta_payload(
+            "msg_stable".to_string(),
+            Some("11111111-1111-1111-1111-111111111111".to_string()),
+            "second".to_string(),
+        );
+
+        let first_json = chat_stream_event_payload_json(&first);
+        let second_json = chat_stream_event_payload_json(&second);
+        for rendered in [&first_json, &second_json] {
+            assert!(rendered.contains(r#""message_id":"msg_stable""#));
+            assert!(rendered.contains(r#""session_id":"11111111-1111-1111-1111-111111111111""#));
+        }
+        assert!(first_json.contains(r#""delta":"first ""#));
+        assert!(second_json.contains(r#""delta":"second""#));
+    }
+
+    #[test]
+    fn public_stream_orders_tool_activity_before_real_answer_chunks() {
+        let message_id = "msg_stable";
+        let session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
+        let activity = ConversationActivityStepResponse {
+            id: "tool-knowledge-search".to_string(),
+            kind: "tool".to_string(),
+            title: "Knowledge Search".to_string(),
+            status: "succeeded".to_string(),
+            summary: Some("Found one source.".to_string()),
+            warnings: Vec::new(),
+        };
+        let mut state = ChatStreamAnswerEmissionState::default();
+
+        let first = state.before_answer_delta(
+            message_id,
+            &session_id,
+            vec![activity],
+            "first ".to_string(),
+            Instant::now(),
+            false,
+        );
+        let second = state.before_answer_delta(
+            message_id,
+            &session_id,
+            Vec::new(),
+            "second".to_string(),
+            Instant::now(),
+            false,
+        );
+
+        assert_eq!(
+            first
+                .iter()
+                .map(|emission| emission.event)
+                .collect::<Vec<_>>(),
+            ["activity_step", "trace_status", "answer_delta"]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|emission| emission.event)
+                .collect::<Vec<_>>(),
+            ["answer_delta"]
+        );
+        for emission in first.iter().chain(&second) {
+            assert_eq!(emission.payload.message_id, message_id);
+            assert_eq!(emission.payload.session_id, session_id);
+        }
+        assert_eq!(first[2].payload.delta.as_deref(), Some("first "));
+        assert_eq!(second[0].payload.delta.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn public_stream_preserves_unified_trace_and_answer_signal_order() {
+        let message_id = "msg_ordered";
+        let session_id = Some("22222222-2222-2222-2222-222222222222".to_string());
+        let activity = ConversationActivityStepResponse {
+            id: "tool-db-query".to_string(),
+            kind: "tool".to_string(),
+            title: "Database Query".to_string(),
+            status: "succeeded".to_string(),
+            summary: Some("Query completed.".to_string()),
+            warnings: Vec::new(),
+        };
+        let signals = [
+            ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
+                AgentTraceEvent::ModelStepStarted {
+                    step: 0,
+                    attempt: 1,
+                },
+            ))),
+            ConversationStreamSignal::Answer("first ".to_string()),
+            ConversationStreamSignal::Answer("second".to_string()),
+            ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
+                AgentTraceEvent::ModelStepCompleted {
+                    step: 0,
+                    attempt: 1,
+                    elapsed_ms: 25,
+                },
+            ))),
+        ];
+        let mut state = ChatStreamAnswerEmissionState::default();
+        let mut emissions = Vec::new();
+
+        for signal in signals {
+            emissions.extend(chat_stream_emissions_for_signal(
+                &mut state,
+                signal,
+                message_id,
+                &session_id,
+                vec![activity.clone()],
+                Instant::now(),
+                false,
+            ));
+        }
+
+        assert_eq!(
+            emissions
+                .iter()
+                .map(|emission| emission.event)
+                .collect::<Vec<_>>(),
+            [
+                "trace_delta",
+                "activity_step",
+                "trace_status",
+                "answer_delta",
+                "answer_delta",
+                "trace_delta",
+            ]
+        );
+        assert_eq!(emissions[3].payload.delta.as_deref(), Some("first "));
+        assert_eq!(emissions[4].payload.delta.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn plain_answer_generator_forwards_provider_sse_deltas() {
+        async fn completion(Json(body): Json<Value>) -> impl IntoResponse {
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["model"], "test-model");
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \",\"tool_calls\":null,\"function_call\":null}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(completion)),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = crate::sage_agent::PlainAnswerPrompt {
+            system: "Answer plainly".to_string(),
+            user: "Say hello".to_string(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let answer = generator
+            .generate(&prompt, "test-model", Some(delta_tx))
+            .await
+            .expect("streamed completion should succeed");
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+
+        assert_eq!(answer, "Hello world");
+        assert_eq!(deltas, vec!["Hello ", "world"]);
+    }
+
+    async fn spawn_plain_answer_provider(body: &'static str) -> String {
+        async fn completion(
+            State(body): State<&'static str>,
+            Json(_request): Json<Value>,
+        ) -> impl IntoResponse {
+            ([("content-type", "text/event-stream")], body)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(body),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+        format!("http://{address}/v1")
+    }
+
+    #[tokio::test]
+    async fn plain_answer_generator_streams_benign_json_code_and_citations() {
+        let api_url = spawn_plain_answer_provider(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"JSON: {\\\"status\\\":\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\\\"ok\\\"} `code` [1].\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "show structured prose".to_string(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let answer = generator
+            .generate(&prompt, "test-model", Some(delta_tx))
+            .await
+            .expect("benign structured prose should remain streamable");
+
+        assert_eq!(answer, "JSON: {\"status\":\"ok\"} `code` [1].");
+        let mut streamed = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            streamed.push(answer_signal(signal));
+        }
+        assert!(streamed.len() > 1);
+        assert_eq!(streamed.concat(), answer);
+    }
+
+    #[test]
+    fn plain_answer_safety_releases_completed_benign_name_objects_before_finish() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("Contact: {\"name\":\"Ali", &sender)
+            .expect("partial benign object should remain pending");
+        assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), "Contact: ");
+        assert!(delta_rx.try_recv().is_err());
+
+        state
+            .push("ce\",\"email\":\"a@example.com\"}", &sender)
+            .expect("completed benign object should be released immediately");
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().unwrap()),
+            "{\"name\":\"Alice\",\"email\":\"a@example.com\"}"
+        );
+        assert!(delta_rx.try_recv().is_err());
+
+        state
+            .finish(&sender)
+            .expect("already released benign answer should finish cleanly");
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_withholds_args_first_tool_envelopes_across_unicode_chunks() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("🌐 {\"args\":{\"sql\":\"SELECT secret\"},", &sender)
+            .expect("args-first envelope should remain pending until classified");
+        assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), "🌐 ");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push("\"name\":\"db_query\"}", &sender)
+            .expect_err("args-first Tool envelope must be rejected before exposure");
+        assert!(error.contains("textual Tool intent"));
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_handles_incomplete_benign_code_fences_without_recursion() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("```json\n{\"status\":", &sender)
+            .expect("an opening fence must remain pending without recursion");
+        assert!(delta_rx.try_recv().is_err());
+
+        state
+            .push("\"ok\"}\n```", &sender)
+            .expect("a completed benign fence should be released");
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().unwrap()),
+            "```json\n{\"status\":\"ok\"}\n```"
+        );
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn plain_answer_generator_rejects_tool_intent_and_unterminated_partial_text() {
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "hello".to_string(),
+        };
+        let tool_call_api = spawn_plain_answer_provider(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"db_query\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let tool_error = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            tool_call_api,
+            "test-key".to_string(),
+            0.1,
+        )
+        .generate(&prompt, "test-model", None)
+        .await
+        .expect_err("final answer Tool intent must be a protocol error");
+        assert!(tool_error.message.contains("Tool intent"));
+        assert!(!tool_error.emitted_any);
+
+        let textual_tool_api = spawn_plain_answer_provider(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"tool_\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"calls\\\":[{\\\"name\\\":\\\"db_query\\\",\\\"args\\\":{}}]}\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let (textual_delta_tx, mut textual_delta_rx) = mpsc::unbounded_channel();
+        let textual_tool_error = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            textual_tool_api,
+            "test-key".to_string(),
+            0.1,
+        )
+        .generate(&prompt, "test-model", Some(textual_delta_tx))
+        .await
+        .expect_err("textual Tool intent split across chunks must be rejected");
+        assert!(textual_tool_error.message.contains("textual Tool intent"));
+        assert!(!textual_tool_error.emitted_any);
+        assert!(textual_delta_rx.try_recv().is_err());
+
+        let unquoted_tool_api = spawn_plain_answer_provider(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"na\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"me: db_query\\nar\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"gs: sql=SELECT 1\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let (unquoted_delta_tx, mut unquoted_delta_rx) = mpsc::unbounded_channel();
+        let unquoted_tool_error = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            unquoted_tool_api,
+            "test-key".to_string(),
+            0.1,
+        )
+        .generate(&prompt, "test-model", Some(unquoted_delta_tx))
+        .await
+        .expect_err("unquoted Tool intent split across chunks must be rejected");
+        assert!(unquoted_tool_error.message.contains("textual Tool intent"));
+        assert!(!unquoted_tool_error.emitted_any);
+        assert!(unquoted_delta_rx.try_recv().is_err());
+
+        let unterminated_api = spawn_plain_answer_provider(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        )
+        .await;
+        let partial_error = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            unterminated_api,
+            "test-key".to_string(),
+            0.1,
+        )
+        .generate(&prompt, "test-model", None)
+        .await
+        .expect_err("unterminated partial text must not silently succeed");
+        assert!(partial_error
+            .message
+            .contains("without a finish terminator"));
+        assert!(!partial_error.emitted_any);
+    }
+
+    struct OneToolPlanner {
+        planned: bool,
+        executed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolPlanner for OneToolPlanner {
+        fn has_actionable_tools(&self) -> bool {
+            true
+        }
+
+        async fn plan_tools(
+            &mut self,
+            _user_message: &str,
+            _is_first_plan: bool,
+        ) -> Result<ToolPlanningOutcome> {
+            self.planned = true;
+            Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
+                vec![crate::sage_agent::ToolCall {
+                    name: "knowledge_search".to_string(),
+                    args: HashMap::from([("query".to_string(), "safety".to_string())]),
+                }],
+                false,
+            )))
+        }
+
+        async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
+            self.executed = true;
+            StepResult {
+                messages: Vec::new(),
+                tool_calls: decision.tool_calls.clone(),
+                executed_tools: vec![ExecutedTool {
+                    tool_call: decision.tool_calls[0].clone(),
+                    result: ToolResult::success("trusted result"),
+                }],
+                done: false,
+            }
+        }
+
+        fn plain_answer_prompt(&self, _user_message: &str) -> PlainAnswerPrompt {
+            PlainAnswerPrompt {
+                system: "answer plainly".to_string(),
+                user: "trusted result".to_string(),
+            }
+        }
+    }
+
+    struct TwoChunkAnswerGenerator;
+
+    #[async_trait::async_trait]
+    impl PlainAnswerGenerator for TwoChunkAnswerGenerator {
+        async fn generate(
+            &self,
+            _prompt: &PlainAnswerPrompt,
+            _model: &str,
+            delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        ) -> std::result::Result<String, PlainAnswerGenerationError> {
+            if let Some(sender) = delta_sender {
+                let _ = sender.send(ConversationStreamSignal::Answer("A trusted ".to_string()));
+                let _ = sender.send(ConversationStreamSignal::Answer("answer".to_string()));
+            }
+            Ok("A trusted answer".to_string())
+        }
+    }
+
+    struct NoActionableToolPlanner;
+
+    #[async_trait::async_trait]
+    impl ToolPlanner for NoActionableToolPlanner {
+        fn has_actionable_tools(&self) -> bool {
+            false
+        }
+
+        async fn plan_tools(
+            &mut self,
+            _user_message: &str,
+            _is_first_plan: bool,
+        ) -> Result<ToolPlanningOutcome> {
+            panic!("a tool-free turn must skip typed planning")
+        }
+
+        async fn execute_tool_decision(&mut self, _decision: &ToolDecision) -> StepResult {
+            panic!("a tool-free turn must not execute Tools")
+        }
+
+        fn plain_answer_prompt(&self, _user_message: &str) -> PlainAnswerPrompt {
+            PlainAnswerPrompt {
+                system: "answer plainly".to_string(),
+                user: "hello".to_string(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_free_turn_streams_plain_answer_without_typed_planning() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let turn = run_turn_with_adapters(
+            &mut NoActionableToolPlanner,
+            &TwoChunkAnswerGenerator,
+            "hello",
+            "test-model",
+            Some(delta_tx),
+        )
+        .await
+        .expect("tool-free turn should complete directly");
+
+        assert_eq!(turn.answer, "A trusted answer");
+        assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), "A trusted ");
+        assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), "answer");
+    }
+
+    #[tokio::test]
+    async fn tool_free_turn_falls_back_before_the_first_answer_chunk() {
+        async fn completion(
+            State(requested_models): State<Arc<Mutex<Vec<String>>>>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            let model = body["model"].as_str().unwrap_or_default().to_string();
+            requested_models.lock().unwrap().push(model.clone());
+            if model == "primary" {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "503 Service Unavailable" })),
+                )
+                    .into_response();
+            }
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"fallback answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+                .into_response()
+        }
+
+        let requested_models = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_models = requested_models.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_models),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::tools::DoneTool));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let settings = RequestLmSettings {
+            api_url: format!("http://{address}/v1"),
+            api_key: "test-key".to_string(),
+            model_chain: vec!["primary".to_string(), "fallback".to_string()],
+            temperature: 0.1,
+        };
+
+        let answer = run_agent_turn(&mut agent, "hello", None, &settings, None)
+            .await
+            .expect("clean pre-chunk failure should use fallback");
+
+        assert_eq!(answer, "fallback answer");
+        assert_eq!(
+            requested_models.lock().unwrap().as_slice(),
+            ["primary", "fallback"]
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_answer_failure_never_restarts_on_a_fallback_model() {
+        async fn completion(
+            State(requested_models): State<Arc<Mutex<Vec<String>>>>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            requested_models
+                .lock()
+                .unwrap()
+                .push(body["model"].as_str().unwrap_or_default().to_string());
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+                    "data: 503 Service Unavailable\n\n"
+                ),
+            )
+        }
+
+        let requested_models = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_models = requested_models.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_models),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::tools::DoneTool));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let settings = RequestLmSettings {
+            api_url: format!("http://{address}/v1"),
+            api_key: "test-key".to_string(),
+            model_chain: vec!["primary".to_string(), "fallback".to_string()],
+            temperature: 0.1,
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let error = run_agent_turn(&mut agent, "hello", None, &settings, Some(delta_tx))
+            .await
+            .expect_err("partial answer failure should terminate the turn");
+
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().unwrap()),
+            "partial answer"
+        );
+        assert_eq!(requested_models.lock().unwrap().as_slice(), ["primary"]);
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn common_turn_runs_plan_tools_then_streams_plain_answer() {
+        let mut planner = OneToolPlanner {
+            planned: false,
+            executed: false,
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let turn = run_turn_with_adapters(
+            &mut planner,
+            &TwoChunkAnswerGenerator,
+            "help me",
+            "test-model",
+            Some(delta_tx),
+        )
+        .await
+        .expect("turn should complete");
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+
+        assert!(planner.planned);
+        assert!(planner.executed);
+        assert_eq!(turn.answer, "A trusted answer");
+        assert_eq!(turn.executed_tools.len(), 1);
+        assert_eq!(deltas, vec!["A trusted ", "answer"]);
+    }
+
+    struct SuccessfulProposalPlanner;
+
+    #[async_trait::async_trait]
+    impl ToolPlanner for SuccessfulProposalPlanner {
+        fn has_actionable_tools(&self) -> bool {
+            true
+        }
+
+        async fn plan_tools(
+            &mut self,
+            _user_message: &str,
+            _is_first_plan: bool,
+        ) -> Result<ToolPlanningOutcome> {
+            Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
+                vec![crate::sage_agent::ToolCall {
+                    name: "propose_config_change_set".to_string(),
+                    args: HashMap::new(),
+                }],
+                true,
+            )))
+        }
+
+        async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
+            StepResult {
+                messages: Vec::new(),
+                tool_calls: decision.tool_calls.clone(),
+                executed_tools: vec![ExecutedTool {
+                    tool_call: decision.tool_calls[0].clone(),
+                    result: ToolResult::success("proposal staged"),
+                }],
+                done: false,
+            }
+        }
+
+        fn plain_answer_prompt(&self, _user_message: &str) -> PlainAnswerPrompt {
+            panic!("a successful deterministic proposal must not generate another answer")
+        }
+    }
+
+    struct ForbiddenAnswerGenerator;
+
+    #[async_trait::async_trait]
+    impl PlainAnswerGenerator for ForbiddenAnswerGenerator {
+        async fn generate(
+            &self,
+            _prompt: &PlainAnswerPrompt,
+            _model: &str,
+            _delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        ) -> std::result::Result<String, PlainAnswerGenerationError> {
+            panic!("a successful deterministic proposal must not call the model")
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_proposal_finishes_with_deterministic_streamed_message() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let turn = run_turn_with_adapters(
+            &mut SuccessfulProposalPlanner,
+            &ForbiddenAnswerGenerator,
+            "change the configuration",
+            "test-model",
+            Some(delta_tx),
+        )
+        .await
+        .expect("proposal turn should complete");
+
+        assert_eq!(
+            turn.answer,
+            "I prepared these changes for review. Use Apply to confirm."
+        );
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().expect("deterministic answer delta")),
+            turn.answer
+        );
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn non_streaming_turn_collects_the_same_plain_answer() {
+        let mut streaming_planner = OneToolPlanner {
+            planned: false,
+            executed: false,
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let streaming = run_turn_with_adapters(
+            &mut streaming_planner,
+            &TwoChunkAnswerGenerator,
+            "help me",
+            "test-model",
+            Some(delta_tx),
+        )
+        .await
+        .expect("streaming turn should complete");
+        let mut streamed_answer = String::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            streamed_answer.push_str(&answer_signal(signal));
+        }
+
+        let mut non_streaming_planner = OneToolPlanner {
+            planned: false,
+            executed: false,
+        };
+        let non_streaming = run_turn_with_adapters(
+            &mut non_streaming_planner,
+            &TwoChunkAnswerGenerator,
+            "help me",
+            "test-model",
+            None,
+        )
+        .await
+        .expect("non-streaming turn should complete");
+
+        assert_eq!(streaming.answer, streamed_answer);
+        assert_eq!(non_streaming.answer, streaming.answer);
+        assert_eq!(
+            non_streaming.executed_tools.len(),
+            streaming.executed_tools.len()
+        );
+    }
+
+    struct GuardedToolPlanner {
+        plan_count: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolPlanner for GuardedToolPlanner {
+        fn has_actionable_tools(&self) -> bool {
+            true
+        }
+
+        async fn plan_tools(
+            &mut self,
+            _user_message: &str,
+            is_first_plan: bool,
+        ) -> Result<ToolPlanningOutcome> {
+            self.plan_count += 1;
+            if is_first_plan {
+                return Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
+                    vec![crate::sage_agent::ToolCall {
+                        name: "db_query".to_string(),
+                        args: HashMap::from([("sql".to_string(), "DELETE FROM users".to_string())]),
+                    }],
+                    false,
+                )));
+            }
+            Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
+                Vec::new(),
+                false,
+            )))
+        }
+
+        async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
+            StepResult {
+                messages: Vec::new(),
+                tool_calls: decision.tool_calls.clone(),
+                executed_tools: vec![ExecutedTool {
+                    tool_call: decision.tool_calls[0].clone(),
+                    result: ToolResult::error("read-only guard rejected the query"),
+                }],
+                done: false,
+            }
+        }
+
+        fn plain_answer_prompt(&self, _user_message: &str) -> PlainAnswerPrompt {
+            PlainAnswerPrompt {
+                system: "answer plainly".to_string(),
+                user: "explain the guarded result".to_string(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_tool_result_replans_even_without_an_explicit_request() {
+        let mut planner = GuardedToolPlanner { plan_count: 0 };
+
+        let turn = run_turn_with_adapters(
+            &mut planner,
+            &TwoChunkAnswerGenerator,
+            "delete the users",
+            "test-model",
+            None,
+        )
+        .await
+        .expect("guarded Tool turn should recover with a plain answer");
+
+        assert_eq!(planner.plan_count, 2);
+        assert_eq!(turn.executed_tools.len(), 1);
+        assert!(!turn.executed_tools[0].result.success);
+        assert_eq!(turn.answer, "A trusted answer");
+    }
 
     #[test]
     fn admin_session_tokens_deserialize_python_type_field() {
@@ -8877,6 +10521,11 @@ mod tests {
         assert!(instruction.contains("PROFILE: custom instance"));
         assert!(!instruction.contains("communicating via Signal"));
         assert!(!instruction.contains("building genuine friendships"));
+        assert!(!instruction.contains("final user-facing answer in messages"));
+        assert!(!instruction.contains("Use done only"));
+        assert!(
+            instruction.contains("Final-answer generation returns only plain user-visible prose")
+        );
     }
 
     #[test]
