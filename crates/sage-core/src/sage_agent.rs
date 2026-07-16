@@ -207,6 +207,13 @@ pub trait ToolPlanner: Send {
         0
     }
 
+    fn plain_answer_reasoning_trace_hook(
+        &self,
+        _step: usize,
+    ) -> Option<ProviderReasoningTraceHook> {
+        None
+    }
+
     fn plain_answer_trace_completed(&self, _step: usize, _elapsed_ms: u128) {}
 
     fn plain_answer_trace_failed(&self, _step: usize, _elapsed_ms: u128, _error: &str) {}
@@ -703,6 +710,7 @@ pub enum AgentTraceEvent {
 }
 
 pub type AgentTraceHook = Arc<dyn Fn(AgentTraceEvent) + Send + Sync>;
+pub type ProviderReasoningTraceHook = Arc<dyn Fn(String) + Send + Sync>;
 
 pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
     let candidate = candidate.trim();
@@ -1773,6 +1781,13 @@ impl ToolPlanner for SageAgent {
         self.turn_step_index += 1;
         self.emit_trace(AgentTraceEvent::ModelStepStarted { step, attempt: 1 });
         step
+    }
+
+    fn plain_answer_reasoning_trace_hook(&self, step: usize) -> Option<ProviderReasoningTraceHook> {
+        let trace_hook = self.trace_hook.clone()?;
+        Some(Arc::new(move |content| {
+            trace_hook(AgentTraceEvent::ProviderReasoning { step, content });
+        }))
     }
 
     fn plain_answer_trace_completed(&self, step: usize, elapsed_ms: u128) {

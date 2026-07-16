@@ -40,8 +40,9 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::sage_agent::{
-    has_syntactic_tool_intent, AgentTraceEvent, ExecutedTool, PlainAnswerPrompt, SageAgent,
-    StepResult, Tool, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
+    has_syntactic_tool_intent, AgentTraceEvent, ExecutedTool, PlainAnswerPrompt,
+    ProviderReasoningTraceHook, SageAgent, StepResult, Tool, ToolPlanner, ToolPlanningOutcome,
+    ToolRegistry, ToolResult,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -7965,9 +7966,10 @@ where
             ConversationTurnAction::GeneratePlain => {
                 let prompt = planner.plain_answer_prompt(input);
                 let trace_step = planner.plain_answer_trace_started();
+                let reasoning_trace_hook = planner.plain_answer_reasoning_trace_hook(trace_step);
                 let started_at = Instant::now();
                 let generation = answer_generator
-                    .generate(&prompt, model, delta_sender.clone())
+                    .generate(&prompt, model, delta_sender.clone(), reasoning_trace_hook)
                     .await;
                 let answer = generation.map_err(|error| {
                     planner.plain_answer_trace_failed(
@@ -8486,6 +8488,7 @@ trait PlainAnswerGenerator: Send + Sync {
         prompt: &PlainAnswerPrompt,
         model: &str,
         delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
     ) -> std::result::Result<String, PlainAnswerGenerationError>;
 }
 
@@ -8748,6 +8751,7 @@ impl OpenAiPlainAnswerGenerator {
         line: &str,
         state: &mut PlainAnswerStreamState,
         delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        reasoning_trace_hook: &Option<ProviderReasoningTraceHook>,
     ) -> std::result::Result<bool, String> {
         let line = line.trim_end_matches('\r');
         let Some(data) = line.strip_prefix("data:") else {
@@ -8785,6 +8789,16 @@ impl OpenAiPlainAnswerGenerator {
                     .to_string(),
             );
         }
+        if let Some(reasoning) = value
+            .pointer("/choices/0/delta/reasoning")
+            .or_else(|| value.pointer("/choices/0/delta/reasoning_content"))
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.is_empty())
+        {
+            if let Some(trace_hook) = reasoning_trace_hook {
+                trace_hook(reasoning.to_string());
+            }
+        }
         if let Some(delta) = value
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
@@ -8808,6 +8822,7 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
         prompt: &PlainAnswerPrompt,
         model: &str,
         delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
     ) -> std::result::Result<String, PlainAnswerGenerationError> {
         let response = self
             .client
@@ -8859,12 +8874,16 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
             while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line = String::from_utf8_lossy(&buffer[..newline]).to_string();
                 buffer.drain(..=newline);
-                done = Self::consume_sse_line(&line, &mut answer_state, &delta_sender).map_err(
-                    |message| PlainAnswerGenerationError {
-                        message,
-                        emitted_any: answer_state.emitted_any,
-                    },
-                )?;
+                done = Self::consume_sse_line(
+                    &line,
+                    &mut answer_state,
+                    &delta_sender,
+                    &reasoning_trace_hook,
+                )
+                .map_err(|message| PlainAnswerGenerationError {
+                    message,
+                    emitted_any: answer_state.emitted_any,
+                })?;
                 if done {
                     break;
                 }
@@ -8875,12 +8894,16 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
         }
         if !buffer.is_empty() && !done {
             let line = String::from_utf8_lossy(&buffer).to_string();
-            done = Self::consume_sse_line(&line, &mut answer_state, &delta_sender).map_err(
-                |message| PlainAnswerGenerationError {
-                    message,
-                    emitted_any: answer_state.emitted_any,
-                },
-            )?;
+            done = Self::consume_sse_line(
+                &line,
+                &mut answer_state,
+                &delta_sender,
+                &reasoning_trace_hook,
+            )
+            .map_err(|message| PlainAnswerGenerationError {
+                message,
+                emitted_any: answer_state.emitted_any,
+            })?;
         }
         if !done {
             return Err(PlainAnswerGenerationError {
@@ -9341,15 +9364,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_answer_generator_forwards_provider_sse_deltas() {
+    async fn plain_answer_generator_forwards_answer_and_reasoning_sse_deltas() {
         async fn completion(Json(body): Json<Value>) -> impl IntoResponse {
             assert_eq!(body["stream"], true);
             assert_eq!(body["model"], "test-model");
             (
                 [("content-type", "text/event-stream")],
                 concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \",\"tool_calls\":null,\"function_call\":null}}]}\n\n",
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Check \",\"content\":\"Hello \",\"tool_calls\":null,\"function_call\":null}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"facts\",\"content\":\"world\"}}]}\n\n",
                     "data: [DONE]\n\n"
                 ),
             )
@@ -9379,9 +9402,22 @@ mod tests {
             user: "Say hello".to_string(),
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let reasoning = Arc::new(Mutex::new(Vec::new()));
+        let reasoning_sink = reasoning.clone();
+        let reasoning_trace_hook: ProviderReasoningTraceHook = Arc::new(move |delta| {
+            reasoning_sink
+                .lock()
+                .expect("reasoning trace lock should remain available")
+                .push(delta);
+        });
 
         let answer = generator
-            .generate(&prompt, "test-model", Some(delta_tx))
+            .generate(
+                &prompt,
+                "test-model",
+                Some(delta_tx),
+                Some(reasoning_trace_hook),
+            )
             .await
             .expect("streamed completion should succeed");
         let mut deltas = Vec::new();
@@ -9391,6 +9427,12 @@ mod tests {
 
         assert_eq!(answer, "Hello world");
         assert_eq!(deltas, vec!["Hello ", "world"]);
+        assert_eq!(
+            *reasoning
+                .lock()
+                .expect("reasoning trace lock should remain available"),
+            vec!["Check ", "facts"]
+        );
     }
 
     async fn spawn_plain_answer_provider(body: &'static str) -> String {
@@ -9435,7 +9477,7 @@ mod tests {
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
         let answer = generator
-            .generate(&prompt, "test-model", Some(delta_tx))
+            .generate(&prompt, "test-model", Some(delta_tx), None)
             .await
             .expect("benign structured prose should remain streamable");
 
@@ -9532,7 +9574,7 @@ mod tests {
             "test-key".to_string(),
             0.1,
         )
-        .generate(&prompt, "test-model", None)
+        .generate(&prompt, "test-model", None, None)
         .await
         .expect_err("final answer Tool intent must be a protocol error");
         assert!(tool_error.message.contains("Tool intent"));
@@ -9551,7 +9593,7 @@ mod tests {
             "test-key".to_string(),
             0.1,
         )
-        .generate(&prompt, "test-model", Some(textual_delta_tx))
+        .generate(&prompt, "test-model", Some(textual_delta_tx), None)
         .await
         .expect_err("textual Tool intent split across chunks must be rejected");
         assert!(textual_tool_error.message.contains("textual Tool intent"));
@@ -9572,7 +9614,7 @@ mod tests {
             "test-key".to_string(),
             0.1,
         )
-        .generate(&prompt, "test-model", Some(unquoted_delta_tx))
+        .generate(&prompt, "test-model", Some(unquoted_delta_tx), None)
         .await
         .expect_err("unquoted Tool intent split across chunks must be rejected");
         assert!(unquoted_tool_error.message.contains("textual Tool intent"));
@@ -9589,7 +9631,7 @@ mod tests {
             "test-key".to_string(),
             0.1,
         )
-        .generate(&prompt, "test-model", None)
+        .generate(&prompt, "test-model", None, None)
         .await
         .expect_err("unterminated partial text must not silently succeed");
         assert!(partial_error
@@ -9654,6 +9696,7 @@ mod tests {
             _prompt: &PlainAnswerPrompt,
             _model: &str,
             delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+            _reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
         ) -> std::result::Result<String, PlainAnswerGenerationError> {
             if let Some(sender) = delta_sender {
                 let _ = sender.send(ConversationStreamSignal::Answer("A trusted ".to_string()));
@@ -9955,6 +9998,7 @@ mod tests {
             _prompt: &PlainAnswerPrompt,
             _model: &str,
             _delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+            _reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
         ) -> std::result::Result<String, PlainAnswerGenerationError> {
             panic!("a successful deterministic proposal must not call the model")
         }
