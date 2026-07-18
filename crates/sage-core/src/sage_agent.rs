@@ -11,7 +11,7 @@ use baml_bridge::{
     BamlAdapter, BamlConvertError,
 };
 use dspy_rs::{configure, BamlType, ChatAdapter, Predict, LM};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
@@ -170,6 +170,20 @@ fn tool_arg_preview(value: &serde_json::Value) -> String {
     rendered.chars().take(500).collect()
 }
 
+fn truncate_chars_with_ellipsis(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let prefix_chars = max_chars.saturating_sub(3);
+    format!(
+        "{}...",
+        value.chars().take(prefix_chars).collect::<String>()
+    )
+}
+
 impl BamlAdapter<ToolArgs> for NativeToolArgsAdapter {
     fn type_ir() -> TypeIR {
         let primitive = Self::primitive_type();
@@ -308,9 +322,9 @@ struct ToolDecisionResponse {
     pub tool_calls: Vec<ToolCall>,
 
     #[output(
-        desc = "True only when Tool results are needed to decide whether another Tool round is required"
+        desc = "Optional hint. True only when Tool results are needed to decide whether another Tool round is required; omit or use false otherwise"
     )]
-    pub replan_after_results: bool,
+    pub replan_after_results: Option<bool>,
 }
 
 /// Provider-neutral Tool plan returned to the web conversation state machine.
@@ -1015,6 +1029,9 @@ pub struct SageAgent {
 
 #[allow(dead_code)]
 impl SageAgent {
+    const MAX_CURRENT_TOOL_RESULT_CHARS: usize = 4_000;
+    const MAX_CURRENT_TOOL_CONTEXT_CHARS: usize = 12_000;
+
     /// Create a new agent with tools and memory
     pub fn new(tools: ToolRegistry, memory: MemoryManager) -> Self {
         Self::new_with_optional_memory(tools, Some(memory), AGENT_INSTRUCTION)
@@ -1247,8 +1264,6 @@ impl SageAgent {
 
         // Load conversation history
         let mut conversation = String::new();
-        let mut has_history = false;
-
         if let Some(memory) = &self.memory {
             let user_tz = memory.get_timezone().ok().flatten();
 
@@ -1267,7 +1282,6 @@ impl SageAgent {
 
                 // Recent messages
                 if !messages.is_empty() {
-                    has_history = true;
                     for msg in &messages {
                         let timestamp = if let Some(tz) = user_tz {
                             let local_time = msg.created_at.with_timezone(&tz);
@@ -1304,12 +1318,12 @@ impl SageAgent {
             }
         }
 
-        // Add current tool results (not yet persisted)
-        for msg in &self.current_tool_results {
-            if !has_history && conversation.is_empty() {
-                has_history = true;
-            }
-            conversation.push_str(&format!("[{}]: {}\n", msg.role, msg.content));
+        // Add bounded, de-duplicated current Tool results (not yet persisted).
+        // Prefer the newest results when the Tool phase exceeded the prompt
+        // budget so the final answer sees the most refined retrieval context.
+        let current_tool_context = self.bounded_current_tool_results_context();
+        if !current_tool_context.is_empty() {
+            conversation.push_str(&current_tool_context);
         }
 
         if conversation.is_empty() {
@@ -1319,6 +1333,34 @@ impl SageAgent {
         }
 
         ctx
+    }
+
+    fn bounded_current_tool_results_context(&self) -> String {
+        let mut seen = HashSet::<String>::new();
+        let mut remaining = Self::MAX_CURRENT_TOOL_CONTEXT_CHARS;
+        let mut selected = Vec::<String>::new();
+
+        for message in self.current_tool_results.iter().rev() {
+            if !seen.insert(message.content.clone()) {
+                continue;
+            }
+            let content =
+                truncate_chars_with_ellipsis(&message.content, Self::MAX_CURRENT_TOOL_RESULT_CHARS);
+            let rendered = format!("[{}]: {}\n", message.role, content);
+            let rendered_chars = rendered.chars().count();
+            if rendered_chars > remaining {
+                if remaining == 0 {
+                    break;
+                }
+                selected.push(truncate_chars_with_ellipsis(&rendered, remaining));
+                break;
+            }
+            remaining -= rendered_chars;
+            selected.push(rendered);
+        }
+
+        selected.reverse();
+        selected.concat()
     }
 
     /// Inject tool result into current request cycle (not persisted to DB)
@@ -1422,13 +1464,7 @@ impl SageAgent {
             return user_message.to_string();
         }
 
-        let results = self
-            .current_tool_results
-            .iter()
-            .filter(|message| message.role == "tool")
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let results = self.bounded_current_tool_results_context();
         format!(
             "ORIGINAL REQUEST\n{}\n\nCOMPLETED TOOL RESULTS\n{}\n\nDecide only whether another Tool round is required.",
             user_message, results
@@ -1480,7 +1516,7 @@ impl SageAgent {
                     });
                     return Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
                         response.tool_calls,
-                        response.replan_after_results,
+                        response.replan_after_results.unwrap_or(false),
                     )));
                 }
                 Err(error) => {
@@ -2078,11 +2114,82 @@ mod tests {
     }
 
     #[test]
+    fn tool_decision_allows_omitted_replan_flag() {
+        let parsed = baml_bridge::parse_llm_output::<__ToolDecisionResponseOutput>(
+            r#"{
+                "tool_calls": [{
+                    "name": "knowledge_search",
+                    "args": {"query": "release safety"}
+                }]
+            }"#,
+            true,
+        );
+
+        assert!(
+            parsed.is_ok(),
+            "omitting the optional replan hint should not invalidate an otherwise usable Tool plan: {parsed:?}"
+        );
+    }
+
+    #[test]
     fn tool_arg_preview_does_not_double_quote_json_strings() {
         assert_eq!(tool_arg_preview(&serde_json::json!("safety")), "safety");
         assert_eq!(
             tool_arg_preview(&serde_json::json!({"query": "safety"})),
             r#"{"query":"safety"}"#
+        );
+    }
+
+    #[test]
+    fn truncation_never_exceeds_very_small_character_budgets() {
+        for max_chars in 0..=3 {
+            assert_eq!(
+                truncate_chars_with_ellipsis("long result", max_chars)
+                    .chars()
+                    .count(),
+                max_chars
+            );
+        }
+    }
+
+    #[test]
+    fn plain_answer_prompt_bounds_and_deduplicates_current_tool_results() {
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Help the user.");
+        let duplicate_call = ToolCall {
+            name: "knowledge_search".to_string(),
+            args: ToolArgs::from([("query".to_string(), serde_json::json!("safety"))]),
+        };
+        let duplicate_result = ToolResult::success(format!(
+            "DUPLICATE_RESULT_{}",
+            "duplicate context ".repeat(400)
+        ));
+        agent.inject_tool_result(&duplicate_call, &duplicate_result);
+        agent.inject_tool_result(&duplicate_call, &duplicate_result);
+        agent.inject_tool_result(
+            &ToolCall {
+                name: "knowledge_search".to_string(),
+                args: ToolArgs::from([("query".to_string(), serde_json::json!("older"))]),
+            },
+            &ToolResult::success(format!("OLDER_RESULT_{}", "older context ".repeat(400))),
+        );
+        agent.inject_tool_result(
+            &ToolCall {
+                name: "knowledge_search".to_string(),
+                args: ToolArgs::from([("query".to_string(), serde_json::json!("newest"))]),
+            },
+            &ToolResult::success(format!("NEWEST_RESULT_{}", "new context ".repeat(500))),
+        );
+
+        let prompt = agent.plain_answer_prompt("Give the final answer.");
+
+        assert!(
+            prompt.user.chars().count() <= 13_500,
+            "final-answer Tool context must stay within a bounded prompt budget"
+        );
+        assert_eq!(prompt.user.matches("DUPLICATE_RESULT_").count(), 1);
+        assert!(
+            prompt.user.contains("NEWEST_RESULT_"),
+            "the most recent Tool result should survive the context budget"
         );
     }
 

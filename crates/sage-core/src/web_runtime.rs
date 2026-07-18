@@ -6887,8 +6887,36 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
 
 #[derive(Debug)]
 struct PlainAnswerGenerationError {
+    kind: PlainAnswerFailureKind,
     message: String,
     emitted_any: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlainAnswerFailureKind {
+    ToolIntent,
+    Repetition,
+    TokenLimit,
+    Other,
+}
+
+impl PlainAnswerGenerationError {
+    fn new(kind: PlainAnswerFailureKind, message: impl Into<String>, emitted_any: bool) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            emitted_any,
+        }
+    }
+
+    fn retryable_before_exposure(&self) -> bool {
+        matches!(
+            self.kind,
+            PlainAnswerFailureKind::ToolIntent
+                | PlainAnswerFailureKind::Repetition
+                | PlainAnswerFailureKind::TokenLimit
+        ) && !self.emitted_any
+    }
 }
 
 impl std::fmt::Display for PlainAnswerGenerationError {
@@ -6922,10 +6950,10 @@ struct OpenAiPlainAnswerGenerator {
 
 const PLAIN_ANSWER_MAX_TOKENS: u32 = 8192;
 
-/// Streams ordinary prose immediately while retaining only ambiguous suffixes
-/// that could still become a textual Tool-call envelope on a later chunk.
-/// Structured-looking candidates are held until the provider terminates, so a
-/// malformed Tool shape can be rejected before any of that shape is public.
+/// Streams ordinary prose while retaining a bounded ambiguous opening plus
+/// suffixes that could still become a textual Tool-call envelope on a later
+/// chunk. Process-like or structured candidates are held until the provider
+/// terminates, so unsafe output can be rejected before it is public.
 #[derive(Default)]
 struct PlainAnswerStreamState {
     answer: String,
@@ -6968,12 +6996,13 @@ impl PlainAnswerStreamState {
         &mut self,
         delta: &str,
         delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), PlainAnswerGenerationError> {
         if delta.is_empty() {
             return Ok(());
         }
         self.answer.push_str(delta);
         self.pending.push_str(delta);
+        self.reject_repetition()?;
         if matches!(
             self.opening_disposition,
             PlainAnswerOpeningDisposition::Undecided
@@ -6993,18 +7022,47 @@ impl PlainAnswerStreamState {
     fn finish(
         &mut self,
         delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), PlainAnswerGenerationError> {
+        self.reject_repetition()?;
         self.reject_tool_intent(&self.pending)?;
         self.emit_pending_prefix(self.pending.len(), delta_sender);
         Ok(())
     }
 
-    fn reject_tool_intent(&self, candidate: &str) -> std::result::Result<(), String> {
+    fn reject_repetition(&self) -> std::result::Result<(), PlainAnswerGenerationError> {
+        let mut sentence_counts = HashMap::<String, usize>::new();
+        for sentence in self.answer.split_inclusive(['.', '!', '?']) {
+            let normalized = sentence
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            if normalized.chars().count() < 48 {
+                continue;
+            }
+            let count = sentence_counts.entry(normalized).or_default();
+            *count += 1;
+            if *count >= 3 {
+                return Err(PlainAnswerGenerationError::new(
+                    PlainAnswerFailureKind::Repetition,
+                    "final plain-answer stream contained repetitive process narration; refusing to expose it",
+                    self.emitted_any,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_tool_intent(
+        &self,
+        candidate: &str,
+    ) -> std::result::Result<(), PlainAnswerGenerationError> {
         if has_syntactic_tool_intent(candidate) {
-            return Err(
-                "final plain-answer stream contained textual Tool intent; refusing to expose it"
-                    .to_string(),
-            );
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::ToolIntent,
+                "final plain-answer stream contained textual Tool intent; refusing to expose it",
+                self.emitted_any,
+            ));
         }
         Ok(())
     }
@@ -7012,6 +7070,7 @@ impl PlainAnswerStreamState {
     /// Hold common model-deliberation openings until the whole candidate is
     /// known safe. Direct answers keep their normal streaming behavior.
     fn classify_opening(value: &str) -> PlainAnswerOpeningDisposition {
+        const MAX_AMBIGUOUS_OPENING_CHARS: usize = 240;
         const DELIBERATION_OPENERS: [&str; 11] = [
             "i have enough context",
             "i have good context",
@@ -7025,20 +7084,75 @@ impl PlainAnswerStreamState {
             "the user is asking",
             "we need to answer",
         ];
+        const PROCESS_NARRATION_OPENERS: [&str; 4] = [
+            "i want to make sure",
+            "i'm going to search",
+            "i am going to search",
+            "before i answer",
+        ];
+        const PROCESS_NARRATION_SUBJECTS: [&str; 8] = [
+            "i ",
+            "i'm ",
+            "i am ",
+            "i'll ",
+            "i will ",
+            "let me ",
+            "we need ",
+            "we should ",
+        ];
+        const PROCESS_NARRATION_ACTIONS: [&str; 7] = [
+            "search",
+            "look up",
+            "look for",
+            "research",
+            "gather",
+            "find more",
+            "check for",
+        ];
+        const AMBIGUOUS_PREAMBLES: [&str; 6] = [
+            "to give you",
+            "to provide you",
+            "to make sure",
+            "before i answer",
+            "for accuracy",
+            "for the most relevant",
+        ];
 
-        let opening = value.trim_start().to_ascii_lowercase();
+        let opening = value
+            .trim_start()
+            .to_ascii_lowercase()
+            .replace('’', "'")
+            .replace('‘', "'");
         if opening.is_empty() {
             return PlainAnswerOpeningDisposition::Undecided;
         }
         if DELIBERATION_OPENERS
             .iter()
+            .chain(PROCESS_NARRATION_OPENERS.iter())
             .any(|candidate| opening.starts_with(candidate))
+        {
+            return PlainAnswerOpeningDisposition::Quarantine;
+        }
+        if PROCESS_NARRATION_SUBJECTS
+            .iter()
+            .any(|subject| opening.contains(subject))
+            && PROCESS_NARRATION_ACTIONS
+                .iter()
+                .any(|action| opening.contains(action))
         {
             return PlainAnswerOpeningDisposition::Quarantine;
         }
         if DELIBERATION_OPENERS
             .iter()
+            .chain(PROCESS_NARRATION_OPENERS.iter())
             .any(|candidate| candidate.starts_with(&opening))
+        {
+            return PlainAnswerOpeningDisposition::Undecided;
+        }
+        if AMBIGUOUS_PREAMBLES
+            .iter()
+            .any(|preamble| opening.starts_with(preamble))
+            && opening.chars().count() < MAX_AMBIGUOUS_OPENING_CHARS
         {
             return PlainAnswerOpeningDisposition::Undecided;
         }
@@ -7048,7 +7162,7 @@ impl PlainAnswerStreamState {
     fn flush_safe_candidates(
         &mut self,
         delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), PlainAnswerGenerationError> {
         loop {
             if self.pending.is_empty() {
                 return Ok(());
@@ -7230,7 +7344,7 @@ impl OpenAiPlainAnswerGenerator {
         state: &mut PlainAnswerStreamState,
         delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
         reasoning_trace_hook: &Option<ProviderReasoningTraceHook>,
-    ) -> std::result::Result<bool, String> {
+    ) -> std::result::Result<bool, PlainAnswerGenerationError> {
         let line = line.trim_end_matches('\r');
         let Some(data) = line.strip_prefix("data:") else {
             return Ok(false);
@@ -7244,9 +7358,13 @@ impl OpenAiPlainAnswerGenerator {
             return Ok(false);
         }
         let value: Value = serde_json::from_str(data).map_err(|error| {
-            format!(
-                "invalid Chat Completions stream event: {error}; payload: {}",
-                truncate_chars(data, 160)
+            PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                format!(
+                    "invalid Chat Completions stream event: {error}; payload: {}",
+                    truncate_chars(data, 160)
+                ),
+                state.emitted_any,
             )
         })?;
         let has_native_tool_calls =
@@ -7262,10 +7380,12 @@ impl OpenAiPlainAnswerGenerator {
             .pointer("/choices/0/delta/function_call")
             .is_some_and(|function_call| !function_call.is_null());
         if has_native_tool_calls || has_native_function_call {
-            return Err(
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::ToolIntent,
                 "final plain-answer stream contained Tool intent; refusing to expose it"
                     .to_string(),
-            );
+                state.emitted_any,
+            ));
         }
         if let Some(reasoning) = value
             .pointer("/choices/0/delta/reasoning")
@@ -7283,13 +7403,29 @@ impl OpenAiPlainAnswerGenerator {
         {
             state.push(delta, delta_sender)?;
         }
-        let finished = value
+        let Some(finish_reason) = value
             .pointer("/choices/0/finish_reason")
-            .is_some_and(|reason| !reason.is_null());
-        if finished {
-            state.finish(delta_sender)?;
+            .filter(|reason| !reason.is_null())
+        else {
+            return Ok(false);
+        };
+        match finish_reason.as_str().unwrap_or("unknown") {
+            "stop" => {
+                state.finish(delta_sender)?;
+                Ok(true)
+            }
+            "length" => Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::TokenLimit,
+                "final plain-answer stream reached the provider token limit; refusing to expose a truncated answer"
+                    .to_string(),
+                state.emitted_any,
+            )),
+            reason => Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                format!("final plain-answer stream ended with unsupported finish reason '{reason}'"),
+                state.emitted_any,
+            )),
         }
-        Ok(finished)
     }
 
     async fn generate_attempt(
@@ -7318,22 +7454,26 @@ impl OpenAiPlainAnswerGenerator {
             }))
             .send()
             .await
-            .map_err(|error| PlainAnswerGenerationError {
-                message: format!("plain answer request failed: {error}"),
-                emitted_any: false,
+            .map_err(|error| {
+                PlainAnswerGenerationError::new(
+                    PlainAnswerFailureKind::Other,
+                    format!("plain answer request failed: {error}"),
+                    false,
+                )
             })?;
 
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(PlainAnswerGenerationError {
-                message: format!(
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                format!(
                     "plain answer provider returned {}: {}",
                     status,
                     truncate_chars(&body, 500)
                 ),
-                emitted_any: false,
-            });
+                false,
+            ));
         }
 
         let mut answer_state = PlainAnswerStreamState::default();
@@ -7341,9 +7481,12 @@ impl OpenAiPlainAnswerGenerator {
         let mut stream = response.bytes_stream();
         let mut done = false;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| PlainAnswerGenerationError {
-                message: format!("plain answer stream failed: {error}"),
-                emitted_any: answer_state.emitted_any,
+            let chunk = chunk.map_err(|error| {
+                PlainAnswerGenerationError::new(
+                    PlainAnswerFailureKind::Other,
+                    format!("plain answer stream failed: {error}"),
+                    answer_state.emitted_any,
+                )
             })?;
             buffer.extend_from_slice(&chunk);
             while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
@@ -7354,11 +7497,7 @@ impl OpenAiPlainAnswerGenerator {
                     &mut answer_state,
                     &delta_sender,
                     &reasoning_trace_hook,
-                )
-                .map_err(|message| PlainAnswerGenerationError {
-                    message,
-                    emitted_any: answer_state.emitted_any,
-                })?;
+                )?;
                 if done {
                     break;
                 }
@@ -7374,23 +7513,21 @@ impl OpenAiPlainAnswerGenerator {
                 &mut answer_state,
                 &delta_sender,
                 &reasoning_trace_hook,
-            )
-            .map_err(|message| PlainAnswerGenerationError {
-                message,
-                emitted_any: answer_state.emitted_any,
-            })?;
+            )?;
         }
         if !done {
-            return Err(PlainAnswerGenerationError {
-                message: "plain answer stream ended without a finish terminator".to_string(),
-                emitted_any: answer_state.emitted_any,
-            });
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "plain answer stream ended without a finish terminator",
+                answer_state.emitted_any,
+            ));
         }
         if answer_state.answer.trim().is_empty() {
-            return Err(PlainAnswerGenerationError {
-                message: "plain answer provider returned no visible text".to_string(),
-                emitted_any: false,
-            });
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "plain answer provider returned no visible text",
+                false,
+            ));
         }
         Ok(answer_state.answer)
     }
@@ -7417,16 +7554,16 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
             Ok(answer) => return Ok(answer),
             Err(error) => error,
         };
-        if error.emitted_any || !error.message.contains("Tool intent") {
+        if !error.retryable_before_exposure() {
             return Err(error);
         }
 
         warn!(
-            "Plain-answer provider emitted a quarantined Tool transcript; retrying final answer once"
+            "Plain-answer provider emitted a quarantined unsafe candidate; retrying final answer once"
         );
         let retry_prompt = PlainAnswerPrompt {
             system: format!(
-                "{}\n\nThe previous final-answer attempt exposed internal planning or a Tool transcript. Retry once. Output only the final answer for the user; do not narrate planning, searches, Tool calls, or Tool results.",
+                "{}\n\nThe previous final-answer attempt contained internal planning, repetitive process narration, or an incomplete answer. Retry once. Output only the final answer for the user; do not narrate planning, searches, Tool calls, or Tool results.",
                 prompt.system
             ),
             user: prompt.user.clone(),
@@ -8044,7 +8181,7 @@ mod tests {
         let error = state
             .push("\"name\":\"db_query\"}", &sender)
             .expect_err("args-first Tool envelope must be rejected before exposure");
-        assert!(error.contains("textual Tool intent"));
+        assert!(error.message.contains("textual Tool intent"));
         assert!(delta_rx.try_recv().is_err());
     }
 
@@ -8074,7 +8211,28 @@ mod tests {
             )
             .expect_err("a serialized Tool transcript must be rejected");
 
-        assert!(error.contains("textual Tool intent"));
+        assert!(error.message.contains("textual Tool intent"));
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_quarantines_unlisted_process_opening_before_repetition() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("To give you the most relevant guidance. ", &sender)
+            .expect("an ambiguous purpose preamble should remain private");
+        assert!(delta_rx.try_recv().is_err());
+
+        let repeated = "I'm searching for more specific information about post-release safety and accompaniment for released political prisoners and their families. ";
+        let error = state
+            .push(&repeated.repeat(3), &sender)
+            .expect_err("unlisted process narration must be rejected before exposure");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::Repetition);
+        assert!(!error.emitted_any);
         assert!(delta_rx.try_recv().is_err());
     }
 
@@ -8268,6 +8426,137 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(answer, "Here are the first-day safety steps.");
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+        assert_eq!(deltas.concat(), answer);
+    }
+
+    #[tokio::test]
+    async fn plain_answer_generator_retries_runaway_search_narration_before_exposure() {
+        async fn completion(
+            State(attempts): State<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> impl IntoResponse {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let body = if attempt == 0 {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"I want to make sure I give you the most relevant guidance. Let me search for more specific information about post-release safety. \"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"I'm searching for more specific information about post-release safety and accompaniment for released political prisoners and their families. \"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"I'm searching for more specific information about post-release safety and accompaniment for released political prisoners and their families. \"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"I'm searching for more specific information about post-release safety and accompaniment for released political prisoners and their families.\"},\"finish_reason\":\"length\"}]}\n\n"
+                )
+            } else {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Move to a trusted location, limit who knows it, and contact a verified legal or humanitarian organization.\"},\"finish_reason\":\"stop\"}]}\n\n"
+            };
+            ([("content-type", "text/event-stream")], body)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_attempts),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "give first-day safety steps".to_string(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let answer = generator
+            .generate(&prompt, "test-model", Some(delta_tx), None)
+            .await
+            .expect("the clean retry should replace the quarantined runaway candidate");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            answer,
+            "Move to a trusted location, limit who knows it, and contact a verified legal or humanitarian organization."
+        );
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+        assert_eq!(
+            deltas.concat(),
+            answer,
+            "the first runaway candidate must never reach the public answer stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_answer_generator_retries_token_limited_quarantined_candidate() {
+        async fn completion(
+            State(attempts): State<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> impl IntoResponse {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let body = if attempt == 0 {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"I want to make sure I give you careful guidance before I answer\"},\"finish_reason\":\"length\"}]}\n\n"
+            } else {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Move to a trusted location and contact a verified legal organization.\"},\"finish_reason\":\"stop\"}]}\n\n"
+            };
+            ([("content-type", "text/event-stream")], body)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_attempts),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "give first-day safety steps".to_string(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let answer = generator
+            .generate(&prompt, "test-model", Some(delta_tx), None)
+            .await
+            .expect("the token-limited candidate should be replaced by one clean retry");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            answer,
+            "Move to a trusted location and contact a verified legal organization."
+        );
         let mut deltas = Vec::new();
         while let Ok(signal) = delta_rx.try_recv() {
             deltas.push(answer_signal(signal));

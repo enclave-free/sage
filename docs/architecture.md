@@ -66,6 +66,20 @@ This file contains the branch-specific integration layer:
 | `POST /admin/tools/execute` | Sage | public admin route; execution delegated to Python |
 | `/admin/ai-config/*` | Sage | public route family and storage both live in Sage |
 
+### Conversation final-answer safety
+
+`POST /llm/chat` plans and runs selected Tools before requesting a separate
+plain final answer. Current-turn Tool results are de-duplicated, limited to
+4,000 characters each and 12,000 characters total, with the newest results
+preferred when the budget is full. The planner's `replan_after_results` field
+is an optional hint; omitting it means no requested replan.
+
+The final-answer stream briefly holds ambiguous planning/search openings and
+structured Tool-like output. Repeated process narration, Tool intent, provider
+token-limit termination, and unsupported finish reasons fail the answer rather
+than being persisted as success. A quarantined Tool, repetition, or token-limit
+failure may retry once only when no answer text has reached the client.
+
 ## InternalAgentClient Contract
 
 `InternalAgentClient` is the main coupling point between Sage and Enclave Python.
