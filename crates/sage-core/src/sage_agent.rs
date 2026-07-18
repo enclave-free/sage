@@ -878,6 +878,13 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
     }
 
     let lowercase = candidate.to_ascii_lowercase();
+    if let Some(tool_calls_start) = lowercase.find("tool calls:") {
+        let transcript = &lowercase[tool_calls_start + "tool calls:".len()..];
+        let first_line = transcript.lines().next().unwrap_or(transcript);
+        if first_line.contains('(') || first_line.contains('{') {
+            return true;
+        }
+    }
     if lowercase.starts_with("```") {
         let after_open = candidate.strip_prefix("```").unwrap_or(candidate);
         let fenced = after_open
@@ -1974,6 +1981,16 @@ mod tests {
 
         registry.register_descriptor("lookup", "Look up a fact", r#"{"query":"text"}"#);
         assert!(registry.has_actionable_tools());
+    }
+
+    #[test]
+    fn textual_tool_transcripts_are_distinct_from_explanatory_prose() {
+        assert!(has_syntactic_tool_intent(
+            "I will search now. Tool calls: knowledge_search(query=\"referral\")\nTool Result: found one"
+        ));
+        assert!(!has_syntactic_tool_intent(
+            "The Activity panel labels these sections Tool calls: and Tool Result: so you can audit the turn."
+        ));
     }
 
     #[test]
