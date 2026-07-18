@@ -2,10 +2,9 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::sage_agent::{Tool, ToolResult};
+use crate::sage_agent::{tool_parse_arg, tool_string_arg, Tool, ToolArgs, ToolResult};
 
 /// Done tool - signals the agent is finished and doesn't need to send another message
 pub struct DoneTool;
@@ -24,7 +23,7 @@ impl Tool for DoneTool {
         r#"{}"#
     }
 
-    async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+    async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
         Ok(ToolResult::success("Done.".to_string()))
     }
 }
@@ -57,15 +56,14 @@ impl Tool for WebSearchTool {
         r#"{ "query": "search query", "count": "results (default 10)", "freshness": "pd=24h, pw=week, pm=month (optional)", "location": "city or 'city, state' for local results (optional)" }"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let query = args
-            .get("query")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let query = tool_string_arg(args, "query")
             .ok_or_else(|| anyhow::anyhow!("query argument required"))?;
 
         let options = sage_tools::SearchOptions {
-            count: args.get("count").and_then(|c| c.parse().ok()),
-            freshness: args.get("freshness").cloned(),
-            location: args.get("location").cloned(),
+            count: tool_parse_arg(args, "count"),
+            freshness: tool_string_arg(args, "freshness").map(str::to_string),
+            location: tool_string_arg(args, "location").map(str::to_string),
             timezone: None,
         };
 

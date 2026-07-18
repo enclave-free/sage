@@ -10,12 +10,11 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::sage_agent::{Tool, ToolResult};
+use crate::sage_agent::{tool_parse_arg, tool_string_arg, Tool, ToolArgs, ToolResult};
 
 /// Dangerous command patterns that should be blocked
 const BLOCKED_PATTERNS: &[&str] = &[
@@ -140,14 +139,11 @@ impl Tool for ShellTool {
         r#"{"command": "shell command to execute (supports pipes, redirects)", "timeout": "optional timeout in seconds (default 60, set appropriately for long-running commands)"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let command = args
-            .get("command")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let command = tool_string_arg(args, "command")
             .ok_or_else(|| anyhow::anyhow!("'command' argument is required"))?;
 
-        let timeout_secs: u64 = args
-            .get("timeout")
-            .and_then(|v| v.parse().ok())
+        let timeout_secs: u64 = tool_parse_arg(args, "timeout")
             .unwrap_or(DEFAULT_TIMEOUT)
             .min(MAX_TIMEOUT);
 

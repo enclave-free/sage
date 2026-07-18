@@ -7,7 +7,6 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::archival_new::ArchivalManager;
@@ -15,7 +14,7 @@ use super::block::BlockManager;
 use super::db::MemoryDb;
 use super::recall_new::RecallManager;
 use super::EmbeddingService;
-use crate::sage_agent::{Tool, ToolResult};
+use crate::sage_agent::{tool_parse_arg, tool_string_arg, Tool, ToolArgs, ToolResult};
 
 // ============================================================================
 // Core Memory Tools
@@ -46,15 +45,12 @@ impl Tool for MemoryReplaceTool {
         r#"{"block": "block label (e.g., 'persona', 'human')", "old": "exact text to find", "new": "replacement text"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let block = args
-            .get("block")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let block = tool_string_arg(args, "block")
             .ok_or_else(|| anyhow::anyhow!("'block' argument required"))?;
-        let old = args
-            .get("old")
+        let old = tool_string_arg(args, "old")
             .ok_or_else(|| anyhow::anyhow!("'old' argument required"))?;
-        let new = args
-            .get("new")
+        let new = tool_string_arg(args, "new")
             .ok_or_else(|| anyhow::anyhow!("'new' argument required"))?;
 
         match self.blocks.replace(block, old, new) {
@@ -92,12 +88,10 @@ impl Tool for MemoryAppendTool {
         r#"{"block": "block label (e.g., 'persona', 'human')", "content": "text to append"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let block = args
-            .get("block")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let block = tool_string_arg(args, "block")
             .ok_or_else(|| anyhow::anyhow!("'block' argument required"))?;
-        let content = args
-            .get("content")
+        let content = tool_string_arg(args, "content")
             .ok_or_else(|| anyhow::anyhow!("'content' argument required"))?;
 
         match self.blocks.append(block, content) {
@@ -135,14 +129,12 @@ impl Tool for MemoryInsertTool {
         r#"{"block": "block label", "content": "text to insert", "line": "line number (0-indexed, -1 for end)"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let block = args
-            .get("block")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let block = tool_string_arg(args, "block")
             .ok_or_else(|| anyhow::anyhow!("'block' argument required"))?;
-        let content = args
-            .get("content")
+        let content = tool_string_arg(args, "content")
             .ok_or_else(|| anyhow::anyhow!("'content' argument required"))?;
-        let line: i32 = args.get("line").and_then(|l| l.parse().ok()).unwrap_or(-1);
+        let line: i32 = tool_parse_arg(args, "line").unwrap_or(-1);
 
         match self.blocks.insert_at_line(block, content, line) {
             Ok(()) => Ok(ToolResult::success(format!(
@@ -208,11 +200,10 @@ impl Tool for ConversationSearchTool {
         r#"{"query": "search query", "limit": "max results (default 5)"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let query = args
-            .get("query")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let query = tool_string_arg(args, "query")
             .ok_or_else(|| anyhow::anyhow!("'query' argument required"))?;
-        let limit: usize = args.get("limit").and_then(|l| l.parse().ok()).unwrap_or(5);
+        let limit: usize = tool_parse_arg(args, "limit").unwrap_or(5);
 
         let mut output = String::new();
         let mut total_results = 0;
@@ -298,14 +289,12 @@ impl Tool for ArchivalInsertTool {
         r#"{"content": "text to store", "tags": "optional comma-separated tags"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let content = args
-            .get("content")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let content = tool_string_arg(args, "content")
             .ok_or_else(|| anyhow::anyhow!("'content' argument required"))?;
 
-        let tags = args
-            .get("tags")
-            .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+        let tags = tool_string_arg(args, "tags")
+            .map(|tags| tags.split(',').map(|s| s.trim().to_string()).collect());
 
         match self.archival.insert(content, tags).await {
             Ok(id) => Ok(ToolResult::success(format!(
@@ -342,14 +331,12 @@ impl Tool for ArchivalSearchTool {
         r#"{"query": "search query", "top_k": "max results (default 5)", "tags": "optional comma-separated tags to filter by"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let query = args
-            .get("query")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let query = tool_string_arg(args, "query")
             .ok_or_else(|| anyhow::anyhow!("'query' argument required"))?;
-        let top_k: usize = args.get("top_k").and_then(|k| k.parse().ok()).unwrap_or(5);
-        let tags = args
-            .get("tags")
-            .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+        let top_k: usize = tool_parse_arg(args, "top_k").unwrap_or(5);
+        let tags = tool_string_arg(args, "tags")
+            .map(|tags| tags.split(',').map(|s| s.trim().to_string()).collect());
 
         match self.archival.search(query, top_k, tags).await {
             Ok(results) => {
@@ -400,12 +387,10 @@ impl Tool for SetPreferenceTool {
         r#"{"key": "preference key (e.g., 'timezone', 'language', 'display_name')", "value": "preference value"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let key = args
-            .get("key")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let key = tool_string_arg(args, "key")
             .ok_or_else(|| anyhow::anyhow!("'key' argument required"))?;
-        let value = args
-            .get("value")
+        let value = tool_string_arg(args, "value")
             .ok_or_else(|| anyhow::anyhow!("'value' argument required"))?;
 
         match self.db.preferences().set(self.agent_id, key, value) {

@@ -6,10 +6,15 @@
 //! - GEPA-compatible instruction optimization
 
 use anyhow::Result;
+use baml_bridge::{
+    baml_types::{type_meta, BamlValue, TypeIR},
+    BamlAdapter, BamlConvertError,
+};
 use dspy_rs::{configure, BamlType, ChatAdapter, Predict, LM};
 use std::collections::{BTreeMap, HashMap};
 #[cfg(unix)]
 use std::io::Write;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
@@ -62,12 +67,160 @@ impl Drop for StdoutSuppressor {
 }
 
 /// A tool call requested by the agent
+struct NativeToolArgsAdapter;
+
+impl NativeToolArgsAdapter {
+    fn union(types: Vec<TypeIR>) -> TypeIR {
+        TypeIR::union_with_meta(types, type_meta::IR::default())
+    }
+
+    fn primitive_type() -> TypeIR {
+        Self::union(vec![
+            TypeIR::string(),
+            TypeIR::int(),
+            TypeIR::float(),
+            TypeIR::bool(),
+            TypeIR::null(),
+        ])
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToolArgs(HashMap<String, serde_json::Value>);
+
+impl ToolArgs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Deref for ToolArgs {
+    type Target = HashMap<String, serde_json::Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ToolArgs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<const N: usize> From<[(String, serde_json::Value); N]> for ToolArgs {
+    fn from(entries: [(String, serde_json::Value); N]) -> Self {
+        Self(HashMap::from(entries))
+    }
+}
+
+impl baml_bridge::ToBamlValue for ToolArgs {
+    fn to_baml_value(&self) -> BamlValue {
+        fn convert(value: &serde_json::Value) -> BamlValue {
+            match value {
+                serde_json::Value::Null => BamlValue::Null,
+                serde_json::Value::Bool(value) => BamlValue::Bool(*value),
+                serde_json::Value::Number(value) => value
+                    .as_i64()
+                    .map(BamlValue::Int)
+                    .or_else(|| value.as_f64().map(BamlValue::Float))
+                    .unwrap_or(BamlValue::Null),
+                serde_json::Value::String(value) => BamlValue::String(value.clone()),
+                serde_json::Value::Array(values) => {
+                    BamlValue::List(values.iter().map(convert).collect())
+                }
+                serde_json::Value::Object(values) => BamlValue::Map(
+                    values
+                        .iter()
+                        .map(|(key, value)| (key.clone(), convert(value)))
+                        .collect(),
+                ),
+            }
+        }
+
+        BamlValue::Map(
+            self.0
+                .iter()
+                .map(|(key, value)| (key.clone(), convert(value)))
+                .collect(),
+        )
+    }
+}
+
+pub(crate) fn tool_string_arg<'a>(args: &'a ToolArgs, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(serde_json::Value::as_str)
+}
+
+pub(crate) fn tool_parse_arg<T>(args: &ToolArgs, key: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    args.get(key).and_then(|value| match value {
+        serde_json::Value::String(value) => value.parse().ok(),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.to_string().parse().ok(),
+        _ => None,
+    })
+}
+
+fn tool_arg_preview(value: &serde_json::Value) -> String {
+    let rendered = match value {
+        serde_json::Value::String(value) => value.clone(),
+        value => value.to_string(),
+    };
+    rendered.chars().take(500).collect()
+}
+
+impl BamlAdapter<ToolArgs> for NativeToolArgsAdapter {
+    fn type_ir() -> TypeIR {
+        let primitive = Self::primitive_type();
+        let nested_value = Self::union(vec![primitive.clone(), TypeIR::list(primitive.clone())]);
+        let object = TypeIR::map(TypeIR::string(), nested_value);
+        let list_item = Self::union(vec![primitive.clone(), object.clone()]);
+        let value = Self::union(vec![primitive, object, TypeIR::list(list_item)]);
+        TypeIR::map(TypeIR::string(), value)
+    }
+
+    fn try_from_baml(
+        value: BamlValue,
+        path: Vec<String>,
+    ) -> std::result::Result<ToolArgs, BamlConvertError> {
+        let BamlValue::Map(values) = value else {
+            return Err(BamlConvertError::new(
+                path,
+                "map",
+                format!("{value:?}"),
+                "expected Tool arguments to be an object",
+            ));
+        };
+
+        let mut args = ToolArgs::new();
+        for (key, value) in values {
+            if value == BamlValue::Null {
+                continue;
+            }
+            let native_value = serde_json::to_value(&value).map_err(|error| {
+                let mut value_path = path.clone();
+                value_path.push(key.clone());
+                BamlConvertError::new(
+                    value_path,
+                    "JSON-compatible Tool argument",
+                    format!("{value:?}"),
+                    format!("failed to preserve Tool argument: {error}"),
+                )
+            })?;
+            args.insert(key, native_value);
+        }
+        Ok(args)
+    }
+}
+
 #[derive(Clone, Debug, Default, BamlType)]
 pub struct ToolCall {
     /// Name of the tool to call
     pub name: String,
     /// Arguments for the tool as key-value pairs
-    pub args: HashMap<String, String>,
+    #[baml(with = "NativeToolArgsAdapter")]
+    pub args: ToolArgs,
 }
 
 /// The agent's response signature
@@ -465,7 +618,7 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn args_schema(&self) -> &str;
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult>;
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult>;
 }
 
 /// Description-only Tool stub for generating prompt text without live backends.
@@ -486,7 +639,7 @@ impl Tool for ToolDescriptor {
     fn args_schema(&self) -> &str {
         &self.args_schema
     }
-    async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+    async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
         unreachable!("ToolDescriptor is description-only and should never be executed")
     }
 }
@@ -953,7 +1106,7 @@ impl SageAgent {
             let args_str = tool_call
                 .args
                 .iter()
-                .map(|(k, v)| format!("{}=\"{}\"", k, v.chars().take(500).collect::<String>()))
+                .map(|(k, v)| format!("{}=\"{}\"", k, tool_arg_preview(v)))
                 .collect::<Vec<_>>()
                 .join(", ");
 
@@ -1829,11 +1982,11 @@ mod tests {
             vec![
                 ToolCall {
                     name: "done".to_string(),
-                    args: HashMap::new(),
+                    args: ToolArgs::new(),
                 },
                 ToolCall {
                     name: "knowledge_search".to_string(),
-                    args: HashMap::from([("query".to_string(), "safety plan".to_string())]),
+                    args: ToolArgs::from([("query".to_string(), serde_json::json!("safety plan"))]),
                 },
             ],
             true,
@@ -1842,6 +1995,64 @@ mod tests {
         assert_eq!(decision.tool_calls.len(), 1);
         assert_eq!(decision.tool_calls[0].name, "knowledge_search");
         assert!(decision.replan_after_results);
+    }
+
+    #[test]
+    fn tool_decision_accepts_native_object_and_array_arguments() {
+        let parsed = baml_bridge::parse_llm_output::<__ToolDecisionResponseOutput>(
+            r#"{
+                "tool_calls": [{
+                    "name": "configure_instance",
+                    "args": {
+                        "settings": {
+                            "instance_name": "FreeThem",
+                            "auto_approve_users": false
+                        },
+                        "user_types": [{
+                            "reference": "families",
+                            "name": "Families",
+                            "display_order": 1
+                        }],
+                        "behavior_rules": ["Be direct", "Protect privacy"]
+                        ,"forbidden_topics": null
+                    }
+                }],
+                "replan_after_results": false
+            }"#,
+            true,
+        )
+        .expect("native Tool arguments should parse");
+
+        let args = &parsed.value.tool_calls[0].args;
+        assert_eq!(
+            args["settings"],
+            serde_json::json!({
+                "instance_name": "FreeThem",
+                "auto_approve_users": false
+            })
+        );
+        assert_eq!(
+            args["user_types"],
+            serde_json::json!([{
+                "reference": "families",
+                "name": "Families",
+                "display_order": 1
+            }])
+        );
+        assert_eq!(
+            args["behavior_rules"],
+            serde_json::json!(["Be direct", "Protect privacy"])
+        );
+        assert!(!args.contains_key("forbidden_topics"));
+    }
+
+    #[test]
+    fn tool_arg_preview_does_not_double_quote_json_strings() {
+        assert_eq!(tool_arg_preview(&serde_json::json!("safety")), "safety");
+        assert_eq!(
+            tool_arg_preview(&serde_json::json!({"query": "safety"})),
+            r#"{"query":"safety"}"#
+        );
     }
 
     #[test]

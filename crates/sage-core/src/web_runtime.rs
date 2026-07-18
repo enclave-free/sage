@@ -42,9 +42,9 @@ use crate::memory::MemoryManager;
 #[cfg(test)]
 use crate::sage_agent::StepResult;
 use crate::sage_agent::{
-    has_syntactic_tool_intent, AgentTraceEvent, ExecutedTool, PlainAnswerPrompt,
-    ProviderReasoningTraceHook, SageAgent, Tool, ToolPlanner, ToolPlanningOutcome, ToolRegistry,
-    ToolResult,
+    has_syntactic_tool_intent, tool_parse_arg, tool_string_arg, AgentTraceEvent, ExecutedTool,
+    PlainAnswerPrompt, ProviderReasoningTraceHook, SageAgent, Tool, ToolArgs, ToolPlanner,
+    ToolPlanningOutcome, ToolRegistry, ToolResult,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -52,6 +52,7 @@ use crate::schema::{
 };
 
 const DEFAULT_PREVIEW_QUESTION: &str = "What should I know about this topic?";
+const ADMIN_CONFIG_TOOL_SET_ID: &str = "admin-config";
 const CURATED_RESOURCES_TOOL_SET_ID: &str = "curated-resources";
 const KNOWLEDGE_SEARCH_TOOL_SET_ID: &str = "knowledge-search";
 const WEB_SEARCH_TOOL_SET_ID: &str = "web-search";
@@ -102,6 +103,14 @@ Output style:
 - Follow the stage-specific output contract at the end of this instruction exactly.
 - Tool planning returns only the typed Tool decision requested by that stage.
 - Final-answer generation returns only plain user-visible prose, with no messages wrapper, Tool call, or done sentinel.
+"#;
+const ADMIN_ONBOARDING_SURFACE: &str = "admin-onboarding";
+const ADMIN_ONBOARDING_INSTRUCTION: &str = r#"
+
+Guided Admin onboarding:
+- Map numbered answers exactly: 1 Name, 2 Description, 3 Assistant name, 4 Accent color, 5 Theme, 6 Default language, 7 Tagline, 8 New-user approval, 9 User types.
+- For fresh setup answers, summarize the configuration you understood and ask the Admin to confirm it conversationally. Do not read the current configuration merely to prepare that summary.
+- After confirmation, use configure_instance for the complete setup in one atomic call. If validation rejects a correctable value, use the returned details to correct it and retry configure_instance.
 "#;
 
 #[derive(Clone, Copy)]
@@ -397,6 +406,8 @@ enum ConversationStreamSignal {
 pub struct ChatRequest {
     pub message: String,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub conversation_surface: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
@@ -817,6 +828,54 @@ enum AdminConfigToolError {
     Failed(String),
 }
 
+fn admin_config_error_detail(value: &Value, fallback: &str) -> String {
+    let Some(detail) = value.get("detail") else {
+        return fallback.to_string();
+    };
+    match detail {
+        Value::String(message) if !message.trim().is_empty() => message.trim().to_string(),
+        Value::Array(errors) => {
+            let messages = errors
+                .iter()
+                .filter_map(|error| {
+                    let message = error.get("msg")?.as_str()?.trim();
+                    if message.is_empty() {
+                        return None;
+                    }
+                    let location = error
+                        .get("loc")
+                        .and_then(Value::as_array)
+                        .map(|segments| {
+                            segments
+                                .iter()
+                                .filter_map(|segment| match segment {
+                                    Value::String(value) => Some(value.clone()),
+                                    Value::Number(value) => Some(value.to_string()),
+                                    _ => None,
+                                })
+                                .skip_while(|segment| segment == "body")
+                                .collect::<Vec<_>>()
+                                .join(".")
+                        })
+                        .unwrap_or_default();
+                    Some(if location.is_empty() {
+                        message.to_string()
+                    } else {
+                        format!("{}: {}", location, message)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if messages.is_empty() {
+                fallback.to_string()
+            } else {
+                messages.join("; ")
+            }
+        }
+        Value::Object(_) => serde_json::to_string(detail).unwrap_or_else(|_| fallback.to_string()),
+        _ => fallback.to_string(),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct InternalEffectiveAiConfig {
     prompt_sections: HashMap<String, Value>,
@@ -1138,11 +1197,10 @@ impl InternalAgentClient {
             return Err(AdminConfigToolError::Unauthorized);
         }
         if !status.is_success() {
-            let detail = value
-                .get("detail")
-                .and_then(|detail| detail.as_str())
-                .unwrap_or("Admin Config tool request failed.");
-            return Err(AdminConfigToolError::Failed(detail.to_string()));
+            return Err(AdminConfigToolError::Failed(admin_config_error_detail(
+                &value,
+                "Admin Config tool request failed.",
+            )));
         }
         serde_json::from_value(value).map_err(|error| {
             AdminConfigToolError::Failed(format!("Invalid Admin Config tool response: {}", error))
@@ -1182,11 +1240,10 @@ impl InternalAgentClient {
             return Err(AdminConfigToolError::Unauthorized);
         }
         if !status.is_success() {
-            let detail = value
-                .get("detail")
-                .and_then(|detail| detail.as_str())
-                .unwrap_or("Admin Config Tool request failed.");
-            return Err(AdminConfigToolError::Failed(detail.to_string()));
+            return Err(AdminConfigToolError::Failed(admin_config_error_detail(
+                &value,
+                "Admin Config Tool request failed.",
+            )));
         }
         Ok(value)
     }
@@ -1357,7 +1414,7 @@ impl Tool for TracedTool {
         self.inner.args_schema()
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
         let started_at = Instant::now();
         let tool_name = self.name().to_string();
         self.trace_deltas
@@ -1440,10 +1497,7 @@ fn tool_trace_title(tool_name: &str) -> String {
     .to_string()
 }
 
-fn tool_call_trace_delta(
-    tool_name: &str,
-    args: &HashMap<String, String>,
-) -> ConversationTraceDeltaResponse {
+fn tool_call_trace_delta(tool_name: &str, args: &ToolArgs) -> ConversationTraceDeltaResponse {
     let arg_names = args.keys().cloned().collect::<Vec<_>>();
     ConversationTraceDeltaResponse {
         id: trace_delta_id("tool-call", tool_name),
@@ -1809,25 +1863,25 @@ fn build_conversation_tool_registry_with_context(
                 "configure_instance",
                 "configure-instance",
                 "Apply the complete guided first-setup configuration atomically after the Admin confirms it conversationally.",
-                r#"{"settings_json":"JSON object containing the complete guided Instance Settings","user_types_json":"optional JSON array of User Types with stable reference fields","onboarding_questions_json":"optional JSON array whose user_type_reference fields use those references","behavior_rules_json":"optional JSON string array","forbidden_topics_json":"optional JSON string array"}"#,
+                r##"{"settings":{"instance_name":"name","description":"purpose","assistant_name":"name","primary_color":"#3B82F6","default_theme":"dark","default_language":"en","header_tagline":"short line","auto_approve_users":false},"user_types":[{"reference":"stable-reference","name":"display name","description":"optional","display_order":1}],"onboarding_questions":[{"field_name":"field","field_type":"text","user_type_reference":"stable-reference"}],"behavior_rules":["rule"],"forbidden_topics":["topic"]}"##,
             ),
             (
                 "update_instance_settings",
                 "update-instance-settings",
                 "Update one or more existing Instance Settings atomically after conversational confirmation.",
-                r#"{"settings_json":"JSON object of supported Instance Setting names and desired values; description is the long Instance Description for the instance purpose and audience; header_tagline is the short header Tagline"}"#,
+                r##"{"settings":{"instance_name":"name","description":"long purpose and audience description","assistant_name":"name","primary_color":"#3B82F6","default_theme":"dark","default_language":"en","header_tagline":"short header line","auto_approve_users":true}}"##,
             ),
             (
                 "update_deployment_settings",
                 "update-deployment-settings",
                 "Update one or more Deployment Settings atomically. Reports restart requirements but never restarts services.",
-                r#"{"settings_json":"JSON object of supported Deployment Setting names and desired string values, including an explicitly supplied secret when requested"}"#,
+                r#"{"settings":{"SUPPORTED_DEPLOYMENT_SETTING":"desired value"}}"#,
             ),
             (
                 "update_agent_settings",
                 "update-agent-settings",
                 "Update global or User-Type-specific Agent Settings, or revert User-Type overrides, atomically.",
-                r#"{"updates_json":"optional JSON object of Agent Setting names and string values","user_type_id":"optional numeric User Type id for overrides","revert_keys_json":"optional JSON string array of User-Type override keys to remove"}"#,
+                r#"{"updates":{"agent_setting":"desired value"},"user_type_id":"optional numeric User Type id for overrides","revert_keys":["User-Type override key to remove"]}"#,
             ),
             (
                 "manage_user_types",
@@ -1839,13 +1893,13 @@ fn build_conversation_tool_registry_with_context(
                 "manage_onboarding_questions",
                 "manage-onboarding-questions",
                 "Create, update, reorder, or delete an Onboarding Question through the authoritative control plane.",
-                r#"{"operation":"create, update, or delete","question_id":"required numeric id for update/delete","field_name":"required for create; optional for update","field_type":"required for create; optional for update","required":"optional true or false","display_order":"optional integer","user_type_id":"optional numeric User Type id","placeholder":"optional","options_json":"optional JSON string array","encryption_enabled":"optional true or false","include_in_chat":"optional true or false"}"#,
+                r#"{"operation":"create, update, or delete","question_id":"required numeric id for update/delete","field_name":"required for create; optional for update","field_type":"required for create; optional for update","required":"optional true or false","display_order":"optional integer","user_type_id":"optional numeric User Type id","placeholder":"optional","options":["option"],"encryption_enabled":"optional true or false","include_in_chat":"optional true or false"}"#,
             ),
             (
                 "update_document_access",
                 "update-document-access",
                 "Set or revert global or User-Type-specific Document Access defaults without changing Document content or lifecycle.",
-                r#"{"user_type_id":"optional numeric User Type id; omit for global defaults","updates_json":"optional JSON array of product updates with job_id and access/default/order fields","revert_job_ids_json":"optional JSON string array of User-Type overrides to remove"}"#,
+                r#"{"user_type_id":"optional numeric User Type id; omit for global defaults","updates":[{"job_id":"document id","available":true,"is_default":true,"display_order":1}],"revert_job_ids":["User-Type override document id to remove"]}"#,
             ),
             (
                 "read_deployment_secret",
@@ -1889,15 +1943,11 @@ impl Tool for KnowledgeSearchTool {
         r#"{"query":"search query","top_k":"optional result count"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let query = args
-            .get("query")
-            .cloned()
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let query = tool_string_arg(args, "query")
+            .map(str::to_string)
             .ok_or_else(|| anyhow!("knowledge_search requires query"))?;
-        let top_k = args
-            .get("top_k")
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(self.top_k);
+        let top_k = tool_parse_arg(args, "top_k").unwrap_or(self.top_k);
 
         let response = self
             .internal
@@ -1973,16 +2023,14 @@ impl Tool for FindResourcesTool {
         r#"{"help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let help_type = args
-            .get("help_type")
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let help_type = tool_string_arg(args, "help_type")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let region = args
-            .get("region")
-            .cloned()
+        let region = tool_string_arg(args, "region")
+            .map(str::to_string)
             .or_else(|| self.jurisdiction.clone());
-        let language = args.get("language").cloned();
+        let language = tool_string_arg(args, "language").map(str::to_string);
         let is_inventory_lookup = help_type.is_none();
 
         let response = self
@@ -2133,15 +2181,11 @@ impl Tool for SearxWebSearchTool {
         r#"{"query":"search query","count":"optional number of results"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let query = args
-            .get("query")
-            .cloned()
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let query = tool_string_arg(args, "query")
+            .map(str::to_string)
             .ok_or_else(|| anyhow!("web_search requires query"))?;
-        let count = args
-            .get("count")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(5);
+        let count = tool_parse_arg(args, "count").unwrap_or(5);
 
         let response = self
             .http
@@ -2222,7 +2266,7 @@ impl Tool for AdminConfigReadTool {
         r#"{}"#
     }
 
-    async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+    async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
         let response = match self
             .internal
             .admin_config_tool(&self.endpoint, &self.auth)
@@ -2279,7 +2323,7 @@ impl Tool for AdminConfigSetupSummaryTool {
         r#"{}"#
     }
 
-    async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+    async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
         let instance_settings = match self.read_control_plane("instance-settings").await {
             Ok(response) => response,
             Err(error) => return Ok(ToolResult::error(error)),
@@ -2427,7 +2471,7 @@ impl Tool for AdminAgentSettingsReadTool {
         r#"{}"#
     }
 
-    async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+    async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
         let global = match load_ai_config_response(&self.state) {
             Ok(response) => response,
             Err(error) => {
@@ -2509,100 +2553,87 @@ impl Tool for AdminAgentSettingsReadTool {
     }
 }
 
-fn required_arg<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a str> {
-    args.get(key)
-        .map(String::as_str)
+fn required_arg<'a>(args: &'a ToolArgs, key: &str) -> Result<&'a str> {
+    tool_string_arg(args, key)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("{} is required", key))
 }
 
-fn json_arg(args: &HashMap<String, String>, key: &str, default: Value) -> Result<Value> {
-    match args.get(key).map(String::as_str).map(str::trim) {
-        Some(value) if !value.is_empty() => serde_json::from_str(value)
-            .map_err(|error| anyhow!("{} must be valid JSON: {}", key, error)),
-        _ => Ok(default),
-    }
-}
-
-fn object_arg(args: &HashMap<String, String>, key: &str, required: bool) -> Result<Value> {
-    let value = json_arg(args, key, json!({}))?;
+fn object_arg(args: &ToolArgs, key: &str, required: bool) -> Result<Value> {
+    let value = args.get(key).cloned().unwrap_or_else(|| json!({}));
     if !value.is_object() || (required && value.as_object().is_some_and(|object| object.is_empty()))
     {
-        return Err(anyhow!("{} must be a non-empty JSON object", key));
+        return Err(anyhow!("{} must be a non-empty object", key));
     }
     Ok(value)
 }
 
-fn array_arg(args: &HashMap<String, String>, key: &str) -> Result<Value> {
-    let value = json_arg(args, key, json!([]))?;
+fn array_arg(args: &ToolArgs, key: &str) -> Result<Value> {
+    let value = args.get(key).cloned().unwrap_or_else(|| json!([]));
     if !value.is_array() {
-        return Err(anyhow!("{} must be a JSON array", key));
+        return Err(anyhow!("{} must be an array", key));
     }
     Ok(value)
 }
 
-fn optional_i64_arg(args: &HashMap<String, String>, key: &str) -> Result<Option<i64>> {
-    args.get(key)
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            value
-                .parse::<i64>()
-                .map_err(|_| anyhow!("{} must be an integer", key))
-        })
-        .transpose()
+fn optional_i64_arg(args: &ToolArgs, key: &str) -> Result<Option<i64>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| anyhow!("{} must be an integer", key)),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => value
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| anyhow!("{} must be an integer", key)),
+        Some(_) => Err(anyhow!("{} must be an integer", key)),
+    }
 }
 
-fn optional_bool_arg(args: &HashMap<String, String>, key: &str) -> Result<Option<bool>> {
-    args.get(key)
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            value
-                .parse::<bool>()
-                .map_err(|_| anyhow!("{} must be true or false", key))
-        })
-        .transpose()
+fn optional_bool_arg(args: &ToolArgs, key: &str) -> Result<Option<bool>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => value
+            .trim()
+            .parse::<bool>()
+            .map(Some)
+            .map_err(|_| anyhow!("{} must be true or false", key)),
+        Some(_) => Err(anyhow!("{} must be true or false", key)),
+    }
 }
 
 fn insert_optional_string(
     payload: &mut serde_json::Map<String, Value>,
-    args: &HashMap<String, String>,
+    args: &ToolArgs,
     key: &str,
 ) {
-    if let Some(value) = args.get(key) {
-        payload.insert(key.to_string(), Value::String(value.clone()));
+    if let Some(value) = tool_string_arg(args, key) {
+        payload.insert(key.to_string(), Value::String(value.to_string()));
     }
 }
 
-fn build_admin_config_direct_payload(
-    tool_name: &str,
-    args: &HashMap<String, String>,
-) -> Result<Value> {
+fn build_admin_config_direct_payload(tool_name: &str, args: &ToolArgs) -> Result<Value> {
     match tool_name {
         "configure_instance" => Ok(json!({
-            "settings": object_arg(args, "settings_json", true)?,
-            "user_types": array_arg(args, "user_types_json")?,
-            "onboarding_questions": array_arg(args, "onboarding_questions_json")?,
-            "behavior_rules": array_arg(args, "behavior_rules_json")?,
-            "forbidden_topics": array_arg(args, "forbidden_topics_json")?,
+            "settings": object_arg(args, "settings", true)?,
+            "user_types": array_arg(args, "user_types")?,
+            "onboarding_questions": array_arg(args, "onboarding_questions")?,
+            "behavior_rules": array_arg(args, "behavior_rules")?,
+            "forbidden_topics": array_arg(args, "forbidden_topics")?,
         })),
         "update_instance_settings" | "update_deployment_settings" => Ok(json!({
-            "settings": object_arg(args, "settings_json", true)?,
+            "settings": object_arg(args, "settings", true)?,
         })),
         "update_agent_settings" => {
             let mut payload = serde_json::Map::from_iter([
-                (
-                    "updates".to_string(),
-                    object_arg(args, "updates_json", false)?,
-                ),
-                (
-                    "revert_keys".to_string(),
-                    array_arg(args, "revert_keys_json")?,
-                ),
+                ("updates".to_string(), object_arg(args, "updates", false)?),
+                ("revert_keys".to_string(), array_arg(args, "revert_keys")?),
             ]);
             if let Some(value) = optional_i64_arg(args, "user_type_id")? {
                 payload.insert("user_type_id".to_string(), Value::from(value));
@@ -2645,17 +2676,17 @@ fn build_admin_config_direct_payload(
             for key in ["field_name", "field_type", "placeholder"] {
                 insert_optional_string(&mut payload, args, key);
             }
-            if args.contains_key("options_json") {
-                payload.insert("options".to_string(), array_arg(args, "options_json")?);
+            if args.contains_key("options") {
+                payload.insert("options".to_string(), array_arg(args, "options")?);
             }
             Ok(Value::Object(payload))
         }
         "update_document_access" => {
             let mut payload = serde_json::Map::from_iter([
-                ("updates".to_string(), array_arg(args, "updates_json")?),
+                ("updates".to_string(), array_arg(args, "updates")?),
                 (
                     "revert_job_ids".to_string(),
-                    array_arg(args, "revert_job_ids_json")?,
+                    array_arg(args, "revert_job_ids")?,
                 ),
             ]);
             if let Some(value) = optional_i64_arg(args, "user_type_id")? {
@@ -2684,7 +2715,7 @@ impl Tool for AdminConfigDirectTool {
         &self.args_schema
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
         let payload = match build_admin_config_direct_payload(&self.name, args) {
             Ok(payload) => payload,
             Err(error) => return Ok(ToolResult::error(error.to_string())),
@@ -2788,10 +2819,9 @@ impl Tool for AdminDbQueryTool {
         r#"{"sql":"read-only SQLite SELECT query"}"#
     }
 
-    async fn execute(&self, args: &HashMap<String, String>) -> Result<ToolResult> {
-        let sql = args
-            .get("sql")
-            .cloned()
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        let sql = tool_string_arg(args, "sql")
+            .map(str::to_string)
             .ok_or_else(|| anyhow!("db_query requires sql"))?;
         let value = self.internal.admin_db_query(&sql).await?;
         if value.get("success").and_then(Value::as_bool) == Some(false) {
@@ -3192,17 +3222,7 @@ async fn chat(
     let mut agent = SageAgent::new_with_optional_memory(
         registry,
         Some(memory),
-        build_agent_instruction(
-            &ai_config.compiled_prompt,
-            request
-                .tools
-                .iter()
-                .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
-            request
-                .tools
-                .iter()
-                .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
-        ),
+        build_chat_agent_instruction(&ai_config.compiled_prompt, &request, &auth),
     );
     let agent_trace_sink = tool_sinks.trace_deltas.clone();
     agent.set_trace_hook(Arc::new(move |event| {
@@ -3520,17 +3540,7 @@ async fn chat_stream(
         let mut agent = SageAgent::new_with_optional_memory(
             registry,
             Some(memory),
-            build_agent_instruction(
-                &ai_config.compiled_prompt,
-                request
-                    .tools
-                    .iter()
-                    .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
-                request
-                    .tools
-                    .iter()
-                    .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
-            ),
+            build_chat_agent_instruction(&ai_config.compiled_prompt, &request, &auth),
         );
         let agent_trace_sink = tool_sinks.trace_deltas.clone();
         agent.set_trace_hook(Arc::new(move |event| {
@@ -3721,6 +3731,7 @@ async fn query(
     let chat_request = ChatRequest {
         message: request.question.clone(),
         session_id: request.session_id.clone(),
+        conversation_surface: None,
         tools: enabled_tools,
         conversation_history: Vec::new(),
         job_ids: request.job_ids.clone(),
@@ -6173,6 +6184,34 @@ fn build_agent_instruction(
     .build_instruction()
 }
 
+fn build_chat_agent_instruction(
+    compiled_prompt: &str,
+    request: &ChatRequest,
+    auth: &InternalAuthContext,
+) -> String {
+    let mut instruction = build_agent_instruction(
+        compiled_prompt,
+        request
+            .tools
+            .iter()
+            .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
+        request
+            .tools
+            .iter()
+            .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
+    );
+    if auth.kind == "admin"
+        && request.conversation_surface.as_deref() == Some(ADMIN_ONBOARDING_SURFACE)
+        && request
+            .tools
+            .iter()
+            .any(|tool| tool == ADMIN_CONFIG_TOOL_SET_ID)
+    {
+        instruction.push_str(ADMIN_ONBOARDING_INSTRUCTION);
+    }
+    instruction
+}
+
 fn query_enabled_tool_sets(request: &QueryRequest) -> Vec<String> {
     let mut tools = request.tools.clone();
     if !tools
@@ -8036,7 +8075,7 @@ mod tests {
             Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
                 vec![crate::sage_agent::ToolCall {
                     name: "knowledge_search".to_string(),
-                    args: HashMap::from([("query".to_string(), "safety".to_string())]),
+                    args: ToolArgs::from([("query".to_string(), json!("safety"))]),
                 }],
                 false,
             )))
@@ -8389,7 +8428,7 @@ mod tests {
                 return Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
                     vec![crate::sage_agent::ToolCall {
                         name: "db_query".to_string(),
-                        args: HashMap::from([("sql".to_string(), "DELETE FROM users".to_string())]),
+                        args: ToolArgs::from([("sql".to_string(), json!("DELETE FROM users"))]),
                     }],
                     false,
                 )));
@@ -8699,9 +8738,9 @@ mod tests {
             jurisdiction: Some("Mexico".to_string()),
             traces: Arc::new(Mutex::new(Vec::new())),
         };
-        let args = HashMap::from([
-            ("help_type".to_string(), "legal".to_string()),
-            ("language".to_string(), "es".to_string()),
+        let args = ToolArgs::from([
+            ("help_type".to_string(), json!("legal")),
+            ("language".to_string(), json!("es")),
         ]);
 
         let result = tool
@@ -8809,7 +8848,7 @@ mod tests {
         };
 
         let result = tool
-            .execute(&HashMap::new())
+            .execute(&ToolArgs::new())
             .await
             .expect("resource inventory should succeed");
         server.abort();
@@ -8909,6 +8948,52 @@ mod tests {
     }
 
     #[test]
+    fn admin_onboarding_surface_adds_lightweight_guided_setup_instruction() {
+        let request = ChatRequest {
+            message: "1. FreeThem, 4. blue".to_string(),
+            session_id: None,
+            conversation_surface: Some(ADMIN_ONBOARDING_SURFACE.to_string()),
+            tools: vec![ADMIN_CONFIG_TOOL_SET_ID.to_string()],
+            conversation_history: Vec::new(),
+            job_ids: None,
+            conversation_channel: None,
+            client_decrypted_context: None,
+        };
+        let admin = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+
+        let instruction = build_chat_agent_instruction("PROFILE", &request, &admin);
+
+        assert!(instruction.contains(
+            "1 Name, 2 Description, 3 Assistant name, 4 Accent color, 5 Theme, 6 Default language, 7 Tagline, 8 New-user approval, 9 User types"
+        ));
+        assert!(instruction.contains("ask the Admin to confirm it conversationally"));
+        assert!(instruction.contains("use configure_instance for the complete setup"));
+        assert!(instruction.contains("use the returned details to correct it"));
+    }
+
+    #[test]
+    fn direct_admin_config_payload_rejects_json_encoded_object_strings() {
+        let args = ToolArgs::from([(
+            "settings".to_string(),
+            json!(r#"{"instance_name":"FreeThem"}"#),
+        )]);
+
+        let error = build_admin_config_direct_payload("update_instance_settings", &args)
+            .expect_err("settings must be passed as a native object");
+
+        assert_eq!(error.to_string(), "settings must be a non-empty object");
+    }
+
+    #[test]
     fn chat_stream_activity_step_payloads_expose_sanitized_tool_progress() {
         let mut payload = ChatStreamEventPayload::new(
             "msg_test",
@@ -8979,7 +9064,7 @@ mod tests {
             r#"{"query":"test"}"#
         }
 
-        async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
             Ok(self.result.clone())
         }
     }
@@ -9002,7 +9087,7 @@ mod tests {
             r#"{"query":"test"}"#
         }
 
-        async fn execute(&self, _args: &HashMap<String, String>) -> Result<ToolResult> {
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
             Err(anyhow::anyhow!("network failure"))
         }
     }
@@ -9018,7 +9103,7 @@ mod tests {
             &sink,
         );
 
-        let result = tool.execute(&HashMap::new()).await.expect("tool runs");
+        let result = tool.execute(&ToolArgs::new()).await.expect("tool runs");
 
         assert!(result.success);
         let deltas = sink.deltas.lock().expect("trace deltas should lock");
@@ -9047,7 +9132,7 @@ mod tests {
         );
 
         let error = failing_tool
-            .execute(&HashMap::new())
+            .execute(&ToolArgs::new())
             .await
             .expect_err("tool should fail");
 
@@ -9072,7 +9157,7 @@ mod tests {
         );
 
         let result = guarded_tool
-            .execute(&HashMap::new())
+            .execute(&ToolArgs::new())
             .await
             .expect("guarded tool returns a ToolResult");
 
@@ -9571,6 +9656,7 @@ mod tests {
         let request = ChatRequest {
             message: "continue from the same conversation".to_string(),
             session_id: Some("session-123".to_string()),
+            conversation_surface: None,
             tools: vec!["admin-config".to_string()],
             conversation_history: vec![ChatHistoryMessage {
                 role: "user".to_string(),
@@ -9675,7 +9761,7 @@ mod tests {
             internal,
             traces: traces.clone(),
         };
-        let args = HashMap::from([("sql".to_string(), "DROP TABLE users".to_string())]);
+        let args = ToolArgs::from([("sql".to_string(), json!("DROP TABLE users"))]);
 
         let result = tool
             .execute(&args)
@@ -9774,14 +9860,11 @@ mod tests {
             name: "update_deployment_settings".to_string(),
             endpoint: "update-deployment-settings".to_string(),
             description: "Update Deployment Settings.".to_string(),
-            args_schema: r#"{"settings_json":"settings"}"#.to_string(),
+            args_schema: r#"{"settings":"settings"}"#.to_string(),
             traces: traces.clone(),
             affected_areas: affected_areas.clone(),
         };
-        let args = HashMap::from([(
-            "settings_json".to_string(),
-            json!({"TINFOIL_API_KEY": secret}).to_string(),
-        )]);
+        let args = ToolArgs::from([("settings".to_string(), json!({"TINFOIL_API_KEY": secret}))]);
 
         let result = tool
             .execute(&args)
@@ -9810,6 +9893,76 @@ mod tests {
                 .expect("Activity should serialize");
         assert!(rendered_activity.contains("TINFOIL_API_KEY"));
         assert!(!rendered_activity.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn direct_admin_config_tool_preserves_structured_validation_details() {
+        let app = Router::new().route(
+            "/internal/agent/admin-config/update-instance-settings",
+            post(|| async {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "detail": [{
+                            "type": "value_error",
+                            "loc": ["body", "settings", "default_language"],
+                            "msg": "Input should be a supported language code",
+                            "input": "English"
+                        }]
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let tool = AdminConfigDirectTool {
+            internal: InternalAgentClient::new(
+                Client::builder().build().expect("http client should build"),
+                format!("http://{}", addr),
+                "test-token".to_string(),
+            ),
+            auth: InternalAuthContext {
+                id: 1,
+                kind: "admin".to_string(),
+                approved: true,
+                pubkey: Some("admin-pubkey".to_string()),
+                email: None,
+                name: None,
+                user_type_id: None,
+                dev_mode: false,
+            },
+            conversation_id: "conversation-422".to_string(),
+            name: "update_instance_settings".to_string(),
+            endpoint: "update-instance-settings".to_string(),
+            description: "Update Instance Settings.".to_string(),
+            args_schema: r#"{"settings":"settings"}"#.to_string(),
+            traces: Arc::new(Mutex::new(Vec::new())),
+            affected_areas: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = tool
+            .execute(&ToolArgs::from([(
+                "settings".to_string(),
+                json!({"default_language": "English"}),
+            )]))
+            .await
+            .expect("validation failure should be returned as a Tool result");
+        server.abort();
+
+        assert!(!result.success);
+        let error = result.error.expect("validation detail should be preserved");
+        assert!(error.contains("settings.default_language"));
+        assert!(error.contains("Input should be a supported language code"));
+        assert!(!error.contains("Admin Config Tool request failed"));
     }
 
     #[tokio::test]
@@ -9866,9 +10019,9 @@ mod tests {
         };
 
         let result = tool
-            .execute(&HashMap::from([(
+            .execute(&ToolArgs::from([(
                 "key".to_string(),
-                "TINFOIL_API_KEY".to_string(),
+                json!("TINFOIL_API_KEY"),
             )]))
             .await
             .expect("secret read Tool should execute");
@@ -9970,7 +10123,7 @@ mod tests {
         };
 
         let result = tool
-            .execute(&HashMap::new())
+            .execute(&ToolArgs::new())
             .await
             .expect("Admin Config read tool should execute");
         server.abort();
@@ -10052,7 +10205,7 @@ mod tests {
         };
 
         let result = tool
-            .execute(&HashMap::new())
+            .execute(&ToolArgs::new())
             .await
             .expect("Admin Config setup summary tool should execute");
         server.abort();
@@ -10478,12 +10631,9 @@ mod tests {
             sources: sources.clone(),
             traces: traces.clone(),
         };
-        let args = HashMap::from([
-            (
-                "query".to_string(),
-                "What does the handbook say?".to_string(),
-            ),
-            ("top_k".to_string(), "3".to_string()),
+        let args = ToolArgs::from([
+            ("query".to_string(), json!("What does the handbook say?")),
+            ("top_k".to_string(), json!(3)),
         ]);
 
         let result = tool
@@ -10561,9 +10711,9 @@ mod tests {
             searxng_url: format!("http://{}", addr),
             traces: traces.clone(),
         };
-        let args = HashMap::from([
-            ("query".to_string(), "deployment checklist".to_string()),
-            ("count".to_string(), "1".to_string()),
+        let args = ToolArgs::from([
+            ("query".to_string(), json!("deployment checklist")),
+            ("count".to_string(), json!(1)),
         ]);
 
         let result = tool
@@ -10612,6 +10762,7 @@ mod tests {
         let request = ChatRequest {
             message: "SELECT 1 AS one".to_string(),
             session_id: None,
+            conversation_surface: None,
             tools: vec![
                 "knowledge-search".to_string(),
                 "curated-resources".to_string(),
@@ -10665,10 +10816,10 @@ mod tests {
             .expect("instance settings write tool should be registered");
         assert!(instance_settings_tool
             .args_schema()
-            .contains("description is the long Instance Description"));
-        assert!(instance_settings_tool
+            .contains(r#""settings":{"#));
+        assert!(!instance_settings_tool
             .args_schema()
-            .contains("header_tagline is the short header Tagline"));
+            .contains("settings_json"));
         assert!(!registry.has("propose_config_change_set"));
         assert!(!registry.has("propose_admin_config_bootstrap"));
         assert!(registry.has("done"));
@@ -10758,6 +10909,7 @@ mod tests {
         let request = ChatRequest {
             message: "Which users are active?".to_string(),
             session_id: None,
+            conversation_surface: None,
             tools: vec!["db-query".to_string()],
             conversation_history: Vec::new(),
             job_ids: None,
@@ -10807,6 +10959,7 @@ mod tests {
         let request = ChatRequest {
             message: "Tell me about the users in our db".to_string(),
             session_id: None,
+            conversation_surface: None,
             tools: vec!["db-query".to_string()],
             conversation_history: Vec::new(),
             job_ids: None,
@@ -10844,6 +10997,7 @@ mod tests {
         let request = ChatRequest {
             message: "Can you use this?".to_string(),
             session_id: None,
+            conversation_surface: None,
             tools: Vec::new(),
             conversation_history: Vec::new(),
             job_ids: None,
@@ -10875,6 +11029,7 @@ mod tests {
         let request = ChatRequest {
             message: "Can you use this?".to_string(),
             session_id: None,
+            conversation_surface: None,
             tools: vec!["db-query".to_string()],
             conversation_history: Vec::new(),
             job_ids: None,
@@ -10907,6 +11062,7 @@ mod tests {
             message: "Do we have anyone from the database registered from any organizations?"
                 .to_string(),
             session_id: None,
+            conversation_surface: None,
             tools: vec!["db-query".to_string()],
             conversation_history: Vec::new(),
             job_ids: None,
@@ -10946,6 +11102,7 @@ mod tests {
         let request = ChatRequest {
             message: "SELECT 1 AS one".to_string(),
             session_id: None,
+            conversation_surface: None,
             tools: vec!["db-query".to_string()],
             conversation_history: Vec::new(),
             job_ids: None,
@@ -10988,6 +11145,7 @@ mod tests {
         let request = ChatRequest {
             message: "show me the deployment settings".to_string(),
             session_id: None,
+            conversation_surface: None,
             tools: vec!["admin-config".to_string(), "knowledge-search".to_string()],
             conversation_history: Vec::new(),
             job_ids: Some(vec!["doc-handbook".to_string()]),
@@ -11156,6 +11314,7 @@ mod tests {
         let effective_request = ChatRequest {
             message: request.question.clone(),
             session_id: None,
+            conversation_surface: None,
             tools: vec![
                 CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                 KNOWLEDGE_SEARCH_TOOL_SET_ID.to_string(),
