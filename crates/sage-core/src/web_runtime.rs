@@ -6931,6 +6931,15 @@ struct PlainAnswerStreamState {
     answer: String,
     pending: String,
     emitted_any: bool,
+    opening_disposition: PlainAnswerOpeningDisposition,
+}
+
+#[derive(Default)]
+enum PlainAnswerOpeningDisposition {
+    #[default]
+    Undecided,
+    Stream,
+    Quarantine,
 }
 
 impl PlainAnswerStreamState {
@@ -6965,6 +6974,19 @@ impl PlainAnswerStreamState {
         }
         self.answer.push_str(delta);
         self.pending.push_str(delta);
+        if matches!(
+            self.opening_disposition,
+            PlainAnswerOpeningDisposition::Undecided
+        ) {
+            self.opening_disposition = Self::classify_opening(&self.pending);
+        }
+        if !matches!(
+            self.opening_disposition,
+            PlainAnswerOpeningDisposition::Stream
+        ) {
+            self.reject_tool_intent(&self.pending)?;
+            return Ok(());
+        }
         self.flush_safe_candidates(delta_sender)
     }
 
@@ -6985,6 +7007,42 @@ impl PlainAnswerStreamState {
             );
         }
         Ok(())
+    }
+
+    /// Hold common model-deliberation openings until the whole candidate is
+    /// known safe. Direct answers keep their normal streaming behavior.
+    fn classify_opening(value: &str) -> PlainAnswerOpeningDisposition {
+        const DELIBERATION_OPENERS: [&str; 11] = [
+            "i have enough context",
+            "i have good context",
+            "let me ",
+            "i'll search",
+            "i will search",
+            "i need to ",
+            "i should ",
+            "actually,",
+            "based on my search",
+            "the user is asking",
+            "we need to answer",
+        ];
+
+        let opening = value.trim_start().to_ascii_lowercase();
+        if opening.is_empty() {
+            return PlainAnswerOpeningDisposition::Undecided;
+        }
+        if DELIBERATION_OPENERS
+            .iter()
+            .any(|candidate| opening.starts_with(candidate))
+        {
+            return PlainAnswerOpeningDisposition::Quarantine;
+        }
+        if DELIBERATION_OPENERS
+            .iter()
+            .any(|candidate| candidate.starts_with(&opening))
+        {
+            return PlainAnswerOpeningDisposition::Undecided;
+        }
+        PlainAnswerOpeningDisposition::Stream
     }
 
     fn flush_safe_candidates(
@@ -7042,6 +7100,7 @@ impl PlainAnswerStreamState {
             lowercase.find("<tool_call"),
             lowercase.find("</tool_call"),
             lowercase.find("<|tool_call"),
+            lowercase.find("tool calls:"),
         ]
         .into_iter()
         .flatten()
@@ -7232,11 +7291,8 @@ impl OpenAiPlainAnswerGenerator {
         }
         Ok(finished)
     }
-}
 
-#[async_trait::async_trait]
-impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
-    async fn generate(
+    async fn generate_attempt(
         &self,
         prompt: &PlainAnswerPrompt,
         model: &str,
@@ -7337,6 +7393,46 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
             });
         }
         Ok(answer_state.answer)
+    }
+}
+
+#[async_trait::async_trait]
+impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
+    async fn generate(
+        &self,
+        prompt: &PlainAnswerPrompt,
+        model: &str,
+        delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
+    ) -> std::result::Result<String, PlainAnswerGenerationError> {
+        let first_attempt = self
+            .generate_attempt(
+                prompt,
+                model,
+                delta_sender.clone(),
+                reasoning_trace_hook.clone(),
+            )
+            .await;
+        let error = match first_attempt {
+            Ok(answer) => return Ok(answer),
+            Err(error) => error,
+        };
+        if error.emitted_any || !error.message.contains("Tool intent") {
+            return Err(error);
+        }
+
+        warn!(
+            "Plain-answer provider emitted a quarantined Tool transcript; retrying final answer once"
+        );
+        let retry_prompt = PlainAnswerPrompt {
+            system: format!(
+                "{}\n\nThe previous final-answer attempt exposed internal planning or a Tool transcript. Retry once. Output only the final answer for the user; do not narrate planning, searches, Tool calls, or Tool results.",
+                prompt.system
+            ),
+            user: prompt.user.clone(),
+        };
+        self.generate_attempt(&retry_prompt, model, delta_sender, reasoning_trace_hook)
+            .await
     }
 }
 
@@ -7582,6 +7678,7 @@ mod tests {
     use itsdangerous::{default_builder, timed_serializer_with_signer, TimestampSigner};
     use serde_json::json;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn answer_signal(signal: ConversationStreamSignal) -> String {
         match signal {
@@ -7952,6 +8049,64 @@ mod tests {
     }
 
     #[test]
+    fn plain_answer_safety_rejects_reasoning_with_textual_tool_transcript_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push(
+                "I have enough context. Let me search for a more specific referral. ",
+                &sender,
+            )
+            .expect("deliberation prefix should remain pending until classified");
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "unclassified model deliberation must not reach the public answer"
+        );
+
+        let error = state
+            .push(
+                "Tool calls: knowledge_search(query=\"referral\", top_k=8)\n\
+                 Tool Result: Knowledge search results: ...\n\
+                 Here are the first-day safety steps.",
+                &sender,
+            )
+            .expect_err("a serialized Tool transcript must be rejected");
+
+        assert!(error.contains("textual Tool intent"));
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_only_delays_suspicious_first_person_openings() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut direct = PlainAnswerStreamState::default();
+
+        direct
+            .push("I can help with that now.", &sender)
+            .expect("a direct first-person answer should stream");
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().unwrap()),
+            "I can help with that now."
+        );
+
+        let mut suspicious_but_benign = PlainAnswerStreamState::default();
+        suspicious_but_benign
+            .push("Let me explain the result directly.", &sender)
+            .expect("a suspicious opening should be quarantined, not rejected");
+        assert!(delta_rx.try_recv().is_err());
+        suspicious_but_benign
+            .finish(&sender)
+            .expect("benign prose should be released once complete");
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().unwrap()),
+            "Let me explain the result directly."
+        );
+    }
+
+    #[test]
     fn plain_answer_safety_handles_incomplete_benign_code_fences_without_recursion() {
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
         let sender = Some(delta_tx);
@@ -8053,6 +8208,71 @@ mod tests {
             .message
             .contains("without a finish terminator"));
         assert!(!partial_error.emitted_any);
+    }
+
+    #[tokio::test]
+    async fn plain_answer_generator_retries_a_quarantined_reasoning_transcript_once() {
+        async fn completion(
+            State(attempts): State<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> impl IntoResponse {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let body = if attempt == 0 {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"I have enough context. Let me search once more. \"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Tool calls: knowledge_search(query=\\\"referral\\\")\\nTool Result: results\\nHere is the answer.\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            } else {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Here are the first-day safety steps.\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            };
+            ([("content-type", "text/event-stream")], body)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_attempts),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "give safety steps".to_string(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let answer = generator
+            .generate(&prompt, "test-model", Some(delta_tx), None)
+            .await
+            .expect("the clean retry should succeed");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(answer, "Here are the first-day safety steps.");
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+        assert_eq!(deltas.concat(), answer);
     }
 
     struct OneToolPlanner {
