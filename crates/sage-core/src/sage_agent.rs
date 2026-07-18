@@ -879,9 +879,20 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
 
     let lowercase = candidate.to_ascii_lowercase();
     if let Some(tool_calls_start) = lowercase.find("tool calls:") {
+        let preamble = &lowercase[..tool_calls_start];
         let transcript = &lowercase[tool_calls_start + "tool calls:".len()..];
         let first_line = transcript.lines().next().unwrap_or(transcript);
-        if first_line.contains('(') || first_line.contains('{') {
+        let has_invocation = first_line.contains('(') || first_line.contains('{');
+        let has_deliberation_preamble = [
+            "let me ",
+            "i'll search",
+            "i will search",
+            "i need to ",
+            "i should ",
+        ]
+        .iter()
+        .any(|marker| preamble.contains(marker));
+        if has_invocation && (has_deliberation_preamble || transcript.contains("tool result:")) {
             return true;
         }
     }
@@ -1990,6 +2001,9 @@ mod tests {
         ));
         assert!(!has_syntactic_tool_intent(
             "The Activity panel labels these sections Tool calls: and Tool Result: so you can audit the turn."
+        ));
+        assert!(!has_syntactic_tool_intent(
+            "For example, the Activity panel may show Tool calls: knowledge_search(query=\"referral\")."
         ));
     }
 
