@@ -748,10 +748,13 @@ struct InternalDocumentSearchResponse {
 #[derive(Clone, Debug, Serialize)]
 struct InternalResourceSearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     help_type: Option<String>,
     jurisdiction: Option<String>,
     language: Option<String>,
     limit: i32,
+    offset: i32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -779,9 +782,23 @@ struct ResourceRecord {
 struct InternalResourceSearchResponse {
     resources: Vec<ResourceRecord>,
     #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
     resolved_country_code: Option<String>,
     #[serde(default)]
     help_type: Option<String>,
+    #[serde(default)]
+    total_count: usize,
+    #[serde(default)]
+    returned_count: usize,
+    #[serde(default)]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    next_offset: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2020,7 +2037,7 @@ impl Tool for FindResourcesTool {
     }
 
     fn args_schema(&self) -> &str {
-        r#"{"help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es"}"#
+        r#"{"query":"optional organization name or exact contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es","offset":"optional continuation offset from a previous result page"}"#
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -2031,15 +2048,21 @@ impl Tool for FindResourcesTool {
             .map(str::to_string)
             .or_else(|| self.jurisdiction.clone());
         let language = tool_string_arg(args, "language").map(str::to_string);
+        let query = tool_string_arg(args, "query")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let offset: i32 = tool_parse_arg(args, "offset").unwrap_or(0).max(0);
         let is_inventory_lookup = help_type.is_none();
 
         let response = self
             .internal
             .resources_search(&InternalResourceSearchRequest {
+                query: query.clone(),
                 help_type: help_type.clone(),
                 jurisdiction: region.clone(),
                 language,
                 limit: if is_inventory_lookup { 10 } else { 5 },
+                offset,
             })
             .await?;
         let response_help_type = response
@@ -2063,8 +2086,13 @@ impl Tool for FindResourcesTool {
                 None => format!("{} resources", response_help_type),
             }
         };
+        let trace_query = if let Some(query) = response.query.as_deref().or(query.as_deref()) {
+            format!("{} matching {}", trace_query, query)
+        } else {
+            trace_query
+        };
 
-        if response.resources.is_empty() {
+        if response.resources.is_empty() && response.total_count == 0 {
             let where_label = response_region.unwrap_or("the requested region");
             let empty_summary = if is_inventory_lookup {
                 "No ready curated resources were found."
@@ -2105,16 +2133,42 @@ impl Tool for FindResourcesTool {
                 } else {
                     "Found vetted curated resources for the answer.".to_string()
                 }),
-                warnings: Vec::new(),
+                warnings: if response.has_more {
+                    vec!["curated_resources_truncated".to_string()]
+                } else {
+                    Vec::new()
+                },
                 guarded: false,
             });
         }
 
-        let mut output = if is_inventory_lookup {
+        let mut output = format!(
+            "Showing {} of {} matching ready Curated Resources (offset {}, limit {}).\n",
+            response.returned_count.max(response.resources.len()),
+            response.total_count.max(response.resources.len()),
+            response.offset.max(offset as usize),
+            response.limit.max(if is_inventory_lookup { 10 } else { 5 }),
+        );
+        if response.has_more {
+            if let Some(next_offset) = response.next_offset {
+                output.push_str(&format!(
+                    "more results are available; continue with next offset {}.\n",
+                    next_offset
+                ));
+            } else {
+                output.push_str("more results are available; ask for the next page.\n");
+            }
+        } else {
+            output.push_str(
+                "This is the complete set of matching ready Curated Resources for the supplied filters.\n",
+            );
+        }
+        output.push('\n');
+        output.push_str(&if is_inventory_lookup {
             "Available curated resources".to_string()
         } else {
             format!("Trusted {} resources", response_help_type)
-        };
+        });
         if let Some(region) = response_region {
             output.push_str(&format!(" for {}", region));
         }
@@ -6162,7 +6216,7 @@ impl<'a> EnclaveWebRuntimeProfile<'a> {
         }
         if self.include_curated_resources_tool {
             instruction.push_str(
-                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Only share contact details returned by find_resources.\n",
+                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- For contact follow-ups (email, phone, website/URL, address, secure channel, or equivalent wording), make a fresh find_resources call when enabled and use only its returned contact details; never rely on earlier assistant prose.\n- Do not claim all, every, or a complete list when the Tool reports more results or completeness is unknown. When it reports no more results, scope completeness claims to matching ready Curated Resources and the supplied filters.\n- Only share contact details returned by find_resources.\n",
             );
         }
         instruction.push_str("\nAgent Settings profile:\n");
@@ -9220,7 +9274,14 @@ mod tests {
                                 }
                             ],
                             "resolved_country_code": "MX",
-                            "help_type": "legal"
+                            "help_type": "legal",
+                            "query": "mexico legal aid network",
+                            "total_count": 6,
+                            "returned_count": 1,
+                            "limit": 5,
+                            "offset": 5,
+                            "has_more": true,
+                            "next_offset": 6
                         }))
                     }
                 }
@@ -9249,6 +9310,8 @@ mod tests {
         };
         let args = ToolArgs::from([
             ("help_type".to_string(), json!("legal")),
+            ("query".to_string(), json!("Mexico Legal Aid Network")),
+            ("offset".to_string(), json!(5)),
             ("language".to_string(), json!("es")),
         ]);
 
@@ -9268,6 +9331,11 @@ mod tests {
             .output
             .contains("secure_channel: Signal: +52-555-0100"));
         assert!(result.output.contains("never invent contact details"));
+        assert!(result
+            .output
+            .contains("Showing 1 of 6 matching ready Curated Resources"));
+        assert!(result.output.contains("more results are available"));
+        assert!(result.output.contains("next offset 6"));
 
         let traces = tool.traces.lock().expect("trace sink should lock");
         assert_eq!(traces.len(), 1);
@@ -9285,6 +9353,8 @@ mod tests {
         assert_eq!(payload["help_type"], "legal");
         assert_eq!(payload["jurisdiction"], "Mexico");
         assert_eq!(payload["language"], "es");
+        assert_eq!(payload["query"], "Mexico Legal Aid Network");
+        assert_eq!(payload["offset"], 5);
         assert_eq!(payload["limit"], 5);
     }
 
