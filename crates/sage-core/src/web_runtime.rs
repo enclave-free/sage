@@ -781,23 +781,14 @@ struct ResourceRecord {
 #[derive(Clone, Debug, Deserialize)]
 struct InternalResourceSearchResponse {
     resources: Vec<ResourceRecord>,
-    #[serde(default)]
     query: Option<String>,
-    #[serde(default)]
     resolved_country_code: Option<String>,
-    #[serde(default)]
     help_type: Option<String>,
-    #[serde(default)]
     total_count: usize,
-    #[serde(default)]
     returned_count: usize,
-    #[serde(default)]
     limit: usize,
-    #[serde(default)]
     offset: usize,
-    #[serde(default)]
     has_more: bool,
-    #[serde(default)]
     next_offset: Option<usize>,
 }
 
@@ -2032,8 +2023,11 @@ impl Tool for FindResourcesTool {
          conversation escalates from information to action - when someone needs to be put in \
          touch with a real organization or person who can help. Also use this for inventory \
          questions like 'what resources do you have?' or 'list available resources'; omit \
-         help_type in that case. Referral results are filtered by region and the type of help \
-         needed and ranked from most-local to global."
+         help_type in that case. For any current contact request or follow-up asking for an \
+         email, phone, website/URL, address, secure channel, or equivalent contact detail, \
+         make a fresh find_resources call when enabled and use only its returned contact data. \
+         Referral results are filtered by region and the type of help needed and ranked from \
+         most-local to global."
     }
 
     fn args_schema(&self) -> &str {
@@ -9398,7 +9392,14 @@ mod tests {
                                 }
                             ],
                             "resolved_country_code": null,
-                            "help_type": null
+                            "help_type": null,
+                            "query": null,
+                            "total_count": 1,
+                            "returned_count": 1,
+                            "limit": 10,
+                            "offset": 0,
+                            "has_more": false,
+                            "next_offset": null
                         }))
                     }
                 }
