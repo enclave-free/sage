@@ -104,6 +104,14 @@ Output style:
 - Tool planning returns only the typed Tool decision requested by that stage.
 - Final-answer generation returns only plain user-visible prose, with no messages wrapper, Tool call, or done sentinel.
 "#;
+const CURATED_RESOURCES_CONTACT_POLICY: &str = r#"
+
+=== CURATED RESOURCES CONTACT GROUNDING ===
+- In Tool-planning mode, a current request or follow-up asking for an email, phone number, website or URL, address, secure channel, or equivalent contact detail requires a fresh find_resources decision whenever Curated Resources is enabled. This includes English and Spanish phrasing such as "me puedes dar el email...", "correo electrónico", "teléfono", "sitio web", "dirección", or "canal seguro".
+- Use recent Conversation context to carry the organization, jurisdiction, language, and help type already established into the fresh find_resources arguments. Do not make the user repeat that context unless it is genuinely missing or ambiguous.
+- This is a model-planning requirement inside the existing Model-Driven Tool Loop. Do not add a deterministic intent classifier or router that directly authorizes or executes find_resources.
+- In final-answer mode, current contact details must come from the fresh find_resources result for this turn. Never copy a contact detail solely from earlier assistant prose, memory, or a previous Tool result. If the fresh result has no matching contact, say so honestly and do not invent or reconstruct one.
+"#;
 const ADMIN_ONBOARDING_SURFACE: &str = "admin-onboarding";
 const ADMIN_ONBOARDING_INSTRUCTION: &str = r#"
 
@@ -2026,8 +2034,9 @@ impl Tool for FindResourcesTool {
          help_type in that case. For any current contact request or follow-up asking for an \
          email, phone, website/URL, address, secure channel, or equivalent contact detail, \
          make a fresh find_resources call when enabled and use only its returned contact data. \
-         Referral results are filtered by region and the type of help needed and ranked from \
-         most-local to global."
+         Use recent Conversation context for the organization, jurisdiction, language, and help \
+         type instead of relying on earlier assistant contact prose. Referral results are filtered \
+         by region and the type of help needed and ranked from most-local to global."
     }
 
     fn args_schema(&self) -> &str {
@@ -6210,8 +6219,9 @@ impl<'a> EnclaveWebRuntimeProfile<'a> {
         }
         if self.include_curated_resources_tool {
             instruction.push_str(
-                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- For contact follow-ups (email, phone, website/URL, address, secure channel, or equivalent wording), make a fresh find_resources call when enabled and use only its returned contact details; never rely on earlier assistant prose.\n- Do not claim all, every, or a complete list when the Tool reports more results or completeness is unknown. When it reports no more results, scope completeness claims to matching ready Curated Resources and the supplied filters.\n- Only share contact details returned by find_resources.\n",
+                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Do not claim all, every, or a complete list when the Tool reports more results or completeness is unknown. When it reports no more results, scope completeness claims to matching ready Curated Resources and the supplied filters.\n- Only share contact details returned by find_resources.\n",
             );
+            instruction.push_str(CURATED_RESOURCES_CONTACT_POLICY);
         }
         instruction.push_str("\nAgent Settings profile:\n");
         instruction.push_str(self.compiled_prompt);
@@ -9525,6 +9535,68 @@ mod tests {
         assert!(
             instruction.contains("Final-answer generation returns only plain user-visible prose")
         );
+    }
+
+    #[test]
+    fn curated_resources_contact_followups_require_fresh_grounding_in_both_modes() {
+        let request = ChatRequest {
+            message: "me puedes dar el email de la organización?".to_string(),
+            session_id: Some("session-123".to_string()),
+            conversation_surface: None,
+            tools: vec![CURATED_RESOURCES_TOOL_SET_ID.to_string()],
+            conversation_history: Vec::new(),
+            job_ids: None,
+            conversation_channel: None,
+            client_decrypted_context: None,
+        };
+        let user = InternalAuthContext {
+            id: 7,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: None,
+            email: Some("user@example.test".to_string()),
+            name: None,
+            user_type_id: Some(3),
+            dev_mode: false,
+        };
+
+        let instruction = build_chat_agent_instruction("PROFILE", &request, &user);
+
+        assert!(instruction.contains("fresh find_resources decision"));
+        assert!(instruction.contains("recent Conversation context"));
+        assert!(instruction.contains("organization, jurisdiction, language, and help type"));
+        assert!(instruction.contains("me puedes dar el email"));
+        for contact_kind in [
+            "email",
+            "phone number",
+            "website or URL",
+            "address",
+            "secure channel",
+            "correo electrónico",
+            "teléfono",
+            "sitio web",
+            "dirección",
+            "canal seguro",
+        ] {
+            assert!(
+                instruction.contains(contact_kind),
+                "contact policy should cover {contact_kind}"
+            );
+        }
+        assert!(instruction.contains("earlier assistant prose"));
+        assert!(instruction.contains("no matching contact"));
+
+        let disabled = build_chat_agent_instruction(
+            "PROFILE",
+            &ChatRequest {
+                tools: Vec::new(),
+                ..request
+            },
+            &user,
+        );
+        assert!(!disabled.contains("CURATED RESOURCES CONTACT GROUNDING"));
+        assert!(!disabled.contains("fresh find_resources decision"));
+        assert!(!disabled.contains("me puedes dar el email"));
     }
 
     #[test]
