@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::memory::MemoryManager;
@@ -699,6 +699,97 @@ pub struct ToolResult {
     pub error: Option<String>,
 }
 
+/// Failure categories that the shared Tool executor can safely classify.
+/// Read-only adapters preserve this type through `anyhow` so retry policy does
+/// not depend on parsing provider or backend error strings.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolExecutionError {
+    #[error("connection failure")]
+    Connection,
+    #[error("request timed out")]
+    Timeout,
+    #[error("backend returned HTTP {0}")]
+    HttpStatus(u16),
+    #[error("malformed backend response")]
+    MalformedContract,
+    #[error("tool execution failed: {0}")]
+    Other(String),
+}
+
+/// Explicit retry/timeout contract for a Tool. The default is no retry; only
+/// read-only Tools opt into the bounded policy constructors below.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolRetryPolicy {
+    None,
+    ReadOnly {
+        per_attempt_timeout: Duration,
+        max_attempts: u32,
+        total_budget: Duration,
+        backoff: Duration,
+    },
+}
+
+impl ToolRetryPolicy {
+    const MIN_RETRY_ATTEMPT_BUDGET_CAP: Duration = Duration::from_secs(1);
+    pub fn none() -> Self {
+        Self::None
+    }
+
+    pub fn read_only(
+        per_attempt_timeout: Duration,
+        max_attempts: u32,
+        total_budget: Duration,
+    ) -> Self {
+        Self::ReadOnly {
+            per_attempt_timeout,
+            max_attempts: max_attempts.max(1),
+            total_budget,
+            backoff: Duration::from_millis(100),
+        }
+    }
+
+    pub fn curated_resources() -> Self {
+        Self::read_only(Duration::from_secs(5), 2, Duration::from_secs(8))
+    }
+
+    pub fn knowledge_search() -> Self {
+        Self::read_only(Duration::from_secs(35), 2, Duration::from_secs(35))
+    }
+
+    fn attempt_timeout(&self, remaining: Duration) -> Option<Duration> {
+        match self {
+            Self::None => None,
+            Self::ReadOnly {
+                per_attempt_timeout,
+                ..
+            } => Some((*per_attempt_timeout).min(remaining)),
+        }
+    }
+
+    fn can_retry(&self, attempt: u32, remaining: Duration) -> bool {
+        match self {
+            Self::None => false,
+            Self::ReadOnly {
+                per_attempt_timeout,
+                max_attempts,
+                backoff,
+                ..
+            } => {
+                attempt < *max_attempts
+                    && remaining
+                        > *backoff + (*per_attempt_timeout).min(Self::MIN_RETRY_ATTEMPT_BUDGET_CAP)
+            }
+        }
+    }
+
+    fn backoff(&self) -> Duration {
+        match self {
+            Self::None => Duration::ZERO,
+            Self::ReadOnly { backoff, .. } => *backoff,
+        }
+    }
+}
+
 impl ToolResult {
     pub fn success(output: impl Into<String>) -> Self {
         Self {
@@ -723,6 +814,9 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn args_schema(&self) -> &str;
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        ToolRetryPolicy::None
+    }
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult>;
 }
 
@@ -957,6 +1051,20 @@ pub enum AgentTraceEvent {
         planning_round: usize,
         attempt: u32,
         status: String,
+        elapsed_ms: u128,
+    },
+    ToolRetryScheduled {
+        call_id: String,
+        tool_name: String,
+        planning_round: usize,
+        attempt: u32,
+        reason: String,
+    },
+    ToolTimedOut {
+        call_id: String,
+        tool_name: String,
+        planning_round: usize,
+        attempt: u32,
         elapsed_ms: u128,
     },
     ModelStepStarted {
@@ -1557,46 +1665,11 @@ impl SageAgent {
     pub async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
         let mut executed_tools = Vec::new();
         for tool_call in &decision.tool_calls {
-            let started_at = Instant::now();
             let call_id = format!("tool-call-{}", Uuid::new_v4().simple());
             let planning_round = decision.planning_round;
-            let attempt = 1;
-            self.emit_trace(AgentTraceEvent::ToolAttempted {
-                call_id: call_id.clone(),
-                tool_name: tool_call.name.clone(),
-                planning_round,
-                attempt,
-            });
-            let result = if let Some(tool) = self.tools.get(&tool_call.name) {
-                match tool.execute(&tool_call.args).await {
-                    Ok(result) => result,
-                    Err(error) => ToolResult::error(error.to_string()),
-                }
-            } else {
-                ToolResult::error(format!("Unknown tool: {}", tool_call.name))
-            };
-            let status = if result.success {
-                "succeeded"
-            } else if tool_call.name == "db_query"
-                && result.error.as_deref().is_some_and(|error| {
-                    let normalized = error.to_ascii_lowercase();
-                    normalized.contains("guard")
-                        || normalized.contains("reject")
-                        || normalized.contains("not allowed")
-                })
-            {
-                "guarded"
-            } else {
-                "failed"
-            };
-            self.emit_trace(AgentTraceEvent::ToolTerminal {
-                call_id,
-                tool_name: tool_call.name.clone(),
-                planning_round,
-                attempt,
-                status: status.to_string(),
-                elapsed_ms: started_at.elapsed().as_millis(),
-            });
+            let result = self
+                .execute_tool_call(&call_id, planning_round, tool_call)
+                .await;
             self.inject_tool_result(tool_call, &result);
             executed_tools.push(ExecutedTool {
                 tool_call: tool_call.clone(),
@@ -1610,6 +1683,170 @@ impl SageAgent {
             executed_tools,
             done: decision.tool_calls.is_empty(),
         }
+    }
+
+    async fn execute_tool_call(
+        &self,
+        call_id: &str,
+        planning_round: usize,
+        tool_call: &ToolCall,
+    ) -> ToolResult {
+        let Some(tool) = self.tools.get(&tool_call.name) else {
+            self.emit_trace(AgentTraceEvent::ToolAttempted {
+                call_id: call_id.to_string(),
+                tool_name: tool_call.name.clone(),
+                planning_round,
+                attempt: 1,
+            });
+            let result = ToolResult::error(format!("Unknown tool: {}", tool_call.name));
+            self.emit_trace(AgentTraceEvent::ToolTerminal {
+                call_id: call_id.to_string(),
+                tool_name: tool_call.name.clone(),
+                planning_round,
+                attempt: 1,
+                status: "failed".to_string(),
+                elapsed_ms: 0,
+            });
+            return result;
+        };
+
+        let policy = tool.retry_policy();
+        let call_started_at = Instant::now();
+        let mut attempt = 1;
+        let (result, terminal_status, elapsed_ms) = loop {
+            self.emit_trace(AgentTraceEvent::ToolAttempted {
+                call_id: call_id.to_string(),
+                tool_name: tool_call.name.clone(),
+                planning_round,
+                attempt,
+            });
+
+            let elapsed = call_started_at.elapsed();
+            let remaining = match &policy {
+                ToolRetryPolicy::None => Duration::from_secs(365 * 24 * 60 * 60),
+                ToolRetryPolicy::ReadOnly { total_budget, .. } => {
+                    total_budget.saturating_sub(elapsed)
+                }
+            };
+            let attempt_started_at = Instant::now();
+            let mut timeout_event_emitted = false;
+            let execution = if let Some(timeout) = policy.attempt_timeout(remaining) {
+                match tokio::time::timeout(timeout, tool.execute(&tool_call.args)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let elapsed_ms = attempt_started_at.elapsed().as_millis();
+                        timeout_event_emitted = true;
+                        self.emit_trace(AgentTraceEvent::ToolTimedOut {
+                            call_id: call_id.to_string(),
+                            tool_name: tool_call.name.clone(),
+                            planning_round,
+                            attempt,
+                            elapsed_ms,
+                        });
+                        Err(anyhow::Error::new(ToolExecutionError::Timeout))
+                    }
+                }
+            } else {
+                tool.execute(&tool_call.args).await
+            };
+
+            let elapsed_ms = call_started_at.elapsed().as_millis();
+            match execution {
+                Ok(result) => {
+                    let status = if result.success {
+                        "succeeded"
+                    } else if tool_call.name == "db_query"
+                        && result.error.as_deref().is_some_and(|error| {
+                            let normalized = error.to_ascii_lowercase();
+                            normalized.contains("guard")
+                                || normalized.contains("reject")
+                                || normalized.contains("not allowed")
+                        })
+                    {
+                        "guarded"
+                    } else {
+                        "failed"
+                    };
+                    break (result, status.to_string(), elapsed_ms);
+                }
+                Err(error) => {
+                    let owned_failure;
+                    let failure = if let Some(failure) = error.downcast_ref::<ToolExecutionError>()
+                    {
+                        failure
+                    } else {
+                        owned_failure = ToolExecutionError::Other(error.to_string());
+                        &owned_failure
+                    };
+                    let reason = match failure {
+                        ToolExecutionError::Connection => "connection_failure",
+                        ToolExecutionError::Timeout => "timeout",
+                        ToolExecutionError::HttpStatus(status) => match *status {
+                            502 => "http_502",
+                            503 => "http_503",
+                            504 => "http_504",
+                            _ => "http_failure",
+                        },
+                        ToolExecutionError::MalformedContract => "malformed_contract",
+                        ToolExecutionError::Other(_) => "non_retryable_failure",
+                    };
+                    let retryable = matches!(
+                        failure,
+                        ToolExecutionError::Connection
+                            | ToolExecutionError::Timeout
+                            | ToolExecutionError::HttpStatus(502..=504)
+                    );
+                    if matches!(failure, ToolExecutionError::Timeout) && !timeout_event_emitted {
+                        let attempt_elapsed_ms = attempt_started_at.elapsed().as_millis();
+                        self.emit_trace(AgentTraceEvent::ToolTimedOut {
+                            call_id: call_id.to_string(),
+                            tool_name: tool_call.name.clone(),
+                            planning_round,
+                            attempt,
+                            elapsed_ms: attempt_elapsed_ms,
+                        });
+                    }
+                    let remaining = match &policy {
+                        ToolRetryPolicy::None => Duration::ZERO,
+                        ToolRetryPolicy::ReadOnly { total_budget, .. } => {
+                            total_budget.saturating_sub(call_started_at.elapsed())
+                        }
+                    };
+                    if retryable && policy.can_retry(attempt, remaining) {
+                        self.emit_trace(AgentTraceEvent::ToolRetryScheduled {
+                            call_id: call_id.to_string(),
+                            tool_name: tool_call.name.clone(),
+                            planning_round,
+                            attempt,
+                            reason: reason.to_string(),
+                        });
+                        tokio::time::sleep(policy.backoff()).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    let terminal_status = if matches!(failure, ToolExecutionError::Timeout) {
+                        "timed_out"
+                    } else {
+                        "failed"
+                    };
+                    break (
+                        ToolResult::error(error.to_string()),
+                        terminal_status.to_string(),
+                        elapsed_ms,
+                    );
+                }
+            }
+        };
+
+        self.emit_trace(AgentTraceEvent::ToolTerminal {
+            call_id: call_id.to_string(),
+            tool_name: tool_call.name.clone(),
+            planning_round,
+            attempt,
+            status: terminal_status,
+            elapsed_ms,
+        });
+        result
     }
 
     fn planning_input_content(&self, user_message: &str, is_first_plan: bool) -> String {
@@ -2073,21 +2310,9 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
                 tool_call.args
             );
 
-            let result = if let Some(tool) = self.tools.get(&tool_call.name) {
-                match tool.execute(&tool_call.args).await {
-                    Ok(result) => {
-                        tracing::debug!("Tool {} result: {:?}", tool_call.name, result);
-                        result
-                    }
-                    Err(e) => {
-                        tracing::error!("Tool {} error: {}", tool_call.name, e);
-                        ToolResult::error(e.to_string())
-                    }
-                }
-            } else {
-                tracing::warn!("Unknown tool: {}", tool_call.name);
-                ToolResult::error(format!("Unknown tool: {}", tool_call.name))
-            };
+            let call_id = format!("tool-call-{}", Uuid::new_v4().simple());
+            let result = self.execute_tool_call(&call_id, 0, tool_call).await;
+            tracing::debug!("Tool {} result: {:?}", tool_call.name, result);
 
             // Inject into current request cycle (for multi-step reasoning)
             self.inject_tool_result(tool_call, &result);
@@ -2210,6 +2435,7 @@ impl ToolPlanner for SageAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn curated_resource_expectation_is_conservative_and_bilingual() {
@@ -2441,5 +2667,379 @@ mod tests {
                 "error should name the failing function: {error}"
             );
         }
+    }
+
+    struct ScriptedRetryTool {
+        policy: ToolRetryPolicy,
+        outcomes: Arc<Mutex<std::collections::VecDeque<Result<ToolResult>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ScriptedRetryTool {
+        fn name(&self) -> &str {
+            "scripted_lookup"
+        }
+
+        fn description(&self) -> &str {
+            "test-only scripted lookup"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        fn retry_policy(&self) -> ToolRetryPolicy {
+            self.policy.clone()
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            self.outcomes
+                .lock()
+                .expect("scripted outcomes should lock")
+                .pop_front()
+                .expect("test should provide a scripted outcome")
+        }
+    }
+
+    struct DelayedTypedTimeoutTool {
+        attempt: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DelayedTypedTimeoutTool {
+        fn name(&self) -> &str {
+            "delayed_timeout_lookup"
+        }
+
+        fn description(&self) -> &str {
+            "test-only delayed timeout lookup"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        fn retry_policy(&self) -> ToolRetryPolicy {
+            ToolRetryPolicy::read_only(Duration::from_millis(100), 2, Duration::from_millis(500))
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            match self
+                .attempt
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            {
+                0 => Err(anyhow::Error::new(ToolExecutionError::HttpStatus(503))),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Err(anyhow::Error::new(ToolExecutionError::Timeout))
+                }
+                _ => Ok(ToolResult::success("recovered")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_retry_reuses_call_correlation_and_emits_one_terminal() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Err(anyhow::Error::new(ToolExecutionError::HttpStatus(503))),
+            Ok(ToolResult::success("recovered")),
+        ])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::read_only(
+                Duration::from_millis(50),
+                2,
+                Duration::from_millis(200),
+            ),
+            outcomes,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            event_sink
+                .lock()
+                .expect("event sink should lock")
+                .push(event);
+        }));
+
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 4,
+            })
+            .await;
+
+        assert!(result.executed_tools[0].result.success);
+        let events = events.lock().expect("event sink should lock");
+        let attempted = events
+            .iter()
+            .filter(|event| matches!(event, AgentTraceEvent::ToolAttempted { .. }))
+            .count();
+        let retries = events
+            .iter()
+            .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+            .count();
+        let terminals = events
+            .iter()
+            .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+            .count();
+        assert_eq!(attempted, 2);
+        assert_eq!(retries, 1);
+        assert_eq!(terminals, 1);
+        let call_ids = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentTraceEvent::ToolAttempted { call_id, .. }
+                | AgentTraceEvent::ToolTerminal { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(call_ids.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[tokio::test]
+    async fn state_changing_default_policy_never_retries() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([Err(
+            anyhow::Error::new(ToolExecutionError::HttpStatus(503)),
+        )])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::none(),
+            outcomes: outcomes.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            event_sink
+                .lock()
+                .expect("event sink should lock")
+                .push(event);
+        }));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(!result.executed_tools[0].result.success);
+        assert_eq!(outcomes.lock().expect("outcomes should lock").len(), 0);
+        let events = events.lock().expect("event sink should lock");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolAttempted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn read_only_policies_keep_the_issue_budgets() {
+        assert_eq!(
+            ToolRetryPolicy::curated_resources(),
+            ToolRetryPolicy::read_only(Duration::from_secs(5), 2, Duration::from_secs(8))
+        );
+        assert_eq!(
+            ToolRetryPolicy::knowledge_search(),
+            ToolRetryPolicy::read_only(Duration::from_secs(35), 2, Duration::from_secs(35))
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_is_skipped_when_only_backoff_budget_remains() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Err(anyhow::Error::new(ToolExecutionError::HttpStatus(503))),
+            Ok(ToolResult::success("should not run")),
+        ])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::read_only(
+                Duration::from_millis(50),
+                2,
+                Duration::from_millis(150),
+            ),
+            outcomes: outcomes.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(!result.executed_tools[0].result.success);
+        assert_eq!(outcomes.lock().expect("outcomes should lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_failure_retries_once_with_privacy_safe_reason() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Err(anyhow::Error::new(ToolExecutionError::Connection)),
+            Ok(ToolResult::success("recovered")),
+        ])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::read_only(
+                Duration::from_millis(50),
+                2,
+                Duration::from_millis(500),
+            ),
+            outcomes,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(result.executed_tools[0].result.success);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolAttempted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+        let retry = events.iter().find_map(|event| match event {
+            AgentTraceEvent::ToolRetryScheduled { reason, .. } => Some(reason.as_str()),
+            _ => None,
+        });
+        assert_eq!(retry, Some("connection_failure"));
+    }
+
+    #[tokio::test]
+    async fn typed_timeout_emits_one_timeout_event_before_retry() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Err(anyhow::Error::new(ToolExecutionError::Timeout)),
+            Ok(ToolResult::success("recovered")),
+        ])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::read_only(
+                Duration::from_millis(50),
+                2,
+                Duration::from_millis(500),
+            ),
+            outcomes,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(result.executed_tools[0].result.success);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTimedOut { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_timeout_trace_duration_is_scoped_to_attempt() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DelayedTypedTimeoutTool {
+            attempt: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "delayed_timeout_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(!result.executed_tools[0].result.success);
+        let events = events.lock().unwrap();
+        let timeout_ms = events.iter().find_map(|event| match event {
+            AgentTraceEvent::ToolTimedOut {
+                attempt: 2,
+                elapsed_ms,
+                ..
+            } => Some(*elapsed_ms),
+            _ => None,
+        });
+        let terminal_ms = events.iter().find_map(|event| match event {
+            AgentTraceEvent::ToolTerminal { elapsed_ms, .. } => Some(*elapsed_ms),
+            _ => None,
+        });
+        assert!(timeout_ms.is_some());
+        assert!(terminal_ms.is_some_and(|terminal| terminal > timeout_ms.unwrap() + 50));
     }
 }

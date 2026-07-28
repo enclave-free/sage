@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Context, Result};
+#[cfg(test)]
+use axum::body::{Body, Bytes};
 use axum::{
     extract::{Path, Query, State},
     http::{
@@ -32,6 +34,8 @@ use std::convert::Infallible;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, warn};
@@ -44,7 +48,8 @@ use crate::sage_agent::StepResult;
 use crate::sage_agent::{
     expects_curated_resource_lookup, has_syntactic_tool_intent, tool_parse_arg, tool_string_arg,
     AgentTraceEvent, ExecutedTool, PlainAnswerPrompt, ProviderReasoningTraceHook, SageAgent, Tool,
-    ToolArgs, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
+    ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
+    ToolRetryPolicy,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -1148,7 +1153,7 @@ impl InternalAgentClient {
             ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(payload);
-        self.send_json(request).await
+        self.send_read_only_tool_json(request).await
     }
 
     async fn resources_search(
@@ -1163,7 +1168,7 @@ impl InternalAgentClient {
             ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(payload);
-        self.send_json(request).await
+        self.send_read_only_tool_json(request).await
     }
 
     async fn admin_db_query(&self, sql: &str) -> Result<Value> {
@@ -1275,6 +1280,38 @@ impl InternalAgentClient {
             return Err(anyhow!("backend returned {}: {}", status, body));
         }
         Ok(response.json::<T>().await?)
+    }
+
+    async fn send_read_only_tool_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T> {
+        let response = request.send().await.map_err(|error| {
+            if error.is_connect() {
+                anyhow::Error::new(ToolExecutionError::Connection)
+            } else if error.is_timeout() {
+                anyhow::Error::new(ToolExecutionError::Timeout)
+            } else {
+                anyhow::Error::new(ToolExecutionError::Other(
+                    "internal read request failed".to_string(),
+                ))
+            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
+                status.as_u16(),
+            )));
+        }
+        let body = response.bytes().await.map_err(|error| {
+            if error.is_timeout() {
+                anyhow::Error::new(ToolExecutionError::Timeout)
+            } else {
+                anyhow::Error::new(ToolExecutionError::Connection)
+            }
+        })?;
+        serde_json::from_slice::<T>(&body)
+            .map_err(|_| anyhow::Error::new(ToolExecutionError::MalformedContract))
     }
 
     async fn send_value(&self, request: reqwest::RequestBuilder) -> Result<Value> {
@@ -1508,6 +1545,44 @@ fn log_agent_trace_event(
             outcome = %status,
             duration_ms = *elapsed_ms,
         ),
+        AgentTraceEvent::ToolRetryScheduled {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            reason,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_execution_retry",
+            conversation_id = %conversation_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "retry",
+            call_id = %call_id,
+            tool_name = %tool_name,
+            round = *planning_round,
+            attempt = *attempt,
+            reason = %reason,
+        ),
+        AgentTraceEvent::ToolTimedOut {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            elapsed_ms,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_execution_timeout",
+            conversation_id = %conversation_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "timeout",
+            call_id = %call_id,
+            tool_name = %tool_name,
+            round = *planning_round,
+            attempt = *attempt,
+            duration_ms = *elapsed_ms,
+        ),
         _ => {}
     }
 }
@@ -1589,7 +1664,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             planning_round,
             attempt,
         } => ConversationTraceDeltaResponse {
-            id: format!("{}-attempted", call_id),
+            id: format!("{}-attempted-{}", call_id, attempt),
             kind: "tool_call".to_string(),
             title: Some(tool_trace_title(&tool_name)),
             content: Some(format!("{} call attempted.", tool_trace_title(&tool_name))),
@@ -1621,6 +1696,54 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             tool_name: Some(tool_name),
             status: Some(status),
             metadata: json!({ "phase": "terminal", "call_id": call_id, "round": planning_round, "attempt": attempt, "duration_ms": elapsed_ms }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ToolRetryScheduled {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            reason,
+        } => ConversationTraceDeltaResponse {
+            id: format!("{}-retry-{}", call_id, attempt),
+            kind: "tool_retry".to_string(),
+            title: Some(tool_trace_title(&tool_name)),
+            content: Some(format!(
+                "Retrying {} after attempt {}.",
+                tool_trace_title(&tool_name),
+                attempt
+            )),
+            tool_name: Some(tool_name),
+            status: Some("running".to_string()),
+            metadata: json!({
+                "phase": "retry",
+                "call_id": call_id,
+                "round": planning_round,
+                "attempt": attempt,
+                "reason": reason,
+            }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ToolTimedOut {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            elapsed_ms,
+        } => ConversationTraceDeltaResponse {
+            id: format!("{}-timeout-{}", call_id, attempt),
+            kind: "timeout".to_string(),
+            title: Some(tool_trace_title(&tool_name)),
+            content: Some(format!("{} timed out.", tool_trace_title(&tool_name))),
+            tool_name: Some(tool_name),
+            status: Some("timed_out".to_string()),
+            metadata: json!({
+                "phase": "timeout",
+                "call_id": call_id,
+                "round": planning_round,
+                "attempt": attempt,
+                "duration_ms": elapsed_ms,
+            }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
         AgentTraceEvent::ModelStepStarted { step, attempt } => ConversationTraceDeltaResponse {
@@ -1981,6 +2104,10 @@ impl Tool for KnowledgeSearchTool {
         r#"{"query":"search query","top_k":"optional result count"}"#
     }
 
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        ToolRetryPolicy::knowledge_search()
+    }
+
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
         let query = tool_string_arg(args, "query")
             .map(str::to_string)
@@ -2064,6 +2191,10 @@ impl Tool for FindResourcesTool {
 
     fn args_schema(&self) -> &str {
         r#"{"query":"optional organization name or exact contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es","offset":"optional continuation offset from a previous result page"}"#
+    }
+
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        ToolRetryPolicy::curated_resources()
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -6911,11 +7042,18 @@ fn conversation_activity_steps_from_trace_deltas(
         .filter(|delta| {
             matches!(
                 delta.kind.as_str(),
-                "tool_selection_observation" | "tool_call" | "tool_result"
+                "tool_selection_observation"
+                    | "tool_call"
+                    | "tool_result"
+                    | "tool_retry"
+                    | "timeout"
             )
         })
         .map(|delta| {
-            if matches!(delta.kind.as_str(), "tool_call" | "tool_result") {
+            if matches!(
+                delta.kind.as_str(),
+                "tool_call" | "tool_result" | "tool_retry" | "timeout"
+            ) {
                 return ConversationActivityStepResponse {
                     id: format!("activity-{}", delta.id),
                     kind: "tool".to_string(),
@@ -7994,7 +8132,7 @@ fn auth_error(error: anyhow::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sage_agent::ToolDecision;
+    use crate::sage_agent::{ToolCall, ToolDecision};
     use flate2::{write::ZlibEncoder, Compression};
     use itsdangerous::{default_builder, timed_serializer_with_signer, TimestampSigner};
     use serde_json::json;
@@ -8994,6 +9132,8 @@ mod tests {
         case: ContactReplayCase,
         two_turn: bool,
         omit_tool_selection: bool,
+        transient_resource_failure: bool,
+        truncated_resource_failure: bool,
     }
 
     #[derive(Clone)]
@@ -9139,13 +9279,34 @@ mod tests {
     async fn contact_replay_resources(
         State(state): State<ContactReplayState>,
         Json(body): Json<Value>,
-    ) -> Json<Value> {
+    ) -> Response {
         let resource_index = {
             let mut requests = state.resource_requests.lock().unwrap();
             let index = requests.len();
             requests.push(body);
             index
         };
+        if state.transient_resource_failure && resource_index == 0 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient resource failure",
+            )
+                .into_response();
+        }
+        if state.truncated_resource_failure && resource_index == 0 {
+            let stream = futures_util::stream::iter(vec![
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{")),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "simulated truncated response",
+                )),
+            ]);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(stream))
+                .expect("truncated response should build");
+        }
         if state.empty_resource {
             return Json(json!({
                 "resources": [],
@@ -9158,7 +9319,8 @@ mod tests {
                 "offset": 0,
                 "has_more": false,
                 "next_offset": null
-            }));
+            }))
+            .into_response();
         }
         let contact_value = if state.two_turn && resource_index == 0 {
             state.case.stale_contact_value()
@@ -9189,6 +9351,7 @@ mod tests {
             "has_more": false,
             "next_offset": null
         }))
+        .into_response()
     }
 
     async fn spawn_contact_replay_servers(
@@ -9196,6 +9359,8 @@ mod tests {
         case: ContactReplayCase,
         two_turn: bool,
         omit_tool_selection: bool,
+        transient_resource_failure: bool,
+        truncated_resource_failure: bool,
     ) -> (ContactReplayState, String, String) {
         let state = ContactReplayState {
             empty_resource,
@@ -9205,6 +9370,8 @@ mod tests {
             resource_requests: Arc::new(Mutex::new(Vec::new())),
             two_turn,
             omit_tool_selection,
+            transient_resource_failure,
+            truncated_resource_failure,
         };
         let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -9266,6 +9433,8 @@ mod tests {
         case: ContactReplayCase,
         two_turn: bool,
         omit_tool_selection: bool,
+        transient_resource_failure: bool,
+        truncated_resource_failure: bool,
     ) -> (
         String,
         ContactReplayState,
@@ -9277,6 +9446,8 @@ mod tests {
             case.clone(),
             two_turn,
             omit_tool_selection,
+            transient_resource_failure,
+            truncated_resource_failure,
         )
         .await;
         let mut registry = ToolRegistry::new();
@@ -9390,7 +9561,17 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let spanish_email = ContactReplayCase::spanish_email();
         let (batch_answer, batch_state, batch_deltas, batch_trace_deltas) =
-            run_real_contact_replay(false, false, true, spanish_email.clone(), true, false).await;
+            run_real_contact_replay(
+                false,
+                false,
+                true,
+                spanish_email.clone(),
+                true,
+                false,
+                false,
+                false,
+            )
+            .await;
         assert_eq!(
             batch_answer,
             "The current Resource Directory contact is fresh@example.test."
@@ -9453,7 +9634,17 @@ mod tests {
         assert!(!batch_answer.contains("stale@example.test"));
 
         let (stream_answer, stream_state, stream_deltas, stream_trace_deltas) =
-            run_real_contact_replay(false, true, true, spanish_email.clone(), true, false).await;
+            run_real_contact_replay(
+                false,
+                true,
+                true,
+                spanish_email.clone(),
+                true,
+                false,
+                false,
+                false,
+            )
+            .await;
         assert_eq!(stream_answer, batch_answer);
         assert_eq!(stream_deltas.concat(), stream_answer);
         assert!(stream_trace_deltas
@@ -9476,8 +9667,17 @@ mod tests {
             contact_key: "phone".to_string(),
             contact_value: "+52-555-0100".to_string(),
         };
-        let (phone_answer, phone_state, _, _) =
-            run_real_contact_replay(false, false, true, english_phone.clone(), true, false).await;
+        let (phone_answer, phone_state, _, _) = run_real_contact_replay(
+            false,
+            false,
+            true,
+            english_phone.clone(),
+            true,
+            false,
+            false,
+            false,
+        )
+        .await;
         assert_eq!(
             phone_answer,
             "The current Resource Directory contact is +52-555-0100."
@@ -9532,8 +9732,17 @@ mod tests {
         ];
         for (index, case) in modality_cases.into_iter().enumerate() {
             let stream = index % 2 == 0;
-            let (answer, state, deltas, trace_deltas) =
-                run_real_contact_replay(false, stream, true, case.clone(), true, false).await;
+            let (answer, state, deltas, trace_deltas) = run_real_contact_replay(
+                false,
+                stream,
+                true,
+                case.clone(),
+                true,
+                false,
+                false,
+                false,
+            )
+            .await;
             assert_eq!(
                 answer,
                 format!(
@@ -9559,13 +9768,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_contact_replay_retry_trace_preserves_attempt_order_and_call_id() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let case = ContactReplayCase::spanish_email();
+        for stream in [false, true] {
+            let (answer, state, answer_deltas, trace_deltas) = run_real_contact_replay(
+                false,
+                stream,
+                true,
+                case.clone(),
+                false,
+                false,
+                true,
+                false,
+            )
+            .await;
+            assert_eq!(
+                answer,
+                "The current Resource Directory contact is fresh@example.test."
+            );
+            if stream {
+                assert_eq!(answer_deltas.concat(), answer);
+            } else {
+                assert!(answer_deltas.is_empty());
+            }
+            assert_eq!(state.resource_requests.lock().unwrap().len(), 2);
+
+            let lifecycle = trace_deltas
+                .iter()
+                .filter(|delta| {
+                    matches!(
+                        delta.kind.as_str(),
+                        "tool_call" | "tool_retry" | "tool_result" | "timeout"
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                lifecycle
+                    .iter()
+                    .map(|delta| delta.kind.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["tool_call", "tool_retry", "tool_call", "tool_result"]
+            );
+            assert_eq!(
+                lifecycle[0].metadata["call_id"],
+                lifecycle[1].metadata["call_id"]
+            );
+            assert_eq!(
+                lifecycle[1].metadata["call_id"],
+                lifecycle[2].metadata["call_id"]
+            );
+            assert_eq!(
+                lifecycle[2].metadata["call_id"],
+                lifecycle[3].metadata["call_id"]
+            );
+            assert_eq!(lifecycle[0].metadata["attempt"], json!(1));
+            assert_eq!(lifecycle[1].metadata["attempt"], json!(1));
+            assert_eq!(lifecycle[2].metadata["attempt"], json!(2));
+            assert_eq!(lifecycle[3].metadata["attempt"], json!(2));
+            assert_ne!(lifecycle[0].id, lifecycle[2].id);
+            assert_eq!(lifecycle[3].status.as_deref(), Some("succeeded"));
+        }
+    }
+
+    #[tokio::test]
     async fn real_contact_replay_is_honest_for_empty_results_and_disabled_resources() {
         let _guard = contact_replay_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let default_case = ContactReplayCase::spanish_email();
-        let (empty_answer, empty_state, _, empty_trace_deltas) =
-            run_real_contact_replay(true, false, true, default_case.clone(), false, false).await;
+        let (empty_answer, empty_state, _, empty_trace_deltas) = run_real_contact_replay(
+            true,
+            false,
+            true,
+            default_case.clone(),
+            false,
+            false,
+            false,
+            false,
+        )
+        .await;
         assert_eq!(
             empty_answer,
             "No matching current contact is currently listed."
@@ -9582,8 +9866,17 @@ mod tests {
             .first()
             .is_some_and(|request| request.to_string().contains("No vetted")));
 
-        let (disabled_answer, disabled_state, _, disabled_trace_deltas) =
-            run_real_contact_replay(false, false, false, default_case, false, false).await;
+        let (disabled_answer, disabled_state, _, disabled_trace_deltas) = run_real_contact_replay(
+            false,
+            false,
+            false,
+            default_case,
+            false,
+            false,
+            false,
+            false,
+        )
+        .await;
         assert_eq!(
             disabled_answer,
             "Curated Resources are unavailable for this turn."
@@ -9615,6 +9908,8 @@ mod tests {
             ContactReplayCase::spanish_email(),
             false,
             false,
+            false,
+            false,
         )
         .await;
         assert_eq!(disabled_stream_answer, disabled_answer);
@@ -9640,7 +9935,8 @@ mod tests {
             contact_value: "unused@example.test".to_string(),
         };
         let (benign_answer, benign_state, _, benign_trace_deltas) =
-            run_real_contact_replay(false, false, true, benign_case, false, false).await;
+            run_real_contact_replay(false, false, true, benign_case, false, false, false, false)
+                .await;
         assert_eq!(
             benign_answer,
             "No contact lookup was requested for this turn."
@@ -9667,6 +9963,8 @@ mod tests {
             ContactReplayCase::spanish_email(),
             false,
             true,
+            false,
+            false,
         )
         .await;
         assert!(omitted_state.resource_requests.lock().unwrap().is_empty());
@@ -9690,6 +9988,8 @@ mod tests {
             ContactReplayCase::spanish_email(),
             false,
             true,
+            false,
+            false,
         )
         .await;
         assert!(!omitted_stream_deltas.is_empty());
@@ -9697,6 +9997,112 @@ mod tests {
             delta.kind == "tool_selection_observation"
                 && delta.metadata["missed_expected_curated_resources"] == json!(true)
         }));
+    }
+
+    #[tokio::test]
+    async fn truncated_read_only_response_retries_as_connection_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("truncated endpoint should bind");
+        let address = listener
+            .local_addr()
+            .expect("truncated endpoint address should resolve");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let body = serde_json::to_vec(&json!({
+            "resources": [{
+                "resource_id": "r1",
+                "name": "Trusted Aid",
+                "resource_type": "ngo",
+                "contact": {},
+                "languages": [],
+                "help_types": ["legal"],
+                "verified_at": null
+            }],
+            "query": "aid",
+            "resolved_country_code": "MX",
+            "help_type": "legal",
+            "total_count": 1,
+            "returned_count": 1,
+            "limit": 5,
+            "offset": 0,
+            "has_more": false,
+            "next_offset": null
+        }))
+        .expect("response body should serialize");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("truncated endpoint should accept");
+                let request_number = seen.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                if request_number == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{",
+                        )
+                        .await
+                        .expect("truncated response should write");
+                } else {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket
+                        .write_all(header.as_bytes())
+                        .await
+                        .expect("recovered response headers should write");
+                    socket
+                        .write_all(&body)
+                        .await
+                        .expect("recovered response body should write");
+                }
+            }
+        });
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{address}"),
+                "test-internal-token".to_string(),
+            ),
+            jurisdiction: Some("MX".to_string()),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "find_resources".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        let server_result = tokio::time::timeout(Duration::from_secs(1), server).await;
+        assert!(
+            server_result.is_ok(),
+            "truncated endpoint should receive the retry request"
+        );
+        server_result
+            .expect("truncated endpoint join should complete")
+            .expect("truncated endpoint should finish");
+        assert!(result.executed_tools[0].result.success);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolRetryScheduled { reason, .. }
+                if reason == "connection_failure"
+        )));
     }
 
     #[tokio::test]
@@ -10882,6 +11288,560 @@ mod tests {
         assert_eq!(lifecycle[2].1, lifecycle[3].1);
     }
 
+    struct EndpointLookupTool {
+        url: String,
+        policy: ToolRetryPolicy,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for EndpointLookupTool {
+        fn name(&self) -> &str {
+            "endpoint_lookup"
+        }
+
+        fn description(&self) -> &str {
+            "test endpoint lookup"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        fn retry_policy(&self) -> ToolRetryPolicy {
+            self.policy.clone()
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            let response = reqwest::Client::new()
+                .get(&self.url)
+                .send()
+                .await
+                .map_err(|error| {
+                    if error.is_connect() {
+                        anyhow::Error::new(ToolExecutionError::Connection)
+                    } else if error.is_timeout() {
+                        anyhow::Error::new(ToolExecutionError::Timeout)
+                    } else {
+                        anyhow::Error::new(ToolExecutionError::Other(
+                            "endpoint request failed".to_string(),
+                        ))
+                    }
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
+                    status.as_u16(),
+                )));
+            }
+            let body = response.bytes().await?;
+            let payload = serde_json::from_slice::<Value>(&body)
+                .map_err(|_| anyhow::Error::new(ToolExecutionError::MalformedContract))?;
+            Ok(ToolResult::success(
+                payload.get("output").and_then(Value::as_str).unwrap_or(""),
+            ))
+        }
+    }
+
+    struct WriteConfigTool {
+        url: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for WriteConfigTool {
+        fn name(&self) -> &str {
+            "write_config"
+        }
+
+        fn description(&self) -> &str {
+            "test state-changing write"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            let response = reqwest::Client::new().get(&self.url).send().await?;
+            if !response.status().is_success() {
+                return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
+                    response.status().as_u16(),
+                )));
+            }
+            Ok(ToolResult::success("written"))
+        }
+    }
+
+    async fn run_endpoint_lookup(
+        mode: &'static str,
+        policy: ToolRetryPolicy,
+    ) -> (ToolResult, Vec<AgentTraceEvent>, usize) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let requests = count.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("endpoint listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("endpoint address should resolve");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    get(move || {
+                        let requests = requests.clone();
+                        async move {
+                            let attempt = requests.fetch_add(1, Ordering::SeqCst);
+                            match mode {
+                                "recover" if attempt == 0 => {
+                                    (StatusCode::SERVICE_UNAVAILABLE, "busy".to_string())
+                                        .into_response()
+                                }
+                                "exhaust" | "504" | "4xx" => (
+                                    if mode == "4xx" {
+                                        StatusCode::BAD_REQUEST
+                                    } else if mode == "504" {
+                                        StatusCode::GATEWAY_TIMEOUT
+                                    } else {
+                                        StatusCode::SERVICE_UNAVAILABLE
+                                    },
+                                    "failure".to_string(),
+                                )
+                                    .into_response(),
+                                "malformed" => {
+                                    (StatusCode::OK, "not-json".to_string()).into_response()
+                                }
+                                "timeout" => {
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    (StatusCode::OK, r#"{"output":"late"}"#.to_string())
+                                        .into_response()
+                                }
+                                "empty" => {
+                                    (StatusCode::OK, r#"{"output":""}"#.to_string()).into_response()
+                                }
+                                _ => (StatusCode::OK, r#"{"output":"ok"}"#.to_string())
+                                    .into_response(),
+                            }
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("endpoint server should run");
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EndpointLookupTool {
+            url: format!("http://{address}/"),
+            policy,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            event_sink
+                .lock()
+                .expect("event sink should lock")
+                .push(event);
+        }));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "endpoint_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await
+            .executed_tools
+            .into_iter()
+            .next()
+            .expect("endpoint Tool should execute")
+            .result;
+        server.abort();
+        let snapshot = events.lock().expect("events should unlock").clone();
+        (result, snapshot, count.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn endpoint_retry_contract_covers_transient_failure_timeout_and_non_retryable_results() {
+        let (result, events, requests) = run_endpoint_lookup(
+            "recover",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
+        assert!(result.success);
+        assert_eq!(requests, 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+
+        let (result, events, requests) = run_endpoint_lookup(
+            "exhaust",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
+        assert!(!result.success);
+        assert_eq!(requests, 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+
+        let (result, events, requests) = run_endpoint_lookup(
+            "504",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
+        assert!(!result.success);
+        assert_eq!(requests, 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+
+        for (mode, expected_requests) in [("4xx", 1), ("malformed", 1)] {
+            let (result, events, requests) = run_endpoint_lookup(
+                mode,
+                ToolRetryPolicy::read_only(
+                    Duration::from_millis(50),
+                    2,
+                    Duration::from_millis(500),
+                ),
+            )
+            .await;
+            assert!(!result.success);
+            assert_eq!(requests, expected_requests);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                    .count(),
+                1
+            );
+        }
+
+        let (result, events, requests) = run_endpoint_lookup(
+            "empty",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
+        assert!(result.success);
+        assert!(result.output.is_empty());
+        assert_eq!(requests, 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            0
+        );
+
+        let (result, events, requests) = run_endpoint_lookup(
+            "success",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
+        assert!(result.success);
+        assert_eq!(requests, 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            0
+        );
+
+        let (result, events, requests) = run_endpoint_lookup(
+            "timeout",
+            ToolRetryPolicy::read_only(Duration::from_millis(25), 2, Duration::from_millis(300)),
+        )
+        .await;
+        assert!(!result.success);
+        assert_eq!(requests, 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTimedOut { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn default_tool_policy_guards_state_changing_write_from_retry() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("write endpoint should bind");
+        let address = listener
+            .local_addr()
+            .expect("write endpoint address should resolve");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    get(move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::SERVICE_UNAVAILABLE, "write rejected").into_response()
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("write endpoint should run");
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(WriteConfigTool {
+            url: format!("http://{address}/"),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "write_config".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        server.abort();
+        assert!(!result.executed_tools[0].result.success);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn production_read_tools_use_typed_retry_path_and_preserve_valid_empty_success() {
+        let resource_requests = Arc::new(AtomicUsize::new(0));
+        let seen_resources = resource_requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("resource endpoint should bind");
+        let address = listener
+            .local_addr()
+            .expect("resource endpoint address should resolve");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/internal/agent/resources/search", post(move || {
+                let seen_resources = seen_resources.clone();
+                async move {
+                    let attempt = seen_resources.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response();
+                    }
+                    Json(json!({
+                        "resources": [{"resource_id":"r1","name":"Trusted Aid","resource_type":"ngo","contact":{},"languages":[],"help_types":["legal"],"verified_at":null}],
+                        "query":"aid","resolved_country_code":"MX","help_type":"legal","total_count":1,"returned_count":1,"limit":5,"offset":0,"has_more":false,"next_offset":null
+                    })).into_response()
+                }
+            }))).await.expect("resource endpoint should run");
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{address}"),
+                "token".to_string(),
+            ),
+            jurisdiction: Some("MX".to_string()),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "find_resources".to_string(),
+                    args: ToolArgs::from([
+                        ("query".to_string(), json!("aid")),
+                        ("help_type".to_string(), json!("legal")),
+                    ]),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        server.abort();
+        assert!(result.executed_tools[0].result.success);
+        assert_eq!(resource_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+
+        let empty_requests = Arc::new(AtomicUsize::new(0));
+        let seen_empty = empty_requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("empty endpoint should bind");
+        let empty_address = listener
+            .local_addr()
+            .expect("empty endpoint address should resolve");
+        let empty_server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/internal/agent/resources/search", post(move || {
+                let seen_empty = seen_empty.clone();
+                async move {
+                    seen_empty.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"resources":[],"query":"none","resolved_country_code":"MX","help_type":"legal","total_count":0,"returned_count":0,"limit":5,"offset":0,"has_more":false,"next_offset":null})).into_response()
+                }
+            }))).await.expect("empty endpoint should run");
+        });
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{empty_address}"),
+                "token".to_string(),
+            ),
+            jurisdiction: Some("MX".to_string()),
+            traces,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "find_resources".to_string(),
+                    args: ToolArgs::from([("help_type".to_string(), json!("legal"))]),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        empty_server.abort();
+        assert!(result.executed_tools[0].result.success);
+        assert_eq!(empty_requests.load(Ordering::SeqCst), 1);
+
+        let knowledge_requests = Arc::new(AtomicUsize::new(0));
+        let seen_knowledge = knowledge_requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("knowledge endpoint should bind");
+        let knowledge_address = listener
+            .local_addr()
+            .expect("knowledge endpoint address should resolve");
+        let knowledge_server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/internal/agent/document-search", post(move || {
+                let seen_knowledge = seen_knowledge.clone();
+                async move {
+                    let attempt = seen_knowledge.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        return (StatusCode::BAD_GATEWAY, "busy").into_response();
+                    }
+                    Json(json!({"sources":[],"context":"","search_query":"handbook","top_k":3})).into_response()
+                }
+            }))).await.expect("knowledge endpoint should run");
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(KnowledgeSearchTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{knowledge_address}"),
+                "token".to_string(),
+            ),
+            user: InternalAuthContext {
+                id: 1,
+                kind: "user".to_string(),
+                approved: true,
+                pubkey: None,
+                email: None,
+                name: None,
+                user_type_id: None,
+                dev_mode: false,
+            },
+            top_k: 3,
+            job_ids: None,
+            jurisdiction: None,
+            situation_details: None,
+            sources: Arc::new(Mutex::new(Vec::new())),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "knowledge_search".to_string(),
+                    args: ToolArgs::from([("query".to_string(), json!("handbook"))]),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        knowledge_server.abort();
+        assert!(result.executed_tools[0].result.success);
+        assert_eq!(knowledge_requests.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn emitted_tool_logs_have_exact_native_structured_keys() {
         let events = [
@@ -10989,6 +11949,85 @@ mod tests {
                 assert!(!serialized.contains(forbidden));
             }
         }
+
+        for (event, expected_keys) in [
+            (
+                AgentTraceEvent::ToolRetryScheduled {
+                    call_id: "call-1".to_string(),
+                    tool_name: "find_resources".to_string(),
+                    planning_round: 2,
+                    attempt: 1,
+                    reason: "http_503".to_string(),
+                },
+                [
+                    "timestamp",
+                    "level",
+                    "target",
+                    "event_name",
+                    "conversation_id",
+                    "actor_kind",
+                    "actor_id",
+                    "phase",
+                    "call_id",
+                    "tool_name",
+                    "round",
+                    "attempt",
+                    "reason",
+                ],
+            ),
+            (
+                AgentTraceEvent::ToolTimedOut {
+                    call_id: "call-1".to_string(),
+                    tool_name: "find_resources".to_string(),
+                    planning_round: 2,
+                    attempt: 1,
+                    elapsed_ms: 5000,
+                },
+                [
+                    "timestamp",
+                    "level",
+                    "target",
+                    "event_name",
+                    "conversation_id",
+                    "actor_kind",
+                    "actor_id",
+                    "phase",
+                    "call_id",
+                    "tool_name",
+                    "round",
+                    "attempt",
+                    "duration_ms",
+                ],
+            ),
+        ] {
+            let value = capture_structured_log(event);
+            let keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                expected_keys
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+            );
+            let serialized = value.to_string();
+            for forbidden in [
+                "prompt",
+                "answer",
+                "email@example",
+                "api_key",
+                "secret",
+                "args",
+                "output",
+                "reasoning",
+            ] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
     }
 
     #[test]
@@ -11066,6 +12105,27 @@ mod tests {
         assert_eq!(attempted.metadata["phase"], json!("attempted"));
         assert_eq!(terminal.kind, "tool_result");
         assert_eq!(terminal.status.as_deref(), Some("failed"));
+
+        let retry = agent_trace_event_delta(AgentTraceEvent::ToolRetryScheduled {
+            call_id: "call-1".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 1,
+            reason: "http_503".to_string(),
+        });
+        assert_eq!(retry.kind, "tool_retry");
+        assert_eq!(retry.metadata["phase"], json!("retry"));
+        assert_eq!(retry.metadata["call_id"], json!("call-1"));
+        let timeout = agent_trace_event_delta(AgentTraceEvent::ToolTimedOut {
+            call_id: "call-1".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 2,
+            elapsed_ms: 5000,
+        });
+        assert_eq!(timeout.kind, "timeout");
+        assert_eq!(timeout.status.as_deref(), Some("timed_out"));
+        assert_eq!(timeout.metadata["phase"], json!("timeout"));
     }
 
     #[test]
@@ -11087,6 +12147,28 @@ mod tests {
             activity[0].summary.as_deref(),
             Some("Selected: Curated Resources.")
         );
+
+        let activity = conversation_activity_steps_from_trace_deltas(&[
+            agent_trace_event_delta(AgentTraceEvent::ToolRetryScheduled {
+                call_id: "call-1".to_string(),
+                tool_name: "find_resources".to_string(),
+                planning_round: 1,
+                attempt: 1,
+                reason: "http_503".to_string(),
+            }),
+            agent_trace_event_delta(AgentTraceEvent::ToolTimedOut {
+                call_id: "call-1".to_string(),
+                tool_name: "find_resources".to_string(),
+                planning_round: 1,
+                attempt: 2,
+                elapsed_ms: 5000,
+            }),
+        ]);
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0].kind, "tool");
+        assert_eq!(activity[0].status, "running");
+        assert_eq!(activity[1].kind, "tool");
+        assert_eq!(activity[1].status, "timed_out");
     }
 
     #[test]
