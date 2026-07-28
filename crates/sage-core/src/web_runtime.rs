@@ -8716,6 +8716,141 @@ mod tests {
         }
     }
 
+    struct ContactFollowupPlanner {
+        enabled: bool,
+        output: String,
+        plan_calls: usize,
+        executed_calls: usize,
+        selected_args: Option<ToolArgs>,
+    }
+
+    impl ContactFollowupPlanner {
+        fn grounded() -> Self {
+            Self {
+                enabled: true,
+                output: "Fresh Curated Resources contact: fresh@example.test".to_string(),
+                plan_calls: 0,
+                executed_calls: 0,
+                selected_args: None,
+            }
+        }
+
+        fn empty_result() -> Self {
+            Self {
+                enabled: true,
+                output: "No matching current contact is listed.".to_string(),
+                plan_calls: 0,
+                executed_calls: 0,
+                selected_args: None,
+            }
+        }
+
+        fn disabled() -> Self {
+            Self {
+                enabled: false,
+                output: "Curated Resources are unavailable for this turn.".to_string(),
+                plan_calls: 0,
+                executed_calls: 0,
+                selected_args: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolPlanner for ContactFollowupPlanner {
+        fn has_actionable_tools(&self) -> bool {
+            self.enabled
+        }
+
+        async fn plan_tools(
+            &mut self,
+            user_message: &str,
+            _is_first_plan: bool,
+        ) -> Result<ToolPlanningOutcome> {
+            assert!(
+                self.enabled,
+                "disabled Curated Resources must skip planning"
+            );
+            assert!(user_message.contains("Acme Legal Aid"));
+            assert!(user_message.contains("Mexico"));
+            assert!(user_message.contains("legal help"));
+            assert!(user_message.contains("me puedes dar el email"));
+            self.plan_calls += 1;
+            let args = ToolArgs::from([
+                ("query".to_string(), json!("Acme Legal Aid")),
+                ("region".to_string(), json!("MX")),
+                ("language".to_string(), json!("es")),
+                ("help_type".to_string(), json!("legal")),
+            ]);
+            self.selected_args = Some(args.clone());
+            Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
+                vec![crate::sage_agent::ToolCall {
+                    name: "find_resources".to_string(),
+                    args,
+                }],
+                false,
+            )))
+        }
+
+        async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
+            assert!(self.enabled, "disabled Curated Resources must not execute");
+            assert_eq!(decision.tool_calls.len(), 1);
+            assert_eq!(decision.tool_calls[0].name, "find_resources");
+            self.executed_calls += 1;
+            StepResult {
+                messages: Vec::new(),
+                tool_calls: decision.tool_calls.clone(),
+                executed_tools: vec![ExecutedTool {
+                    tool_call: decision.tool_calls[0].clone(),
+                    result: ToolResult::success(self.output.clone()),
+                }],
+                done: false,
+            }
+        }
+
+        fn plain_answer_prompt(&self, user_message: &str) -> PlainAnswerPrompt {
+            PlainAnswerPrompt {
+                system: "Answer only from the current Tool result.".to_string(),
+                user: format!(
+                    "Earlier assistant prose mentioned stale@example.test.\nCurrent request: {user_message}\nFresh Tool result: {}",
+                    self.output
+                ),
+            }
+        }
+    }
+
+    struct ContactAnswerGenerator;
+
+    #[async_trait::async_trait]
+    impl PlainAnswerGenerator for ContactAnswerGenerator {
+        async fn generate(
+            &self,
+            prompt: &PlainAnswerPrompt,
+            _model: &str,
+            delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+            _reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
+        ) -> std::result::Result<String, PlainAnswerGenerationError> {
+            let answer = if prompt.user.contains("fresh@example.test") {
+                "The current Curated Resources result lists fresh@example.test."
+            } else if prompt
+                .user
+                .contains("No matching current contact is listed.")
+            {
+                "No matching current contact is listed."
+            } else {
+                "Curated Resources are unavailable for this turn."
+            };
+            if let Some(sender) = delta_sender {
+                let _ = sender.send(ConversationStreamSignal::Answer(answer.to_string()));
+            }
+            Ok(answer.to_string())
+        }
+    }
+
+    fn contact_followup_input() -> String {
+        "RECENT CONVERSATION\nassistant: Acme Legal Aid contact was stale@example.test.\nuser: The organization is in Mexico and I need legal help.\nCURRENT REQUEST\nme puedes dar el email?".to_string()
+    }
+
     struct UnstructuredActionablePlanner;
 
     #[async_trait::async_trait]
@@ -8783,6 +8918,109 @@ mod tests {
         assert_eq!(turn.answer, "A trusted answer");
         assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), "A trusted ");
         assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), "answer");
+    }
+
+    #[tokio::test]
+    async fn contact_followup_plans_fresh_lookup_with_retained_context_and_grounded_contact() {
+        let mut planner = ContactFollowupPlanner::grounded();
+        let input = contact_followup_input();
+        let turn = run_turn_with_adapters(
+            &mut planner,
+            &ContactAnswerGenerator,
+            &input,
+            "test-model",
+            None,
+        )
+        .await
+        .expect("contact follow-up should complete through the shared turn seam");
+
+        assert_eq!(planner.plan_calls, 1);
+        assert_eq!(planner.executed_calls, 1);
+        let args = planner
+            .selected_args
+            .as_ref()
+            .expect("fresh find_resources args should be captured");
+        assert_eq!(args["query"], json!("Acme Legal Aid"));
+        assert_eq!(args["region"], json!("MX"));
+        assert_eq!(args["language"], json!("es"));
+        assert_eq!(args["help_type"], json!("legal"));
+        assert_eq!(
+            turn.answer,
+            "The current Curated Resources result lists fresh@example.test."
+        );
+        assert!(!turn.answer.contains("stale@example.test"));
+    }
+
+    #[tokio::test]
+    async fn contact_followup_empty_result_is_honest_and_disabled_resources_stay_tool_free() {
+        let mut empty_planner = ContactFollowupPlanner::empty_result();
+        let empty_turn = run_turn_with_adapters(
+            &mut empty_planner,
+            &ContactAnswerGenerator,
+            &contact_followup_input(),
+            "test-model",
+            None,
+        )
+        .await
+        .expect("empty contact result should still produce a bounded answer");
+        assert_eq!(empty_planner.executed_calls, 1);
+        assert_eq!(empty_turn.answer, "No matching current contact is listed.");
+        assert!(!empty_turn.answer.contains("stale@example.test"));
+
+        let mut disabled_planner = ContactFollowupPlanner::disabled();
+        let disabled_turn = run_turn_with_adapters(
+            &mut disabled_planner,
+            &ContactAnswerGenerator,
+            &contact_followup_input(),
+            "test-model",
+            None,
+        )
+        .await
+        .expect("disabled Curated Resources should answer without planning");
+        assert_eq!(disabled_planner.plan_calls, 0);
+        assert_eq!(disabled_planner.executed_calls, 0);
+        assert_eq!(
+            disabled_turn.answer,
+            "Curated Resources are unavailable for this turn."
+        );
+        assert!(!disabled_turn.answer.contains("find_resources"));
+    }
+
+    #[tokio::test]
+    async fn contact_followup_batch_and_streaming_paths_share_fresh_grounding() {
+        let input = contact_followup_input();
+        let mut batch_planner = ContactFollowupPlanner::grounded();
+        let batch = run_turn_with_adapters(
+            &mut batch_planner,
+            &ContactAnswerGenerator,
+            &input,
+            "test-model",
+            None,
+        )
+        .await
+        .expect("batch turn should complete");
+
+        let mut stream_planner = ContactFollowupPlanner::grounded();
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let streamed = run_turn_with_adapters(
+            &mut stream_planner,
+            &ContactAnswerGenerator,
+            &input,
+            "test-model",
+            Some(delta_tx),
+        )
+        .await
+        .expect("streaming turn should complete");
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+
+        assert_eq!(batch.answer, streamed.answer);
+        assert_eq!(deltas.concat(), streamed.answer);
+        assert_eq!(batch_planner.selected_args, stream_planner.selected_args);
+        assert_eq!(batch_planner.executed_calls, 1);
+        assert_eq!(stream_planner.executed_calls, 1);
     }
 
     #[tokio::test]
