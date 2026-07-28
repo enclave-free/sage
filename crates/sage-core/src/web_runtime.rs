@@ -47,9 +47,10 @@ use crate::memory::MemoryManager;
 use crate::sage_agent::StepResult;
 use crate::sage_agent::{
     expects_curated_resource_lookup, has_syntactic_tool_intent, tool_parse_arg, tool_string_arg,
-    AgentTraceEvent, ExecutedTool, PlainAnswerPrompt, ProviderReasoningTraceHook, SageAgent, Tool,
-    ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
-    ToolRetryPolicy,
+    AgentTraceEvent, ConversationTimingOutcome, ConversationTimingPhase, ExecutedTool,
+    PlainAnswerPrompt, ProviderReasoningTraceHook, ProviderTimingEvent, ProviderTimingTraceHook,
+    SageAgent, Tool, ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry,
+    ToolResult, ToolRetryPolicy,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -1479,6 +1480,7 @@ fn trace_delta_id(prefix: &str, name: &str) -> String {
 fn log_agent_trace_event(
     event: &AgentTraceEvent,
     conversation_id: &str,
+    message_id: &str,
     actor_kind: &str,
     actor_id: i32,
 ) {
@@ -1495,6 +1497,7 @@ fn log_agent_trace_event(
             target: "sage.tool_selection",
             event_name = "tool_selection_observation",
             conversation_id = %conversation_id,
+            message_id = %message_id,
             actor_kind = %actor_kind,
             actor_id,
             phase = "planning",
@@ -1505,7 +1508,7 @@ fn log_agent_trace_event(
             selection_count = selected_tools.len(),
             expected_curated_resources = *expected_curated_resources,
             missed_expected_curated_resources = *missed_expected_curated_resources,
-            outcome = %outcome,
+            outcome = outcome.as_str(),
         ),
         AgentTraceEvent::ToolAttempted {
             call_id,
@@ -1516,6 +1519,7 @@ fn log_agent_trace_event(
             target: "sage.tool_selection",
             event_name = "tool_execution",
             conversation_id = %conversation_id,
+            message_id = %message_id,
             actor_kind = %actor_kind,
             actor_id,
             phase = "attempted",
@@ -1535,6 +1539,7 @@ fn log_agent_trace_event(
             target: "sage.tool_selection",
             event_name = "tool_execution",
             conversation_id = %conversation_id,
+            message_id = %message_id,
             actor_kind = %actor_kind,
             actor_id,
             phase = "terminal",
@@ -1543,7 +1548,7 @@ fn log_agent_trace_event(
             round = *planning_round,
             attempt = *attempt,
             outcome = %status,
-            duration_ms = *elapsed_ms,
+            duration_ms = *elapsed_ms as u64,
         ),
         AgentTraceEvent::ToolRetryScheduled {
             call_id,
@@ -1555,6 +1560,7 @@ fn log_agent_trace_event(
             target: "sage.tool_selection",
             event_name = "tool_execution_retry",
             conversation_id = %conversation_id,
+            message_id = %message_id,
             actor_kind = %actor_kind,
             actor_id,
             phase = "retry",
@@ -1574,6 +1580,7 @@ fn log_agent_trace_event(
             target: "sage.tool_selection",
             event_name = "tool_execution_timeout",
             conversation_id = %conversation_id,
+            message_id = %message_id,
             actor_kind = %actor_kind,
             actor_id,
             phase = "timeout",
@@ -1582,6 +1589,30 @@ fn log_agent_trace_event(
             round = *planning_round,
             attempt = *attempt,
             duration_ms = *elapsed_ms,
+        ),
+        AgentTraceEvent::Timing {
+            phase,
+            planning_round,
+            tool_name,
+            call_id,
+            attempt,
+            outcome,
+            elapsed_ms,
+        } => tracing::info!(
+            target: "sage.conversation_timing",
+            event_name = "conversation_phase_timing",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = phase.as_str(),
+            round = planning_round.unwrap_or_default(),
+            attempt = *attempt,
+            call_id = call_id.as_deref().unwrap_or(""),
+            tool_name = tool_name.as_deref().unwrap_or(""),
+            outcome = outcome.as_str(),
+            duration_ms = *elapsed_ms as u64,
+            provider_wait_proxy = phase.is_provider_wait_proxy(),
         ),
         _ => {}
     }
@@ -1614,8 +1645,78 @@ fn tool_trace_title(tool_name: &str) -> String {
     .to_string()
 }
 
+fn timing_phase_title(phase: ConversationTimingPhase) -> String {
+    match phase {
+        ConversationTimingPhase::ToolPlanningModelDuration => "Tool-planning model duration",
+        ConversationTimingPhase::FinalAnswerModelDuration => "Final-answer model duration",
+        ConversationTimingPhase::FinalAnswerResponseHeaderWait => {
+            "Final-answer provider response-header wait"
+        }
+        ConversationTimingPhase::FinalAnswerFirstProviderEventWait => {
+            "Final-answer provider first-event wait"
+        }
+        ConversationTimingPhase::ToolExecution => "Tool execution",
+        ConversationTimingPhase::ResourceDirectoryLookup => "Resource Directory lookup",
+        ConversationTimingPhase::Retrieval => "Retrieval",
+        ConversationTimingPhase::RetryDelay => "Retry delay",
+        ConversationTimingPhase::TotalTurn => "Total turn",
+    }
+    .to_string()
+}
+
 fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResponse {
     match event {
+        AgentTraceEvent::Timing {
+            phase,
+            planning_round,
+            tool_name,
+            call_id,
+            attempt,
+            outcome,
+            elapsed_ms,
+        } => {
+            let title = timing_phase_title(phase);
+            let proxy = phase.is_provider_wait_proxy();
+            let proxy_suffix = if proxy {
+                " (provider-wait proxy: network, queue, or startup)"
+            } else {
+                ""
+            };
+            let summary = format!("{}: {} ms{}.", title, elapsed_ms, proxy_suffix);
+            let mut metadata = json!({
+                "phase": phase.as_str(),
+                "round": planning_round,
+                "attempt": attempt,
+                "call_id": call_id,
+                "outcome": outcome.as_str(),
+                "duration_ms": elapsed_ms,
+                "provider_wait_proxy": proxy,
+            });
+            if proxy {
+                metadata["wait_origin"] = json!("request_start");
+                metadata["proxy_scope"] =
+                    json!("network, provider queue, or model startup may contribute");
+            }
+            ConversationTraceDeltaResponse {
+                id: trace_delta_id(
+                    "timing",
+                    &format!(
+                        "{}-{}-{}-{}",
+                        phase.as_str(),
+                        planning_round.unwrap_or_default(),
+                        attempt,
+                        call_id.as_deref().unwrap_or("turn")
+                    ),
+                ),
+                kind: "timing".to_string(),
+                title: Some(title),
+                content: Some(summary),
+                tool_name,
+                status: Some(outcome.as_str().to_string()),
+                metadata,
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+            }
+        }
         AgentTraceEvent::ToolSelectionObservation {
             round,
             attempt,
@@ -1859,6 +1960,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
     }
 }
 
+#[cfg(test)]
 fn turn_timing_trace_delta(elapsed_ms: u128) -> ConversationTraceDeltaResponse {
     ConversationTraceDeltaResponse {
         id: trace_delta_id("timing", "turn"),
@@ -1867,7 +1969,14 @@ fn turn_timing_trace_delta(elapsed_ms: u128) -> ConversationTraceDeltaResponse {
         content: Some("Conversation turn completed.".to_string()),
         tool_name: None,
         status: Some("succeeded".to_string()),
-        metadata: json!({ "duration_ms": elapsed_ms }),
+        metadata: json!({
+            "phase": ConversationTimingPhase::TotalTurn.as_str(),
+            "round": null,
+            "attempt": 1,
+            "outcome": "succeeded",
+            "duration_ms": elapsed_ms,
+            "provider_wait_proxy": false,
+        }),
         created_at: Some(chrono::Utc::now().to_rfc3339()),
     }
 }
@@ -3031,6 +3140,22 @@ impl Tool for AdminDbQueryTool {
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        Ok(self.execute_db_query_with_outcome(args).await?.0)
+    }
+
+    async fn execute_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(ToolResult, ConversationTimingOutcome)> {
+        self.execute_db_query_with_outcome(args).await
+    }
+}
+
+impl AdminDbQueryTool {
+    async fn execute_db_query_with_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(ToolResult, ConversationTimingOutcome)> {
         let sql = tool_string_arg(args, "sql")
             .map(str::to_string)
             .ok_or_else(|| anyhow!("db_query requires sql"))?;
@@ -3051,7 +3176,7 @@ impl Tool for AdminDbQueryTool {
                     guarded: true,
                 });
             }
-            return Ok(ToolResult::error(error));
+            return Ok((ToolResult::error(error), ConversationTimingOutcome::Guarded));
         }
 
         if let Ok(mut sink) = self.traces.lock() {
@@ -3065,7 +3190,10 @@ impl Tool for AdminDbQueryTool {
             });
         }
 
-        Ok(ToolResult::success(serde_json::to_string_pretty(&value)?))
+        Ok((
+            ToolResult::success(serde_json::to_string_pretty(&value)?),
+            ConversationTimingOutcome::Succeeded,
+        ))
     }
 }
 
@@ -3165,6 +3293,36 @@ struct ChatStreamEmission {
     payload: ChatStreamEventPayload,
 }
 
+fn chat_stream_terminal_emissions(
+    message_id: &str,
+    session_id: &Option<String>,
+    model: String,
+    tools_used: Vec<ToolCallInfoResponse>,
+    trace: Option<ConversationTraceResponse>,
+    admin_config_affected_areas: Vec<String>,
+) -> Vec<ChatStreamEmission> {
+    let mut emissions = Vec::new();
+    if trace.is_some() {
+        let mut payload = ChatStreamEventPayload::new(message_id, session_id.clone());
+        payload.trace = trace;
+        payload.admin_config_affected_areas = admin_config_affected_areas.clone();
+        emissions.push(ChatStreamEmission {
+            event: "trace_final",
+            payload,
+        });
+    }
+    let mut done = ChatStreamEventPayload::new(message_id, session_id.clone());
+    done.model = Some(model);
+    done.provider = Some("sage".to_string());
+    done.tools_used = tools_used;
+    done.admin_config_affected_areas = admin_config_affected_areas;
+    emissions.push(ChatStreamEmission {
+        event: "done",
+        payload: done,
+    });
+    emissions
+}
+
 #[derive(Default)]
 struct ChatStreamAnswerEmissionState {
     activity_steps_sent: bool,
@@ -3245,11 +3403,29 @@ fn chat_stream_emissions_for_signal(
         ConversationStreamSignal::Trace(trace_delta) => {
             let mut payload =
                 ChatStreamEventPayload::new(message_id.to_string(), session_id.clone());
+            let timing_activity =
+                if answer_state.activity_steps_sent && trace_delta.kind == "timing" {
+                    conversation_activity_steps_from_trace_deltas(&[(*trace_delta).clone()])
+                        .into_iter()
+                        .next()
+                } else {
+                    None
+                };
             payload.trace_delta = Some(*trace_delta);
-            vec![ChatStreamEmission {
+            let mut emissions = vec![ChatStreamEmission {
                 event: "trace_delta",
                 payload,
-            }]
+            }];
+            if let Some(activity_step) = timing_activity {
+                let mut activity_payload =
+                    ChatStreamEventPayload::new(message_id.to_string(), session_id.clone());
+                activity_payload.activity_step = Some(activity_step);
+                emissions.push(ChatStreamEmission {
+                    event: "activity_step",
+                    payload: activity_payload,
+                });
+            }
+            emissions
         }
         ConversationStreamSignal::Answer(delta) => answer_state.before_answer_delta(
             message_id,
@@ -3437,12 +3613,14 @@ async fn chat(
     );
     let agent_trace_sink = tool_sinks.trace_deltas.clone();
     let trace_conversation_id = session.id.to_string();
+    let trace_message_id = format!("msg_{}", Uuid::new_v4().simple());
     let trace_actor_kind = auth.kind.clone();
     let trace_actor_id = auth.id;
     agent.set_trace_hook(Arc::new(move |event| {
         log_agent_trace_event(
             &event,
             &trace_conversation_id,
+            &trace_message_id,
             &trace_actor_kind,
             trace_actor_id,
         );
@@ -3765,12 +3943,14 @@ async fn chat_stream(
         );
         let agent_trace_sink = tool_sinks.trace_deltas.clone();
         let trace_conversation_id = session.id.to_string();
+        let trace_message_id = message_id.clone();
         let trace_actor_kind = auth.kind.clone();
         let trace_actor_id = auth.id;
         agent.set_trace_hook(Arc::new(move |event| {
             log_agent_trace_event(
                 &event,
                 &trace_conversation_id,
+                &trace_message_id,
                 &trace_actor_kind,
                 trace_actor_id,
             );
@@ -3881,20 +4061,16 @@ async fn chat_stream(
         )
         .await;
 
-        if trace.is_some() {
-            let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-            payload.trace = trace;
-            payload.admin_config_affected_areas =
-                tool_loop.admin_config_affected_areas.clone();
-            yield Ok(chat_stream_sse_event("trace_final", &payload));
+        for emission in chat_stream_terminal_emissions(
+            &message_id,
+            &session_id,
+            state.config.tinfoil_model.clone(),
+            tool_loop.tools_used,
+            trace,
+            tool_loop.admin_config_affected_areas,
+        ) {
+            yield Ok(chat_stream_sse_event(emission.event, &emission.payload));
         }
-
-        let mut done = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-        done.model = Some(state.config.tinfoil_model.clone());
-        done.provider = Some("sage".to_string());
-        done.tools_used = tool_loop.tools_used;
-        done.admin_config_affected_areas = tool_loop.admin_config_affected_areas;
-        yield Ok(chat_stream_sse_event("done", &done));
     };
     Ok(Sse::new(stream))
 }
@@ -4001,12 +4177,14 @@ async fn query(
     );
     let agent_trace_sink = tool_sinks.trace_deltas.clone();
     let trace_conversation_id = session.id.to_string();
+    let trace_message_id = format!("msg_{}", Uuid::new_v4().simple());
     let trace_actor_kind = auth.kind.clone();
     let trace_actor_id = auth.id;
     agent.set_trace_hook(Arc::new(move |event| {
         log_agent_trace_event(
             &event,
             &trace_conversation_id,
+            &trace_message_id,
             &trace_actor_kind,
             trace_actor_id,
         );
@@ -6667,9 +6845,16 @@ where
                 let prompt = planner.plain_answer_prompt(input);
                 let trace_step = planner.plain_answer_trace_started();
                 let reasoning_trace_hook = planner.plain_answer_reasoning_trace_hook(trace_step);
+                let timing_hook = planner.plain_answer_provider_timing_hook(trace_step);
                 let started_at = Instant::now();
                 let generation = answer_generator
-                    .generate(&prompt, model, delta_sender.clone(), reasoning_trace_hook)
+                    .generate_with_timing(
+                        &prompt,
+                        model,
+                        delta_sender.clone(),
+                        reasoning_trace_hook,
+                        timing_hook,
+                    )
                     .await;
                 let answer = generation.map_err(|error| {
                     planner.plain_answer_trace_failed(
@@ -6820,10 +7005,32 @@ async fn run_conversation_tool_loop(
 ) -> AppResult<ConversationToolLoopOutput> {
     let turn_started_at = Instant::now();
     agent.set_contact_lookup_expected(expects_curated_resource_lookup(raw_user_message));
-    let answer = run_agent_turn(agent, input, memory_user_id, lm, answer_delta_sender).await?;
-    sinks.trace_deltas.emit(turn_timing_trace_delta(
-        turn_started_at.elapsed().as_millis(),
-    ));
+    let answer = match run_agent_turn(agent, input, memory_user_id, lm, answer_delta_sender).await {
+        Ok(answer) => answer,
+        Err(error) => {
+            let elapsed_ms = turn_started_at.elapsed().as_millis();
+            agent.emit_trace_event(AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::TotalTurn,
+                planning_round: None,
+                tool_name: None,
+                call_id: None,
+                attempt: 1,
+                outcome: ConversationTimingOutcome::Failed,
+                elapsed_ms,
+            });
+            return Err(error);
+        }
+    };
+    let elapsed_ms = turn_started_at.elapsed().as_millis();
+    agent.emit_trace_event(AgentTraceEvent::Timing {
+        phase: ConversationTimingPhase::TotalTurn,
+        planning_round: None,
+        tool_name: None,
+        call_id: None,
+        attempt: 1,
+        outcome: ConversationTimingOutcome::Succeeded,
+        elapsed_ms,
+    });
     let tools_used = sinks
         .traces
         .lock()
@@ -7047,9 +7254,23 @@ fn conversation_activity_steps_from_trace_deltas(
                     | "tool_result"
                     | "tool_retry"
                     | "timeout"
+                    | "timing"
             )
         })
         .map(|delta| {
+            if delta.kind == "timing" {
+                return ConversationActivityStepResponse {
+                    id: format!("activity-{}", delta.id),
+                    kind: "timing".to_string(),
+                    title: delta.title.clone().unwrap_or_else(|| "Timing".to_string()),
+                    status: delta
+                        .status
+                        .clone()
+                        .unwrap_or_else(|| "succeeded".to_string()),
+                    summary: delta.content.clone(),
+                    warnings: Vec::new(),
+                };
+            }
             if matches!(
                 delta.kind.as_str(),
                 "tool_call" | "tool_result" | "tool_retry" | "timeout"
@@ -7259,6 +7480,18 @@ trait PlainAnswerGenerator: Send + Sync {
         delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
         reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
     ) -> std::result::Result<String, PlainAnswerGenerationError>;
+
+    async fn generate_with_timing(
+        &self,
+        prompt: &PlainAnswerPrompt,
+        model: &str,
+        delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
+        _timing_hook: Option<ProviderTimingTraceHook>,
+    ) -> std::result::Result<String, PlainAnswerGenerationError> {
+        self.generate(prompt, model, delta_sender, reasoning_trace_hook)
+            .await
+    }
 }
 
 /// OpenAI-compatible Chat Completions adapter. Provider wire types remain
@@ -7314,10 +7547,10 @@ impl PlainAnswerStreamState {
         "```",
     ];
 
-    fn push(
+    fn push_staged(
         &mut self,
         delta: &str,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        answer_deltas: &mut Vec<String>,
     ) -> std::result::Result<(), PlainAnswerGenerationError> {
         if delta.is_empty() {
             return Ok(());
@@ -7338,16 +7571,16 @@ impl PlainAnswerStreamState {
             self.reject_tool_intent(&self.pending)?;
             return Ok(());
         }
-        self.flush_safe_candidates(delta_sender)
+        self.flush_safe_candidates_staged(answer_deltas)
     }
 
-    fn finish(
+    fn finish_staged(
         &mut self,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        answer_deltas: &mut Vec<String>,
     ) -> std::result::Result<(), PlainAnswerGenerationError> {
         self.reject_repetition()?;
         self.reject_tool_intent(&self.pending)?;
-        self.emit_pending_prefix(self.pending.len(), delta_sender);
+        self.emit_pending_prefix_staged(self.pending.len(), answer_deltas);
         Ok(())
     }
 
@@ -7481,9 +7714,9 @@ impl PlainAnswerStreamState {
         PlainAnswerOpeningDisposition::Stream
     }
 
-    fn flush_safe_candidates(
+    fn flush_safe_candidates_staged(
         &mut self,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        answer_deltas: &mut Vec<String>,
     ) -> std::result::Result<(), PlainAnswerGenerationError> {
         loop {
             if self.pending.is_empty() {
@@ -7496,18 +7729,18 @@ impl PlainAnswerStreamState {
             let candidate_start = Self::structural_candidate_start(&self.pending);
             let Some(candidate_start) = candidate_start.filter(|start| *start < suffix_start)
             else {
-                self.emit_pending_prefix(suffix_start, delta_sender);
+                self.emit_pending_prefix_staged(suffix_start, answer_deltas);
                 return Ok(());
             };
             if candidate_start > 0 {
-                self.emit_pending_prefix(candidate_start, delta_sender);
+                self.emit_pending_prefix_staged(candidate_start, answer_deltas);
             }
             self.reject_tool_intent(&self.pending)?;
             let Some(candidate_end) = Self::structural_candidate_end(&self.pending) else {
                 return Ok(());
             };
             self.reject_tool_intent(&self.pending[..candidate_end])?;
-            self.emit_pending_prefix(candidate_end, delta_sender);
+            self.emit_pending_prefix_staged(candidate_end, answer_deltas);
         }
     }
 
@@ -7635,19 +7868,41 @@ impl PlainAnswerStreamState {
         None
     }
 
-    fn emit_pending_prefix(
-        &mut self,
-        end: usize,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-    ) {
+    fn emit_pending_prefix_staged(&mut self, end: usize, answer_deltas: &mut Vec<String>) {
         if end == 0 {
             return;
         }
         let delta: String = self.pending.drain(..end).collect();
-        if let Some(sender) = delta_sender {
-            self.emitted_any = true;
-            let _ = sender.send(ConversationStreamSignal::Answer(delta));
+        answer_deltas.push(delta);
+    }
+
+    #[cfg(test)]
+    fn push(
+        &mut self,
+        delta: &str,
+        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<(), PlainAnswerGenerationError> {
+        let mut answer_deltas = Vec::new();
+        let result = self.push_staged(delta, &mut answer_deltas);
+        if result.is_ok() {
+            self.emitted_any |= !answer_deltas.is_empty();
+            release_answer_deltas(answer_deltas, delta_sender);
         }
+        result
+    }
+
+    #[cfg(test)]
+    fn finish(
+        &mut self,
+        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<(), PlainAnswerGenerationError> {
+        let mut answer_deltas = Vec::new();
+        let result = self.finish_staged(&mut answer_deltas);
+        if result.is_ok() {
+            self.emitted_any |= !answer_deltas.is_empty();
+            release_answer_deltas(answer_deltas, delta_sender);
+        }
+        result
     }
 }
 
@@ -7664,8 +7919,12 @@ impl OpenAiPlainAnswerGenerator {
     fn consume_sse_line(
         line: &str,
         state: &mut PlainAnswerStreamState,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-        reasoning_trace_hook: &Option<ProviderReasoningTraceHook>,
+        answer_deltas: &mut Vec<String>,
+        reasoning_deltas: &mut Vec<String>,
+        first_provider_event_observed: &mut bool,
+        timing_hook: &Option<ProviderTimingTraceHook>,
+        attempt: u32,
+        request_started_at: Instant,
     ) -> std::result::Result<bool, PlainAnswerGenerationError> {
         let line = line.trim_end_matches('\r');
         let Some(data) = line.strip_prefix("data:") else {
@@ -7673,8 +7932,21 @@ impl OpenAiPlainAnswerGenerator {
         };
         let data = data.trim_start();
         if data == "[DONE]" {
-            state.finish(delta_sender)?;
-            return Ok(true);
+            let result = state.finish_staged(answer_deltas);
+            if result.is_ok() {
+                mark_first_provider_event(
+                    first_provider_event_observed,
+                    timing_hook,
+                    attempt,
+                    request_started_at,
+                    if *first_provider_event_observed {
+                        ConversationTimingOutcome::Succeeded
+                    } else {
+                        ConversationTimingOutcome::Failed
+                    },
+                );
+            }
+            return result.map(|_| true);
         }
         if data.is_empty() {
             return Ok(false);
@@ -7689,6 +7961,89 @@ impl OpenAiPlainAnswerGenerator {
                 state.emitted_any,
             )
         })?;
+        let choices = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .filter(|choices| !choices.is_empty())
+            .ok_or_else(|| {
+                PlainAnswerGenerationError::new(
+                    PlainAnswerFailureKind::Other,
+                    "invalid Chat Completions stream event: choices must be a non-empty array",
+                    state.emitted_any,
+                )
+            })?;
+        if !choices[0].is_object() {
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "invalid Chat Completions stream event: first choice must be an object",
+                state.emitted_any,
+            ));
+        }
+        let choice = &choices[0];
+        let has_delta = choice.get("delta").is_some_and(Value::is_object);
+        if choice
+            .get("delta")
+            .is_some_and(|delta| !delta.is_null() && !delta.is_object())
+        {
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "invalid Chat Completions stream event: delta must be an object",
+                state.emitted_any,
+            ));
+        }
+        let has_finish_reason = choice
+            .get("finish_reason")
+            .is_some_and(|reason| !reason.is_null());
+        if !has_delta && !has_finish_reason {
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "invalid Chat Completions stream event: choice has no delta or finish reason",
+                state.emitted_any,
+            ));
+        }
+        if let Some(delta) = choice.get("delta").filter(|value| value.is_object()) {
+            let recognized_delta_field = [
+                "content",
+                "role",
+                "reasoning",
+                "reasoning_content",
+                "tool_calls",
+                "function_call",
+            ]
+            .iter()
+            .any(|field| delta.get(*field).is_some());
+            if !recognized_delta_field && !has_finish_reason {
+                return Err(PlainAnswerGenerationError::new(
+                    PlainAnswerFailureKind::Other,
+                    "invalid Chat Completions stream event: delta has no recognized fields",
+                    state.emitted_any,
+                ));
+            }
+            for field in ["content", "reasoning", "reasoning_content"] {
+                if delta
+                    .get(field)
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+                {
+                    return Err(PlainAnswerGenerationError::new(
+                        PlainAnswerFailureKind::Other,
+                        format!(
+                            "invalid Chat Completions stream event: delta.{field} must be a string"
+                        ),
+                        state.emitted_any,
+                    ));
+                }
+            }
+            if delta
+                .get("role")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
+                return Err(PlainAnswerGenerationError::new(
+                    PlainAnswerFailureKind::Other,
+                    "invalid Chat Completions stream event: delta.role must be a string",
+                    state.emitted_any,
+                ));
+            }
+        }
         let has_native_tool_calls =
             value
                 .pointer("/choices/0/delta/tool_calls")
@@ -7709,32 +8064,47 @@ impl OpenAiPlainAnswerGenerator {
                 state.emitted_any,
             ));
         }
-        if let Some(reasoning) = value
-            .pointer("/choices/0/delta/reasoning")
-            .or_else(|| value.pointer("/choices/0/delta/reasoning_content"))
-            .and_then(Value::as_str)
-            .filter(|reasoning| !reasoning.is_empty())
-        {
-            if let Some(trace_hook) = reasoning_trace_hook {
-                trace_hook(reasoning.to_string());
+        for field in ["reasoning", "reasoning_content"] {
+            if let Some(reasoning) = value
+                .pointer(&format!("/choices/0/delta/{field}"))
+                .and_then(Value::as_str)
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                reasoning_deltas.push(reasoning.to_string());
             }
         }
         if let Some(delta) = value
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
         {
-            state.push(delta, delta_sender)?;
+            state.push_staged(delta, answer_deltas)?;
         }
         let Some(finish_reason) = value
             .pointer("/choices/0/finish_reason")
             .filter(|reason| !reason.is_null())
         else {
+            mark_first_provider_event(
+                first_provider_event_observed,
+                timing_hook,
+                attempt,
+                request_started_at,
+                ConversationTimingOutcome::Succeeded,
+            );
             return Ok(false);
         };
         match finish_reason.as_str().unwrap_or("unknown") {
             "stop" => {
-                state.finish(delta_sender)?;
-                Ok(true)
+                let result = state.finish_staged(answer_deltas);
+                if result.is_ok() {
+                    mark_first_provider_event(
+                        first_provider_event_observed,
+                        timing_hook,
+                        attempt,
+                        request_started_at,
+                        ConversationTimingOutcome::Succeeded,
+                    );
+                }
+                result.map(|_| true)
             }
             "length" => Err(PlainAnswerGenerationError::new(
                 PlainAnswerFailureKind::TokenLimit,
@@ -7754,10 +8124,14 @@ impl OpenAiPlainAnswerGenerator {
         &self,
         prompt: &PlainAnswerPrompt,
         model: &str,
+        attempt: u32,
         delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
         reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
+        timing_hook: Option<ProviderTimingTraceHook>,
     ) -> std::result::Result<String, PlainAnswerGenerationError> {
-        let response = self
+        let request_started_at = Instant::now();
+        let mut first_provider_event_observed = false;
+        let response = match self
             .client
             .post(format!(
                 "{}/chat/completions",
@@ -7776,17 +8150,53 @@ impl OpenAiPlainAnswerGenerator {
             }))
             .send()
             .await
-            .map_err(|error| {
-                PlainAnswerGenerationError::new(
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let elapsed_ms = request_started_at.elapsed().as_millis();
+                if let Some(timing_hook) = &timing_hook {
+                    timing_hook(ProviderTimingEvent::ResponseHeaders {
+                        attempt,
+                        elapsed_ms,
+                        outcome: ConversationTimingOutcome::Failed,
+                    });
+                }
+                mark_first_provider_event(
+                    &mut first_provider_event_observed,
+                    &timing_hook,
+                    attempt,
+                    request_started_at,
+                    ConversationTimingOutcome::Failed,
+                );
+                return Err(PlainAnswerGenerationError::new(
                     PlainAnswerFailureKind::Other,
                     format!("plain answer request failed: {error}"),
                     false,
-                )
-            })?;
+                ));
+            }
+        };
 
         let status = response.status();
+        if let Some(timing_hook) = &timing_hook {
+            timing_hook(ProviderTimingEvent::ResponseHeaders {
+                attempt,
+                elapsed_ms: request_started_at.elapsed().as_millis(),
+                outcome: if status.is_success() {
+                    ConversationTimingOutcome::Succeeded
+                } else {
+                    ConversationTimingOutcome::Failed
+                },
+            });
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            mark_first_provider_event(
+                &mut first_provider_event_observed,
+                &timing_hook,
+                attempt,
+                request_started_at,
+                ConversationTimingOutcome::Failed,
+            );
             return Err(PlainAnswerGenerationError::new(
                 PlainAnswerFailureKind::Other,
                 format!(
@@ -7803,23 +8213,57 @@ impl OpenAiPlainAnswerGenerator {
         let mut stream = response.bytes_stream();
         let mut done = false;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                PlainAnswerGenerationError::new(
-                    PlainAnswerFailureKind::Other,
-                    format!("plain answer stream failed: {error}"),
-                    answer_state.emitted_any,
-                )
-            })?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    mark_first_provider_event(
+                        &mut first_provider_event_observed,
+                        &timing_hook,
+                        attempt,
+                        request_started_at,
+                        ConversationTimingOutcome::Failed,
+                    );
+                    return Err(PlainAnswerGenerationError::new(
+                        PlainAnswerFailureKind::Other,
+                        format!("plain answer stream failed: {error}"),
+                        answer_state.emitted_any,
+                    ));
+                }
+            };
             buffer.extend_from_slice(&chunk);
             while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line = String::from_utf8_lossy(&buffer[..newline]).to_string();
                 buffer.drain(..=newline);
-                done = Self::consume_sse_line(
+                let mut staged_answer_deltas = Vec::new();
+                let mut staged_reasoning_deltas = Vec::new();
+                done = match Self::consume_sse_line(
                     &line,
                     &mut answer_state,
-                    &delta_sender,
-                    &reasoning_trace_hook,
-                )?;
+                    &mut staged_answer_deltas,
+                    &mut staged_reasoning_deltas,
+                    &mut first_provider_event_observed,
+                    &timing_hook,
+                    attempt,
+                    request_started_at,
+                ) {
+                    Ok(done) => {
+                        release_reasoning_deltas(staged_reasoning_deltas, &reasoning_trace_hook);
+                        answer_state.emitted_any |=
+                            delta_sender.is_some() && !staged_answer_deltas.is_empty();
+                        release_answer_deltas(staged_answer_deltas, &delta_sender);
+                        done
+                    }
+                    Err(error) => {
+                        mark_first_provider_event(
+                            &mut first_provider_event_observed,
+                            &timing_hook,
+                            attempt,
+                            request_started_at,
+                            ConversationTimingOutcome::Failed,
+                        );
+                        return Err(error);
+                    }
+                };
                 if done {
                     break;
                 }
@@ -7830,14 +8274,45 @@ impl OpenAiPlainAnswerGenerator {
         }
         if !buffer.is_empty() && !done {
             let line = String::from_utf8_lossy(&buffer).to_string();
-            done = Self::consume_sse_line(
+            let mut staged_answer_deltas = Vec::new();
+            let mut staged_reasoning_deltas = Vec::new();
+            done = match Self::consume_sse_line(
                 &line,
                 &mut answer_state,
-                &delta_sender,
-                &reasoning_trace_hook,
-            )?;
+                &mut staged_answer_deltas,
+                &mut staged_reasoning_deltas,
+                &mut first_provider_event_observed,
+                &timing_hook,
+                attempt,
+                request_started_at,
+            ) {
+                Ok(done) => {
+                    release_reasoning_deltas(staged_reasoning_deltas, &reasoning_trace_hook);
+                    answer_state.emitted_any |=
+                        delta_sender.is_some() && !staged_answer_deltas.is_empty();
+                    release_answer_deltas(staged_answer_deltas, &delta_sender);
+                    done
+                }
+                Err(error) => {
+                    mark_first_provider_event(
+                        &mut first_provider_event_observed,
+                        &timing_hook,
+                        attempt,
+                        request_started_at,
+                        ConversationTimingOutcome::Failed,
+                    );
+                    return Err(error);
+                }
+            };
         }
         if !done {
+            mark_first_provider_event(
+                &mut first_provider_event_observed,
+                &timing_hook,
+                attempt,
+                request_started_at,
+                ConversationTimingOutcome::Failed,
+            );
             return Err(PlainAnswerGenerationError::new(
                 PlainAnswerFailureKind::Other,
                 "plain answer stream ended without a finish terminator",
@@ -7864,12 +8339,26 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
         delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
         reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
     ) -> std::result::Result<String, PlainAnswerGenerationError> {
+        self.generate_with_timing(prompt, model, delta_sender, reasoning_trace_hook, None)
+            .await
+    }
+
+    async fn generate_with_timing(
+        &self,
+        prompt: &PlainAnswerPrompt,
+        model: &str,
+        delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
+        timing_hook: Option<ProviderTimingTraceHook>,
+    ) -> std::result::Result<String, PlainAnswerGenerationError> {
         let first_attempt = self
             .generate_attempt(
                 prompt,
                 model,
+                1,
                 delta_sender.clone(),
                 reasoning_trace_hook.clone(),
+                timing_hook.clone(),
             )
             .await;
         let error = match first_attempt {
@@ -7890,8 +8379,59 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
             ),
             user: prompt.user.clone(),
         };
-        self.generate_attempt(&retry_prompt, model, delta_sender, reasoning_trace_hook)
-            .await
+        self.generate_attempt(
+            &retry_prompt,
+            model,
+            2,
+            delta_sender,
+            reasoning_trace_hook,
+            timing_hook,
+        )
+        .await
+    }
+}
+
+fn mark_first_provider_event(
+    observed: &mut bool,
+    timing_hook: &Option<ProviderTimingTraceHook>,
+    attempt: u32,
+    request_started_at: Instant,
+    outcome: ConversationTimingOutcome,
+) {
+    if *observed {
+        return;
+    }
+    *observed = true;
+    if let Some(timing_hook) = timing_hook {
+        timing_hook(ProviderTimingEvent::FirstProviderEvent {
+            attempt,
+            elapsed_ms: request_started_at.elapsed().as_millis(),
+            outcome,
+        });
+    }
+}
+
+fn release_answer_deltas(
+    answer_deltas: Vec<String>,
+    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) {
+    let Some(sender) = delta_sender else {
+        return;
+    };
+    for delta in answer_deltas {
+        let _ = sender.send(ConversationStreamSignal::Answer(delta));
+    }
+}
+
+fn release_reasoning_deltas(
+    reasoning_deltas: Vec<String>,
+    reasoning_trace_hook: &Option<ProviderReasoningTraceHook>,
+) {
+    let Some(hook) = reasoning_trace_hook else {
+        return;
+    };
+    for delta in reasoning_deltas {
+        hook(delta);
     }
 }
 
@@ -8168,7 +8708,11 @@ mod tests {
         }
     }
 
-    fn capture_structured_log(event: AgentTraceEvent) -> Value {
+    fn capture_structured_log_with_ids(
+        event: AgentTraceEvent,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Value {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writer_bytes = bytes.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -8179,10 +8723,183 @@ mod tests {
             .with_writer(move || LogCaptureWriter(writer_bytes.clone()))
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            log_agent_trace_event(&event, "conversation-1", "user", 7);
+            log_agent_trace_event(&event, conversation_id, message_id, "user", 7);
         });
         let bytes = bytes.lock().unwrap().clone();
         serde_json::from_slice(bytes.trim_ascii_end()).expect("captured tracing event is JSON")
+    }
+
+    fn capture_structured_log(event: AgentTraceEvent) -> Value {
+        capture_structured_log_with_ids(event, "conversation-1", "msg_test")
+    }
+
+    #[test]
+    fn structured_trace_events_correlate_turns_without_collapsing_same_conversation() {
+        let event = AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::TotalTurn,
+            planning_round: None,
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 42,
+        };
+        let first =
+            capture_structured_log_with_ids(event.clone(), "conversation-shared", "msg-one");
+        let second = capture_structured_log_with_ids(event, "conversation-shared", "msg-two");
+        assert_eq!(first["conversation_id"], json!("conversation-shared"));
+        assert_eq!(second["conversation_id"], json!("conversation-shared"));
+        assert_eq!(first["message_id"], json!("msg-one"));
+        assert_eq!(second["message_id"], json!("msg-two"));
+        assert_ne!(first["message_id"], second["message_id"]);
+    }
+
+    #[test]
+    fn latency_phase_timing_is_named_and_content_free() {
+        let delta = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
+            planning_round: Some(2),
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 37,
+        });
+        assert_eq!(delta.kind, "timing");
+        assert_eq!(
+            delta.title.as_deref(),
+            Some("Final-answer provider first-event wait")
+        );
+        assert_eq!(
+            delta.metadata["phase"],
+            json!("final_answer_first_provider_event_wait")
+        );
+        assert_eq!(delta.metadata["duration_ms"], json!(37));
+        let delta_json = serde_json::to_string(&delta).unwrap();
+        assert!(!delta_json.contains("contact@example"));
+
+        let log = capture_structured_log(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ResourceDirectoryLookup,
+            planning_round: Some(2),
+            tool_name: Some("find_resources".to_string()),
+            call_id: Some("call-1".to_string()),
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 12,
+        });
+        assert_eq!(log["phase"], json!("resource_directory_lookup"));
+        assert_eq!(log["duration_ms"], json!(12));
+        let serialized = log.to_string();
+        for forbidden in [
+            "prompt",
+            "answer",
+            "contact",
+            "args",
+            "output",
+            "secret",
+            "reasoning",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn timing_activity_rows_have_human_labels_and_duration_only() {
+        let delta = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::RetryDelay,
+            planning_round: Some(2),
+            tool_name: Some("find_resources".to_string()),
+            call_id: Some("call-1".to_string()),
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 101,
+        });
+        let rows = conversation_activity_steps_from_trace_deltas(&[delta]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Retry delay");
+        assert!(rows[0].summary.as_deref().unwrap().contains("101 ms"));
+        assert!(!rows[0].summary.as_deref().unwrap().contains("call-1"));
+    }
+
+    #[test]
+    fn guarded_timing_outcome_remains_guarded_in_transport_delta() {
+        let delta = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ToolExecution,
+            planning_round: Some(1),
+            tool_name: Some("db_query".to_string()),
+            call_id: Some("call-guarded".to_string()),
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Guarded,
+            elapsed_ms: 9,
+        });
+        assert_eq!(delta.status.as_deref(), Some("guarded"));
+        assert_eq!(delta.metadata["outcome"], json!("guarded"));
+    }
+
+    #[test]
+    fn timing_deltas_keep_planning_rounds_distinct_and_logs_allowlist_metadata() {
+        let first = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ToolPlanningModelDuration,
+            planning_round: Some(1),
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 4,
+        });
+        let second = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ToolPlanningModelDuration,
+            planning_round: Some(2),
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 7,
+        });
+        assert_ne!(first.id, second.id);
+        assert!(first.id.contains("tool-planning-model-duration-1-1-turn"));
+        assert!(second.id.contains("tool-planning-model-duration-2-1-turn"));
+
+        let log = capture_structured_log(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
+            planning_round: Some(3),
+            tool_name: None,
+            call_id: None,
+            attempt: 2,
+            outcome: ConversationTimingOutcome::Failed,
+            elapsed_ms: 19,
+        });
+        let keys = log
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "timestamp",
+                "level",
+                "target",
+                "event_name",
+                "conversation_id",
+                "message_id",
+                "actor_kind",
+                "actor_id",
+                "phase",
+                "round",
+                "attempt",
+                "call_id",
+                "tool_name",
+                "outcome",
+                "duration_ms",
+                "provider_wait_proxy",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(log["provider_wait_proxy"], json!(true));
+        assert_eq!(log["outcome"], json!("failed"));
     }
 
     #[test]
@@ -8371,6 +9088,250 @@ mod tests {
         assert_eq!(emissions[4].payload.delta.as_deref(), Some("second"));
     }
 
+    #[test]
+    fn public_transport_orders_selection_retry_result_provider_wait_answer_and_terminal_events() {
+        let message_id = "msg_transport-order";
+        let session_id = Some("44444444-4444-4444-4444-444444444444".to_string());
+        let selection = AgentTraceEvent::ToolSelectionObservation {
+            round: 1,
+            attempt: 1,
+            enabled_tools: vec!["find_resources".to_string()],
+            selected_tools: vec!["find_resources".to_string()],
+            expected_curated_resources: true,
+            missed_expected_curated_resources: false,
+            outcome: "planned".to_string(),
+        };
+        let attempted = AgentTraceEvent::ToolAttempted {
+            call_id: "call-transport".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 1,
+        };
+        let retry = AgentTraceEvent::ToolRetryScheduled {
+            call_id: "call-transport".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 1,
+            reason: "connection_failure".to_string(),
+        };
+        let terminal = AgentTraceEvent::ToolTerminal {
+            call_id: "call-transport".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 2,
+            status: "succeeded".to_string(),
+            elapsed_ms: 12,
+        };
+        let traces = [
+            selection,
+            attempted,
+            retry,
+            terminal,
+            AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::FinalAnswerResponseHeaderWait,
+                planning_round: Some(2),
+                tool_name: None,
+                call_id: None,
+                attempt: 1,
+                outcome: ConversationTimingOutcome::Succeeded,
+                elapsed_ms: 4,
+            },
+            AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
+                planning_round: Some(2),
+                tool_name: None,
+                call_id: None,
+                attempt: 1,
+                outcome: ConversationTimingOutcome::Succeeded,
+                elapsed_ms: 8,
+            },
+        ];
+        let mut answer_state = ChatStreamAnswerEmissionState::default();
+        let mut emissions = Vec::new();
+        for trace in traces {
+            emissions.extend(chat_stream_emissions_for_signal(
+                &mut answer_state,
+                ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(trace))),
+                message_id,
+                &session_id,
+                Vec::new(),
+                Instant::now(),
+                false,
+            ));
+        }
+        emissions.extend(chat_stream_emissions_for_signal(
+            &mut answer_state,
+            ConversationStreamSignal::Answer("answer".to_string()),
+            message_id,
+            &session_id,
+            Vec::new(),
+            Instant::now(),
+            false,
+        ));
+        emissions.extend(chat_stream_emissions_for_signal(
+            &mut answer_state,
+            ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
+                AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::FinalAnswerModelDuration,
+                    planning_round: Some(2),
+                    tool_name: None,
+                    call_id: None,
+                    attempt: 1,
+                    outcome: ConversationTimingOutcome::Succeeded,
+                    elapsed_ms: 16,
+                },
+            ))),
+            message_id,
+            &session_id,
+            Vec::new(),
+            Instant::now(),
+            false,
+        ));
+        emissions.extend(chat_stream_emissions_for_signal(
+            &mut answer_state,
+            ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
+                AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::TotalTurn,
+                    planning_round: None,
+                    tool_name: None,
+                    call_id: None,
+                    attempt: 1,
+                    outcome: ConversationTimingOutcome::Succeeded,
+                    elapsed_ms: 20,
+                },
+            ))),
+            message_id,
+            &session_id,
+            Vec::new(),
+            Instant::now(),
+            false,
+        ));
+        emissions.extend(chat_stream_terminal_emissions(
+            message_id,
+            &session_id,
+            "test-model".to_string(),
+            vec![ToolCallInfoResponse {
+                tool_id: "find-resources".to_string(),
+                tool_name: "Find Resources".to_string(),
+                query: Some("Acme Legal Aid".to_string()),
+                output_summary: Some("Fresh result".to_string()),
+                warnings: Vec::new(),
+                guarded: false,
+            }],
+            Some(ConversationTraceResponse {
+                visibility: "detailed".to_string(),
+                reasoning: ReasoningTraceResponse {
+                    summary: "Completed transport trace".to_string(),
+                },
+                trace_deltas: Vec::new(),
+                tools: Vec::new(),
+                retrieval: Vec::new(),
+                activity_steps: Vec::new(),
+                suppressed: false,
+            }),
+            Vec::new(),
+        ));
+        let event_names = emissions
+            .iter()
+            .map(|emission| emission.event)
+            .collect::<Vec<_>>();
+        assert_eq!(event_names.first(), Some(&"trace_delta"));
+        let trace_position = |kind: &str| {
+            emissions
+                .iter()
+                .position(|emission| {
+                    emission.event == "trace_delta"
+                        && emission
+                            .payload
+                            .trace_delta
+                            .as_ref()
+                            .is_some_and(|delta| delta.kind == kind)
+                })
+                .expect("trace kind should be transported")
+        };
+        assert!(trace_position("tool_selection_observation") < trace_position("tool_call"));
+        assert!(trace_position("tool_retry") < trace_position("tool_result"));
+        let answer_index = event_names
+            .iter()
+            .position(|event| *event == "answer_delta")
+            .unwrap();
+        let late_final_timing_index = emissions
+            .iter()
+            .position(|emission| {
+                emission.event == "trace_delta"
+                    && emission.payload.trace_delta.as_ref().is_some_and(|delta| {
+                        delta.metadata["phase"] == json!("final_answer_model_duration")
+                    })
+            })
+            .unwrap();
+        let timing_position = |phase: &str| {
+            emissions
+                .iter()
+                .position(|emission| {
+                    emission.event == "trace_delta"
+                        && emission
+                            .payload
+                            .trace_delta
+                            .as_ref()
+                            .is_some_and(|delta| delta.metadata["phase"] == json!(phase))
+                })
+                .expect("timing phase should be transported")
+        };
+        assert!(timing_position("final_answer_response_header_wait") < answer_index);
+        assert!(timing_position("final_answer_first_provider_event_wait") < answer_index);
+        assert!(answer_index < late_final_timing_index);
+        assert!(answer_index < timing_position("total_turn"));
+        assert_eq!(
+            event_names[event_names.len() - 2..],
+            ["trace_final", "done"]
+        );
+        assert!(emissions[event_names.len() - 2].payload.trace.is_some());
+        assert_eq!(
+            emissions[event_names.len() - 1].payload.model.as_deref(),
+            Some("test-model")
+        );
+    }
+
+    #[test]
+    fn public_stream_emits_late_timing_activity_after_answer_started() {
+        let message_id = "msg_timing";
+        let session_id = Some("33333333-3333-3333-3333-333333333333".to_string());
+        let mut state = ChatStreamAnswerEmissionState {
+            activity_steps_sent: true,
+            writing_status_sent: true,
+        };
+        let emissions = chat_stream_emissions_for_signal(
+            &mut state,
+            ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
+                AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::FinalAnswerModelDuration,
+                    planning_round: Some(1),
+                    tool_name: None,
+                    call_id: None,
+                    attempt: 1,
+                    outcome: ConversationTimingOutcome::Succeeded,
+                    elapsed_ms: 18,
+                },
+            ))),
+            message_id,
+            &session_id,
+            Vec::new(),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(
+            emissions
+                .iter()
+                .map(|emission| emission.event)
+                .collect::<Vec<_>>(),
+            vec!["trace_delta", "activity_step"]
+        );
+        assert_eq!(
+            emissions[1].payload.activity_step.as_ref().unwrap().title,
+            "Final-answer model duration"
+        );
+    }
+
     #[tokio::test]
     async fn plain_answer_generator_forwards_answer_and_reasoning_sse_deltas() {
         async fn completion(Json(body): Json<Value>) -> impl IntoResponse {
@@ -8418,13 +9379,22 @@ mod tests {
                 .expect("reasoning trace lock should remain available")
                 .push(delta);
         });
+        let provider_timing = Arc::new(Mutex::new(Vec::new()));
+        let provider_timing_sink = provider_timing.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            provider_timing_sink
+                .lock()
+                .expect("timing lock should remain available")
+                .push(event);
+        });
 
         let answer = generator
-            .generate(
+            .generate_with_timing(
                 &prompt,
                 "test-model",
                 Some(delta_tx),
                 Some(reasoning_trace_hook),
+                Some(timing_hook),
             )
             .await
             .expect("streamed completion should succeed");
@@ -8441,6 +9411,208 @@ mod tests {
                 .expect("reasoning trace lock should remain available"),
             vec!["Check ", "facts"]
         );
+        let timing = provider_timing
+            .lock()
+            .expect("timing lock should remain available");
+        assert!(matches!(
+            timing.as_slice(),
+            [
+                ProviderTimingEvent::ResponseHeaders { attempt: 1, outcome, .. },
+                ProviderTimingEvent::FirstProviderEvent { attempt: 1, outcome: first_outcome, .. },
+            ] if *outcome == ConversationTimingOutcome::Succeeded
+                && *first_outcome == ConversationTimingOutcome::Succeeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_timing_signals_precede_released_answer_deltas() {
+        let api_url = spawn_plain_answer_provider(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let timing_sender = sender.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            let (phase, elapsed_ms) = match event {
+                ProviderTimingEvent::ResponseHeaders { elapsed_ms, .. } => (
+                    ConversationTimingPhase::FinalAnswerResponseHeaderWait,
+                    elapsed_ms,
+                ),
+                ProviderTimingEvent::FirstProviderEvent { elapsed_ms, .. } => (
+                    ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
+                    elapsed_ms,
+                ),
+            };
+            let _ = timing_sender.send(ConversationStreamSignal::Trace(Box::new(
+                agent_trace_event_delta(AgentTraceEvent::Timing {
+                    phase,
+                    planning_round: Some(1),
+                    tool_name: None,
+                    call_id: None,
+                    attempt: 1,
+                    outcome: ConversationTimingOutcome::Succeeded,
+                    elapsed_ms,
+                }),
+            )));
+        });
+
+        let answer = generator
+            .generate_with_timing(&prompt, "test-model", Some(sender), None, Some(timing_hook))
+            .await
+            .expect("provider stream should complete");
+        assert_eq!(answer, "Hello");
+        let mut signals = Vec::new();
+        while let Ok(signal) = receiver.try_recv() {
+            signals.push(signal);
+        }
+        assert!(matches!(
+            signals.as_slice(),
+            [
+                ConversationStreamSignal::Trace(header),
+                ConversationStreamSignal::Trace(first),
+                ConversationStreamSignal::Answer(delta),
+            ] if header.metadata["phase"] == json!("final_answer_response_header_wait")
+                && first.metadata["phase"] == json!("final_answer_first_provider_event_wait")
+                && delta == "Hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_or_semantically_empty_provider_events_emit_one_failed_first_timing() {
+        let api_url = spawn_plain_answer_provider("data: {}\n\ndata: [DONE]\n\n").await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        });
+        let result = generator
+            .generate_with_timing(&prompt, "test-model", None, None, Some(timing_hook))
+            .await;
+        assert!(result.is_err());
+        let events = events.lock().unwrap();
+        let first_events = events
+            .iter()
+            .filter(|event| matches!(event, ProviderTimingEvent::FirstProviderEvent { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(first_events.len(), 1);
+        assert!(matches!(
+            first_events[0],
+            ProviderTimingEvent::FirstProviderEvent { outcome, .. }
+                if *outcome == ConversationTimingOutcome::Failed
+        ));
+    }
+
+    #[tokio::test]
+    async fn unusable_choice_content_and_reasoning_types_emit_one_failed_first_timing() {
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":123}}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":123}}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{}}]}\n\ndata: [DONE]\n\n",
+        ] {
+            let api_url = spawn_plain_answer_provider(body).await;
+            let generator = OpenAiPlainAnswerGenerator::new(
+                Client::new(),
+                api_url,
+                "test-key".to_string(),
+                0.1,
+            );
+            let prompt = PlainAnswerPrompt {
+                system: "answer plainly".to_string(),
+                user: "say hello".to_string(),
+            };
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            });
+            assert!(generator
+                .generate_with_timing(&prompt, "test-model", None, None, Some(timing_hook))
+                .await
+                .is_err());
+            let events = events.lock().unwrap();
+            let first_events = events
+                .iter()
+                .filter(|event| matches!(event, ProviderTimingEvent::FirstProviderEvent { .. }))
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                first_events.as_slice(),
+                [ProviderTimingEvent::FirstProviderEvent { outcome, .. }]
+                    if *outcome == ConversationTimingOutcome::Failed
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn role_only_provider_event_is_a_valid_first_event() {
+        let api_url = spawn_plain_answer_provider(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        });
+        let answer = generator
+            .generate_with_timing(&prompt, "test-model", None, None, Some(timing_hook))
+            .await
+            .expect("role-only provider event should be accepted");
+        assert_eq!(answer, "Hello");
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ProviderTimingEvent::FirstProviderEvent {
+                outcome: ConversationTimingOutcome::Succeeded,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn done_without_a_valid_provider_event_is_failed_once() {
+        let api_url = spawn_plain_answer_provider("data: [DONE]\n\n").await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        });
+        assert!(generator
+            .generate_with_timing(&prompt, "test-model", None, None, Some(timing_hook))
+            .await
+            .is_err());
+        let events = events.lock().unwrap();
+        let first_events = events
+            .iter()
+            .filter(|event| matches!(event, ProviderTimingEvent::FirstProviderEvent { .. }))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            first_events.as_slice(),
+            [ProviderTimingEvent::FirstProviderEvent { outcome, .. }]
+                if *outcome == ConversationTimingOutcome::Failed
+        ));
     }
 
     async fn spawn_plain_answer_provider(body: &'static str) -> String {
@@ -9440,6 +10612,7 @@ mod tests {
         ContactReplayState,
         Vec<String>,
         Vec<ConversationTraceDeltaResponse>,
+        Vec<ConversationStreamSignal>,
     ) {
         let (state, provider_url, resource_url) = spawn_contact_replay_servers(
             empty_resource,
@@ -9510,15 +10683,27 @@ mod tests {
             );
         }
         let input = contact_replay_input(&case, initial_answer.as_deref());
-        let answer = run_agent_turn(&mut agent, &input, None, &settings, delta_sender)
-            .await
-            .expect("real planner/tool/final-answer chain should complete");
+        let replay_sinks = ConversationToolLoopSinks::new(None);
+        let answer = run_conversation_tool_loop(
+            &mut agent,
+            &input,
+            &case.followup,
+            &replay_sinks,
+            None,
+            &settings,
+            delta_sender,
+        )
+        .await
+        .expect("real planner/tool/final-answer chain should complete")
+        .answer;
         let mut deltas = Vec::new();
         let mut transported_trace_deltas = Vec::new();
+        let mut transported_signals = Vec::new();
         if let Some(receiver) = delta_receiver.as_mut() {
             let mut saw_answer = false;
             let mut saw_selection = false;
             while let Ok(signal) = receiver.try_recv() {
+                transported_signals.push(signal.clone());
                 match signal {
                     ConversationStreamSignal::Answer(delta) => {
                         if stream && enabled {
@@ -9551,7 +10736,7 @@ mod tests {
                 .expect("trace sink should lock")
                 .clone()
         };
-        (answer, state, deltas, trace_deltas)
+        (answer, state, deltas, trace_deltas, transported_signals)
     }
 
     #[tokio::test]
@@ -9560,7 +10745,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let spanish_email = ContactReplayCase::spanish_email();
-        let (batch_answer, batch_state, batch_deltas, batch_trace_deltas) =
+        let (batch_answer, batch_state, batch_deltas, batch_trace_deltas, _) =
             run_real_contact_replay(
                 false,
                 false,
@@ -9633,7 +10818,7 @@ mod tests {
         assert!(final_text.contains("stale@example.test"));
         assert!(!batch_answer.contains("stale@example.test"));
 
-        let (stream_answer, stream_state, stream_deltas, stream_trace_deltas) =
+        let (stream_answer, stream_state, stream_deltas, stream_trace_deltas, _) =
             run_real_contact_replay(
                 false,
                 true,
@@ -9667,7 +10852,7 @@ mod tests {
             contact_key: "phone".to_string(),
             contact_value: "+52-555-0100".to_string(),
         };
-        let (phone_answer, phone_state, _, _) = run_real_contact_replay(
+        let (phone_answer, phone_state, _, _, _) = run_real_contact_replay(
             false,
             false,
             true,
@@ -9732,7 +10917,7 @@ mod tests {
         ];
         for (index, case) in modality_cases.into_iter().enumerate() {
             let stream = index % 2 == 0;
-            let (answer, state, deltas, trace_deltas) = run_real_contact_replay(
+            let (answer, state, deltas, trace_deltas, _) = run_real_contact_replay(
                 false,
                 stream,
                 true,
@@ -9768,13 +10953,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_stream_and_nonstream_transport_preserve_the_same_timing_phases() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let case = ContactReplayCase::spanish_email();
+        let (_, _, _, batch_trace, _) =
+            run_real_contact_replay(false, false, true, case.clone(), false, false, false, false)
+                .await;
+        let (_, _, _, stream_trace, _) =
+            run_real_contact_replay(false, true, true, case, false, false, false, false).await;
+        let phases = |trace: &[ConversationTraceDeltaResponse]| {
+            trace
+                .iter()
+                .filter(|delta| delta.kind == "timing")
+                .filter_map(|delta| delta.metadata["phase"].as_str().map(str::to_string))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let batch_phases = phases(&batch_trace);
+        let stream_phases = phases(&stream_trace);
+        assert!(batch_phases.contains("final_answer_response_header_wait"));
+        assert!(batch_phases.contains("final_answer_first_provider_event_wait"));
+        assert!(batch_phases.contains("final_answer_model_duration"));
+        assert_eq!(batch_phases, stream_phases);
+    }
+
+    #[tokio::test]
     async fn real_contact_replay_retry_trace_preserves_attempt_order_and_call_id() {
         let _guard = contact_replay_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let case = ContactReplayCase::spanish_email();
         for stream in [false, true] {
-            let (answer, state, answer_deltas, trace_deltas) = run_real_contact_replay(
+            let (answer, state, answer_deltas, trace_deltas, _) = run_real_contact_replay(
                 false,
                 stream,
                 true,
@@ -9834,12 +11045,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_stream_replay_drives_full_public_lifecycle_transport() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let case = ContactReplayCase::spanish_email();
+        let (answer, _state, answer_deltas, trace_deltas, signals) =
+            run_real_contact_replay(false, true, true, case, false, false, true, false).await;
+        assert_eq!(answer_deltas.concat(), answer);
+        assert!(
+            !signals.is_empty(),
+            "real streaming replay should emit signals"
+        );
+
+        let message_id = "msg-real-replay";
+        let session_id = Some("55555555-5555-5555-5555-555555555555".to_string());
+        let activity_steps = conversation_activity_steps_from_trace_deltas(&trace_deltas);
+        let mut answer_state = ChatStreamAnswerEmissionState::default();
+        let mut emissions = Vec::new();
+        for signal in signals {
+            emissions.extend(chat_stream_emissions_for_signal(
+                &mut answer_state,
+                signal,
+                message_id,
+                &session_id,
+                activity_steps.clone(),
+                Instant::now(),
+                false,
+            ));
+        }
+        emissions.extend(chat_stream_terminal_emissions(
+            message_id,
+            &session_id,
+            "test-model".to_string(),
+            vec![ToolCallInfoResponse {
+                tool_id: "find-resources".to_string(),
+                tool_name: "Find Resources".to_string(),
+                query: Some("Acme Legal Aid".to_string()),
+                output_summary: Some("Fresh result".to_string()),
+                warnings: Vec::new(),
+                guarded: false,
+            }],
+            Some(ConversationTraceResponse {
+                visibility: "detailed".to_string(),
+                reasoning: ReasoningTraceResponse {
+                    summary: "Completed real replay trace".to_string(),
+                },
+                trace_deltas: trace_deltas.clone(),
+                tools: Vec::new(),
+                retrieval: Vec::new(),
+                activity_steps,
+                suppressed: false,
+            }),
+            Vec::new(),
+        ));
+
+        let trace_position = |kind: &str| {
+            emissions
+                .iter()
+                .position(|emission| {
+                    emission.event == "trace_delta"
+                        && emission
+                            .payload
+                            .trace_delta
+                            .as_ref()
+                            .is_some_and(|delta| delta.kind == kind)
+                })
+                .expect("real trace kind should be transported")
+        };
+        let answer_position = emissions
+            .iter()
+            .position(|emission| emission.event == "answer_delta")
+            .expect("real answer should be transported");
+        let final_model_position = trace_position("timing");
+        let selection_position = trace_position("tool_selection_observation");
+        let retry_position = trace_position("tool_retry");
+        let result_position = trace_position("tool_result");
+        assert!(selection_position < retry_position);
+        assert!(retry_position < result_position);
+        assert!(result_position < answer_position);
+        assert!(emissions[..answer_position].iter().any(|emission| emission
+            .payload
+            .trace_delta
+            .as_ref()
+            .is_some_and(|delta| {
+                delta.kind == "timing"
+                    && delta.metadata["phase"] == json!("final_answer_response_header_wait")
+            })));
+        assert!(emissions[..answer_position].iter().any(|emission| emission
+            .payload
+            .trace_delta
+            .as_ref()
+            .is_some_and(|delta| {
+                delta.kind == "timing"
+                    && delta.metadata["phase"] == json!("final_answer_first_provider_event_wait")
+            })));
+        assert!(emissions[answer_position + 1..]
+            .iter()
+            .any(
+                |emission| emission.payload.trace_delta.as_ref().is_some_and(|delta| {
+                    delta.kind == "timing"
+                        && delta.metadata["phase"] == json!("final_answer_model_duration")
+                })
+            ));
+        assert!(emissions[answer_position + 1..]
+            .iter()
+            .any(
+                |emission| emission.payload.trace_delta.as_ref().is_some_and(|delta| {
+                    delta.kind == "timing" && delta.metadata["phase"] == json!("total_turn")
+                })
+            ));
+        assert_eq!(emissions[emissions.len() - 2].event, "trace_final");
+        assert!(emissions[emissions.len() - 2].payload.trace.is_some());
+        assert_eq!(
+            emissions.last().map(|emission| emission.event),
+            Some("done")
+        );
+        assert_eq!(
+            emissions
+                .last()
+                .and_then(|emission| emission.payload.model.as_deref()),
+            Some("test-model")
+        );
+        assert!(final_model_position < answer_position);
+    }
+
+    #[tokio::test]
     async fn real_contact_replay_is_honest_for_empty_results_and_disabled_resources() {
         let _guard = contact_replay_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let default_case = ContactReplayCase::spanish_email();
-        let (empty_answer, empty_state, _, empty_trace_deltas) = run_real_contact_replay(
+        let (empty_answer, empty_state, _, empty_trace_deltas, _) = run_real_contact_replay(
             true,
             false,
             true,
@@ -9866,17 +11203,18 @@ mod tests {
             .first()
             .is_some_and(|request| request.to_string().contains("No vetted")));
 
-        let (disabled_answer, disabled_state, _, disabled_trace_deltas) = run_real_contact_replay(
-            false,
-            false,
-            false,
-            default_case,
-            false,
-            false,
-            false,
-            false,
-        )
-        .await;
+        let (disabled_answer, disabled_state, _, disabled_trace_deltas, _) =
+            run_real_contact_replay(
+                false,
+                false,
+                false,
+                default_case,
+                false,
+                false,
+                false,
+                false,
+            )
+            .await;
         assert_eq!(
             disabled_answer,
             "Curated Resources are unavailable for this turn."
@@ -9901,6 +11239,7 @@ mod tests {
             disabled_stream_state,
             disabled_stream_deltas,
             disabled_stream_trace_deltas,
+            _,
         ) = run_real_contact_replay(
             false,
             true,
@@ -9934,7 +11273,7 @@ mod tests {
             contact_key: "email".to_string(),
             contact_value: "unused@example.test".to_string(),
         };
-        let (benign_answer, benign_state, _, benign_trace_deltas) =
+        let (benign_answer, benign_state, _, benign_trace_deltas, _) =
             run_real_contact_replay(false, false, true, benign_case, false, false, false, false)
                 .await;
         assert_eq!(
@@ -9956,7 +11295,7 @@ mod tests {
         );
         assert_eq!(benign_selection.metadata["selected_tools"], json!([]));
 
-        let (_, omitted_state, _, omitted_trace_deltas) = run_real_contact_replay(
+        let (_, omitted_state, _, omitted_trace_deltas, _) = run_real_contact_replay(
             false,
             false,
             true,
@@ -9981,17 +11320,18 @@ mod tests {
             json!(true)
         );
 
-        let (_, _, omitted_stream_deltas, omitted_stream_trace_deltas) = run_real_contact_replay(
-            false,
-            true,
-            true,
-            ContactReplayCase::spanish_email(),
-            false,
-            true,
-            false,
-            false,
-        )
-        .await;
+        let (_, _, omitted_stream_deltas, omitted_stream_trace_deltas, _) =
+            run_real_contact_replay(
+                false,
+                true,
+                true,
+                ContactReplayCase::spanish_email(),
+                false,
+                true,
+                false,
+                false,
+            )
+            .await;
         assert!(!omitted_stream_deltas.is_empty());
         assert!(omitted_stream_trace_deltas.iter().any(|delta| {
             delta.kind == "tool_selection_observation"
@@ -10143,6 +11483,7 @@ mod tests {
                 } else {
                     ToolResult::success("unused")
                 },
+                outcome: None,
             }));
             registry.register(Arc::new(crate::tools::DoneTool));
             let mut agent = SageAgent::new_without_memory(registry, "test");
@@ -11181,6 +12522,7 @@ mod tests {
     struct TestTraceTool {
         name: &'static str,
         result: ToolResult,
+        outcome: Option<ConversationTimingOutcome>,
     }
 
     #[async_trait::async_trait]
@@ -11200,6 +12542,19 @@ mod tests {
         async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
             Ok(self.result.clone())
         }
+
+        async fn execute_with_timing_outcome(
+            &self,
+            args: &ToolArgs,
+        ) -> Result<(ToolResult, ConversationTimingOutcome)> {
+            let result = self.execute(args).await?;
+            let outcome = self.outcome.clone().unwrap_or(if result.success {
+                ConversationTimingOutcome::Succeeded
+            } else {
+                ConversationTimingOutcome::Failed
+            });
+            Ok((result, outcome))
+        }
     }
 
     #[tokio::test]
@@ -11208,10 +12563,12 @@ mod tests {
         registry.register(Arc::new(TestTraceTool {
             name: "web_search",
             result: ToolResult::error("network failure"),
+            outcome: None,
         }));
         registry.register(Arc::new(TestTraceTool {
             name: "db_query",
             result: ToolResult::error("read-only guard rejected the query"),
+            outcome: Some(ConversationTimingOutcome::Guarded),
         }));
         let mut agent = SageAgent::new_without_memory(registry, "test");
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -11876,6 +13233,7 @@ mod tests {
                 "target",
                 "event_name",
                 "conversation_id",
+                "message_id",
                 "actor_kind",
                 "actor_id",
                 "phase",
@@ -11894,6 +13252,7 @@ mod tests {
                 "target",
                 "event_name",
                 "conversation_id",
+                "message_id",
                 "actor_kind",
                 "actor_id",
                 "phase",
@@ -11908,6 +13267,7 @@ mod tests {
                 "target",
                 "event_name",
                 "conversation_id",
+                "message_id",
                 "actor_kind",
                 "actor_id",
                 "phase",
@@ -11965,6 +13325,7 @@ mod tests {
                     "target",
                     "event_name",
                     "conversation_id",
+                    "message_id",
                     "actor_kind",
                     "actor_id",
                     "phase",
@@ -11989,6 +13350,7 @@ mod tests {
                     "target",
                     "event_name",
                     "conversation_id",
+                    "message_id",
                     "actor_kind",
                     "actor_id",
                     "phase",
@@ -12738,6 +14100,153 @@ mod tests {
         assert_eq!(traces[0].tool_id, "db-query");
         assert!(traces[0].guarded);
         assert_eq!(traces[0].warnings, vec!["db_query_rejected".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn database_tool_rejection_emits_guarded_timing_in_batch_and_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/internal/agent/admin-db-query",
+                    post(|| async {
+                        Json(json!({
+                            "success": false,
+                            "columns": [],
+                            "rows": [],
+                            "executionTimeMs": 0,
+                            "error": "Only SELECT queries are allowed."
+                        }))
+                    }),
+                ),
+            )
+            .await
+            .expect("test backend should serve");
+        });
+        let tool = AdminDbQueryTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{addr}"),
+                "test-token".to_string(),
+            ),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(tool));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let batch_events = Arc::new(Mutex::new(Vec::new()));
+        let batch_sink = batch_events.clone();
+        let (stream_sender, mut stream_receiver) = mpsc::unbounded_channel();
+        agent.set_trace_hook(Arc::new(move |event| {
+            batch_sink.lock().unwrap().push(event.clone());
+            let _ = stream_sender.send(ConversationStreamSignal::Trace(Box::new(
+                agent_trace_event_delta(event),
+            )));
+        }));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "db_query".to_string(),
+                    args: ToolArgs::from([("sql".to_string(), json!("DROP TABLE users"))]),
+                }],
+                replan_after_results: false,
+                planning_round: 3,
+            })
+            .await;
+        server.abort();
+
+        assert!(!result.executed_tools[0].result.success);
+        assert!(batch_events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::ToolExecution,
+                outcome: ConversationTimingOutcome::Guarded,
+                planning_round: Some(3),
+                ..
+            }
+        )));
+        assert!(batch_events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolTerminal { status, .. } if status == "guarded"
+        )));
+        let mut streamed = Vec::new();
+        while let Ok(signal) = stream_receiver.try_recv() {
+            if let ConversationStreamSignal::Trace(delta) = signal {
+                streamed.push(delta);
+            }
+        }
+        assert!(streamed
+            .iter()
+            .any(|delta| { delta.kind == "timing" && delta.status.as_deref() == Some("guarded") }));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_emits_correlated_failed_timing_in_batch_and_stream() {
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "test");
+        let batch_events = Arc::new(Mutex::new(Vec::new()));
+        let batch_sink = batch_events.clone();
+        let (stream_sender, mut stream_receiver) = mpsc::unbounded_channel();
+        agent.set_trace_hook(Arc::new(move |event| {
+            batch_sink.lock().unwrap().push(event.clone());
+            let _ = stream_sender.send(ConversationStreamSignal::Trace(Box::new(
+                agent_trace_event_delta(event),
+            )));
+        }));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "unregistered_tool".to_string(),
+                    args: ToolArgs::default(),
+                }],
+                replan_after_results: false,
+                planning_round: 4,
+            })
+            .await;
+        assert!(!result.executed_tools[0].result.success);
+        let batch = batch_events.lock().unwrap();
+        let timing = batch
+            .iter()
+            .find_map(|event| match event {
+                AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::ToolExecution,
+                    outcome: ConversationTimingOutcome::Failed,
+                    planning_round: Some(4),
+                    tool_name: Some(tool_name),
+                    call_id: Some(call_id),
+                    attempt: 1,
+                    ..
+                } => Some((tool_name.clone(), call_id.clone())),
+                _ => None,
+            })
+            .expect("unknown Tool should emit failed execution timing");
+        assert!(batch.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolTerminal {
+                tool_name,
+                call_id,
+                status,
+                attempt: 1,
+                ..
+            } if tool_name == &timing.0 && call_id == &timing.1 && status == "failed"
+        )));
+        let mut streamed = Vec::new();
+        while let Ok(signal) = stream_receiver.try_recv() {
+            if let ConversationStreamSignal::Trace(delta) = signal {
+                streamed.push(delta);
+            }
+        }
+        assert!(streamed.iter().any(|delta| {
+            delta.kind == "timing"
+                && delta.status.as_deref() == Some("failed")
+                && delta.metadata["phase"] == json!("tool_execution")
+                && delta.metadata["call_id"] == json!(timing.1)
+        }));
     }
 
     #[tokio::test]
