@@ -2036,7 +2036,8 @@ impl Tool for FindResourcesTool {
          make a fresh find_resources call when enabled and use only its returned contact data. \
          Use recent Conversation context for the organization, jurisdiction, language, and help \
          type instead of relying on earlier assistant contact prose. Referral results are filtered \
-         by region and the type of help needed and ranked from most-local to global."
+         by region and the type of help needed and ranked from most-local to global. If the fresh \
+         result has no matching contact, say so honestly and do not invent or reconstruct one."
     }
 
     fn args_schema(&self) -> &str {
@@ -7874,6 +7875,7 @@ mod tests {
     use serde_json::json;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
 
     fn answer_signal(signal: ConversationStreamSignal) -> String {
         match signal {
@@ -7882,6 +7884,11 @@ mod tests {
                 panic!("expected answer signal, received trace {}", delta.id)
             }
         }
+    }
+
+    fn contact_replay_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     #[test]
@@ -8716,141 +8723,6 @@ mod tests {
         }
     }
 
-    struct ContactFollowupPlanner {
-        enabled: bool,
-        output: String,
-        plan_calls: usize,
-        executed_calls: usize,
-        selected_args: Option<ToolArgs>,
-    }
-
-    impl ContactFollowupPlanner {
-        fn grounded() -> Self {
-            Self {
-                enabled: true,
-                output: "Fresh Curated Resources contact: fresh@example.test".to_string(),
-                plan_calls: 0,
-                executed_calls: 0,
-                selected_args: None,
-            }
-        }
-
-        fn empty_result() -> Self {
-            Self {
-                enabled: true,
-                output: "No matching current contact is listed.".to_string(),
-                plan_calls: 0,
-                executed_calls: 0,
-                selected_args: None,
-            }
-        }
-
-        fn disabled() -> Self {
-            Self {
-                enabled: false,
-                output: "Curated Resources are unavailable for this turn.".to_string(),
-                plan_calls: 0,
-                executed_calls: 0,
-                selected_args: None,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ToolPlanner for ContactFollowupPlanner {
-        fn has_actionable_tools(&self) -> bool {
-            self.enabled
-        }
-
-        async fn plan_tools(
-            &mut self,
-            user_message: &str,
-            _is_first_plan: bool,
-        ) -> Result<ToolPlanningOutcome> {
-            assert!(
-                self.enabled,
-                "disabled Curated Resources must skip planning"
-            );
-            assert!(user_message.contains("Acme Legal Aid"));
-            assert!(user_message.contains("Mexico"));
-            assert!(user_message.contains("legal help"));
-            assert!(user_message.contains("me puedes dar el email"));
-            self.plan_calls += 1;
-            let args = ToolArgs::from([
-                ("query".to_string(), json!("Acme Legal Aid")),
-                ("region".to_string(), json!("MX")),
-                ("language".to_string(), json!("es")),
-                ("help_type".to_string(), json!("legal")),
-            ]);
-            self.selected_args = Some(args.clone());
-            Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
-                vec![crate::sage_agent::ToolCall {
-                    name: "find_resources".to_string(),
-                    args,
-                }],
-                false,
-            )))
-        }
-
-        async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
-            assert!(self.enabled, "disabled Curated Resources must not execute");
-            assert_eq!(decision.tool_calls.len(), 1);
-            assert_eq!(decision.tool_calls[0].name, "find_resources");
-            self.executed_calls += 1;
-            StepResult {
-                messages: Vec::new(),
-                tool_calls: decision.tool_calls.clone(),
-                executed_tools: vec![ExecutedTool {
-                    tool_call: decision.tool_calls[0].clone(),
-                    result: ToolResult::success(self.output.clone()),
-                }],
-                done: false,
-            }
-        }
-
-        fn plain_answer_prompt(&self, user_message: &str) -> PlainAnswerPrompt {
-            PlainAnswerPrompt {
-                system: "Answer only from the current Tool result.".to_string(),
-                user: format!(
-                    "Earlier assistant prose mentioned stale@example.test.\nCurrent request: {user_message}\nFresh Tool result: {}",
-                    self.output
-                ),
-            }
-        }
-    }
-
-    struct ContactAnswerGenerator;
-
-    #[async_trait::async_trait]
-    impl PlainAnswerGenerator for ContactAnswerGenerator {
-        async fn generate(
-            &self,
-            prompt: &PlainAnswerPrompt,
-            _model: &str,
-            delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-            _reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
-        ) -> std::result::Result<String, PlainAnswerGenerationError> {
-            let answer = if prompt.user.contains("fresh@example.test") {
-                "The current Curated Resources result lists fresh@example.test."
-            } else if prompt
-                .user
-                .contains("No matching current contact is listed.")
-            {
-                "No matching current contact is listed."
-            } else {
-                "Curated Resources are unavailable for this turn."
-            };
-            if let Some(sender) = delta_sender {
-                let _ = sender.send(ConversationStreamSignal::Answer(answer.to_string()));
-            }
-            Ok(answer.to_string())
-        }
-    }
-
-    fn contact_followup_input() -> String {
-        "RECENT CONVERSATION\nassistant: Acme Legal Aid contact was stale@example.test.\nuser: The organization is in Mexico and I need legal help.\nCURRENT REQUEST\nme puedes dar el email?".to_string()
-    }
-
     struct UnstructuredActionablePlanner;
 
     #[async_trait::async_trait]
@@ -8920,107 +8792,517 @@ mod tests {
         assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), "answer");
     }
 
-    #[tokio::test]
-    async fn contact_followup_plans_fresh_lookup_with_retained_context_and_grounded_contact() {
-        let mut planner = ContactFollowupPlanner::grounded();
-        let input = contact_followup_input();
-        let turn = run_turn_with_adapters(
-            &mut planner,
-            &ContactAnswerGenerator,
-            &input,
-            "test-model",
-            None,
-        )
-        .await
-        .expect("contact follow-up should complete through the shared turn seam");
-
-        assert_eq!(planner.plan_calls, 1);
-        assert_eq!(planner.executed_calls, 1);
-        let args = planner
-            .selected_args
-            .as_ref()
-            .expect("fresh find_resources args should be captured");
-        assert_eq!(args["query"], json!("Acme Legal Aid"));
-        assert_eq!(args["region"], json!("MX"));
-        assert_eq!(args["language"], json!("es"));
-        assert_eq!(args["help_type"], json!("legal"));
-        assert_eq!(
-            turn.answer,
-            "The current Curated Resources result lists fresh@example.test."
-        );
-        assert!(!turn.answer.contains("stale@example.test"));
+    #[derive(Clone, Debug)]
+    struct ContactReplayCase {
+        followup: String,
+        context: String,
+        initial_turn: String,
+        language: String,
+        help_type: String,
+        contact_key: String,
+        contact_value: String,
     }
 
-    #[tokio::test]
-    async fn contact_followup_empty_result_is_honest_and_disabled_resources_stay_tool_free() {
-        let mut empty_planner = ContactFollowupPlanner::empty_result();
-        let empty_turn = run_turn_with_adapters(
-            &mut empty_planner,
-            &ContactAnswerGenerator,
-            &contact_followup_input(),
-            "test-model",
-            None,
-        )
-        .await
-        .expect("empty contact result should still produce a bounded answer");
-        assert_eq!(empty_planner.executed_calls, 1);
-        assert_eq!(empty_turn.answer, "No matching current contact is listed.");
-        assert!(!empty_turn.answer.contains("stale@example.test"));
-
-        let mut disabled_planner = ContactFollowupPlanner::disabled();
-        let disabled_turn = run_turn_with_adapters(
-            &mut disabled_planner,
-            &ContactAnswerGenerator,
-            &contact_followup_input(),
-            "test-model",
-            None,
-        )
-        .await
-        .expect("disabled Curated Resources should answer without planning");
-        assert_eq!(disabled_planner.plan_calls, 0);
-        assert_eq!(disabled_planner.executed_calls, 0);
-        assert_eq!(
-            disabled_turn.answer,
-            "Curated Resources are unavailable for this turn."
-        );
-        assert!(!disabled_turn.answer.contains("find_resources"));
-    }
-
-    #[tokio::test]
-    async fn contact_followup_batch_and_streaming_paths_share_fresh_grounding() {
-        let input = contact_followup_input();
-        let mut batch_planner = ContactFollowupPlanner::grounded();
-        let batch = run_turn_with_adapters(
-            &mut batch_planner,
-            &ContactAnswerGenerator,
-            &input,
-            "test-model",
-            None,
-        )
-        .await
-        .expect("batch turn should complete");
-
-        let mut stream_planner = ContactFollowupPlanner::grounded();
-        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
-        let streamed = run_turn_with_adapters(
-            &mut stream_planner,
-            &ContactAnswerGenerator,
-            &input,
-            "test-model",
-            Some(delta_tx),
-        )
-        .await
-        .expect("streaming turn should complete");
-        let mut deltas = Vec::new();
-        while let Ok(signal) = delta_rx.try_recv() {
-            deltas.push(answer_signal(signal));
+    impl ContactReplayCase {
+        fn spanish_email() -> Self {
+            Self {
+                followup: "me puedes dar el email?".to_string(),
+                context: "La organización está en México y necesito ayuda legal.".to_string(),
+                initial_turn:
+                    "PRIMER TURNO: Cuéntame sobre Acme Legal Aid en México para ayuda legal."
+                        .to_string(),
+                language: "es".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "email".to_string(),
+                contact_value: "fresh@example.test".to_string(),
+            }
         }
 
-        assert_eq!(batch.answer, streamed.answer);
-        assert_eq!(deltas.concat(), streamed.answer);
-        assert_eq!(batch_planner.selected_args, stream_planner.selected_args);
-        assert_eq!(batch_planner.executed_calls, 1);
-        assert_eq!(stream_planner.executed_calls, 1);
+        fn stale_contact_value(&self) -> String {
+            if self.contact_key == "email" {
+                "stale@example.test".to_string()
+            } else if self.contact_key == "phone" {
+                "+52-555-0000".to_string()
+            } else {
+                format!("stale-{}", self.contact_key)
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ContactReplayState {
+        planner_requests: Arc<Mutex<Vec<Value>>>,
+        final_answer_requests: Arc<Mutex<Vec<Value>>>,
+        resource_requests: Arc<Mutex<Vec<Value>>>,
+        empty_resource: bool,
+        case: ContactReplayCase,
+        two_turn: bool,
+    }
+
+    async fn contact_replay_provider(
+        State(state): State<ContactReplayState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            let final_index = state.final_answer_requests.lock().unwrap().len();
+            state
+                .final_answer_requests
+                .lock()
+                .unwrap()
+                .push(body.clone());
+            let body_text = body.to_string();
+            let answer = if state.two_turn && final_index == 0 {
+                format!(
+                    "The initial Resource Directory contact was {}.",
+                    state.case.stale_contact_value()
+                )
+            } else if body_text.contains("No vetted") {
+                "No matching current contact is currently listed.".to_string()
+            } else if !body_text.contains("CURATED RESOURCES CONTACT GROUNDING") {
+                "Curated Resources are unavailable for this turn.".to_string()
+            } else if !body_text.contains(&state.case.contact_value) {
+                "No fresh contact result was supplied.".to_string()
+            } else {
+                format!(
+                    "The current Resource Directory contact is {}.",
+                    state.case.contact_value
+                )
+            };
+            let first = answer
+                .split_once(' ')
+                .map(|(prefix, suffix)| (format!("{prefix} "), suffix.to_string()))
+                .unwrap_or_else(|| (answer.to_string(), String::new()));
+            return (
+                [("content-type", "text/event-stream")],
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{\"content\":{}}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                     data: [DONE]\n\n",
+                    serde_json::to_string(&first.0).unwrap(),
+                    serde_json::to_string(&first.1).unwrap(),
+                ),
+            )
+                .into_response();
+        }
+
+        let body_text = body.to_string();
+        let plan_index = state.planner_requests.lock().unwrap().len();
+        let has_contact_policy = body_text.contains("CURATED RESOURCES CONTACT GROUNDING")
+            && ((state.two_turn && plan_index == 0)
+                || (body_text.contains(&state.case.followup)
+                    && body_text.contains("CURRENT REQUEST")))
+            && body_text.contains("Acme Legal Aid")
+            && (plan_index == 0 || body_text.contains(&state.case.context));
+        state.planner_requests.lock().unwrap().push(body);
+        let tool_calls = if has_contact_policy {
+            json!([{
+                "name": "find_resources",
+                "args": {
+                    "query": "Acme Legal Aid",
+                    "region": "MX",
+                    "language": state.case.language,
+                    "help_type": state.case.help_type,
+                }
+            }])
+            .to_string()
+        } else {
+            "[]".to_string()
+        };
+        let planner_content = format!(
+            "[[ ## tool_calls ## ]]\n{tool_calls}\n\n[[ ## replan_after_results ## ]]\nfalse\n\n[[ ## completed ## ]]"
+        );
+        Json(json!({
+            "id": "contact-plan",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": planner_content
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .into_response()
+    }
+
+    async fn contact_replay_resources(
+        State(state): State<ContactReplayState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let resource_index = {
+            let mut requests = state.resource_requests.lock().unwrap();
+            let index = requests.len();
+            requests.push(body);
+            index
+        };
+        if state.empty_resource {
+            return Json(json!({
+                "resources": [],
+                "query": "Acme Legal Aid",
+                "resolved_country_code": "MX",
+                "help_type": "legal",
+                "total_count": 0,
+                "returned_count": 0,
+                "limit": 5,
+                "offset": 0,
+                "has_more": false,
+                "next_offset": null
+            }));
+        }
+        let contact_value = if state.two_turn && resource_index == 0 {
+            state.case.stale_contact_value()
+        } else {
+            state.case.contact_value.clone()
+        };
+        let mut contact = serde_json::Map::new();
+        contact.insert(state.case.contact_key.clone(), Value::String(contact_value));
+        Json(json!({
+            "resources": [{
+                "resource_id": "acme-mx",
+                "name": "Acme Legal Aid",
+                "resource_type": "legal",
+                "description": "Freshly verified contact record.",
+                "contact": contact,
+                "languages": ["es", "en"],
+                "coverage": "Mexico",
+                "help_types": ["legal"],
+                "verified_at": "2026-07-27T00:00:00Z"
+            }],
+            "query": "Acme Legal Aid",
+            "resolved_country_code": "MX",
+            "help_type": "legal",
+            "total_count": 1,
+            "returned_count": 1,
+            "limit": 5,
+            "offset": 0,
+            "has_more": false,
+            "next_offset": null
+        }))
+    }
+
+    async fn spawn_contact_replay_servers(
+        empty_resource: bool,
+        case: ContactReplayCase,
+        two_turn: bool,
+    ) -> (ContactReplayState, String, String) {
+        let state = ContactReplayState {
+            empty_resource,
+            case,
+            planner_requests: Arc::new(Mutex::new(Vec::new())),
+            final_answer_requests: Arc::new(Mutex::new(Vec::new())),
+            resource_requests: Arc::new(Mutex::new(Vec::new())),
+            two_turn,
+        };
+        let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("provider listener should bind");
+        let provider_address = provider_listener
+            .local_addr()
+            .expect("provider listener has address");
+        let provider_state = state.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                provider_listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(contact_replay_provider))
+                    .with_state(provider_state),
+            )
+            .await
+            .expect("provider replay server should run");
+        });
+
+        let resource_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("resource listener should bind");
+        let resource_address = resource_listener
+            .local_addr()
+            .expect("resource listener has address");
+        let resource_state = state.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                resource_listener,
+                Router::new()
+                    .route(
+                        "/internal/agent/resources/search",
+                        post(contact_replay_resources),
+                    )
+                    .with_state(resource_state),
+            )
+            .await
+            .expect("resource replay server should run");
+        });
+        (
+            state,
+            format!("http://{provider_address}/v1"),
+            format!("http://{resource_address}"),
+        )
+    }
+
+    fn contact_replay_input(case: &ContactReplayCase, previous_answer: Option<&str>) -> String {
+        let previous = previous_answer.unwrap_or("Acme Legal Aid contact was stale@example.test.");
+        format!(
+            "RECENT CONVERSATION\nassistant: {previous}\nuser: Acme Legal Aid — {}\nCURRENT REQUEST\n{}",
+            case.context, case.followup
+        )
+    }
+
+    async fn run_real_contact_replay(
+        empty_resource: bool,
+        stream: bool,
+        enabled: bool,
+        case: ContactReplayCase,
+        two_turn: bool,
+    ) -> (String, ContactReplayState, Vec<String>) {
+        let (state, provider_url, resource_url) =
+            spawn_contact_replay_servers(empty_resource, case.clone(), two_turn).await;
+        let mut registry = ToolRegistry::new();
+        if enabled {
+            registry.register(Arc::new(FindResourcesTool {
+                internal: InternalAgentClient::new(
+                    Client::new(),
+                    resource_url,
+                    "test-internal-token".to_string(),
+                ),
+                jurisdiction: Some("MX".to_string()),
+                traces: Arc::new(Mutex::new(Vec::new())),
+            }));
+        }
+        registry.register(Arc::new(crate::tools::DoneTool));
+        let instruction = build_agent_instruction("PROFILE", false, enabled);
+        let mut agent = SageAgent::new_without_memory(registry, instruction);
+        SageAgent::configure_lm_with_temperature(&provider_url, "test-key", "test-model", 0.1)
+            .await
+            .expect("scripted provider should configure");
+        let settings = RequestLmSettings {
+            api_url: provider_url,
+            api_key: "test-key".to_string(),
+            model_chain: vec!["test-model".to_string()],
+            temperature: 0.1,
+        };
+        let (delta_sender, mut delta_receiver) = if stream {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let initial_answer = if two_turn {
+            Some(
+                run_agent_turn(&mut agent, &case.initial_turn, None, &settings, None)
+                    .await
+                    .expect("initial organization turn should complete"),
+            )
+        } else {
+            None
+        };
+        if let Some(initial) = initial_answer.as_deref() {
+            assert!(
+                initial.contains(&case.stale_contact_value()),
+                "unexpected initial answer: {initial}"
+            );
+        }
+        let input = contact_replay_input(&case, initial_answer.as_deref());
+        let answer = run_agent_turn(&mut agent, &input, None, &settings, delta_sender)
+            .await
+            .expect("real planner/tool/final-answer chain should complete");
+        let mut deltas = Vec::new();
+        if let Some(receiver) = delta_receiver.as_mut() {
+            while let Ok(signal) = receiver.try_recv() {
+                deltas.push(answer_signal(signal));
+            }
+        }
+        (answer, state, deltas)
+    }
+
+    #[tokio::test]
+    async fn real_contact_replay_uses_sage_planner_tool_and_fresh_final_grounding() {
+        let _guard = contact_replay_lock().lock().unwrap();
+        let spanish_email = ContactReplayCase::spanish_email();
+        let (batch_answer, batch_state, batch_deltas) =
+            run_real_contact_replay(false, false, true, spanish_email.clone(), true).await;
+        assert_eq!(
+            batch_answer,
+            "The current Resource Directory contact is fresh@example.test."
+        );
+        assert!(batch_deltas.is_empty());
+        let planner_request = batch_state
+            .planner_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("real Sage planner request should reach the provider");
+        let planner_text = planner_request.to_string();
+        assert!(planner_text.contains("CURATED RESOURCES CONTACT GROUNDING"));
+        assert!(planner_text.contains("me puedes dar el email"));
+        assert!(planner_text.contains("Acme Legal Aid"));
+        assert!(planner_text.contains(&spanish_email.context));
+        assert!(planner_text.contains("stale@example.test"));
+        assert!(planner_text.contains(&spanish_email.followup));
+        let resource_request = batch_state
+            .resource_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("real find_resources Tool should call Resource Directory");
+        assert_eq!(resource_request["query"], "Acme Legal Aid");
+        assert_eq!(resource_request["jurisdiction"], "MX");
+        assert_eq!(resource_request["language"], spanish_email.language);
+        assert_eq!(resource_request["help_type"], spanish_email.help_type);
+        let final_request = batch_state
+            .final_answer_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("plain final-answer provider should be called");
+        let final_text = final_request.to_string();
+        assert!(final_text.contains(&spanish_email.contact_value));
+        assert!(final_text.contains("fresh find_resources result"));
+        assert!(final_text.contains("stale@example.test"));
+        assert!(!batch_answer.contains("stale@example.test"));
+
+        let (stream_answer, stream_state, stream_deltas) =
+            run_real_contact_replay(false, true, true, spanish_email.clone(), true).await;
+        assert_eq!(stream_answer, batch_answer);
+        assert_eq!(stream_deltas.concat(), stream_answer);
+        assert_eq!(
+            stream_state.resource_requests.lock().unwrap().len(),
+            2,
+            "streaming handler seam should execute the real Tool on both turns"
+        );
+
+        let english_phone = ContactReplayCase {
+            followup: "can you give me the phone number?".to_string(),
+            context: "The organization is in Mexico and I need legal help.".to_string(),
+            initial_turn:
+                "INITIAL ORGANIZATION TURN: Tell me about Acme Legal Aid in Mexico for legal help."
+                    .to_string(),
+            language: "en".to_string(),
+            help_type: "legal".to_string(),
+            contact_key: "phone".to_string(),
+            contact_value: "+52-555-0100".to_string(),
+        };
+        let (phone_answer, phone_state, _) =
+            run_real_contact_replay(false, false, true, english_phone.clone(), true).await;
+        assert_eq!(
+            phone_answer,
+            "The current Resource Directory contact is +52-555-0100."
+        );
+        assert_eq!(phone_state.planner_requests.lock().unwrap().len(), 2);
+        assert!(phone_state.planner_requests.lock().unwrap()[1]
+            .to_string()
+            .contains(&english_phone.stale_contact_value()));
+        assert_eq!(phone_state.resource_requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            phone_state.resource_requests.lock().unwrap()[1]["language"],
+            "en"
+        );
+
+        let modality_cases = [
+            ContactReplayCase {
+                followup: "can you give me the email?".to_string(),
+                context: "The organization is in Mexico and I need legal help.".to_string(),
+                initial_turn: "INITIAL ORGANIZATION TURN: Tell me about Acme Legal Aid in Mexico for legal help.".to_string(),
+                language: "en".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "email".to_string(),
+                contact_value: "fresh-en@example.test".to_string(),
+            },
+            ContactReplayCase {
+                followup: "me das el sitio web?".to_string(),
+                context: "La organización está en México y necesito ayuda legal.".to_string(),
+                initial_turn: "PRIMER TURNO: Cuéntame sobre Acme Legal Aid en México para ayuda legal.".to_string(),
+                language: "es".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "url".to_string(),
+                contact_value: "https://fresh.example.test".to_string(),
+            },
+            ContactReplayCase {
+                followup: "what is the address?".to_string(),
+                context: "The organization is in Mexico and I need legal help.".to_string(),
+                initial_turn: "INITIAL ORGANIZATION TURN: Tell me about Acme Legal Aid in Mexico for legal help.".to_string(),
+                language: "en".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "address".to_string(),
+                contact_value: "Fresh Street 42, Mexico City".to_string(),
+            },
+            ContactReplayCase {
+                followup: "me puedes dar el canal seguro?".to_string(),
+                context: "La organización está en México y necesito ayuda legal.".to_string(),
+                initial_turn: "PRIMER TURNO: Cuéntame sobre Acme Legal Aid en México para ayuda legal.".to_string(),
+                language: "es".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "secure_channel".to_string(),
+                contact_value: "Signal: fresh-contact".to_string(),
+            },
+        ];
+        for (index, case) in modality_cases.into_iter().enumerate() {
+            let stream = index % 2 == 0;
+            let (answer, state, deltas) =
+                run_real_contact_replay(false, stream, true, case.clone(), true).await;
+            assert_eq!(
+                answer,
+                format!(
+                    "The current Resource Directory contact is {}.",
+                    case.contact_value
+                )
+            );
+            assert_eq!(state.planner_requests.lock().unwrap().len(), 2);
+            let resource_requests = state.resource_requests.lock().unwrap();
+            assert_eq!(resource_requests.len(), 2);
+            assert_eq!(resource_requests[1]["language"], case.language);
+            assert_eq!(resource_requests[1]["help_type"], case.help_type);
+            assert_eq!(resource_requests[1]["query"], "Acme Legal Aid");
+            if stream {
+                assert_eq!(deltas.concat(), answer);
+            } else {
+                assert!(deltas.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn real_contact_replay_is_honest_for_empty_results_and_disabled_resources() {
+        let _guard = contact_replay_lock().lock().unwrap();
+        let default_case = ContactReplayCase::spanish_email();
+        let (empty_answer, empty_state, _) =
+            run_real_contact_replay(true, false, true, default_case.clone(), false).await;
+        assert_eq!(
+            empty_answer,
+            "No matching current contact is currently listed."
+        );
+        assert!(!empty_answer.contains("stale@example.test"));
+        assert_eq!(empty_state.resource_requests.lock().unwrap().len(), 1);
+        assert!(empty_state
+            .final_answer_requests
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(|request| request.to_string().contains("No vetted")));
+
+        let (disabled_answer, disabled_state, _) =
+            run_real_contact_replay(false, false, false, default_case, false).await;
+        assert_eq!(
+            disabled_answer,
+            "Curated Resources are unavailable for this turn."
+        );
+        assert!(disabled_state.planner_requests.lock().unwrap().is_empty());
+        assert!(disabled_state.resource_requests.lock().unwrap().is_empty());
+        let disabled_final = disabled_state
+            .final_answer_requests
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("disabled turn should use plain answer path");
+        assert!(!disabled_final
+            .to_string()
+            .contains("CURATED RESOURCES CONTACT GROUNDING"));
     }
 
     #[tokio::test]
@@ -9823,6 +10105,31 @@ mod tests {
         }
         assert!(instruction.contains("earlier assistant prose"));
         assert!(instruction.contains("no matching contact"));
+
+        let contact_tool = FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                "http://resource-directory.test".to_string(),
+                "test-token".to_string(),
+            ),
+            jurisdiction: None,
+            traces: Arc::new(Mutex::new(Vec::new())),
+        };
+        let tool_description = contact_tool.description();
+        for shared_rule in [
+            "fresh find_resources call",
+            "Use recent Conversation context",
+            "organization, jurisdiction, language, and help type",
+            "only its returned contact data",
+            "instead of relying on earlier assistant contact prose",
+            "If the fresh result has no matching contact",
+            "do not invent or reconstruct one",
+        ] {
+            assert!(
+                tool_description.contains(shared_rule),
+                "Tool contract must retain the shared contact-grounding rule: {shared_rule}"
+            );
+        }
 
         let disabled = build_chat_agent_instruction(
             "PROFILE",
