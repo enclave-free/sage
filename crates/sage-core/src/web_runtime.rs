@@ -1620,6 +1620,20 @@ fn log_agent_trace_event(
     }
 }
 
+fn install_conversation_trace_hook(
+    agent: &mut SageAgent,
+    trace_sink: ConversationTraceDeltaSink,
+    conversation_id: String,
+    message_id: String,
+    actor_kind: String,
+    actor_id: i32,
+) {
+    agent.set_trace_hook(Arc::new(move |event| {
+        log_agent_trace_event(&event, &conversation_id, &message_id, &actor_kind, actor_id);
+        trace_sink.emit(agent_trace_event_delta(event));
+    }));
+}
+
 fn tool_trace_title(tool_name: &str) -> String {
     match tool_name {
         "knowledge_search" => "Knowledge Search",
@@ -3652,21 +3666,14 @@ async fn chat(
         Some(memory),
         build_chat_agent_instruction(&ai_config.compiled_prompt, &request, &auth),
     );
-    let agent_trace_sink = tool_sinks.trace_deltas.clone();
-    let trace_conversation_id = session.id.to_string();
-    let trace_message_id = format!("msg_{}", Uuid::new_v4().simple());
-    let trace_actor_kind = auth.kind.clone();
-    let trace_actor_id = auth.id;
-    agent.set_trace_hook(Arc::new(move |event| {
-        log_agent_trace_event(
-            &event,
-            &trace_conversation_id,
-            &trace_message_id,
-            &trace_actor_kind,
-            trace_actor_id,
-        );
-        agent_trace_sink.emit(agent_trace_event_delta(event));
-    }));
+    install_conversation_trace_hook(
+        &mut agent,
+        tool_sinks.trace_deltas.clone(),
+        session.id.to_string(),
+        format!("msg_{}", Uuid::new_v4().simple()),
+        auth.kind.clone(),
+        auth.id,
+    );
 
     let input =
         build_conversation_turn_input(&auth, &profile, &request, persisted_context.as_ref());
@@ -3982,21 +3989,14 @@ async fn chat_stream(
             Some(memory),
             build_chat_agent_instruction(&ai_config.compiled_prompt, &request, &auth),
         );
-        let agent_trace_sink = tool_sinks.trace_deltas.clone();
-        let trace_conversation_id = session.id.to_string();
-        let trace_message_id = message_id.clone();
-        let trace_actor_kind = auth.kind.clone();
-        let trace_actor_id = auth.id;
-        agent.set_trace_hook(Arc::new(move |event| {
-            log_agent_trace_event(
-                &event,
-                &trace_conversation_id,
-                &trace_message_id,
-                &trace_actor_kind,
-                trace_actor_id,
-            );
-            agent_trace_sink.emit(agent_trace_event_delta(event));
-        }));
+        install_conversation_trace_hook(
+            &mut agent,
+            tool_sinks.trace_deltas.clone(),
+            session.id.to_string(),
+            message_id.clone(),
+            auth.kind.clone(),
+            auth.id,
+        );
         let input = build_conversation_turn_input(
             &auth,
             &profile,
@@ -4216,21 +4216,14 @@ async fn query(
                 .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
         ),
     );
-    let agent_trace_sink = tool_sinks.trace_deltas.clone();
-    let trace_conversation_id = session.id.to_string();
-    let trace_message_id = format!("msg_{}", Uuid::new_v4().simple());
-    let trace_actor_kind = auth.kind.clone();
-    let trace_actor_id = auth.id;
-    agent.set_trace_hook(Arc::new(move |event| {
-        log_agent_trace_event(
-            &event,
-            &trace_conversation_id,
-            &trace_message_id,
-            &trace_actor_kind,
-            trace_actor_id,
-        );
-        agent_trace_sink.emit(agent_trace_event_delta(event));
-    }));
+    install_conversation_trace_hook(
+        &mut agent,
+        tool_sinks.trace_deltas.clone(),
+        session.id.to_string(),
+        format!("msg_{}", Uuid::new_v4().simple()),
+        auth.kind.clone(),
+        auth.id,
+    );
 
     let input = build_query_conversation_turn_input(&auth, &profile, &request, &chat_request, None);
     let tool_loop = run_conversation_tool_loop(
