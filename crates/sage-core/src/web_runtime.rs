@@ -1736,7 +1736,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 "The model selected enabled Tools."
             };
             ConversationTraceDeltaResponse {
-                id: trace_delta_id("tool-selection", &round.to_string()),
+                id: trace_delta_id("tool-selection", &format!("{}-{}", round, attempt)),
                 kind: "tool_selection_observation".to_string(),
                 title: Some("Tool Selection".to_string()),
                 content: Some(summary.to_string()),
@@ -13785,6 +13785,20 @@ mod tests {
             json!(true)
         );
         assert!(!serde_json::to_string(&selection).unwrap().contains("email"));
+
+        let retried_selection =
+            agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
+                round: 2,
+                attempt: 2,
+                enabled_tools: vec!["find_resources".to_string()],
+                selected_tools: vec!["find_resources".to_string()],
+                expected_curated_resources: true,
+                missed_expected_curated_resources: false,
+                outcome: "planned".to_string(),
+            });
+        assert_ne!(selection.id, retried_selection.id);
+        assert_eq!(retried_selection.metadata["round"], json!(2));
+        assert_eq!(retried_selection.metadata["attempt"], json!(2));
 
         let attempted = agent_trace_event_delta(AgentTraceEvent::ToolAttempted {
             call_id: "call-1".to_string(),
