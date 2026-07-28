@@ -42,9 +42,9 @@ use crate::memory::MemoryManager;
 #[cfg(test)]
 use crate::sage_agent::StepResult;
 use crate::sage_agent::{
-    has_syntactic_tool_intent, tool_parse_arg, tool_string_arg, AgentTraceEvent, ExecutedTool,
-    PlainAnswerPrompt, ProviderReasoningTraceHook, SageAgent, Tool, ToolArgs, ToolPlanner,
-    ToolPlanningOutcome, ToolRegistry, ToolResult,
+    expects_curated_resource_lookup, has_syntactic_tool_intent, tool_parse_arg, tool_string_arg,
+    AgentTraceEvent, ExecutedTool, PlainAnswerPrompt, ProviderReasoningTraceHook, SageAgent, Tool,
+    ToolArgs, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -1411,47 +1411,6 @@ impl ConversationTraceDeltaSink {
     }
 }
 
-struct TracedTool {
-    inner: Arc<dyn Tool>,
-    trace_deltas: ConversationTraceDeltaSink,
-}
-
-#[async_trait::async_trait]
-impl Tool for TracedTool {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-
-    fn args_schema(&self) -> &str {
-        self.inner.args_schema()
-    }
-
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        let started_at = Instant::now();
-        let tool_name = self.name().to_string();
-        self.trace_deltas
-            .emit(tool_call_trace_delta(&tool_name, args));
-        let result = self.inner.execute(args).await;
-        let elapsed_ms = started_at.elapsed().as_millis();
-        match &result {
-            Ok(tool_result) => {
-                self.trace_deltas
-                    .emit(tool_result_trace_delta(&tool_name, tool_result, elapsed_ms))
-            }
-            Err(error) => self.trace_deltas.emit(tool_error_trace_delta(
-                &tool_name,
-                &error.to_string(),
-                elapsed_ms,
-            )),
-        }
-        result
-    }
-}
-
 #[derive(Clone)]
 struct ConversationToolLoopSinks {
     sources: Arc<Mutex<Vec<QuerySource>>>,
@@ -1471,13 +1430,6 @@ impl ConversationToolLoopSinks {
     }
 }
 
-fn traced_tool(tool: Arc<dyn Tool>, trace_deltas: &ConversationTraceDeltaSink) -> Arc<dyn Tool> {
-    Arc::new(TracedTool {
-        inner: tool,
-        trace_deltas: trace_deltas.clone(),
-    })
-}
-
 fn trace_delta_id(prefix: &str, name: &str) -> String {
     format!(
         "{}-{}-{}",
@@ -1487,10 +1439,84 @@ fn trace_delta_id(prefix: &str, name: &str) -> String {
     )
 }
 
+fn log_agent_trace_event(
+    event: &AgentTraceEvent,
+    conversation_id: &str,
+    actor_kind: &str,
+    actor_id: i32,
+) {
+    match event {
+        AgentTraceEvent::ToolSelectionObservation {
+            round,
+            attempt,
+            enabled_tools,
+            selected_tools,
+            expected_curated_resources,
+            missed_expected_curated_resources,
+            outcome,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_selection_observation",
+            conversation_id = %conversation_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "planning",
+            round = *round,
+            attempt = *attempt,
+            enabled_tools = ?enabled_tools,
+            selected_tools = ?selected_tools,
+            selection_count = selected_tools.len(),
+            expected_curated_resources = *expected_curated_resources,
+            missed_expected_curated_resources = *missed_expected_curated_resources,
+            outcome = %outcome,
+        ),
+        AgentTraceEvent::ToolAttempted {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_execution",
+            conversation_id = %conversation_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "attempted",
+            call_id = %call_id,
+            tool_name = %tool_name,
+            round = *planning_round,
+            attempt = *attempt,
+        ),
+        AgentTraceEvent::ToolTerminal {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            status,
+            elapsed_ms,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_execution",
+            conversation_id = %conversation_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "terminal",
+            call_id = %call_id,
+            tool_name = %tool_name,
+            round = *planning_round,
+            attempt = *attempt,
+            outcome = %status,
+            duration_ms = *elapsed_ms,
+        ),
+        _ => {}
+    }
+}
+
 fn tool_trace_title(tool_name: &str) -> String {
     match tool_name {
         "knowledge_search" => "Knowledge Search",
         "web_search" => "Web Search",
+        "find_resources" => "Curated Resources",
         "db_query" => "Database Query",
         "read_admin_setup_summary"
         | "read_instance_settings"
@@ -1513,72 +1539,90 @@ fn tool_trace_title(tool_name: &str) -> String {
     .to_string()
 }
 
-fn tool_call_trace_delta(tool_name: &str, args: &ToolArgs) -> ConversationTraceDeltaResponse {
-    let arg_names = args.keys().cloned().collect::<Vec<_>>();
-    ConversationTraceDeltaResponse {
-        id: trace_delta_id("tool-call", tool_name),
-        kind: "tool_call".to_string(),
-        title: Some(tool_trace_title(tool_name)),
-        content: Some(format!("Calling {}.", tool_name)),
-        tool_name: Some(tool_name.to_string()),
-        status: Some("running".to_string()),
-        metadata: json!({ "args": arg_names }),
-        created_at: Some(chrono::Utc::now().to_rfc3339()),
-    }
-}
-
-fn tool_result_trace_delta(
-    tool_name: &str,
-    result: &ToolResult,
-    elapsed_ms: u128,
-) -> ConversationTraceDeltaResponse {
-    let status = if result.success {
-        "succeeded"
-    } else if tool_name == "db_query" {
-        "guarded"
-    } else {
-        "failed"
-    };
-    let content = if result.success {
-        "Tool completed.".to_string()
-    } else {
-        result
-            .error
-            .as_deref()
-            .map(|error| truncate_chars(error, 240))
-            .unwrap_or_else(|| "Tool failed.".to_string())
-    };
-    ConversationTraceDeltaResponse {
-        id: trace_delta_id("tool-result", tool_name),
-        kind: "tool_result".to_string(),
-        title: Some(tool_trace_title(tool_name)),
-        content: Some(content),
-        tool_name: Some(tool_name.to_string()),
-        status: Some(status.to_string()),
-        metadata: json!({ "duration_ms": elapsed_ms }),
-        created_at: Some(chrono::Utc::now().to_rfc3339()),
-    }
-}
-
-fn tool_error_trace_delta(
-    tool_name: &str,
-    error: &str,
-    elapsed_ms: u128,
-) -> ConversationTraceDeltaResponse {
-    ConversationTraceDeltaResponse {
-        id: trace_delta_id("tool-result", tool_name),
-        kind: "tool_result".to_string(),
-        title: Some(tool_trace_title(tool_name)),
-        content: Some(truncate_chars(error, 240)),
-        tool_name: Some(tool_name.to_string()),
-        status: Some("failed".to_string()),
-        metadata: json!({ "duration_ms": elapsed_ms }),
-        created_at: Some(chrono::Utc::now().to_rfc3339()),
-    }
-}
-
 fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResponse {
     match event {
+        AgentTraceEvent::ToolSelectionObservation {
+            round,
+            attempt,
+            enabled_tools,
+            selected_tools,
+            expected_curated_resources,
+            missed_expected_curated_resources,
+            outcome,
+        } => {
+            let summary = if missed_expected_curated_resources {
+                "Curated Resources was expected but not selected."
+            } else if selected_tools.is_empty() {
+                "No Tools were selected."
+            } else {
+                "The model selected enabled Tools."
+            };
+            ConversationTraceDeltaResponse {
+                id: trace_delta_id("tool-selection", &round.to_string()),
+                kind: "tool_selection_observation".to_string(),
+                title: Some("Tool Selection".to_string()),
+                content: Some(summary.to_string()),
+                tool_name: None,
+                status: Some(
+                    if missed_expected_curated_resources || outcome == "failed" {
+                        "failed".to_string()
+                    } else {
+                        "succeeded".to_string()
+                    },
+                ),
+                metadata: json!({
+                    "round": round,
+                    "attempt": attempt,
+                    "enabled_tools": enabled_tools,
+                    "selected_tools": selected_tools,
+                    "selection_count": selected_tools.len(),
+                    "expected_curated_resources": expected_curated_resources,
+                    "missed_expected_curated_resources": missed_expected_curated_resources,
+                    "outcome": outcome,
+                }),
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+            }
+        }
+        AgentTraceEvent::ToolAttempted {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+        } => ConversationTraceDeltaResponse {
+            id: format!("{}-attempted", call_id),
+            kind: "tool_call".to_string(),
+            title: Some(tool_trace_title(&tool_name)),
+            content: Some(format!("{} call attempted.", tool_trace_title(&tool_name))),
+            tool_name: Some(tool_name),
+            status: Some("running".to_string()),
+            metadata: json!({ "phase": "attempted", "call_id": call_id, "round": planning_round, "attempt": attempt }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ToolTerminal {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            status,
+            elapsed_ms,
+        } => ConversationTraceDeltaResponse {
+            id: format!("{}-terminal", call_id),
+            kind: "tool_result".to_string(),
+            title: Some(tool_trace_title(&tool_name)),
+            content: Some(
+                match status.as_str() {
+                    "succeeded" => "Tool completed.",
+                    "guarded" => "Tool was guarded.",
+                    "timed_out" => "Tool timed out.",
+                    _ => "Tool failed.",
+                }
+                .to_string(),
+            ),
+            tool_name: Some(tool_name),
+            status: Some(status),
+            metadata: json!({ "phase": "terminal", "call_id": call_id, "round": planning_round, "attempt": attempt, "duration_ms": elapsed_ms }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
         AgentTraceEvent::ModelStepStarted { step, attempt } => ConversationTraceDeltaResponse {
             id: trace_delta_id("model-step", &format!("{}-{}-started", step, attempt)),
             kind: "model_step".to_string(),
@@ -1751,19 +1795,16 @@ fn build_conversation_tool_registry_with_context(
         .iter()
         .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID)
     {
-        registry.register(traced_tool(
-            Arc::new(KnowledgeSearchTool {
-                internal: internal.clone(),
-                user: auth.clone(),
-                top_k,
-                job_ids: request.job_ids.clone(),
-                jurisdiction: jurisdiction.clone(),
-                situation_details: situation_details.clone(),
-                sources: sinks.sources.clone(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(KnowledgeSearchTool {
+            internal: internal.clone(),
+            user: auth.clone(),
+            top_k,
+            job_ids: request.job_ids.clone(),
+            jurisdiction: jurisdiction.clone(),
+            situation_details: situation_details.clone(),
+            sources: sinks.sources.clone(),
+            traces: sinks.traces.clone(),
+        }));
     }
 
     if request
@@ -1771,47 +1812,35 @@ fn build_conversation_tool_registry_with_context(
         .iter()
         .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID)
     {
-        registry.register(traced_tool(
-            Arc::new(FindResourcesTool {
-                internal: internal.clone(),
-                jurisdiction: jurisdiction.clone(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(FindResourcesTool {
+            internal: internal.clone(),
+            jurisdiction: jurisdiction.clone(),
+            traces: sinks.traces.clone(),
+        }));
     }
 
     if request.tools.iter().any(|tool| tool == "web-search") {
-        registry.register(traced_tool(
-            Arc::new(SearxWebSearchTool {
-                http: http.clone(),
-                searxng_url: searxng_url.to_string(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(SearxWebSearchTool {
+            http: http.clone(),
+            searxng_url: searxng_url.to_string(),
+            traces: sinks.traces.clone(),
+        }));
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "db-query") {
-        registry.register(traced_tool(
-            Arc::new(AdminDbQueryTool {
-                internal: internal.clone(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(AdminDbQueryTool {
+            internal: internal.clone(),
+            traces: sinks.traces.clone(),
+        }));
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "admin-config") {
-        registry.register(traced_tool(
-            Arc::new(AdminConfigSetupSummaryTool {
-                internal: internal.clone(),
-                state: state.cloned(),
-                auth: auth.clone(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(AdminConfigSetupSummaryTool {
+            internal: internal.clone(),
+            state: state.cloned(),
+            auth: auth.clone(),
+            traces: sinks.traces.clone(),
+        }));
         for (name, endpoint, description) in [
             (
                 "read_instance_settings",
@@ -1851,28 +1880,22 @@ fn build_conversation_tool_registry_with_context(
         ] {
             if name == "read_agent_settings" {
                 if let Some(state) = state.cloned() {
-                    registry.register(traced_tool(
-                        Arc::new(AdminAgentSettingsReadTool {
-                            state,
-                            auth: auth.clone(),
-                            traces: sinks.traces.clone(),
-                        }),
-                        &sinks.trace_deltas,
-                    ));
+                    registry.register(Arc::new(AdminAgentSettingsReadTool {
+                        state,
+                        auth: auth.clone(),
+                        traces: sinks.traces.clone(),
+                    }));
                     continue;
                 }
             }
-            registry.register(traced_tool(
-                Arc::new(AdminConfigReadTool {
-                    internal: internal.clone(),
-                    auth: auth.clone(),
-                    name: name.to_string(),
-                    endpoint: endpoint.to_string(),
-                    description: description.to_string(),
-                    traces: sinks.traces.clone(),
-                }),
-                &sinks.trace_deltas,
-            ));
+            registry.register(Arc::new(AdminConfigReadTool {
+                internal: internal.clone(),
+                auth: auth.clone(),
+                name: name.to_string(),
+                endpoint: endpoint.to_string(),
+                description: description.to_string(),
+                traces: sinks.traces.clone(),
+            }));
         }
         for (name, endpoint, description, args_schema) in [
             (
@@ -1924,7 +1947,7 @@ fn build_conversation_tool_registry_with_context(
                 r#"{"key":"secret Deployment Setting name explicitly requested by the Admin"}"#,
             ),
         ] {
-            registry.register(traced_tool(
+            registry.register(
                 Arc::new(AdminConfigDirectTool {
                     internal: internal.clone(),
                     auth: auth.clone(),
@@ -1936,8 +1959,7 @@ fn build_conversation_tool_registry_with_context(
                     traces: sinks.traces.clone(),
                     affected_areas: sinks.admin_config_affected_areas.clone(),
                 }),
-                &sinks.trace_deltas,
-            ));
+            );
         }
     }
 
@@ -3283,7 +3305,16 @@ async fn chat(
         build_chat_agent_instruction(&ai_config.compiled_prompt, &request, &auth),
     );
     let agent_trace_sink = tool_sinks.trace_deltas.clone();
+    let trace_conversation_id = session.id.to_string();
+    let trace_actor_kind = auth.kind.clone();
+    let trace_actor_id = auth.id;
     agent.set_trace_hook(Arc::new(move |event| {
+        log_agent_trace_event(
+            &event,
+            &trace_conversation_id,
+            &trace_actor_kind,
+            trace_actor_id,
+        );
         agent_trace_sink.emit(agent_trace_event_delta(event));
     }));
 
@@ -3292,6 +3323,7 @@ async fn chat(
     let tool_loop = run_conversation_tool_loop(
         &mut agent,
         &input,
+        &request.message,
         &tool_sinks,
         Some(&memory_user_id),
         &lm_settings,
@@ -3601,7 +3633,16 @@ async fn chat_stream(
             build_chat_agent_instruction(&ai_config.compiled_prompt, &request, &auth),
         );
         let agent_trace_sink = tool_sinks.trace_deltas.clone();
+        let trace_conversation_id = session.id.to_string();
+        let trace_actor_kind = auth.kind.clone();
+        let trace_actor_id = auth.id;
         agent.set_trace_hook(Arc::new(move |event| {
+            log_agent_trace_event(
+                &event,
+                &trace_conversation_id,
+                &trace_actor_kind,
+                trace_actor_id,
+            );
             agent_trace_sink.emit(agent_trace_event_delta(event));
         }));
         let input = build_conversation_turn_input(
@@ -3614,6 +3655,7 @@ async fn chat_stream(
             let tool_loop_future = run_conversation_tool_loop(
                 &mut agent,
                 &input,
+                &request.message,
                 &tool_sinks,
                 Some(&memory_user_id),
                 &lm_settings,
@@ -3827,7 +3869,16 @@ async fn query(
         ),
     );
     let agent_trace_sink = tool_sinks.trace_deltas.clone();
+    let trace_conversation_id = session.id.to_string();
+    let trace_actor_kind = auth.kind.clone();
+    let trace_actor_id = auth.id;
     agent.set_trace_hook(Arc::new(move |event| {
+        log_agent_trace_event(
+            &event,
+            &trace_conversation_id,
+            &trace_actor_kind,
+            trace_actor_id,
+        );
         agent_trace_sink.emit(agent_trace_event_delta(event));
     }));
 
@@ -3835,6 +3886,7 @@ async fn query(
     let tool_loop = run_conversation_tool_loop(
         &mut agent,
         &input,
+        &request.question,
         &tool_sinks,
         Some(&memory_user_id),
         &lm_settings,
@@ -6629,12 +6681,14 @@ struct ConversationToolLoopOutput {
 async fn run_conversation_tool_loop(
     agent: &mut SageAgent,
     input: &str,
+    raw_user_message: &str,
     sinks: &ConversationToolLoopSinks,
     memory_user_id: Option<&str>,
     lm: &RequestLmSettings,
     answer_delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> AppResult<ConversationToolLoopOutput> {
     let turn_started_at = Instant::now();
+    agent.set_contact_lookup_expected(expects_curated_resource_lookup(raw_user_message));
     let answer = run_agent_turn(agent, input, memory_user_id, lm, answer_delta_sender).await?;
     sinks.trace_deltas.emit(turn_timing_trace_delta(
         turn_started_at.elapsed().as_millis(),
@@ -6800,7 +6854,8 @@ fn build_conversation_trace(
     let tools = detailed_tools;
     let retrieval = detailed_retrieval;
 
-    let activity_steps = conversation_activity_steps_from_tool_traces(&tools);
+    let mut activity_steps = conversation_activity_steps_from_tool_traces(&tools);
+    activity_steps.extend(conversation_activity_steps_from_trace_deltas(&trace_deltas));
 
     Some(ConversationTraceResponse {
         visibility: "detailed".to_string(),
@@ -6832,7 +6887,11 @@ fn conversation_activity_steps_from_sinks(
         .lock()
         .map(|traces| dedupe_tool_calls(traces.clone()))
         .unwrap_or_default();
-    conversation_activity_steps_from_tools(&tools)
+    let mut steps = conversation_activity_steps_from_tools(&tools);
+    steps.extend(conversation_activity_steps_from_trace_deltas(
+        &sinks.trace_deltas.snapshot(),
+    ));
+    steps
 }
 
 fn conversation_activity_steps_from_tool_traces(
@@ -6841,6 +6900,72 @@ fn conversation_activity_steps_from_tool_traces(
     tools
         .iter()
         .map(conversation_activity_step_from_tool_trace)
+        .collect()
+}
+
+fn conversation_activity_steps_from_trace_deltas(
+    deltas: &[ConversationTraceDeltaResponse],
+) -> Vec<ConversationActivityStepResponse> {
+    deltas
+        .iter()
+        .filter(|delta| {
+            matches!(
+                delta.kind.as_str(),
+                "tool_selection_observation" | "tool_call" | "tool_result"
+            )
+        })
+        .map(|delta| {
+            if matches!(delta.kind.as_str(), "tool_call" | "tool_result") {
+                return ConversationActivityStepResponse {
+                    id: format!("activity-{}", delta.id),
+                    kind: "tool".to_string(),
+                    title: delta.title.clone().unwrap_or_else(|| "Tool".to_string()),
+                    status: delta
+                        .status
+                        .clone()
+                        .unwrap_or_else(|| "running".to_string()),
+                    summary: delta.content.clone(),
+                    warnings: Vec::new(),
+                };
+            }
+            let missed = delta
+                .metadata
+                .get("missed_expected_curated_resources")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let selected = delta
+                .metadata
+                .get("selected_tools")
+                .and_then(Value::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(tool_trace_title)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let summary = if missed {
+                "Curated Resources was expected but not selected.".to_string()
+            } else if delta.metadata.get("outcome").and_then(Value::as_str) == Some("failed") {
+                "Tool planning failed before a selection was recorded.".to_string()
+            } else if selected.is_empty() {
+                "No Tools were selected.".to_string()
+            } else {
+                format!("Selected: {}.", selected.join(", "))
+            };
+            ConversationActivityStepResponse {
+                id: format!("activity-{}", delta.id),
+                kind: "tool_selection_observation".to_string(),
+                title: "Tool Selection".to_string(),
+                status: delta
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| "succeeded".to_string()),
+                summary: Some(summary),
+                warnings: Vec::new(),
+            }
+        })
         .collect()
 }
 
@@ -7891,6 +8016,37 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[derive(Clone)]
+    struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_structured_log(event: AgentTraceEvent) -> Value {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer_bytes = bytes.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_ansi(false)
+            .with_target(true)
+            .with_writer(move || LogCaptureWriter(writer_bytes.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_agent_trace_event(&event, "conversation-1", "user", 7);
+        });
+        let bytes = bytes.lock().unwrap().clone();
+        serde_json::from_slice(bytes.trim_ascii_end()).expect("captured tracing event is JSON")
+    }
+
     #[test]
     fn conversation_turn_transitions_skip_planning_and_bound_replans() {
         assert_eq!(
@@ -8837,6 +8993,54 @@ mod tests {
         empty_resource: bool,
         case: ContactReplayCase,
         two_turn: bool,
+        omit_tool_selection: bool,
+    }
+
+    #[derive(Clone)]
+    struct TransportFailureState {
+        mode: &'static str,
+        requests: Arc<Mutex<usize>>,
+    }
+
+    async fn transport_failure_provider(
+        State(state): State<TransportFailureState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let stream = body.get("stream").and_then(Value::as_bool) == Some(true);
+        *state.requests.lock().unwrap() += 1;
+        if state.mode == "planner_failure" {
+            return Json(json!({
+                "id": "planner-failure",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "plain prose, not a typed tool plan"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .into_response();
+        }
+        if !stream {
+            return Json(json!({
+                "id": "tool-failure-plan",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "[[ ## tool_calls ## ]]\n[{\"name\":\"web_search\",\"args\":{}}]\n\n[[ ## replan_after_results ## ]]\nfalse\n\n[[ ## completed ## ]]"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .into_response();
+        }
+        (
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Tool failed honestly.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+            .into_response()
     }
 
     async fn contact_replay_provider(
@@ -8858,6 +9062,8 @@ mod tests {
                 )
             } else if body_text.contains("No vetted") {
                 "No matching current contact is currently listed.".to_string()
+            } else if !expects_curated_resource_lookup(&state.case.followup) {
+                "No contact lookup was requested for this turn.".to_string()
             } else if !body_text.contains("CURATED RESOURCES CONTACT GROUNDING") {
                 "Curated Resources are unavailable for this turn.".to_string()
             } else if !body_text.contains(&state.case.contact_value) {
@@ -8888,13 +9094,14 @@ mod tests {
         let body_text = body.to_string();
         let plan_index = state.planner_requests.lock().unwrap().len();
         let has_contact_policy = body_text.contains("CURATED RESOURCES CONTACT GROUNDING")
+            && expects_curated_resource_lookup(&state.case.followup)
             && ((state.two_turn && plan_index == 0)
                 || (body_text.contains(&state.case.followup)
                     && body_text.contains("CURRENT REQUEST")))
             && body_text.contains("Acme Legal Aid")
             && (plan_index == 0 || body_text.contains(&state.case.context));
         state.planner_requests.lock().unwrap().push(body);
-        let tool_calls = if has_contact_policy {
+        let tool_calls = if has_contact_policy && !state.omit_tool_selection {
             json!([{
                 "name": "find_resources",
                 "args": {
@@ -8988,6 +9195,7 @@ mod tests {
         empty_resource: bool,
         case: ContactReplayCase,
         two_turn: bool,
+        omit_tool_selection: bool,
     ) -> (ContactReplayState, String, String) {
         let state = ContactReplayState {
             empty_resource,
@@ -8996,6 +9204,7 @@ mod tests {
             final_answer_requests: Arc::new(Mutex::new(Vec::new())),
             resource_requests: Arc::new(Mutex::new(Vec::new())),
             two_turn,
+            omit_tool_selection,
         };
         let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -9056,9 +9265,20 @@ mod tests {
         enabled: bool,
         case: ContactReplayCase,
         two_turn: bool,
-    ) -> (String, ContactReplayState, Vec<String>) {
-        let (state, provider_url, resource_url) =
-            spawn_contact_replay_servers(empty_resource, case.clone(), two_turn).await;
+        omit_tool_selection: bool,
+    ) -> (
+        String,
+        ContactReplayState,
+        Vec<String>,
+        Vec<ConversationTraceDeltaResponse>,
+    ) {
+        let (state, provider_url, resource_url) = spawn_contact_replay_servers(
+            empty_resource,
+            case.clone(),
+            two_turn,
+            omit_tool_selection,
+        )
+        .await;
         let mut registry = ToolRegistry::new();
         if enabled {
             registry.register(Arc::new(FindResourcesTool {
@@ -9074,6 +9294,26 @@ mod tests {
         registry.register(Arc::new(crate::tools::DoneTool));
         let instruction = build_agent_instruction("PROFILE", false, enabled);
         let mut agent = SageAgent::new_without_memory(registry, instruction);
+        let (delta_sender, mut delta_receiver) = if stream {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let transport_sender = delta_sender.clone();
+        let captured_trace_deltas = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = captured_trace_deltas.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            let delta = agent_trace_event_delta(event);
+            trace_sink
+                .lock()
+                .expect("trace sink should lock")
+                .push(delta.clone());
+            if let Some(sender) = &transport_sender {
+                let _ = sender.send(ConversationStreamSignal::Trace(Box::new(delta)));
+            }
+        }));
+        agent.set_contact_lookup_expected(expects_curated_resource_lookup(&case.followup));
         SageAgent::configure_lm_with_temperature(&provider_url, "test-key", "test-model", 0.1)
             .await
             .expect("scripted provider should configure");
@@ -9082,12 +9322,6 @@ mod tests {
             api_key: "test-key".to_string(),
             model_chain: vec!["test-model".to_string()],
             temperature: 0.1,
-        };
-        let (delta_sender, mut delta_receiver) = if stream {
-            let (sender, receiver) = mpsc::unbounded_channel();
-            (Some(sender), Some(receiver))
-        } else {
-            (None, None)
         };
         let initial_answer = if two_turn {
             Some(
@@ -9109,25 +9343,77 @@ mod tests {
             .await
             .expect("real planner/tool/final-answer chain should complete");
         let mut deltas = Vec::new();
+        let mut transported_trace_deltas = Vec::new();
         if let Some(receiver) = delta_receiver.as_mut() {
+            let mut saw_answer = false;
+            let mut saw_selection = false;
             while let Ok(signal) = receiver.try_recv() {
-                deltas.push(answer_signal(signal));
+                match signal {
+                    ConversationStreamSignal::Answer(delta) => {
+                        if stream && enabled {
+                            assert!(
+                                saw_selection,
+                                "stream answer must follow the live selection trace_delta"
+                            );
+                        }
+                        saw_answer = true;
+                        deltas.push(delta);
+                    }
+                    ConversationStreamSignal::Trace(delta) => {
+                        if stream && delta.kind == "tool_selection_observation" {
+                            assert!(
+                                !saw_answer,
+                                "selection trace_delta must precede answer chunks"
+                            );
+                            saw_selection = true;
+                        }
+                        transported_trace_deltas.push(*delta);
+                    }
+                }
             }
         }
-        (answer, state, deltas)
+        let trace_deltas = if stream {
+            transported_trace_deltas
+        } else {
+            captured_trace_deltas
+                .lock()
+                .expect("trace sink should lock")
+                .clone()
+        };
+        (answer, state, deltas, trace_deltas)
     }
 
     #[tokio::test]
     async fn real_contact_replay_uses_sage_planner_tool_and_fresh_final_grounding() {
-        let _guard = contact_replay_lock().lock().unwrap();
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let spanish_email = ContactReplayCase::spanish_email();
-        let (batch_answer, batch_state, batch_deltas) =
-            run_real_contact_replay(false, false, true, spanish_email.clone(), true).await;
+        let (batch_answer, batch_state, batch_deltas, batch_trace_deltas) =
+            run_real_contact_replay(false, false, true, spanish_email.clone(), true, false).await;
         assert_eq!(
             batch_answer,
             "The current Resource Directory contact is fresh@example.test."
         );
         assert!(batch_deltas.is_empty());
+        assert!(batch_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
+        let batch_attempt = batch_trace_deltas
+            .iter()
+            .find(|delta| delta.kind == "tool_call")
+            .expect("selected Tool should emit an attempted lifecycle delta");
+        let batch_terminal = batch_trace_deltas
+            .iter()
+            .find(|delta| delta.kind == "tool_result")
+            .expect("selected Tool should emit a terminal lifecycle delta");
+        assert_eq!(batch_attempt.metadata["phase"], json!("attempted"));
+        assert_eq!(batch_terminal.metadata["phase"], json!("terminal"));
+        assert_eq!(
+            batch_attempt.metadata["call_id"],
+            batch_terminal.metadata["call_id"]
+        );
+        assert_eq!(batch_terminal.status.as_deref(), Some("succeeded"));
         let planner_request = batch_state
             .planner_requests
             .lock()
@@ -9166,10 +9452,13 @@ mod tests {
         assert!(final_text.contains("stale@example.test"));
         assert!(!batch_answer.contains("stale@example.test"));
 
-        let (stream_answer, stream_state, stream_deltas) =
-            run_real_contact_replay(false, true, true, spanish_email.clone(), true).await;
+        let (stream_answer, stream_state, stream_deltas, stream_trace_deltas) =
+            run_real_contact_replay(false, true, true, spanish_email.clone(), true, false).await;
         assert_eq!(stream_answer, batch_answer);
         assert_eq!(stream_deltas.concat(), stream_answer);
+        assert!(stream_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
         assert_eq!(
             stream_state.resource_requests.lock().unwrap().len(),
             2,
@@ -9187,8 +9476,8 @@ mod tests {
             contact_key: "phone".to_string(),
             contact_value: "+52-555-0100".to_string(),
         };
-        let (phone_answer, phone_state, _) =
-            run_real_contact_replay(false, false, true, english_phone.clone(), true).await;
+        let (phone_answer, phone_state, _, _) =
+            run_real_contact_replay(false, false, true, english_phone.clone(), true, false).await;
         assert_eq!(
             phone_answer,
             "The current Resource Directory contact is +52-555-0100."
@@ -9243,8 +9532,8 @@ mod tests {
         ];
         for (index, case) in modality_cases.into_iter().enumerate() {
             let stream = index % 2 == 0;
-            let (answer, state, deltas) =
-                run_real_contact_replay(false, stream, true, case.clone(), true).await;
+            let (answer, state, deltas, trace_deltas) =
+                run_real_contact_replay(false, stream, true, case.clone(), true, false).await;
             assert_eq!(
                 answer,
                 format!(
@@ -9263,21 +9552,29 @@ mod tests {
             } else {
                 assert!(deltas.is_empty());
             }
+            assert!(trace_deltas
+                .iter()
+                .any(|delta| delta.kind == "tool_selection_observation"));
         }
     }
 
     #[tokio::test]
     async fn real_contact_replay_is_honest_for_empty_results_and_disabled_resources() {
-        let _guard = contact_replay_lock().lock().unwrap();
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let default_case = ContactReplayCase::spanish_email();
-        let (empty_answer, empty_state, _) =
-            run_real_contact_replay(true, false, true, default_case.clone(), false).await;
+        let (empty_answer, empty_state, _, empty_trace_deltas) =
+            run_real_contact_replay(true, false, true, default_case.clone(), false, false).await;
         assert_eq!(
             empty_answer,
             "No matching current contact is currently listed."
         );
         assert!(!empty_answer.contains("stale@example.test"));
         assert_eq!(empty_state.resource_requests.lock().unwrap().len(), 1);
+        assert!(empty_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
         assert!(empty_state
             .final_answer_requests
             .lock()
@@ -9285,8 +9582,8 @@ mod tests {
             .first()
             .is_some_and(|request| request.to_string().contains("No vetted")));
 
-        let (disabled_answer, disabled_state, _) =
-            run_real_contact_replay(false, false, false, default_case, false).await;
+        let (disabled_answer, disabled_state, _, disabled_trace_deltas) =
+            run_real_contact_replay(false, false, false, default_case, false, false).await;
         assert_eq!(
             disabled_answer,
             "Curated Resources are unavailable for this turn."
@@ -9303,10 +9600,240 @@ mod tests {
         assert!(!disabled_final
             .to_string()
             .contains("CURATED RESOURCES CONTACT GROUNDING"));
+        assert!(!disabled_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
+        let (
+            disabled_stream_answer,
+            disabled_stream_state,
+            disabled_stream_deltas,
+            disabled_stream_trace_deltas,
+        ) = run_real_contact_replay(
+            false,
+            true,
+            false,
+            ContactReplayCase::spanish_email(),
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(disabled_stream_answer, disabled_answer);
+        assert!(!disabled_stream_deltas.is_empty());
+        assert!(disabled_stream_state
+            .resource_requests
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(!disabled_stream_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
+
+        let benign_case = ContactReplayCase {
+            followup: "Please address my concern.".to_string(),
+            context: "The organization is in Mexico and I need legal help.".to_string(),
+            initial_turn:
+                "INITIAL ORGANIZATION TURN: Tell me about Acme Legal Aid in Mexico for legal help."
+                    .to_string(),
+            language: "en".to_string(),
+            help_type: "legal".to_string(),
+            contact_key: "email".to_string(),
+            contact_value: "unused@example.test".to_string(),
+        };
+        let (benign_answer, benign_state, _, benign_trace_deltas) =
+            run_real_contact_replay(false, false, true, benign_case, false, false).await;
+        assert_eq!(
+            benign_answer,
+            "No contact lookup was requested for this turn."
+        );
+        assert!(benign_state.resource_requests.lock().unwrap().is_empty());
+        let benign_selection = benign_trace_deltas
+            .iter()
+            .find(|delta| delta.kind == "tool_selection_observation")
+            .expect("benign Conversation turn should expose its planning observation");
+        assert_eq!(
+            benign_selection.metadata["expected_curated_resources"],
+            json!(false)
+        );
+        assert_eq!(
+            benign_selection.metadata["missed_expected_curated_resources"],
+            json!(false)
+        );
+        assert_eq!(benign_selection.metadata["selected_tools"], json!([]));
+
+        let (_, omitted_state, _, omitted_trace_deltas) = run_real_contact_replay(
+            false,
+            false,
+            true,
+            ContactReplayCase::spanish_email(),
+            false,
+            true,
+        )
+        .await;
+        assert!(omitted_state.resource_requests.lock().unwrap().is_empty());
+        let omitted = omitted_trace_deltas
+            .iter()
+            .find(|delta| delta.kind == "tool_selection_observation")
+            .expect("omitted planning round should emit an observation");
+        assert_eq!(omitted.metadata["expected_curated_resources"], json!(true));
+        assert_eq!(omitted.metadata["selected_tools"], json!([]));
+        assert_eq!(omitted.metadata["selection_count"], json!(0));
+        assert_eq!(omitted.metadata["outcome"], json!("planned"));
+        assert_eq!(
+            omitted.metadata["missed_expected_curated_resources"],
+            json!(true)
+        );
+
+        let (_, _, omitted_stream_deltas, omitted_stream_trace_deltas) = run_real_contact_replay(
+            false,
+            true,
+            true,
+            ContactReplayCase::spanish_email(),
+            false,
+            true,
+        )
+        .await;
+        assert!(!omitted_stream_deltas.is_empty());
+        assert!(omitted_stream_trace_deltas.iter().any(|delta| {
+            delta.kind == "tool_selection_observation"
+                && delta.metadata["missed_expected_curated_resources"] == json!(true)
+        }));
+    }
+
+    #[tokio::test]
+    async fn conversation_transport_reports_planner_and_tool_failures() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (mode, stream) in [
+            ("planner_failure", false),
+            ("tool_failure", false),
+            ("planner_failure", true),
+            ("tool_failure", true),
+        ] {
+            let state = TransportFailureState {
+                mode,
+                requests: Arc::new(Mutex::new(0)),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn({
+                let state = state.clone();
+                async move {
+                    axum::serve(
+                        listener,
+                        Router::new()
+                            .route("/v1/chat/completions", post(transport_failure_provider))
+                            .with_state(state),
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(TestTraceTool {
+                name: "web_search",
+                result: if mode == "tool_failure" {
+                    ToolResult::error("network failure")
+                } else {
+                    ToolResult::success("unused")
+                },
+            }));
+            registry.register(Arc::new(crate::tools::DoneTool));
+            let mut agent = SageAgent::new_without_memory(registry, "test");
+            agent.set_contact_lookup_expected(false);
+            let settings = RequestLmSettings {
+                api_url: format!("http://{address}/v1"),
+                api_key: "test-key".to_string(),
+                model_chain: vec!["test-model".to_string()],
+                temperature: 0.1,
+            };
+            SageAgent::configure_lm_with_temperature(
+                &settings.api_url,
+                &settings.api_key,
+                &settings.model_chain[0],
+                settings.temperature,
+            )
+            .await
+            .unwrap();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let captured_trace_deltas = Arc::new(Mutex::new(Vec::new()));
+            let captured = captured_trace_deltas.clone();
+            let trace_sender = sender.clone();
+            agent.set_trace_hook(Arc::new(move |event| {
+                let delta = agent_trace_event_delta(event);
+                captured.lock().unwrap().push(delta.clone());
+                if stream {
+                    let _ = trace_sender.send(ConversationStreamSignal::Trace(Box::new(delta)));
+                }
+            }));
+            let result = run_agent_turn(
+                &mut agent,
+                "test request",
+                None,
+                &settings,
+                stream.then_some(sender),
+            )
+            .await;
+            let mut signals = Vec::new();
+            while let Ok(signal) = receiver.try_recv() {
+                signals.push(signal);
+            }
+            let streamed_trace_deltas = signals
+                .iter()
+                .filter_map(|signal| match signal {
+                    ConversationStreamSignal::Trace(delta) => Some(delta.as_ref()),
+                    ConversationStreamSignal::Answer(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let captured_trace_deltas = captured_trace_deltas.lock().unwrap().clone();
+            let trace_deltas = if stream {
+                streamed_trace_deltas
+            } else {
+                captured_trace_deltas.iter().collect()
+            };
+            if mode == "planner_failure" {
+                assert!(result.is_err());
+                let failed = trace_deltas
+                    .iter()
+                    .find(|delta| delta.kind == "tool_selection_observation")
+                    .expect("exhausted planner should transport a failed selection observation");
+                assert_eq!(failed.status.as_deref(), Some("failed"));
+                assert_eq!(failed.metadata["attempt"], json!(3));
+                assert!(!signals
+                    .iter()
+                    .any(|signal| matches!(signal, ConversationStreamSignal::Answer(_))));
+            } else {
+                assert_eq!(result.unwrap(), "Tool failed honestly.");
+                let attempted = trace_deltas
+                    .iter()
+                    .find(|delta| delta.kind == "tool_call")
+                    .expect("failed Tool should transport attempted evidence");
+                let terminal = trace_deltas
+                    .iter()
+                    .find(|delta| delta.kind == "tool_result")
+                    .expect("failed Tool should transport terminal evidence");
+                assert_eq!(terminal.status.as_deref(), Some("failed"));
+                assert_eq!(attempted.metadata["call_id"], terminal.metadata["call_id"]);
+                if stream {
+                    let first_answer = signals
+                        .iter()
+                        .position(|signal| matches!(signal, ConversationStreamSignal::Answer(_)))
+                        .expect("final answer should be transported");
+                    let terminal_index = signals
+                        .iter()
+                        .position(|signal| matches!(signal, ConversationStreamSignal::Trace(delta) if delta.kind == "tool_result"))
+                        .unwrap();
+                    assert!(terminal_index < first_answer);
+                }
+            }
+        }
     }
 
     #[tokio::test]
     async fn tool_free_turn_falls_back_before_the_first_answer_chunk() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         async fn completion(
             State(requested_models): State<Arc<Mutex<Vec<String>>>>,
             Json(body): Json<Value>,
@@ -9368,6 +9895,9 @@ mod tests {
 
     #[tokio::test]
     async fn partial_answer_failure_never_restarts_on_a_fallback_model() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         async fn completion(
             State(requested_models): State<Arc<Mutex<Vec<String>>>>,
             Json(body): Json<Value>,
@@ -10266,112 +10796,199 @@ mod tests {
         }
     }
 
-    struct FailingTraceTool {
-        name: &'static str,
-    }
-
-    #[async_trait::async_trait]
-    impl Tool for FailingTraceTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn description(&self) -> &str {
-            "Failing test trace tool"
-        }
-
-        fn args_schema(&self) -> &str {
-            r#"{"query":"test"}"#
-        }
-
-        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
-            Err(anyhow::anyhow!("network failure"))
-        }
-    }
-
     #[tokio::test]
-    async fn traced_tool_emits_call_and_result_trace_deltas() {
-        let sink = ConversationTraceDeltaSink::new(None);
-        let tool = traced_tool(
-            Arc::new(TestTraceTool {
-                name: "read_instance_settings",
-                result: ToolResult::success("raw tool output should not enter trace"),
-            }),
-            &sink,
-        );
-
-        let result = tool.execute(&ToolArgs::new()).await.expect("tool runs");
-
-        assert!(result.success);
-        let deltas = sink.deltas.lock().expect("trace deltas should lock");
-        assert_eq!(deltas.len(), 2);
-        assert_eq!(deltas[0].kind, "tool_call");
-        assert_eq!(deltas[0].title.as_deref(), Some("Admin Config"));
-        assert_eq!(
-            deltas[0].tool_name.as_deref(),
-            Some("read_instance_settings")
-        );
-        assert_eq!(deltas[0].status.as_deref(), Some("running"));
-        assert_eq!(deltas[1].kind, "tool_result");
-        assert_eq!(deltas[1].content.as_deref(), Some("Tool completed."));
-        assert_eq!(deltas[1].status.as_deref(), Some("succeeded"));
-        assert!(!serde_json::to_string(&*deltas)
-            .expect("trace deltas serialize")
-            .contains("raw tool output"));
+    async fn sage_execution_emits_one_attempt_and_terminal_for_each_selected_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TestTraceTool {
+            name: "web_search",
+            result: ToolResult::error("network failure"),
+        }));
+        registry.register(Arc::new(TestTraceTool {
+            name: "db_query",
+            result: ToolResult::error("read-only guard rejected the query"),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            event_sink
+                .lock()
+                .expect("event sink should lock")
+                .push(event);
+        }));
+        let decision = crate::sage_agent::ToolDecision {
+            tool_calls: vec![
+                crate::sage_agent::ToolCall {
+                    name: "web_search".to_string(),
+                    args: ToolArgs::new(),
+                },
+                crate::sage_agent::ToolCall {
+                    name: "db_query".to_string(),
+                    args: ToolArgs::new(),
+                },
+            ],
+            replan_after_results: false,
+            planning_round: 3,
+        };
+        let result = agent.execute_tool_decision(&decision).await;
+        assert_eq!(result.executed_tools.len(), 2);
+        let events = events.lock().expect("event sink should lock");
+        let lifecycle = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentTraceEvent::ToolAttempted {
+                    call_id,
+                    tool_name,
+                    planning_round,
+                    attempt,
+                } => Some((
+                    "attempted",
+                    call_id.clone(),
+                    tool_name.clone(),
+                    *planning_round,
+                    *attempt,
+                    None,
+                )),
+                AgentTraceEvent::ToolTerminal {
+                    call_id,
+                    tool_name,
+                    planning_round,
+                    attempt,
+                    status,
+                    ..
+                } => Some((
+                    "terminal",
+                    call_id.clone(),
+                    tool_name.clone(),
+                    *planning_round,
+                    *attempt,
+                    Some(status.clone()),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 4);
+        assert_eq!(lifecycle[0].0, "attempted");
+        assert_eq!(lifecycle[1].0, "terminal");
+        assert_eq!(lifecycle[2].0, "attempted");
+        assert_eq!(lifecycle[3].0, "terminal");
+        assert_eq!(lifecycle[0].2, "web_search");
+        assert_eq!(lifecycle[1].5.as_deref(), Some("failed"));
+        assert_eq!(lifecycle[3].5.as_deref(), Some("guarded"));
+        assert_eq!(lifecycle[0].3, 3);
+        assert_eq!(lifecycle[0].4, 1);
+        assert_ne!(lifecycle[0].1, lifecycle[2].1);
+        assert_eq!(lifecycle[0].1, lifecycle[1].1);
+        assert_eq!(lifecycle[2].1, lifecycle[3].1);
     }
 
-    #[tokio::test]
-    async fn traced_tool_emits_failed_guarded_and_timed_result_deltas() {
-        let failed_sink = ConversationTraceDeltaSink::new(None);
-        let failing_tool = traced_tool(
-            Arc::new(FailingTraceTool { name: "web_search" }),
-            &failed_sink,
-        );
-
-        let error = failing_tool
-            .execute(&ToolArgs::new())
-            .await
-            .expect_err("tool should fail");
-
-        assert!(error.to_string().contains("network failure"));
-        let failed_deltas = failed_sink
-            .deltas
-            .lock()
-            .expect("failed trace deltas should lock");
-        assert_eq!(failed_deltas.len(), 2);
-        assert_eq!(failed_deltas[1].kind, "tool_result");
-        assert_eq!(failed_deltas[1].title.as_deref(), Some("Web Search"));
-        assert_eq!(failed_deltas[1].status.as_deref(), Some("failed"));
-        assert!(failed_deltas[1].metadata["duration_ms"].is_number());
-
-        let guarded_sink = ConversationTraceDeltaSink::new(None);
-        let guarded_tool = traced_tool(
-            Arc::new(TestTraceTool {
-                name: "db_query",
-                result: ToolResult::error("Query guard blocked api_key=sk-test-secret"),
-            }),
-            &guarded_sink,
-        );
-
-        let result = guarded_tool
-            .execute(&ToolArgs::new())
-            .await
-            .expect("guarded tool returns a ToolResult");
-
-        assert!(!result.success);
-        let guarded_deltas = guarded_sink
-            .deltas
-            .lock()
-            .expect("guarded trace deltas should lock");
-        assert_eq!(guarded_deltas.len(), 2);
-        assert_eq!(guarded_deltas[1].kind, "tool_result");
-        assert_eq!(guarded_deltas[1].title.as_deref(), Some("Database Query"));
-        assert_eq!(guarded_deltas[1].status.as_deref(), Some("guarded"));
-        assert_eq!(guarded_deltas[1].content.as_deref(), Some("[redacted]"));
-        assert!(guarded_deltas[1].metadata["duration_ms"].is_number());
-        assert!(!serde_json::to_string(&*guarded_deltas)
-            .expect("guarded trace deltas serialize")
-            .contains("sk-test-secret"));
+    #[test]
+    fn emitted_tool_logs_have_exact_native_structured_keys() {
+        let events = [
+            AgentTraceEvent::ToolSelectionObservation {
+                round: 2,
+                attempt: 2,
+                enabled_tools: vec!["find_resources".to_string()],
+                selected_tools: vec!["find_resources".to_string()],
+                expected_curated_resources: true,
+                missed_expected_curated_resources: false,
+                outcome: "planned".to_string(),
+            },
+            AgentTraceEvent::ToolAttempted {
+                call_id: "call-1".to_string(),
+                tool_name: "find_resources".to_string(),
+                planning_round: 2,
+                attempt: 1,
+            },
+            AgentTraceEvent::ToolTerminal {
+                call_id: "call-1".to_string(),
+                tool_name: "find_resources".to_string(),
+                planning_round: 2,
+                attempt: 1,
+                status: "failed".to_string(),
+                elapsed_ms: 9,
+            },
+        ];
+        let expected: [&[&str]; 3] = [
+            &[
+                "timestamp",
+                "level",
+                "target",
+                "event_name",
+                "conversation_id",
+                "actor_kind",
+                "actor_id",
+                "phase",
+                "round",
+                "attempt",
+                "enabled_tools",
+                "selected_tools",
+                "selection_count",
+                "expected_curated_resources",
+                "missed_expected_curated_resources",
+                "outcome",
+            ],
+            &[
+                "timestamp",
+                "level",
+                "target",
+                "event_name",
+                "conversation_id",
+                "actor_kind",
+                "actor_id",
+                "phase",
+                "call_id",
+                "tool_name",
+                "round",
+                "attempt",
+            ],
+            &[
+                "timestamp",
+                "level",
+                "target",
+                "event_name",
+                "conversation_id",
+                "actor_kind",
+                "actor_id",
+                "phase",
+                "call_id",
+                "tool_name",
+                "round",
+                "attempt",
+                "outcome",
+                "duration_ms",
+            ],
+        ];
+        for (event, expected_keys) in events.into_iter().zip(expected) {
+            let value = capture_structured_log(event);
+            let keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                expected_keys
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+            );
+            assert!(!value.to_string().contains("fields"));
+            let serialized = value.to_string();
+            for forbidden in [
+                "prompt",
+                "answer",
+                "email@example",
+                "api_key",
+                "secret",
+                "args",
+                "output",
+                "reasoning",
+            ] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
     }
 
     #[test]
@@ -10412,6 +11029,64 @@ mod tests {
         assert_eq!(correction.status.as_deref(), Some("running"));
         assert_eq!(timing.kind, "timing");
         assert_eq!(timing.metadata["duration_ms"], json!(1234));
+
+        let selection = agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
+            round: 2,
+            attempt: 1,
+            enabled_tools: vec!["find_resources".to_string(), "knowledge_search".to_string()],
+            selected_tools: Vec::new(),
+            expected_curated_resources: true,
+            missed_expected_curated_resources: true,
+            outcome: "planned".to_string(),
+        });
+        assert_eq!(selection.kind, "tool_selection_observation");
+        assert_eq!(selection.status.as_deref(), Some("failed"));
+        assert_eq!(selection.metadata["selection_count"], json!(0));
+        assert_eq!(
+            selection.metadata["missed_expected_curated_resources"],
+            json!(true)
+        );
+        assert!(!serde_json::to_string(&selection).unwrap().contains("email"));
+
+        let attempted = agent_trace_event_delta(AgentTraceEvent::ToolAttempted {
+            call_id: "call-1".to_string(),
+            tool_name: "unknown_tool".to_string(),
+            planning_round: 1,
+            attempt: 1,
+        });
+        let terminal = agent_trace_event_delta(AgentTraceEvent::ToolTerminal {
+            call_id: "call-1".to_string(),
+            tool_name: "unknown_tool".to_string(),
+            planning_round: 1,
+            attempt: 1,
+            status: "failed".to_string(),
+            elapsed_ms: 3,
+        });
+        assert_eq!(attempted.kind, "tool_call");
+        assert_eq!(attempted.metadata["phase"], json!("attempted"));
+        assert_eq!(terminal.kind, "tool_result");
+        assert_eq!(terminal.status.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn selection_observation_activity_is_accessible_and_content_free() {
+        let delta = agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
+            round: 1,
+            attempt: 1,
+            enabled_tools: vec!["find_resources".to_string()],
+            selected_tools: vec!["find_resources".to_string()],
+            expected_curated_resources: true,
+            missed_expected_curated_resources: false,
+            outcome: "planned".to_string(),
+        });
+        let activity = conversation_activity_steps_from_trace_deltas(&[delta]);
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].title, "Tool Selection");
+        assert_eq!(activity[0].kind, "tool_selection_observation");
+        assert_eq!(
+            activity[0].summary.as_deref(),
+            Some("Selected: Curated Resources.")
+        );
     }
 
     #[test]

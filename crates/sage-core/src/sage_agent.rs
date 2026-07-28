@@ -333,6 +333,7 @@ struct ToolDecisionResponse {
 pub struct ToolDecision {
     pub tool_calls: Vec<ToolCall>,
     pub replan_after_results: bool,
+    pub planning_round: usize,
 }
 
 impl ToolDecision {
@@ -343,6 +344,7 @@ impl ToolDecision {
                 .filter(|tool_call| tool_call.name != "done")
                 .collect(),
             replan_after_results,
+            planning_round: 0,
         }
     }
 }
@@ -359,6 +361,10 @@ pub enum ToolPlanningOutcome {
 #[allow(dead_code)]
 pub trait ToolPlanner: Send {
     fn has_actionable_tools(&self) -> bool;
+
+    /// Supply the current raw User message's diagnostic contact cue. The
+    /// planner must not infer this from synthesized context.
+    fn set_contact_lookup_expected(&mut self, _expected: bool) {}
 
     async fn plan_tools(
         &mut self,
@@ -413,6 +419,91 @@ Write only the final user-visible answer as plain text.
 Do not emit JSON, schema field markers, tool_calls, function calls, or internal reasoning.
 The Tool phase is complete. Use the supplied Tool results as facts, respect their warnings and failures, and do not claim that a failed Tool succeeded.
 "#;
+
+/// Detect only explicit contact-detail cues. The result is diagnostic metadata
+/// for Tool planning; it never creates or authorizes a Tool decision.
+pub(crate) fn expects_curated_resource_lookup(input: &str) -> bool {
+    let normalized = input
+        .to_lowercase()
+        .chars()
+        .map(|character| match character {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'é' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' => 'u',
+            'ñ' => 'n',
+            character if character.is_alphanumeric() => character,
+            _ => ' ',
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        "email",
+        "e mail",
+        "correo",
+        "correo electronico",
+        "phone",
+        "telephone",
+        "telefono",
+        "celular",
+        "website",
+        "web site",
+        "url",
+        "sitio web",
+        "pagina web",
+        "what is the address",
+        "where is the address",
+        "address is",
+        "address",
+        "postal address",
+        "direccion",
+        "domicilio",
+        "secure channel",
+        "secure contact",
+        "encrypted channel",
+        "canal seguro",
+        "contacto seguro",
+        "canal cifrado",
+    ]
+    .iter()
+    .any(|cue| {
+        let present = normalized == *cue
+            || normalized.starts_with(&format!("{} ", cue))
+            || normalized.ends_with(&format!(" {}", cue))
+            || normalized.contains(&format!(" {} ", cue));
+        if !present {
+            return false;
+        }
+        if *cue == "address" {
+            if normalized.contains("physical address")
+                || normalized.contains("mailing address")
+                || normalized.contains("postal address")
+            {
+                return true;
+            }
+            // “Address this/the/my concern” is ordinary prose, not a request
+            // for a physical contact address. Other contact cues in a mixed
+            // sentence are still allowed to establish the expectation.
+            for non_contact in [
+                "address this",
+                "address the",
+                "address my",
+                "address your",
+                "address our",
+                "address a",
+                "address an",
+            ] {
+                if normalized.contains(non_contact) {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+}
 
 /// Correction agent signature for fixing malformed responses
 ///
@@ -685,6 +776,16 @@ impl ToolRegistry {
         self.tools.keys().any(|name| name != "done")
     }
 
+    /// Return enabled Tool names in stable registry order for content-free
+    /// planning observations. No Tool arguments or output are included.
+    pub fn names(&self) -> Vec<String> {
+        self.tools
+            .keys()
+            .filter(|name| name.as_str() != "done")
+            .cloned()
+            .collect()
+    }
+
     #[allow(dead_code)]
     pub fn has(&self, name: &str) -> bool {
         self.tools.contains_key(name)
@@ -835,6 +936,29 @@ pub struct StepResult {
 
 #[derive(Clone, Debug)]
 pub enum AgentTraceEvent {
+    ToolSelectionObservation {
+        round: usize,
+        attempt: u32,
+        enabled_tools: Vec<String>,
+        selected_tools: Vec<String>,
+        expected_curated_resources: bool,
+        missed_expected_curated_resources: bool,
+        outcome: String,
+    },
+    ToolAttempted {
+        call_id: String,
+        tool_name: String,
+        planning_round: usize,
+        attempt: u32,
+    },
+    ToolTerminal {
+        call_id: String,
+        tool_name: String,
+        planning_round: usize,
+        attempt: u32,
+        status: String,
+        elapsed_ms: u128,
+    },
     ModelStepStarted {
         step: usize,
         attempt: u32,
@@ -1022,6 +1146,7 @@ pub struct SageAgent {
     /// Track what was sent in previous step (messages + tool names) for context
     /// The messages Vec contains the actual message content sent
     previous_step_summary: Option<(Vec<String>, Vec<String>)>,
+    contact_lookup_expected: bool,
     max_steps: usize,
     turn_step_index: usize,
     trace_hook: Option<AgentTraceHook>,
@@ -1050,6 +1175,7 @@ impl SageAgent {
             instruction: instruction.into(),
             current_tool_results: Vec::new(),
             previous_step_summary: None,
+            contact_lookup_expected: false,
             max_steps: 10,
             turn_step_index: 0,
             trace_hook: None,
@@ -1431,11 +1557,16 @@ impl SageAgent {
     pub async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
         let mut executed_tools = Vec::new();
         for tool_call in &decision.tool_calls {
-            tracing::info!(
-                "Executing planned tool: {} with args: {:?}",
-                tool_call.name,
-                tool_call.args
-            );
+            let started_at = Instant::now();
+            let call_id = format!("tool-call-{}", Uuid::new_v4().simple());
+            let planning_round = decision.planning_round;
+            let attempt = 1;
+            self.emit_trace(AgentTraceEvent::ToolAttempted {
+                call_id: call_id.clone(),
+                tool_name: tool_call.name.clone(),
+                planning_round,
+                attempt,
+            });
             let result = if let Some(tool) = self.tools.get(&tool_call.name) {
                 match tool.execute(&tool_call.args).await {
                     Ok(result) => result,
@@ -1444,6 +1575,28 @@ impl SageAgent {
             } else {
                 ToolResult::error(format!("Unknown tool: {}", tool_call.name))
             };
+            let status = if result.success {
+                "succeeded"
+            } else if tool_call.name == "db_query"
+                && result.error.as_deref().is_some_and(|error| {
+                    let normalized = error.to_ascii_lowercase();
+                    normalized.contains("guard")
+                        || normalized.contains("reject")
+                        || normalized.contains("not allowed")
+                })
+            {
+                "guarded"
+            } else {
+                "failed"
+            };
+            self.emit_trace(AgentTraceEvent::ToolTerminal {
+                call_id,
+                tool_name: tool_call.name.clone(),
+                planning_round,
+                attempt,
+                status: status.to_string(),
+                elapsed_ms: started_at.elapsed().as_millis(),
+            });
             self.inject_tool_result(tool_call, &result);
             executed_tools.push(ExecutedTool {
                 tool_call: tool_call.clone(),
@@ -1514,10 +1667,33 @@ impl SageAgent {
                         attempt,
                         elapsed_ms: started_at.elapsed().as_millis(),
                     });
-                    return Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
+                    let decision = ToolDecision::new(
                         response.tool_calls,
                         response.replan_after_results.unwrap_or(false),
-                    )));
+                    );
+                    let mut decision = decision;
+                    decision.planning_round = step_index;
+                    let enabled_tools = self.tools.names();
+                    let selected_tools = decision
+                        .tool_calls
+                        .iter()
+                        .map(|tool_call| tool_call.name.clone())
+                        .collect::<Vec<_>>();
+                    let expected_curated_resources =
+                        enabled_tools.iter().any(|name| name == "find_resources")
+                            && self.contact_lookup_expected;
+                    let missed_expected_curated_resources = expected_curated_resources
+                        && !selected_tools.iter().any(|name| name == "find_resources");
+                    self.emit_trace(AgentTraceEvent::ToolSelectionObservation {
+                        round: step_index,
+                        attempt,
+                        enabled_tools,
+                        selected_tools,
+                        expected_curated_resources,
+                        missed_expected_curated_resources,
+                        outcome: "planned".to_string(),
+                    });
+                    return Ok(ToolPlanningOutcome::Decision(decision));
                 }
                 Err(error) => {
                     self.emit_trace(AgentTraceEvent::ModelStepFailed {
@@ -1543,6 +1719,18 @@ impl SageAgent {
             }
         }
 
+        let enabled_tools = self.tools.names();
+        let expected_curated_resources = enabled_tools.iter().any(|name| name == "find_resources")
+            && self.contact_lookup_expected;
+        self.emit_trace(AgentTraceEvent::ToolSelectionObservation {
+            round: step_index,
+            attempt: MAX_TOOL_PLAN_ATTEMPTS,
+            enabled_tools,
+            selected_tools: Vec::new(),
+            expected_curated_resources,
+            missed_expected_curated_resources: expected_curated_resources,
+            outcome: "failed".to_string(),
+        });
         Err(anyhow::anyhow!(
             "Tool planning failed after {} attempts: {:?}",
             MAX_TOOL_PLAN_ATTEMPTS,
@@ -1967,6 +2155,10 @@ impl ToolPlanner for SageAgent {
         self.tools.has_actionable_tools()
     }
 
+    fn set_contact_lookup_expected(&mut self, expected: bool) {
+        self.contact_lookup_expected = expected;
+    }
+
     async fn plan_tools(
         &mut self,
         user_message: &str,
@@ -2018,6 +2210,31 @@ impl ToolPlanner for SageAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curated_resource_expectation_is_conservative_and_bilingual() {
+        assert!(expects_curated_resource_lookup("Can you share the email?"));
+        assert!(expects_curated_resource_lookup(
+            "¿Me das el teléfono y la dirección?"
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Necesito el sitio web o canal seguro."
+        ));
+        assert!(!expects_curated_resource_lookup(
+            "Tell me about this organization."
+        ));
+        assert!(!expects_curated_resource_lookup("What help is available?"));
+        assert!(!expects_curated_resource_lookup(
+            "Please address this concern."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Please address this concern and give me the email."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Please address my concern and share their physical address."
+        ));
+        assert!(!expects_curated_resource_lookup("Show me a curl example."));
+    }
 
     #[test]
     fn done_does_not_make_a_registry_actionable() {
