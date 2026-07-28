@@ -1246,7 +1246,7 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
             return true;
         }
     }
-    if provider_neutral_labels_have_tool_intent(&lowercase) {
+    if provider_neutral_labels_have_tool_intent(candidate) {
         return true;
     }
     if lowercase.starts_with("```") {
@@ -1340,13 +1340,6 @@ pub(crate) fn lookup_process_narration_opening(value: &str) -> ProcessNarrationO
     ProcessNarrationOpeningMatch::None
 }
 
-fn contains_lookup_process_narration(value: &str) -> bool {
-    let normalized = value.to_lowercase();
-    LOOKUP_PROCESS_NARRATION_OPENERS
-        .iter()
-        .any(|candidate| normalized.contains(candidate))
-}
-
 fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
     let value = value.trim_start();
     let (first_line, remaining) = value.split_once('\n').unwrap_or((value, ""));
@@ -1371,17 +1364,15 @@ fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
     {
         return true;
     }
-    if let Some(arguments) = remaining
+    if remaining
         .strip_prefix("args:")
         .or_else(|| remaining.strip_prefix("arguments:"))
+        .is_some()
     {
-        let arguments = arguments.trim_start();
-        if arguments.starts_with('{')
-            || arguments.starts_with('[')
-            || arguments.starts_with("```json")
-        {
-            return true;
-        }
+        // A valid Tool label/name followed by an explicit argument label is
+        // itself a serialized invocation envelope. The provider may render
+        // those arguments as JSON, bullets, or key=value prose.
+        return true;
     }
 
     let same_line_suffix = first_line[name_end..].trim_start();
@@ -1408,7 +1399,70 @@ fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
             })
 }
 
+fn provider_neutral_tool_label_is_bare_name(value: &str) -> bool {
+    let name = value.trim();
+    !name.is_empty()
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+}
+
+fn provider_neutral_tool_label_is_explanatory(candidate: &str, start: usize, label: &str) -> bool {
+    if !matches!(label, "tool:" | "tool decision:") {
+        return false;
+    }
+    let same_line_preamble = candidate[..start]
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .trim_end();
+    if same_line_preamble.ends_with("curated resources") {
+        return true;
+    }
+
+    // A reporting/copular predicate directly before `Tool:` makes the label
+    // part of documentation prose ("the panel shows Tool: done"). Selection
+    // adjectives and process narration ("Selected Tool: ...") do not.
+    let normalized_preamble = same_line_preamble
+        .trim_end_matches(|character: char| !character.is_alphanumeric() && character != '_');
+    let mut words = normalized_preamble.split_whitespace().rev();
+    let predicate = words.next().unwrap_or_default();
+    let has_subject = words.next().is_some();
+    has_subject
+        && [
+            "is", "are", "reads", "shows", "says", "displays", "uses", "prints", "renders",
+            "appears", "means", "as",
+        ]
+        .contains(&predicate)
+}
+
+fn provider_neutral_tool_label_has_lexical_boundary(candidate: &str, start: usize) -> bool {
+    start == 0
+        || candidate[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|character| {
+                !character.is_alphanumeric() && !matches!(character, '_' | '-' | '.')
+            })
+}
+
+pub(crate) fn provider_neutral_tool_label_start_at_or_after(
+    candidate: &str,
+    minimum_start: usize,
+) -> Option<usize> {
+    let lowercase = candidate.to_ascii_lowercase();
+    ["tool:", "tool decision:"]
+        .iter()
+        .flat_map(|label| lowercase.match_indices(label).map(|(start, _)| start))
+        .filter(|start| {
+            *start >= minimum_start
+                && provider_neutral_tool_label_has_lexical_boundary(&lowercase, *start)
+        })
+        .min()
+}
+
 fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
+    let candidate = candidate.to_ascii_lowercase();
     let mut labels = Vec::new();
     for label in ["tool:", "tool decision:"] {
         labels.extend(
@@ -1419,30 +1473,18 @@ fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
     }
     labels.sort_unstable_by_key(|(start, _)| *start);
 
-    for (label_index, (start, label)) in labels.iter().enumerate() {
-        let preamble = &candidate[..*start];
-        let invocation = &candidate[*start + label.len()..];
-        if !provider_neutral_tool_label_has_invocation(invocation) {
+    for (start, label) in labels {
+        if !provider_neutral_tool_label_has_lexical_boundary(&candidate, start) {
             continue;
         }
-        let starts_line = preamble.is_empty() || preamble.ends_with('\n');
-        let has_deliberation_preamble = [
-            "let me ",
-            "i'll search",
-            "i will search",
-            "i'll look up",
-            "i will look up",
-            "i'm going to search",
-            "i am going to search",
-            "i'm going to look up",
-            "i am going to look up",
-            "i need to ",
-            "i should ",
-        ]
-        .iter()
-        .any(|marker| preamble.contains(marker))
-            || contains_lookup_process_narration(preamble);
-        if starts_line || has_deliberation_preamble || label_index > 0 {
+        let invocation = &candidate[start + label.len()..];
+        if provider_neutral_tool_label_has_invocation(invocation) {
+            return true;
+        }
+        if provider_neutral_tool_label_is_bare_name(invocation) {
+            if provider_neutral_tool_label_is_explanatory(&candidate, start, label) {
+                continue;
+            }
             return true;
         }
     }
@@ -2896,8 +2938,23 @@ mod tests {
         assert!(has_syntactic_tool_intent(
             "Tool decision: find_resources\n\nArgs:\n```json\n{\"offset\":30}\n```"
         ));
+        assert!(has_syntactic_tool_intent("Tool decision: find_resources"));
+        assert!(has_syntactic_tool_intent("Tool: find_resources"));
+        assert!(has_syntactic_tool_intent("Tool: done"));
+        assert!(has_syntactic_tool_intent(
+            "I will search. Tool: find_resources"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Internal choice: Tool decision: find_resources"
+        ));
         assert!(has_syntactic_tool_intent(
             "Tool: find_resources\n\nArgs:\n{\"query\":\"Issue 539 Inventory\"}"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool decision: find_resources\n\nArgs:\n- region: \"Mexico\"\n- language: \"es\""
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool: find_resources\nArgs: help_type=\"legal\", region=\"Mexico\""
         ));
         assert!(has_syntactic_tool_intent(
             "Tool: find_resources\n```json\n{\"query\":\"Issue 539 Inventory\",\"offset\":30}\n```"
@@ -2913,6 +2970,9 @@ mod tests {
         ));
         assert!(!has_syntactic_tool_intent(
             "The Tool decision: section in Activity explains which lookup ran."
+        ));
+        assert!(!has_syntactic_tool_intent(
+            "The Activity label is Tool: done"
         ));
         assert!(has_syntactic_tool_intent(
             "The Curated Resources Tool: finds vetted organizations. Tool: find_resources(query=\"legal aid\")"

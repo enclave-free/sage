@@ -47,11 +47,11 @@ use crate::memory::MemoryManager;
 use crate::sage_agent::StepResult;
 use crate::sage_agent::{
     expects_curated_resource_lookup, has_syntactic_tool_intent, lookup_process_narration_opening,
-    tool_parse_arg, tool_string_arg, AgentTraceEvent, ConversationTimingOutcome,
-    ConversationTimingPhase, ExecutedTool, PlainAnswerPrompt, ProcessNarrationOpeningMatch,
-    ProviderReasoningTraceHook, ProviderTimingEvent, ProviderTimingTraceHook, SageAgent, Tool,
-    ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
-    ToolRetryPolicy,
+    provider_neutral_tool_label_start_at_or_after, tool_parse_arg, tool_string_arg,
+    AgentTraceEvent, ConversationTimingOutcome, ConversationTimingPhase, ExecutedTool,
+    PlainAnswerPrompt, ProcessNarrationOpeningMatch, ProviderReasoningTraceHook,
+    ProviderTimingEvent, ProviderTimingTraceHook, SageAgent, Tool, ToolArgs, ToolExecutionError,
+    ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult, ToolRetryPolicy,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -7552,6 +7552,7 @@ struct PlainAnswerStreamState {
     answer: String,
     pending: String,
     emitted_any: bool,
+    emitted_context: String,
     opening_disposition: PlainAnswerOpeningDisposition,
 }
 
@@ -7652,7 +7653,16 @@ impl PlainAnswerStreamState {
         &self,
         candidate: &str,
     ) -> std::result::Result<(), PlainAnswerGenerationError> {
-        if has_syntactic_tool_intent(candidate) {
+        let trimmed = candidate.trim_start().to_ascii_lowercase();
+        let starts_provider_neutral_label =
+            trimmed.starts_with("tool:") || trimmed.starts_with("tool decision:");
+        let has_tool_intent = if starts_provider_neutral_label && !self.emitted_context.is_empty() {
+            let contextual_candidate = format!("{}{candidate}", self.emitted_context);
+            has_syntactic_tool_intent(&contextual_candidate)
+        } else {
+            has_syntactic_tool_intent(candidate)
+        };
+        if has_tool_intent {
             return Err(PlainAnswerGenerationError::new(
                 PlainAnswerFailureKind::ToolIntent,
                 "final plain-answer stream contained textual Tool intent; refusing to expose it",
@@ -7778,7 +7788,8 @@ impl PlainAnswerStreamState {
                 .pending
                 .len()
                 .saturating_sub(Self::ambiguous_suffix_len(&self.pending));
-            let candidate_start = Self::structural_candidate_start(&self.pending);
+            let candidate_start =
+                Self::structural_candidate_start(&self.pending, &self.emitted_context);
             let Some(candidate_start) = candidate_start.filter(|start| *start < suffix_start)
             else {
                 self.emit_pending_prefix_staged(suffix_start, answer_deltas);
@@ -7810,11 +7821,21 @@ impl PlainAnswerStreamState {
             .unwrap_or(0)
     }
 
-    fn structural_candidate_start(value: &str) -> Option<usize> {
+    fn structural_candidate_start(value: &str, emitted_context: &str) -> Option<usize> {
         let lowercase = value.to_ascii_lowercase();
         let delimiter_start = value
             .char_indices()
             .find_map(|(index, ch)| matches!(ch, '{' | '[').then_some(index));
+        let provider_neutral_start = if emitted_context.is_empty() {
+            provider_neutral_tool_label_start_at_or_after(value, 0)
+        } else {
+            let contextual_candidate = format!("{emitted_context}{value}");
+            provider_neutral_tool_label_start_at_or_after(
+                &contextual_candidate,
+                emitted_context.len(),
+            )
+            .and_then(|start| start.checked_sub(emitted_context.len()))
+        };
         let marker_start = [
             lowercase.find("```"),
             lowercase.find("[[ ##"),
@@ -7822,8 +7843,7 @@ impl PlainAnswerStreamState {
             lowercase.find("</tool_call"),
             lowercase.find("<|tool_call"),
             lowercase.find("tool calls:"),
-            lowercase.find("tool:"),
-            lowercase.find("tool decision:"),
+            provider_neutral_start,
         ]
         .into_iter()
         .flatten()
@@ -7888,10 +7908,16 @@ impl PlainAnswerStreamState {
         }
         let newline = candidate.find('\n')?;
         let next_line = candidate[newline + 1..].trim_start_matches(char::is_whitespace);
-        if next_line.is_empty()
+        let next_line_prefix = next_line
+            .lines()
+            .next()
+            .unwrap_or(next_line)
+            .trim_end()
+            .to_ascii_lowercase();
+        if next_line_prefix.is_empty()
             || Self::STRUCTURAL_START_MARKERS
                 .iter()
-                .any(|marker| marker.starts_with(&next_line.to_ascii_lowercase()))
+                .any(|marker| marker.starts_with(&next_line_prefix))
         {
             return None;
         }
@@ -7970,10 +7996,20 @@ impl PlainAnswerStreamState {
     }
 
     fn emit_pending_prefix_staged(&mut self, end: usize, answer_deltas: &mut Vec<String>) {
+        const MAX_EMITTED_CONTEXT_BYTES: usize = 256;
+
         if end == 0 {
             return;
         }
         let delta: String = self.pending.drain(..end).collect();
+        self.emitted_context.push_str(&delta);
+        if self.emitted_context.len() > MAX_EMITTED_CONTEXT_BYTES {
+            let mut start = self.emitted_context.len() - MAX_EMITTED_CONTEXT_BYTES;
+            while !self.emitted_context.is_char_boundary(start) {
+                start += 1;
+            }
+            self.emitted_context.drain(..start);
+        }
         answer_deltas.push(delta);
     }
 
@@ -9930,6 +9966,391 @@ mod tests {
     }
 
     #[test]
+    fn plain_answer_safety_rejects_live_tool_argument_serializations_before_exposure() {
+        let candidates = [
+            concat!(
+                "Tool decision: find_resources\n\n",
+                "Args:\n",
+                "- region: \"Mexico\"\n",
+                "- help_type: \"legal\"\n",
+                "- language: \"es\"\n",
+                "- query: \"Issue 539 Legal Aid\"",
+            ),
+            concat!(
+                "Tool: find_resources\n",
+                "Args: help_type=\"legal\", query=\"Issue 539 Legal Aid\", ",
+                "region=\"Mexico\", language=\"en\"",
+            ),
+        ];
+
+        for candidate in candidates {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            let error = state
+                .push(candidate, &sender)
+                .and_then(|_| state.finish(&sender))
+                .expect_err("live Tool argument serialization must be rejected");
+
+            assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+            assert!(!error.emitted_any);
+            assert!(delta_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_bare_internal_tool_labels_before_exposure() {
+        for candidate in [
+            "Tool decision: find_resources",
+            "Tool: find_resources",
+            "Tool: done",
+            "I will search. Tool: find_resources",
+            "Before I answer, Tool: find_resources",
+            "To provide you the result, Tool: find_resources",
+            "Internal choice: Tool decision: find_resources",
+        ] {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            let error = match state
+                .push(candidate, &sender)
+                .and_then(|_| state.finish(&sender))
+            {
+                Err(error) => error,
+                Ok(()) => panic!("bare internal Tool label became a final answer: {candidate}"),
+            };
+
+            assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+            assert!(!error.emitted_any);
+            assert!(delta_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_em_dash_tool_label_for_every_two_chunk_split() {
+        let candidate = "Before I answer — Tool: find_resources";
+
+        for split in candidate.char_indices().map(|(index, _)| index).skip(1) {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            let first_result = state.push(&candidate[..split], &sender);
+            assert!(
+                delta_rx.try_recv().is_err(),
+                "split {split} exposed the Tool label before it was complete"
+            );
+            let error = match first_result {
+                Err(error) => error,
+                Ok(()) => state
+                    .push(&candidate[split..], &sender)
+                    .and_then(|_| state.finish(&sender))
+                    .expect_err("the complete em-dash Tool label must be rejected"),
+            };
+
+            assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+            assert!(!error.emitted_any);
+            assert!(delta_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_selected_tool_label_for_every_two_chunk_split() {
+        let candidate = "Selected Tool: find_resources";
+
+        for split in candidate.char_indices().map(|(index, _)| index).skip(1) {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            let first_result = state.push(&candidate[..split], &sender);
+            let error = match first_result {
+                Err(error) => error,
+                Ok(()) => state
+                    .push(&candidate[split..], &sender)
+                    .and_then(|_| state.finish(&sender))
+                    .expect_err("the complete selected Tool label must be rejected"),
+            };
+
+            assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+            let mut exposed = Vec::new();
+            while let Ok(signal) = delta_rx.try_recv() {
+                exposed.push(answer_signal(signal));
+            }
+            let exposed = exposed.concat();
+            assert_eq!(error.emitted_any, !exposed.is_empty());
+            assert!(
+                !exposed.to_ascii_lowercase().contains("tool")
+                    && !exposed.contains("find_resources"),
+                "split {split} exposed the Tool envelope: {exposed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_held_tool_argument_envelopes_before_exposure() {
+        for candidate in [
+            concat!(
+                "To provide you the result, Tool: find_resources\n",
+                "Args:\n",
+                "```json\n",
+                "{\"query\":\"legal aid\"}\n",
+                "```",
+            ),
+            concat!(
+                "To provide you the result, Tool: find_resources\n",
+                "Args:\n",
+                "- query: \"legal aid\"\n",
+                "- region: \"Mexico\"",
+            ),
+            concat!(
+                "To provide you the result, Tool: find_resources\n",
+                "Args: query=\"legal aid\", region=\"Mexico\"",
+            ),
+        ] {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            let error = state
+                .push(candidate, &sender)
+                .and_then(|_| state.finish(&sender))
+                .expect_err("held Tool argument envelope must be rejected");
+
+            assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+            assert!(!error.emitted_any);
+            assert!(delta_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_explanatory_disguised_envelopes_for_every_split() {
+        for candidate in [
+            concat!(
+                "The Activity label is Tool: find_resources\n",
+                "Args:\n",
+                "```json\n",
+                "{\"query\":\"legal aid\"}\n",
+                "```",
+            ),
+            concat!(
+                "The Activity label is Tool: find_resources\n",
+                "Args:\n",
+                "- query: \"legal aid\"\n",
+                "- region: \"Mexico\"",
+            ),
+            concat!(
+                "The Activity label is: Tool: find_resources\n",
+                "Args: query=\"legal aid\", region=\"Mexico\"",
+            ),
+            concat!(
+                "The Activity label is Tool decision: find_resources\n",
+                "Args: query=\"legal aid\", region=\"Mexico\"",
+            ),
+        ] {
+            for split in candidate.char_indices().map(|(index, _)| index).skip(1) {
+                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+                let sender = Some(delta_tx);
+                let mut state = PlainAnswerStreamState::default();
+
+                let first_result = state.push(&candidate[..split], &sender);
+                let error = match first_result {
+                    Err(error) => error,
+                    Ok(()) => state
+                        .push(&candidate[split..], &sender)
+                        .and_then(|_| state.finish(&sender))
+                        .expect_err("argument syntax must override the explanatory label"),
+                };
+
+                assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+                let mut exposed = Vec::new();
+                while let Ok(signal) = delta_rx.try_recv() {
+                    exposed.push(answer_signal(signal));
+                }
+                let exposed = exposed.concat();
+                assert_eq!(error.emitted_any, !exposed.is_empty());
+                assert!(
+                    !exposed.to_ascii_lowercase().contains("tool:")
+                        && !exposed.contains("find_resources")
+                        && !exposed.to_ascii_lowercase().contains("args:"),
+                    "split {split} exposed the disguised Tool envelope: {exposed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_tool_envelopes_after_emitted_newline() {
+        for candidate in [
+            "Tool: find_resources",
+            concat!(
+                "Tool: find_resources\n",
+                "Args:\n",
+                "```json\n",
+                "{\"query\":\"legal aid\"}\n",
+                "```",
+            ),
+            concat!(
+                "Tool: find_resources\n",
+                "Args:\n",
+                "- query: \"legal aid\"\n",
+                "- region: \"Mexico\"",
+            ),
+            concat!(
+                "Tool: find_resources\n",
+                "Args: query=\"legal aid\", region=\"Mexico\"",
+            ),
+        ] {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            state
+                .push("Here is the answer.\n", &sender)
+                .expect("safe prefix should stream");
+            assert_eq!(
+                answer_signal(delta_rx.try_recv().expect("safe prefix delta")),
+                "Here is the answer.\n"
+            );
+            assert!(delta_rx.try_recv().is_err());
+
+            let error = state
+                .push(candidate, &sender)
+                .and_then(|_| state.finish(&sender))
+                .expect_err("Tool envelope after emitted newline must be rejected");
+
+            assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+            assert!(error.emitted_any);
+            assert!(
+                delta_rx.try_recv().is_err(),
+                "Tool envelope was exposed after the safe prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_allows_held_explanatory_tool_labels() {
+        for candidate in [
+            "Before I answer, here is the Curated Resources Tool: overview",
+            "To provide you the exact label, the Activity label is Tool: done",
+        ] {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            state
+                .push(candidate, &sender)
+                .expect("held explanatory Tool prose should remain a candidate");
+            assert!(delta_rx.try_recv().is_err());
+            state
+                .finish(&sender)
+                .expect("held explanatory Tool prose should be released at finish");
+
+            let mut deltas = Vec::new();
+            while let Ok(signal) = delta_rx.try_recv() {
+                deltas.push(answer_signal(signal));
+            }
+            assert_eq!(deltas.concat(), candidate);
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_streams_direct_explanatory_tool_label_for_every_split() {
+        for candidate in [
+            "The Activity label is Tool: done",
+            "The Activity label is: Tool: done",
+            "The Activity panel shows Tool: done",
+            "The documented syntax is Tool: done",
+            "The Activity label is Tool decision: find_resources",
+        ] {
+            for split in candidate.char_indices().map(|(index, _)| index).skip(1) {
+                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+                let sender = Some(delta_tx);
+                let mut state = PlainAnswerStreamState::default();
+
+                let result = state
+                    .push(&candidate[..split], &sender)
+                    .and_then(|_| state.push(&candidate[split..], &sender))
+                    .and_then(|_| state.finish(&sender));
+                assert!(
+                    result.is_ok(),
+                    "split {split} rejected direct explanatory Tool prose: {result:?}"
+                );
+
+                let mut deltas = Vec::new();
+                while let Ok(signal) = delta_rx.try_recv() {
+                    deltas.push(answer_signal(signal));
+                }
+                assert_eq!(deltas.concat(), candidate, "split {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_streams_embedded_tool_identifier_for_every_split() {
+        let candidate = "Run devtool:build to compile the local demo.";
+
+        for split in candidate.char_indices().map(|(index, _)| index).skip(1) {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            state
+                .push(&candidate[..split], &sender)
+                .and_then(|_| state.push(&candidate[split..], &sender))
+                .and_then(|_| state.finish(&sender))
+                .expect("embedded tool: identifier must remain ordinary prose");
+
+            let mut deltas = Vec::new();
+            while let Ok(signal) = delta_rx.try_recv() {
+                deltas.push(answer_signal(signal));
+            }
+            assert_eq!(deltas.concat(), candidate, "split {split}");
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_live_json_tool_decision_for_every_two_chunk_split() {
+        let candidate = concat!(
+            "Tool decision: find_resources\n\n",
+            "Args:\n",
+            "```json\n",
+            "{\n",
+            "  \"help_type\": \"legal\",\n",
+            "  \"language\": \"en\",\n",
+            "  \"query\": \"Issue 539 Legal Aid\",\n",
+            "  \"region\": \"Mexico\"\n",
+            "}\n",
+            "```",
+        );
+
+        for split in candidate.char_indices().map(|(index, _)| index).skip(1) {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            let first_result = state.push(&candidate[..split], &sender);
+            assert!(
+                delta_rx.try_recv().is_err(),
+                "split {split} exposed the Tool envelope before it was complete"
+            );
+            let error = match first_result {
+                Err(error) => error,
+                Ok(()) => state
+                    .push(&candidate[split..], &sender)
+                    .and_then(|_| state.finish(&sender))
+                    .expect_err("the complete live JSON Tool envelope must be rejected"),
+            };
+
+            assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+            assert!(!error.emitted_any);
+            assert!(delta_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn plain_answer_safety_quarantines_split_spanish_lookup_narration() {
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
         let sender = Some(delta_tx);
@@ -10448,6 +10869,74 @@ mod tests {
         assert_eq!(deltas.concat(), answer);
         assert!(!answer.contains("Tool decision"));
         assert!(!answer.contains("find_resources"));
+    }
+
+    #[tokio::test]
+    async fn plain_answer_generator_retries_json_tool_decision_split_after_args_label() {
+        async fn completion(
+            State(attempts): State<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> impl IntoResponse {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let body = if attempt == 0 {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Tool decision: find_resources\\n\\nArgs:\\n\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"```json\\n{\\n  \\\"help_type\\\": \\\"legal\\\",\\n  \\\"query\\\": \\\"Issue 539 Legal Aid\\\"\\n}\\n```\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            } else {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"The current Resource Directory email is fresh-539@example.test.\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            };
+            ([("content-type", "text/event-stream")], body)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_attempts),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = PlainAnswerPrompt {
+            system: "answer from the completed Resource Directory result".to_string(),
+            user: "give me the current email".to_string(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let answer = generator
+            .generate(&prompt, "test-model", Some(delta_tx), None)
+            .await
+            .expect("the split JSON Tool decision should be quarantined and retried");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            answer,
+            "The current Resource Directory email is fresh-539@example.test."
+        );
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+        assert_eq!(deltas.concat(), answer);
     }
 
     #[tokio::test]
