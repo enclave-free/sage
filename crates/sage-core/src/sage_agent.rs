@@ -15,8 +15,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::memory::MemoryManager;
@@ -333,6 +336,7 @@ struct ToolDecisionResponse {
 pub struct ToolDecision {
     pub tool_calls: Vec<ToolCall>,
     pub replan_after_results: bool,
+    pub planning_round: usize,
 }
 
 impl ToolDecision {
@@ -343,6 +347,7 @@ impl ToolDecision {
                 .filter(|tool_call| tool_call.name != "done")
                 .collect(),
             replan_after_results,
+            planning_round: 0,
         }
     }
 }
@@ -359,6 +364,10 @@ pub enum ToolPlanningOutcome {
 #[allow(dead_code)]
 pub trait ToolPlanner: Send {
     fn has_actionable_tools(&self) -> bool;
+
+    /// Supply the current raw User message's diagnostic contact cue. The
+    /// planner must not infer this from synthesized context.
+    fn set_contact_lookup_expected(&mut self, _expected: bool) {}
 
     async fn plan_tools(
         &mut self,
@@ -378,6 +387,10 @@ pub trait ToolPlanner: Send {
         &self,
         _step: usize,
     ) -> Option<ProviderReasoningTraceHook> {
+        None
+    }
+
+    fn plain_answer_provider_timing_hook(&self, _step: usize) -> Option<ProviderTimingTraceHook> {
         None
     }
 
@@ -413,6 +426,91 @@ Write only the final user-visible answer as plain text.
 Do not emit JSON, schema field markers, tool_calls, function calls, or internal reasoning.
 The Tool phase is complete. Use the supplied Tool results as facts, respect their warnings and failures, and do not claim that a failed Tool succeeded.
 "#;
+
+/// Detect only explicit contact-detail cues. The result is diagnostic metadata
+/// for Tool planning; it never creates or authorizes a Tool decision.
+pub(crate) fn expects_curated_resource_lookup(input: &str) -> bool {
+    let normalized = input
+        .to_lowercase()
+        .chars()
+        .map(|character| match character {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'é' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' => 'u',
+            'ñ' => 'n',
+            character if character.is_alphanumeric() => character,
+            _ => ' ',
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        "email",
+        "e mail",
+        "correo",
+        "correo electronico",
+        "phone",
+        "telephone",
+        "telefono",
+        "celular",
+        "website",
+        "web site",
+        "url",
+        "sitio web",
+        "pagina web",
+        "what is the address",
+        "where is the address",
+        "address is",
+        "address",
+        "postal address",
+        "direccion",
+        "domicilio",
+        "secure channel",
+        "secure contact",
+        "encrypted channel",
+        "canal seguro",
+        "contacto seguro",
+        "canal cifrado",
+    ]
+    .iter()
+    .any(|cue| {
+        let present = normalized == *cue
+            || normalized.starts_with(&format!("{} ", cue))
+            || normalized.ends_with(&format!(" {}", cue))
+            || normalized.contains(&format!(" {} ", cue));
+        if !present {
+            return false;
+        }
+        if *cue == "address" {
+            if normalized.contains("physical address")
+                || normalized.contains("mailing address")
+                || normalized.contains("postal address")
+            {
+                return true;
+            }
+            // “Address this/the/my concern” is ordinary prose, not a request
+            // for a physical contact address. Other contact cues in a mixed
+            // sentence are still allowed to establish the expectation.
+            for non_contact in [
+                "address this",
+                "address the",
+                "address my",
+                "address your",
+                "address our",
+                "address a",
+                "address an",
+            ] {
+                if normalized.contains(non_contact) {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+}
 
 /// Correction agent signature for fixing malformed responses
 ///
@@ -608,6 +706,97 @@ pub struct ToolResult {
     pub error: Option<String>,
 }
 
+/// Failure categories that the shared Tool executor can safely classify.
+/// Read-only adapters preserve this type through `anyhow` so retry policy does
+/// not depend on parsing provider or backend error strings.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolExecutionError {
+    #[error("connection failure")]
+    Connection,
+    #[error("request timed out")]
+    Timeout,
+    #[error("backend returned HTTP {0}")]
+    HttpStatus(u16),
+    #[error("malformed backend response")]
+    MalformedContract,
+    #[error("tool execution failed: {0}")]
+    Other(String),
+}
+
+/// Explicit retry/timeout contract for a Tool. The default is no retry; only
+/// read-only Tools opt into the bounded policy constructors below.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolRetryPolicy {
+    None,
+    ReadOnly {
+        per_attempt_timeout: Duration,
+        max_attempts: u32,
+        total_budget: Duration,
+        backoff: Duration,
+    },
+}
+
+impl ToolRetryPolicy {
+    const MIN_RETRY_ATTEMPT_BUDGET_CAP: Duration = Duration::from_secs(1);
+    pub fn none() -> Self {
+        Self::None
+    }
+
+    pub fn read_only(
+        per_attempt_timeout: Duration,
+        max_attempts: u32,
+        total_budget: Duration,
+    ) -> Self {
+        Self::ReadOnly {
+            per_attempt_timeout,
+            max_attempts: max_attempts.max(1),
+            total_budget,
+            backoff: Duration::from_millis(100),
+        }
+    }
+
+    pub fn curated_resources() -> Self {
+        Self::read_only(Duration::from_secs(5), 2, Duration::from_secs(8))
+    }
+
+    pub fn knowledge_search() -> Self {
+        Self::read_only(Duration::from_secs(35), 2, Duration::from_secs(35))
+    }
+
+    fn attempt_timeout(&self, remaining: Duration) -> Option<Duration> {
+        match self {
+            Self::None => None,
+            Self::ReadOnly {
+                per_attempt_timeout,
+                ..
+            } => Some((*per_attempt_timeout).min(remaining)),
+        }
+    }
+
+    fn can_retry(&self, attempt: u32, remaining: Duration) -> bool {
+        match self {
+            Self::None => false,
+            Self::ReadOnly {
+                per_attempt_timeout,
+                max_attempts,
+                backoff,
+                ..
+            } => {
+                attempt < *max_attempts
+                    && remaining
+                        > *backoff + (*per_attempt_timeout).min(Self::MIN_RETRY_ATTEMPT_BUDGET_CAP)
+            }
+        }
+    }
+
+    fn backoff(&self) -> Duration {
+        match self {
+            Self::None => Duration::ZERO,
+            Self::ReadOnly { backoff, .. } => *backoff,
+        }
+    }
+}
+
 impl ToolResult {
     pub fn success(output: impl Into<String>) -> Self {
         Self {
@@ -632,6 +821,21 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn args_schema(&self) -> &str;
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        ToolRetryPolicy::None
+    }
+    async fn execute_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(ToolResult, ConversationTimingOutcome)> {
+        let result = self.execute(args).await?;
+        let outcome = if result.success {
+            ConversationTimingOutcome::Succeeded
+        } else {
+            ConversationTimingOutcome::Failed
+        };
+        Ok((result, outcome))
+    }
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult>;
 }
 
@@ -683,6 +887,16 @@ impl ToolRegistry {
     /// model call for an otherwise tool-free conversation.
     pub fn has_actionable_tools(&self) -> bool {
         self.tools.keys().any(|name| name != "done")
+    }
+
+    /// Return enabled Tool names in stable registry order for content-free
+    /// planning observations. No Tool arguments or output are included.
+    pub fn names(&self) -> Vec<String> {
+        self.tools
+            .keys()
+            .filter(|name| name.as_str() != "done")
+            .cloned()
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -835,6 +1049,43 @@ pub struct StepResult {
 
 #[derive(Clone, Debug)]
 pub enum AgentTraceEvent {
+    ToolSelectionObservation {
+        round: usize,
+        attempt: u32,
+        enabled_tools: Vec<String>,
+        selected_tools: Vec<String>,
+        expected_curated_resources: bool,
+        missed_expected_curated_resources: bool,
+        outcome: String,
+    },
+    ToolAttempted {
+        call_id: String,
+        tool_name: String,
+        planning_round: usize,
+        attempt: u32,
+    },
+    ToolTerminal {
+        call_id: String,
+        tool_name: String,
+        planning_round: usize,
+        attempt: u32,
+        status: String,
+        elapsed_ms: u128,
+    },
+    ToolRetryScheduled {
+        call_id: String,
+        tool_name: String,
+        planning_round: usize,
+        attempt: u32,
+        reason: String,
+    },
+    ToolTimedOut {
+        call_id: String,
+        tool_name: String,
+        planning_round: usize,
+        attempt: u32,
+        elapsed_ms: u128,
+    },
     ModelStepStarted {
         step: usize,
         attempt: u32,
@@ -874,10 +1125,92 @@ pub enum AgentTraceEvent {
         elapsed_ms: u128,
         error: String,
     },
+    /// Content-free phase timing. `elapsed_ms` is attributable to the named
+    /// product-visible phase; provider wait phases are explicitly proxies.
+    Timing {
+        phase: ConversationTimingPhase,
+        planning_round: Option<usize>,
+        tool_name: Option<String>,
+        call_id: Option<String>,
+        attempt: u32,
+        outcome: ConversationTimingOutcome,
+        elapsed_ms: u128,
+    },
 }
 
 pub type AgentTraceHook = Arc<dyn Fn(AgentTraceEvent) + Send + Sync>;
 pub type ProviderReasoningTraceHook = Arc<dyn Fn(String) + Send + Sync>;
+
+#[derive(Clone, Debug)]
+pub enum ProviderTimingEvent {
+    ResponseHeaders {
+        attempt: u32,
+        elapsed_ms: u128,
+        outcome: ConversationTimingOutcome,
+    },
+    FirstProviderEvent {
+        attempt: u32,
+        elapsed_ms: u128,
+        outcome: ConversationTimingOutcome,
+    },
+}
+
+pub type ProviderTimingTraceHook = Arc<dyn Fn(ProviderTimingEvent) + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversationTimingPhase {
+    ToolPlanningModelDuration,
+    FinalAnswerModelDuration,
+    FinalAnswerResponseHeaderWait,
+    FinalAnswerFirstProviderEventWait,
+    ToolExecution,
+    ResourceDirectoryLookup,
+    Retrieval,
+    RetryDelay,
+    TotalTurn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversationTimingOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Guarded,
+}
+
+impl ConversationTimingOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Guarded => "guarded",
+        }
+    }
+}
+
+impl ConversationTimingPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolPlanningModelDuration => "tool_planning_model_duration",
+            Self::FinalAnswerModelDuration => "final_answer_model_duration",
+            Self::FinalAnswerResponseHeaderWait => "final_answer_response_header_wait",
+            Self::FinalAnswerFirstProviderEventWait => "final_answer_first_provider_event_wait",
+            Self::ToolExecution => "tool_execution",
+            Self::ResourceDirectoryLookup => "resource_directory_lookup",
+            Self::Retrieval => "retrieval",
+            Self::RetryDelay => "retry_delay",
+            Self::TotalTurn => "total_turn",
+        }
+    }
+
+    pub fn is_provider_wait_proxy(self) -> bool {
+        matches!(
+            self,
+            Self::FinalAnswerResponseHeaderWait | Self::FinalAnswerFirstProviderEventWait
+        )
+    }
+}
 
 pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
     let candidate = candidate.trim();
@@ -891,7 +1224,10 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
         return true;
     }
 
-    let lowercase = candidate.to_ascii_lowercase();
+    // Use the same apostrophe normalization as the opening classifier's
+    // process-narration vocabulary so held text cannot become releasable only
+    // because the provider used a typographic apostrophe.
+    let lowercase = candidate.to_ascii_lowercase().replace(['’', '‘'], "'");
     if let Some(tool_calls_start) = lowercase.find("tool calls:") {
         let preamble = &lowercase[..tool_calls_start];
         let transcript = &lowercase[tool_calls_start + "tool calls:".len()..];
@@ -909,6 +1245,9 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
         if has_invocation && (has_deliberation_preamble || transcript.contains("tool result:")) {
             return true;
         }
+    }
+    if provider_neutral_labels_have_tool_intent(&lowercase) {
+        return true;
     }
     if lowercase.starts_with("```") {
         let after_open = candidate.strip_prefix("```").unwrap_or(candidate);
@@ -972,6 +1311,87 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
     has_name_field && has_args_field
 }
 
+fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
+    let value = value.trim_start();
+    let (first_line, remaining) = value.split_once('\n').unwrap_or((value, ""));
+    let first_line = first_line.trim();
+    let name_end = first_line
+        .find(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        })
+        .unwrap_or(first_line.len());
+    if name_end == 0 {
+        return false;
+    }
+    let name = &first_line[..name_end];
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return false;
+    }
+    let remaining = remaining.trim_start();
+    if remaining.starts_with('{') || remaining.starts_with('[') || remaining.starts_with("```json")
+    {
+        return true;
+    }
+    if let Some(arguments) = remaining
+        .strip_prefix("args:")
+        .or_else(|| remaining.strip_prefix("arguments:"))
+    {
+        let arguments = arguments.trim_start();
+        if arguments.starts_with('{')
+            || arguments.starts_with('[')
+            || arguments.starts_with("```json")
+        {
+            return true;
+        }
+    }
+
+    let same_line_suffix = first_line[name_end..].trim_start();
+    same_line_suffix.starts_with('(') || same_line_suffix.starts_with('{')
+}
+
+fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
+    let mut labels = Vec::new();
+    for label in ["tool:", "tool decision:"] {
+        labels.extend(
+            candidate
+                .match_indices(label)
+                .map(|(start, _)| (start, label)),
+        );
+    }
+    labels.sort_unstable_by_key(|(start, _)| *start);
+
+    for (label_index, (start, label)) in labels.iter().enumerate() {
+        let preamble = &candidate[..*start];
+        let invocation = &candidate[*start + label.len()..];
+        if !provider_neutral_tool_label_has_invocation(invocation) {
+            continue;
+        }
+        let starts_line = preamble.is_empty() || preamble.ends_with('\n');
+        let has_deliberation_preamble = [
+            "let me ",
+            "i'll search",
+            "i will search",
+            "i'll look up",
+            "i will look up",
+            "i'm going to search",
+            "i am going to search",
+            "i'm going to look up",
+            "i am going to look up",
+            "i need to ",
+            "i should ",
+        ]
+        .iter()
+        .any(|marker| preamble.contains(marker));
+        if starts_line || has_deliberation_preamble || label_index > 0 {
+            return true;
+        }
+    }
+    false
+}
+
 fn json_has_tool_intent(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Array(values) => values.iter().any(json_has_tool_intent),
@@ -1022,9 +1442,11 @@ pub struct SageAgent {
     /// Track what was sent in previous step (messages + tool names) for context
     /// The messages Vec contains the actual message content sent
     previous_step_summary: Option<(Vec<String>, Vec<String>)>,
+    contact_lookup_expected: bool,
     max_steps: usize,
     turn_step_index: usize,
     trace_hook: Option<AgentTraceHook>,
+    final_answer_attempt: Arc<AtomicU32>,
 }
 
 #[allow(dead_code)]
@@ -1050,9 +1472,11 @@ impl SageAgent {
             instruction: instruction.into(),
             current_tool_results: Vec::new(),
             previous_step_summary: None,
+            contact_lookup_expected: false,
             max_steps: 10,
             turn_step_index: 0,
             trace_hook: None,
+            final_answer_attempt: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -1409,6 +1833,10 @@ impl SageAgent {
         }
     }
 
+    pub(crate) fn emit_trace_event(&self, event: AgentTraceEvent) {
+        self.emit_trace(event);
+    }
+
     /// Build the plain final-answer prompt after the bounded Tool phase.
     pub fn plain_answer_prompt(&self, user_message: &str) -> PlainAnswerPrompt {
         let context = self.build_context();
@@ -1431,19 +1859,11 @@ impl SageAgent {
     pub async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
         let mut executed_tools = Vec::new();
         for tool_call in &decision.tool_calls {
-            tracing::info!(
-                "Executing planned tool: {} with args: {:?}",
-                tool_call.name,
-                tool_call.args
-            );
-            let result = if let Some(tool) = self.tools.get(&tool_call.name) {
-                match tool.execute(&tool_call.args).await {
-                    Ok(result) => result,
-                    Err(error) => ToolResult::error(error.to_string()),
-                }
-            } else {
-                ToolResult::error(format!("Unknown tool: {}", tool_call.name))
-            };
+            let call_id = format!("tool-call-{}", Uuid::new_v4().simple());
+            let planning_round = decision.planning_round;
+            let result = self
+                .execute_tool_call(&call_id, planning_round, tool_call)
+                .await;
             self.inject_tool_result(tool_call, &result);
             executed_tools.push(ExecutedTool {
                 tool_call: tool_call.clone(),
@@ -1457,6 +1877,236 @@ impl SageAgent {
             executed_tools,
             done: decision.tool_calls.is_empty(),
         }
+    }
+
+    async fn execute_tool_call(
+        &self,
+        call_id: &str,
+        planning_round: usize,
+        tool_call: &ToolCall,
+    ) -> ToolResult {
+        let Some(tool) = self.tools.get(&tool_call.name) else {
+            self.emit_trace(AgentTraceEvent::ToolAttempted {
+                call_id: call_id.to_string(),
+                tool_name: tool_call.name.clone(),
+                planning_round,
+                attempt: 1,
+            });
+            let result = ToolResult::error(format!("Unknown tool: {}", tool_call.name));
+            self.emit_trace(AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::ToolExecution,
+                planning_round: Some(planning_round),
+                tool_name: Some(tool_call.name.clone()),
+                call_id: Some(call_id.to_string()),
+                attempt: 1,
+                outcome: ConversationTimingOutcome::Failed,
+                elapsed_ms: 0,
+            });
+            self.emit_trace(AgentTraceEvent::ToolTerminal {
+                call_id: call_id.to_string(),
+                tool_name: tool_call.name.clone(),
+                planning_round,
+                attempt: 1,
+                status: "failed".to_string(),
+                elapsed_ms: 0,
+            });
+            return result;
+        };
+
+        let policy = tool.retry_policy();
+        let call_started_at = Instant::now();
+        let mut attempt = 1;
+        let (result, terminal_status, elapsed_ms) = loop {
+            self.emit_trace(AgentTraceEvent::ToolAttempted {
+                call_id: call_id.to_string(),
+                tool_name: tool_call.name.clone(),
+                planning_round,
+                attempt,
+            });
+
+            let elapsed = call_started_at.elapsed();
+            let remaining = match &policy {
+                ToolRetryPolicy::None => Duration::from_secs(365 * 24 * 60 * 60),
+                ToolRetryPolicy::ReadOnly { total_budget, .. } => {
+                    total_budget.saturating_sub(elapsed)
+                }
+            };
+            let attempt_started_at = Instant::now();
+            let mut timeout_event_emitted = false;
+            let execution = if let Some(timeout) = policy.attempt_timeout(remaining) {
+                match tokio::time::timeout(
+                    timeout,
+                    tool.execute_with_timing_outcome(&tool_call.args),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let elapsed_ms = attempt_started_at.elapsed().as_millis();
+                        timeout_event_emitted = true;
+                        self.emit_trace(AgentTraceEvent::ToolTimedOut {
+                            call_id: call_id.to_string(),
+                            tool_name: tool_call.name.clone(),
+                            planning_round,
+                            attempt,
+                            elapsed_ms,
+                        });
+                        Err(anyhow::Error::new(ToolExecutionError::Timeout))
+                    }
+                }
+            } else {
+                tool.execute_with_timing_outcome(&tool_call.args).await
+            };
+
+            let attempt_elapsed_ms = attempt_started_at.elapsed().as_millis();
+            let phase = match tool_call.name.as_str() {
+                "find_resources" => Some(ConversationTimingPhase::ResourceDirectoryLookup),
+                "knowledge_search" => Some(ConversationTimingPhase::Retrieval),
+                _ => None,
+            };
+            match execution {
+                Ok((result, outcome)) => {
+                    let elapsed_ms = call_started_at.elapsed().as_millis();
+                    let status = outcome.as_str();
+                    if let Some(phase) = phase {
+                        self.emit_trace(AgentTraceEvent::Timing {
+                            phase,
+                            planning_round: Some(planning_round),
+                            tool_name: Some(tool_call.name.clone()),
+                            call_id: Some(call_id.to_string()),
+                            attempt,
+                            outcome,
+                            elapsed_ms: attempt_elapsed_ms,
+                        });
+                    }
+                    self.emit_trace(AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::ToolExecution,
+                        planning_round: Some(planning_round),
+                        tool_name: Some(tool_call.name.clone()),
+                        call_id: Some(call_id.to_string()),
+                        attempt,
+                        outcome,
+                        elapsed_ms,
+                    });
+                    break (result, status.to_string(), elapsed_ms);
+                }
+                Err(error) => {
+                    let owned_failure;
+                    let failure = if let Some(failure) = error.downcast_ref::<ToolExecutionError>()
+                    {
+                        failure
+                    } else {
+                        owned_failure = ToolExecutionError::Other(error.to_string());
+                        &owned_failure
+                    };
+                    let reason = match failure {
+                        ToolExecutionError::Connection => "connection_failure",
+                        ToolExecutionError::Timeout => "timeout",
+                        ToolExecutionError::HttpStatus(status) => match *status {
+                            502 => "http_502",
+                            503 => "http_503",
+                            504 => "http_504",
+                            _ => "http_failure",
+                        },
+                        ToolExecutionError::MalformedContract => "malformed_contract",
+                        ToolExecutionError::Other(_) => "non_retryable_failure",
+                    };
+                    let retryable = matches!(
+                        failure,
+                        ToolExecutionError::Connection
+                            | ToolExecutionError::Timeout
+                            | ToolExecutionError::HttpStatus(502..=504)
+                    );
+                    if let Some(phase) = phase {
+                        self.emit_trace(AgentTraceEvent::Timing {
+                            phase,
+                            planning_round: Some(planning_round),
+                            tool_name: Some(tool_call.name.clone()),
+                            call_id: Some(call_id.to_string()),
+                            attempt,
+                            outcome: if matches!(failure, ToolExecutionError::Timeout) {
+                                ConversationTimingOutcome::TimedOut
+                            } else {
+                                ConversationTimingOutcome::Failed
+                            },
+                            elapsed_ms: attempt_elapsed_ms,
+                        });
+                    }
+                    if matches!(failure, ToolExecutionError::Timeout) && !timeout_event_emitted {
+                        let attempt_elapsed_ms = attempt_started_at.elapsed().as_millis();
+                        self.emit_trace(AgentTraceEvent::ToolTimedOut {
+                            call_id: call_id.to_string(),
+                            tool_name: tool_call.name.clone(),
+                            planning_round,
+                            attempt,
+                            elapsed_ms: attempt_elapsed_ms,
+                        });
+                    }
+                    let remaining = match &policy {
+                        ToolRetryPolicy::None => Duration::ZERO,
+                        ToolRetryPolicy::ReadOnly { total_budget, .. } => {
+                            total_budget.saturating_sub(call_started_at.elapsed())
+                        }
+                    };
+                    if retryable && policy.can_retry(attempt, remaining) {
+                        self.emit_trace(AgentTraceEvent::ToolRetryScheduled {
+                            call_id: call_id.to_string(),
+                            tool_name: tool_call.name.clone(),
+                            planning_round,
+                            attempt,
+                            reason: reason.to_string(),
+                        });
+                        let delay_started_at = Instant::now();
+                        tokio::time::sleep(policy.backoff()).await;
+                        self.emit_trace(AgentTraceEvent::Timing {
+                            phase: ConversationTimingPhase::RetryDelay,
+                            planning_round: Some(planning_round),
+                            tool_name: Some(tool_call.name.clone()),
+                            call_id: Some(call_id.to_string()),
+                            attempt,
+                            outcome: ConversationTimingOutcome::Succeeded,
+                            elapsed_ms: delay_started_at.elapsed().as_millis(),
+                        });
+                        attempt += 1;
+                        continue;
+                    }
+                    let terminal_status = if matches!(failure, ToolExecutionError::Timeout) {
+                        "timed_out"
+                    } else {
+                        "failed"
+                    };
+                    let elapsed_ms = call_started_at.elapsed().as_millis();
+                    self.emit_trace(AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::ToolExecution,
+                        planning_round: Some(planning_round),
+                        tool_name: Some(tool_call.name.clone()),
+                        call_id: Some(call_id.to_string()),
+                        attempt,
+                        outcome: if terminal_status == "timed_out" {
+                            ConversationTimingOutcome::TimedOut
+                        } else {
+                            ConversationTimingOutcome::Failed
+                        },
+                        elapsed_ms,
+                    });
+                    break (
+                        ToolResult::error(error.to_string()),
+                        terminal_status.to_string(),
+                        elapsed_ms,
+                    );
+                }
+            }
+        };
+
+        self.emit_trace(AgentTraceEvent::ToolTerminal {
+            call_id: call_id.to_string(),
+            tool_name: tool_call.name.clone(),
+            planning_round,
+            attempt,
+            status: terminal_status,
+            elapsed_ms,
+        });
+        result
     }
 
     fn planning_input_content(&self, user_message: &str, is_first_plan: bool) -> String {
@@ -1509,22 +2159,65 @@ impl SageAgent {
             let started_at = Instant::now();
             match predictor.call(input.clone()).await {
                 Ok(response) => {
+                    let elapsed_ms = started_at.elapsed().as_millis();
                     self.emit_trace(AgentTraceEvent::ModelStepCompleted {
                         step: step_index,
                         attempt,
-                        elapsed_ms: started_at.elapsed().as_millis(),
+                        elapsed_ms,
                     });
-                    return Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
+                    self.emit_trace(AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::ToolPlanningModelDuration,
+                        planning_round: Some(step_index),
+                        tool_name: None,
+                        call_id: None,
+                        attempt,
+                        outcome: ConversationTimingOutcome::Succeeded,
+                        elapsed_ms,
+                    });
+                    let decision = ToolDecision::new(
                         response.tool_calls,
                         response.replan_after_results.unwrap_or(false),
-                    )));
+                    );
+                    let mut decision = decision;
+                    decision.planning_round = step_index;
+                    let enabled_tools = self.tools.names();
+                    let selected_tools = decision
+                        .tool_calls
+                        .iter()
+                        .map(|tool_call| tool_call.name.clone())
+                        .collect::<Vec<_>>();
+                    let expected_curated_resources =
+                        enabled_tools.iter().any(|name| name == "find_resources")
+                            && self.contact_lookup_expected;
+                    let missed_expected_curated_resources = expected_curated_resources
+                        && !selected_tools.iter().any(|name| name == "find_resources");
+                    self.emit_trace(AgentTraceEvent::ToolSelectionObservation {
+                        round: step_index,
+                        attempt,
+                        enabled_tools,
+                        selected_tools,
+                        expected_curated_resources,
+                        missed_expected_curated_resources,
+                        outcome: "planned".to_string(),
+                    });
+                    return Ok(ToolPlanningOutcome::Decision(decision));
                 }
                 Err(error) => {
+                    let elapsed_ms = started_at.elapsed().as_millis();
                     self.emit_trace(AgentTraceEvent::ModelStepFailed {
                         step: step_index,
                         attempt,
-                        elapsed_ms: started_at.elapsed().as_millis(),
+                        elapsed_ms,
                         error: format!("{:?}", error),
+                    });
+                    self.emit_trace(AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::ToolPlanningModelDuration,
+                        planning_round: Some(step_index),
+                        tool_name: None,
+                        call_id: None,
+                        attempt,
+                        outcome: ConversationTimingOutcome::Failed,
+                        elapsed_ms,
                     });
                     // This planner is only entered when actionable tools are available.
                     // A bare-prose parse failure is therefore not a trustworthy terminal
@@ -1537,12 +2230,34 @@ impl SageAgent {
                             step: step_index,
                             attempt,
                         });
+                        let delay_started_at = Instant::now();
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        self.emit_trace(AgentTraceEvent::Timing {
+                            phase: ConversationTimingPhase::RetryDelay,
+                            planning_round: Some(step_index),
+                            tool_name: None,
+                            call_id: None,
+                            attempt,
+                            outcome: ConversationTimingOutcome::Succeeded,
+                            elapsed_ms: delay_started_at.elapsed().as_millis(),
+                        });
                     }
                 }
             }
         }
 
+        let enabled_tools = self.tools.names();
+        let expected_curated_resources = enabled_tools.iter().any(|name| name == "find_resources")
+            && self.contact_lookup_expected;
+        self.emit_trace(AgentTraceEvent::ToolSelectionObservation {
+            round: step_index,
+            attempt: MAX_TOOL_PLAN_ATTEMPTS,
+            enabled_tools,
+            selected_tools: Vec::new(),
+            expected_curated_resources,
+            missed_expected_curated_resources: expected_curated_resources,
+            outcome: "failed".to_string(),
+        });
         Err(anyhow::anyhow!(
             "Tool planning failed after {} attempts: {:?}",
             MAX_TOOL_PLAN_ATTEMPTS,
@@ -1885,21 +2600,9 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
                 tool_call.args
             );
 
-            let result = if let Some(tool) = self.tools.get(&tool_call.name) {
-                match tool.execute(&tool_call.args).await {
-                    Ok(result) => {
-                        tracing::debug!("Tool {} result: {:?}", tool_call.name, result);
-                        result
-                    }
-                    Err(e) => {
-                        tracing::error!("Tool {} error: {}", tool_call.name, e);
-                        ToolResult::error(e.to_string())
-                    }
-                }
-            } else {
-                tracing::warn!("Unknown tool: {}", tool_call.name);
-                ToolResult::error(format!("Unknown tool: {}", tool_call.name))
-            };
+            let call_id = format!("tool-call-{}", Uuid::new_v4().simple());
+            let result = self.execute_tool_call(&call_id, 0, tool_call).await;
+            tracing::debug!("Tool {} result: {:?}", tool_call.name, result);
 
             // Inject into current request cycle (for multi-step reasoning)
             self.inject_tool_result(tool_call, &result);
@@ -1967,6 +2670,10 @@ impl ToolPlanner for SageAgent {
         self.tools.has_actionable_tools()
     }
 
+    fn set_contact_lookup_expected(&mut self, expected: bool) {
+        self.contact_lookup_expected = expected;
+    }
+
     async fn plan_tools(
         &mut self,
         user_message: &str,
@@ -1984,6 +2691,7 @@ impl ToolPlanner for SageAgent {
     }
 
     fn plain_answer_trace_started(&mut self) -> usize {
+        self.final_answer_attempt.store(1, Ordering::Relaxed);
         let step = self.turn_step_index;
         self.turn_step_index += 1;
         self.emit_trace(AgentTraceEvent::ModelStepStarted { step, attempt: 1 });
@@ -1997,20 +2705,84 @@ impl ToolPlanner for SageAgent {
         }))
     }
 
+    fn plain_answer_provider_timing_hook(&self, step: usize) -> Option<ProviderTimingTraceHook> {
+        let trace_hook = self.trace_hook.clone()?;
+        let final_answer_attempt = self.final_answer_attempt.clone();
+        Some(Arc::new(move |timing| {
+            let (phase, attempt, elapsed_ms, outcome) = match timing {
+                ProviderTimingEvent::ResponseHeaders {
+                    attempt,
+                    elapsed_ms,
+                    outcome,
+                } => {
+                    final_answer_attempt.fetch_max(attempt, Ordering::Relaxed);
+                    (
+                        ConversationTimingPhase::FinalAnswerResponseHeaderWait,
+                        attempt,
+                        elapsed_ms,
+                        outcome,
+                    )
+                }
+                ProviderTimingEvent::FirstProviderEvent {
+                    attempt,
+                    elapsed_ms,
+                    outcome,
+                } => {
+                    final_answer_attempt.fetch_max(attempt, Ordering::Relaxed);
+                    (
+                        ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
+                        attempt,
+                        elapsed_ms,
+                        outcome,
+                    )
+                }
+            };
+            trace_hook(AgentTraceEvent::Timing {
+                phase,
+                planning_round: Some(step),
+                tool_name: None,
+                call_id: None,
+                attempt,
+                outcome,
+                elapsed_ms,
+            });
+        }))
+    }
+
     fn plain_answer_trace_completed(&self, step: usize, elapsed_ms: u128) {
+        let attempt = self.final_answer_attempt.load(Ordering::Relaxed);
         self.emit_trace(AgentTraceEvent::ModelStepCompleted {
             step,
-            attempt: 1,
+            attempt,
+            elapsed_ms,
+        });
+        self.emit_trace(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::FinalAnswerModelDuration,
+            planning_round: Some(step),
+            tool_name: None,
+            call_id: None,
+            attempt,
+            outcome: ConversationTimingOutcome::Succeeded,
             elapsed_ms,
         });
     }
 
     fn plain_answer_trace_failed(&self, step: usize, elapsed_ms: u128, error: &str) {
+        let attempt = self.final_answer_attempt.load(Ordering::Relaxed);
         self.emit_trace(AgentTraceEvent::ModelStepFailed {
             step,
-            attempt: 1,
+            attempt,
             elapsed_ms,
             error: error.to_string(),
+        });
+        self.emit_trace(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::FinalAnswerModelDuration,
+            planning_round: Some(step),
+            tool_name: None,
+            call_id: None,
+            attempt,
+            outcome: ConversationTimingOutcome::Failed,
+            elapsed_ms,
         });
     }
 }
@@ -2018,6 +2790,32 @@ impl ToolPlanner for SageAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn curated_resource_expectation_is_conservative_and_bilingual() {
+        assert!(expects_curated_resource_lookup("Can you share the email?"));
+        assert!(expects_curated_resource_lookup(
+            "¿Me das el teléfono y la dirección?"
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Necesito el sitio web o canal seguro."
+        ));
+        assert!(!expects_curated_resource_lookup(
+            "Tell me about this organization."
+        ));
+        assert!(!expects_curated_resource_lookup("What help is available?"));
+        assert!(!expects_curated_resource_lookup(
+            "Please address this concern."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Please address this concern and give me the email."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Please address my concern and share their physical address."
+        ));
+        assert!(!expects_curated_resource_lookup("Show me a curl example."));
+    }
 
     #[test]
     fn done_does_not_make_a_registry_actionable() {
@@ -2035,11 +2833,44 @@ mod tests {
         assert!(has_syntactic_tool_intent(
             "I will search now. Tool calls: knowledge_search(query=\"referral\")\nTool Result: found one"
         ));
+        assert!(has_syntactic_tool_intent(
+            "I'll look up the current contact details. Tool: find_resources(help_type=\"legal\")"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool decision: find_resources\n\nArgs:\n```json\n{\"offset\":30}\n```"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool: find_resources\n\nArgs:\n{\"query\":\"Issue 539 Inventory\"}"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool: find_resources\n```json\n{\"query\":\"Issue 539 Inventory\",\"offset\":30}\n```"
+        ));
         assert!(!has_syntactic_tool_intent(
             "The Activity panel labels these sections Tool calls: and Tool Result: so you can audit the turn."
         ));
         assert!(!has_syntactic_tool_intent(
             "For example, the Activity panel may show Tool calls: knowledge_search(query=\"referral\")."
+        ));
+        assert!(!has_syntactic_tool_intent(
+            "The Curated Resources Tool: finds vetted organizations when contact details are requested."
+        ));
+        assert!(!has_syntactic_tool_intent(
+            "The Tool decision: section in Activity explains which lookup ran."
+        ));
+        assert!(has_syntactic_tool_intent(
+            "The Curated Resources Tool: finds vetted organizations. Tool: find_resources(query=\"legal aid\")"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "The Tool decision: section is explanatory.\nTool decision: find_resources\nArgs: {\"offset\":10}"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool: find_resources will run\nArgs: {\"query\":\"legal aid\"}"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "I’m going to search. Tool: find_resources(query=\"legal aid\")"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "I'm going to search. Tool: find_resources(query=\"legal aid\")"
         ));
     }
 
@@ -2224,5 +3055,379 @@ mod tests {
                 "error should name the failing function: {error}"
             );
         }
+    }
+
+    struct ScriptedRetryTool {
+        policy: ToolRetryPolicy,
+        outcomes: Arc<Mutex<std::collections::VecDeque<Result<ToolResult>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ScriptedRetryTool {
+        fn name(&self) -> &str {
+            "scripted_lookup"
+        }
+
+        fn description(&self) -> &str {
+            "test-only scripted lookup"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        fn retry_policy(&self) -> ToolRetryPolicy {
+            self.policy.clone()
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            self.outcomes
+                .lock()
+                .expect("scripted outcomes should lock")
+                .pop_front()
+                .expect("test should provide a scripted outcome")
+        }
+    }
+
+    struct DelayedTypedTimeoutTool {
+        attempt: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DelayedTypedTimeoutTool {
+        fn name(&self) -> &str {
+            "delayed_timeout_lookup"
+        }
+
+        fn description(&self) -> &str {
+            "test-only delayed timeout lookup"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        fn retry_policy(&self) -> ToolRetryPolicy {
+            ToolRetryPolicy::read_only(Duration::from_millis(100), 2, Duration::from_millis(500))
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            match self
+                .attempt
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            {
+                0 => Err(anyhow::Error::new(ToolExecutionError::HttpStatus(503))),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Err(anyhow::Error::new(ToolExecutionError::Timeout))
+                }
+                _ => Ok(ToolResult::success("recovered")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_retry_reuses_call_correlation_and_emits_one_terminal() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Err(anyhow::Error::new(ToolExecutionError::HttpStatus(503))),
+            Ok(ToolResult::success("recovered")),
+        ])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::read_only(
+                Duration::from_millis(50),
+                2,
+                Duration::from_millis(200),
+            ),
+            outcomes,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            event_sink
+                .lock()
+                .expect("event sink should lock")
+                .push(event);
+        }));
+
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 4,
+            })
+            .await;
+
+        assert!(result.executed_tools[0].result.success);
+        let events = events.lock().expect("event sink should lock");
+        let attempted = events
+            .iter()
+            .filter(|event| matches!(event, AgentTraceEvent::ToolAttempted { .. }))
+            .count();
+        let retries = events
+            .iter()
+            .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+            .count();
+        let terminals = events
+            .iter()
+            .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+            .count();
+        assert_eq!(attempted, 2);
+        assert_eq!(retries, 1);
+        assert_eq!(terminals, 1);
+        let call_ids = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentTraceEvent::ToolAttempted { call_id, .. }
+                | AgentTraceEvent::ToolTerminal { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(call_ids.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[tokio::test]
+    async fn state_changing_default_policy_never_retries() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([Err(
+            anyhow::Error::new(ToolExecutionError::HttpStatus(503)),
+        )])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::none(),
+            outcomes: outcomes.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            event_sink
+                .lock()
+                .expect("event sink should lock")
+                .push(event);
+        }));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(!result.executed_tools[0].result.success);
+        assert_eq!(outcomes.lock().expect("outcomes should lock").len(), 0);
+        let events = events.lock().expect("event sink should lock");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolAttempted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn read_only_policies_keep_the_issue_budgets() {
+        assert_eq!(
+            ToolRetryPolicy::curated_resources(),
+            ToolRetryPolicy::read_only(Duration::from_secs(5), 2, Duration::from_secs(8))
+        );
+        assert_eq!(
+            ToolRetryPolicy::knowledge_search(),
+            ToolRetryPolicy::read_only(Duration::from_secs(35), 2, Duration::from_secs(35))
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_is_skipped_when_only_backoff_budget_remains() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Err(anyhow::Error::new(ToolExecutionError::HttpStatus(503))),
+            Ok(ToolResult::success("should not run")),
+        ])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::read_only(
+                Duration::from_millis(50),
+                2,
+                Duration::from_millis(150),
+            ),
+            outcomes: outcomes.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(!result.executed_tools[0].result.success);
+        assert_eq!(outcomes.lock().expect("outcomes should lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_failure_retries_once_with_privacy_safe_reason() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Err(anyhow::Error::new(ToolExecutionError::Connection)),
+            Ok(ToolResult::success("recovered")),
+        ])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::read_only(
+                Duration::from_millis(50),
+                2,
+                Duration::from_millis(500),
+            ),
+            outcomes,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(result.executed_tools[0].result.success);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolAttempted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+        let retry = events.iter().find_map(|event| match event {
+            AgentTraceEvent::ToolRetryScheduled { reason, .. } => Some(reason.as_str()),
+            _ => None,
+        });
+        assert_eq!(retry, Some("connection_failure"));
+    }
+
+    #[tokio::test]
+    async fn typed_timeout_emits_one_timeout_event_before_retry() {
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Err(anyhow::Error::new(ToolExecutionError::Timeout)),
+            Ok(ToolResult::success("recovered")),
+        ])));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ScriptedRetryTool {
+            policy: ToolRetryPolicy::read_only(
+                Duration::from_millis(50),
+                2,
+                Duration::from_millis(500),
+            ),
+            outcomes,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "scripted_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(result.executed_tools[0].result.success);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTimedOut { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_timeout_trace_duration_is_scoped_to_attempt() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DelayedTypedTimeoutTool {
+            attempt: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "delayed_timeout_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        assert!(!result.executed_tools[0].result.success);
+        let events = events.lock().unwrap();
+        let timeout_ms = events.iter().find_map(|event| match event {
+            AgentTraceEvent::ToolTimedOut {
+                attempt: 2,
+                elapsed_ms,
+                ..
+            } => Some(*elapsed_ms),
+            _ => None,
+        });
+        let terminal_ms = events.iter().find_map(|event| match event {
+            AgentTraceEvent::ToolTerminal { elapsed_ms, .. } => Some(*elapsed_ms),
+            _ => None,
+        });
+        assert!(timeout_ms.is_some());
+        assert!(terminal_ms.is_some_and(|terminal| terminal > timeout_ms.unwrap() + 50));
     }
 }

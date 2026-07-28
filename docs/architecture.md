@@ -92,6 +92,7 @@ Active calls:
 - `GET /internal/agent/document-access`
 - `GET /internal/agent/user-profile-context/{user_id}`
 - `POST /internal/agent/document-search`
+- `POST /internal/agent/resources/search` — accepts optional `query`, `limit`, and `offset`; returns normalized query plus `total_count`, `returned_count`, `limit`, `offset`, `has_more`, and `next_offset` metadata for ready Curated Resources. Query relevance (exact normalized ID/name/contact, then partial name/contact, then description) precedes existing scope, verification, language, display-order, and name ranking.
 - `POST /internal/agent/admin-db-query`
 
 ADR-0023 target calls:

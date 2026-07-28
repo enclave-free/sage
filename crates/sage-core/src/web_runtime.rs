@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Context, Result};
+#[cfg(test)]
+use axum::body::{Body, Bytes};
 use axum::{
     extract::{Path, Query, State},
     http::{
@@ -32,6 +34,8 @@ use std::convert::Infallible;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, warn};
@@ -42,9 +46,11 @@ use crate::memory::MemoryManager;
 #[cfg(test)]
 use crate::sage_agent::StepResult;
 use crate::sage_agent::{
-    has_syntactic_tool_intent, tool_parse_arg, tool_string_arg, AgentTraceEvent, ExecutedTool,
-    PlainAnswerPrompt, ProviderReasoningTraceHook, SageAgent, Tool, ToolArgs, ToolPlanner,
-    ToolPlanningOutcome, ToolRegistry, ToolResult,
+    expects_curated_resource_lookup, has_syntactic_tool_intent, tool_parse_arg, tool_string_arg,
+    AgentTraceEvent, ConversationTimingOutcome, ConversationTimingPhase, ExecutedTool,
+    PlainAnswerPrompt, ProviderReasoningTraceHook, ProviderTimingEvent, ProviderTimingTraceHook,
+    SageAgent, Tool, ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry,
+    ToolResult, ToolRetryPolicy,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -103,6 +109,14 @@ Output style:
 - Follow the stage-specific output contract at the end of this instruction exactly.
 - Tool planning returns only the typed Tool decision requested by that stage.
 - Final-answer generation returns only plain user-visible prose, with no messages wrapper, Tool call, or done sentinel.
+"#;
+const CURATED_RESOURCES_CONTACT_POLICY: &str = r#"
+
+=== CURATED RESOURCES CONTACT GROUNDING ===
+- In Tool-planning mode, a current request or follow-up asking for an email, phone number, website or URL, address, secure channel, or equivalent contact detail requires a fresh find_resources decision whenever Curated Resources is enabled. This includes English and Spanish phrasing such as "me puedes dar el email...", "correo electrónico", "teléfono", "sitio web", "dirección", or "canal seguro".
+- Use recent Conversation context to carry the organization, jurisdiction, language, and help type already established into the fresh find_resources arguments. Do not make the user repeat that context unless it is genuinely missing or ambiguous.
+- This is a model-planning requirement inside the existing Model-Driven Tool Loop. Do not add a deterministic intent classifier or router that directly authorizes or executes find_resources.
+- In final-answer mode, current contact details must come from the fresh find_resources result for this turn. Never copy a contact detail solely from earlier assistant prose, memory, or a previous Tool result. If the fresh result has no matching contact, say so honestly and do not invent or reconstruct one.
 "#;
 const ADMIN_ONBOARDING_SURFACE: &str = "admin-onboarding";
 const ADMIN_ONBOARDING_INSTRUCTION: &str = r#"
@@ -318,6 +332,8 @@ pub struct ToolCallInfoResponse {
     pub output_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub metadata: Value,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guarded: bool,
 }
@@ -748,10 +764,13 @@ struct InternalDocumentSearchResponse {
 #[derive(Clone, Debug, Serialize)]
 struct InternalResourceSearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     help_type: Option<String>,
     jurisdiction: Option<String>,
     language: Option<String>,
     limit: i32,
+    offset: i32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -778,10 +797,15 @@ struct ResourceRecord {
 #[derive(Clone, Debug, Deserialize)]
 struct InternalResourceSearchResponse {
     resources: Vec<ResourceRecord>,
-    #[serde(default)]
+    query: Option<String>,
     resolved_country_code: Option<String>,
-    #[serde(default)]
     help_type: Option<String>,
+    total_count: usize,
+    returned_count: usize,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
+    next_offset: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1132,7 +1156,7 @@ impl InternalAgentClient {
             ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(payload);
-        self.send_json(request).await
+        self.send_read_only_tool_json(request).await
     }
 
     async fn resources_search(
@@ -1147,7 +1171,7 @@ impl InternalAgentClient {
             ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(payload);
-        self.send_json(request).await
+        self.send_read_only_tool_json(request).await
     }
 
     async fn admin_db_query(&self, sql: &str) -> Result<Value> {
@@ -1259,6 +1283,38 @@ impl InternalAgentClient {
             return Err(anyhow!("backend returned {}: {}", status, body));
         }
         Ok(response.json::<T>().await?)
+    }
+
+    async fn send_read_only_tool_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T> {
+        let response = request.send().await.map_err(|error| {
+            if error.is_connect() {
+                anyhow::Error::new(ToolExecutionError::Connection)
+            } else if error.is_timeout() {
+                anyhow::Error::new(ToolExecutionError::Timeout)
+            } else {
+                anyhow::Error::new(ToolExecutionError::Other(
+                    "internal read request failed".to_string(),
+                ))
+            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
+                status.as_u16(),
+            )));
+        }
+        let body = response.bytes().await.map_err(|error| {
+            if error.is_timeout() {
+                anyhow::Error::new(ToolExecutionError::Timeout)
+            } else {
+                anyhow::Error::new(ToolExecutionError::Connection)
+            }
+        })?;
+        serde_json::from_slice::<T>(&body)
+            .map_err(|_| anyhow::Error::new(ToolExecutionError::MalformedContract))
     }
 
     async fn send_value(&self, request: reqwest::RequestBuilder) -> Result<Value> {
@@ -1395,47 +1451,6 @@ impl ConversationTraceDeltaSink {
     }
 }
 
-struct TracedTool {
-    inner: Arc<dyn Tool>,
-    trace_deltas: ConversationTraceDeltaSink,
-}
-
-#[async_trait::async_trait]
-impl Tool for TracedTool {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-
-    fn args_schema(&self) -> &str {
-        self.inner.args_schema()
-    }
-
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        let started_at = Instant::now();
-        let tool_name = self.name().to_string();
-        self.trace_deltas
-            .emit(tool_call_trace_delta(&tool_name, args));
-        let result = self.inner.execute(args).await;
-        let elapsed_ms = started_at.elapsed().as_millis();
-        match &result {
-            Ok(tool_result) => {
-                self.trace_deltas
-                    .emit(tool_result_trace_delta(&tool_name, tool_result, elapsed_ms))
-            }
-            Err(error) => self.trace_deltas.emit(tool_error_trace_delta(
-                &tool_name,
-                &error.to_string(),
-                elapsed_ms,
-            )),
-        }
-        result
-    }
-}
-
 #[derive(Clone)]
 struct ConversationToolLoopSinks {
     sources: Arc<Mutex<Vec<QuerySource>>>,
@@ -1455,13 +1470,6 @@ impl ConversationToolLoopSinks {
     }
 }
 
-fn traced_tool(tool: Arc<dyn Tool>, trace_deltas: &ConversationTraceDeltaSink) -> Arc<dyn Tool> {
-    Arc::new(TracedTool {
-        inner: tool,
-        trace_deltas: trace_deltas.clone(),
-    })
-}
-
 fn trace_delta_id(prefix: &str, name: &str) -> String {
     format!(
         "{}-{}-{}",
@@ -1471,10 +1479,166 @@ fn trace_delta_id(prefix: &str, name: &str) -> String {
     )
 }
 
+fn log_agent_trace_event(
+    event: &AgentTraceEvent,
+    conversation_id: &str,
+    message_id: &str,
+    actor_kind: &str,
+    actor_id: i32,
+) {
+    match event {
+        AgentTraceEvent::ToolSelectionObservation {
+            round,
+            attempt,
+            enabled_tools,
+            selected_tools,
+            expected_curated_resources,
+            missed_expected_curated_resources,
+            outcome,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_selection_observation",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "planning",
+            round = *round,
+            attempt = *attempt,
+            enabled_tools = ?enabled_tools,
+            selected_tools = ?selected_tools,
+            selection_count = selected_tools.len(),
+            expected_curated_resources = *expected_curated_resources,
+            missed_expected_curated_resources = *missed_expected_curated_resources,
+            outcome = outcome.as_str(),
+        ),
+        AgentTraceEvent::ToolAttempted {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_execution",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "attempted",
+            call_id = %call_id,
+            tool_name = %tool_name,
+            round = *planning_round,
+            attempt = *attempt,
+        ),
+        AgentTraceEvent::ToolTerminal {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            status,
+            elapsed_ms,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_execution",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "terminal",
+            call_id = %call_id,
+            tool_name = %tool_name,
+            round = *planning_round,
+            attempt = *attempt,
+            outcome = %status,
+            duration_ms = *elapsed_ms as u64,
+        ),
+        AgentTraceEvent::ToolRetryScheduled {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            reason,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_execution_retry",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "retry",
+            call_id = %call_id,
+            tool_name = %tool_name,
+            round = *planning_round,
+            attempt = *attempt,
+            reason = %reason,
+        ),
+        AgentTraceEvent::ToolTimedOut {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            elapsed_ms,
+        } => tracing::info!(
+            target: "sage.tool_selection",
+            event_name = "tool_execution_timeout",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = "timeout",
+            call_id = %call_id,
+            tool_name = %tool_name,
+            round = *planning_round,
+            attempt = *attempt,
+            duration_ms = *elapsed_ms,
+        ),
+        AgentTraceEvent::Timing {
+            phase,
+            planning_round,
+            tool_name,
+            call_id,
+            attempt,
+            outcome,
+            elapsed_ms,
+        } => tracing::info!(
+            target: "sage.conversation_timing",
+            event_name = "conversation_phase_timing",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = phase.as_str(),
+            round = planning_round.unwrap_or_default(),
+            attempt = *attempt,
+            call_id = call_id.as_deref().unwrap_or(""),
+            tool_name = tool_name.as_deref().unwrap_or(""),
+            outcome = outcome.as_str(),
+            duration_ms = *elapsed_ms as u64,
+            provider_wait_proxy = phase.is_provider_wait_proxy(),
+        ),
+        _ => {}
+    }
+}
+
+fn install_conversation_trace_hook(
+    agent: &mut SageAgent,
+    trace_sink: ConversationTraceDeltaSink,
+    conversation_id: String,
+    message_id: String,
+    actor_kind: String,
+    actor_id: i32,
+) {
+    agent.set_trace_hook(Arc::new(move |event| {
+        log_agent_trace_event(&event, &conversation_id, &message_id, &actor_kind, actor_id);
+        trace_sink.emit(agent_trace_event_delta(event));
+    }));
+}
+
 fn tool_trace_title(tool_name: &str) -> String {
     match tool_name {
         "knowledge_search" => "Knowledge Search",
         "web_search" => "Web Search",
+        "find_resources" => "Curated Resources",
         "db_query" => "Database Query",
         "read_admin_setup_summary"
         | "read_instance_settings"
@@ -1497,72 +1661,208 @@ fn tool_trace_title(tool_name: &str) -> String {
     .to_string()
 }
 
-fn tool_call_trace_delta(tool_name: &str, args: &ToolArgs) -> ConversationTraceDeltaResponse {
-    let arg_names = args.keys().cloned().collect::<Vec<_>>();
-    ConversationTraceDeltaResponse {
-        id: trace_delta_id("tool-call", tool_name),
-        kind: "tool_call".to_string(),
-        title: Some(tool_trace_title(tool_name)),
-        content: Some(format!("Calling {}.", tool_name)),
-        tool_name: Some(tool_name.to_string()),
-        status: Some("running".to_string()),
-        metadata: json!({ "args": arg_names }),
-        created_at: Some(chrono::Utc::now().to_rfc3339()),
+fn timing_phase_title(phase: ConversationTimingPhase) -> String {
+    match phase {
+        ConversationTimingPhase::ToolPlanningModelDuration => "Tool-planning model duration",
+        ConversationTimingPhase::FinalAnswerModelDuration => "Final-answer model duration",
+        ConversationTimingPhase::FinalAnswerResponseHeaderWait => {
+            "Final-answer provider response-header wait"
+        }
+        ConversationTimingPhase::FinalAnswerFirstProviderEventWait => {
+            "Final-answer provider first-event wait"
+        }
+        ConversationTimingPhase::ToolExecution => "Tool execution",
+        ConversationTimingPhase::ResourceDirectoryLookup => "Resource Directory lookup",
+        ConversationTimingPhase::Retrieval => "Retrieval",
+        ConversationTimingPhase::RetryDelay => "Retry delay",
+        ConversationTimingPhase::TotalTurn => "Total turn",
     }
-}
-
-fn tool_result_trace_delta(
-    tool_name: &str,
-    result: &ToolResult,
-    elapsed_ms: u128,
-) -> ConversationTraceDeltaResponse {
-    let status = if result.success {
-        "succeeded"
-    } else if tool_name == "db_query" {
-        "guarded"
-    } else {
-        "failed"
-    };
-    let content = if result.success {
-        "Tool completed.".to_string()
-    } else {
-        result
-            .error
-            .as_deref()
-            .map(|error| truncate_chars(error, 240))
-            .unwrap_or_else(|| "Tool failed.".to_string())
-    };
-    ConversationTraceDeltaResponse {
-        id: trace_delta_id("tool-result", tool_name),
-        kind: "tool_result".to_string(),
-        title: Some(tool_trace_title(tool_name)),
-        content: Some(content),
-        tool_name: Some(tool_name.to_string()),
-        status: Some(status.to_string()),
-        metadata: json!({ "duration_ms": elapsed_ms }),
-        created_at: Some(chrono::Utc::now().to_rfc3339()),
-    }
-}
-
-fn tool_error_trace_delta(
-    tool_name: &str,
-    error: &str,
-    elapsed_ms: u128,
-) -> ConversationTraceDeltaResponse {
-    ConversationTraceDeltaResponse {
-        id: trace_delta_id("tool-result", tool_name),
-        kind: "tool_result".to_string(),
-        title: Some(tool_trace_title(tool_name)),
-        content: Some(truncate_chars(error, 240)),
-        tool_name: Some(tool_name.to_string()),
-        status: Some("failed".to_string()),
-        metadata: json!({ "duration_ms": elapsed_ms }),
-        created_at: Some(chrono::Utc::now().to_rfc3339()),
-    }
+    .to_string()
 }
 
 fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResponse {
     match event {
+        AgentTraceEvent::Timing {
+            phase,
+            planning_round,
+            tool_name,
+            call_id,
+            attempt,
+            outcome,
+            elapsed_ms,
+        } => {
+            let title = timing_phase_title(phase);
+            let proxy = phase.is_provider_wait_proxy();
+            let proxy_suffix = if proxy {
+                " (provider-wait proxy: network, queue, or startup)"
+            } else {
+                ""
+            };
+            let summary = format!("{}: {} ms{}.", title, elapsed_ms, proxy_suffix);
+            let mut metadata = json!({
+                "phase": phase.as_str(),
+                "round": planning_round,
+                "attempt": attempt,
+                "call_id": call_id,
+                "outcome": outcome.as_str(),
+                "duration_ms": elapsed_ms,
+                "provider_wait_proxy": proxy,
+            });
+            if proxy {
+                metadata["wait_origin"] = json!("request_start");
+                metadata["proxy_scope"] =
+                    json!("network, provider queue, or model startup may contribute");
+            }
+            ConversationTraceDeltaResponse {
+                id: trace_delta_id(
+                    "timing",
+                    &format!(
+                        "{}-{}-{}-{}",
+                        phase.as_str(),
+                        planning_round.unwrap_or_default(),
+                        attempt,
+                        call_id.as_deref().unwrap_or("turn")
+                    ),
+                ),
+                kind: "timing".to_string(),
+                title: Some(title),
+                content: Some(summary),
+                tool_name,
+                status: Some(outcome.as_str().to_string()),
+                metadata,
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+            }
+        }
+        AgentTraceEvent::ToolSelectionObservation {
+            round,
+            attempt,
+            enabled_tools,
+            selected_tools,
+            expected_curated_resources,
+            missed_expected_curated_resources,
+            outcome,
+        } => {
+            let summary = if missed_expected_curated_resources {
+                "Curated Resources was expected but not selected."
+            } else if selected_tools.is_empty() {
+                "No Tools were selected."
+            } else {
+                "The model selected enabled Tools."
+            };
+            ConversationTraceDeltaResponse {
+                id: trace_delta_id("tool-selection", &format!("{}-{}", round, attempt)),
+                kind: "tool_selection_observation".to_string(),
+                title: Some("Tool Selection".to_string()),
+                content: Some(summary.to_string()),
+                tool_name: None,
+                status: Some(
+                    if missed_expected_curated_resources || outcome == "failed" {
+                        "failed".to_string()
+                    } else {
+                        "succeeded".to_string()
+                    },
+                ),
+                metadata: json!({
+                    "round": round,
+                    "attempt": attempt,
+                    "enabled_tools": enabled_tools,
+                    "selected_tools": selected_tools,
+                    "selection_count": selected_tools.len(),
+                    "expected_curated_resources": expected_curated_resources,
+                    "missed_expected_curated_resources": missed_expected_curated_resources,
+                    "outcome": outcome,
+                }),
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+            }
+        }
+        AgentTraceEvent::ToolAttempted {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+        } => ConversationTraceDeltaResponse {
+            id: format!("{}-attempted-{}", call_id, attempt),
+            kind: "tool_call".to_string(),
+            title: Some(tool_trace_title(&tool_name)),
+            content: Some(format!("{} call attempted.", tool_trace_title(&tool_name))),
+            tool_name: Some(tool_name),
+            status: Some("running".to_string()),
+            metadata: json!({ "phase": "attempted", "call_id": call_id, "round": planning_round, "attempt": attempt }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ToolTerminal {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            status,
+            elapsed_ms,
+        } => ConversationTraceDeltaResponse {
+            id: format!("{}-terminal", call_id),
+            kind: "tool_result".to_string(),
+            title: Some(tool_trace_title(&tool_name)),
+            content: Some(
+                match status.as_str() {
+                    "succeeded" => "Tool completed.",
+                    "guarded" => "Tool was guarded.",
+                    "timed_out" => "Tool timed out.",
+                    _ => "Tool failed.",
+                }
+                .to_string(),
+            ),
+            tool_name: Some(tool_name),
+            status: Some(status),
+            metadata: json!({ "phase": "terminal", "call_id": call_id, "round": planning_round, "attempt": attempt, "duration_ms": elapsed_ms }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ToolRetryScheduled {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            reason,
+        } => ConversationTraceDeltaResponse {
+            id: format!("{}-retry-{}", call_id, attempt),
+            kind: "tool_retry".to_string(),
+            title: Some(tool_trace_title(&tool_name)),
+            content: Some(format!(
+                "Retrying {} after attempt {}.",
+                tool_trace_title(&tool_name),
+                attempt
+            )),
+            tool_name: Some(tool_name),
+            status: Some("running".to_string()),
+            metadata: json!({
+                "phase": "retry",
+                "call_id": call_id,
+                "round": planning_round,
+                "attempt": attempt,
+                "reason": reason,
+            }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ToolTimedOut {
+            call_id,
+            tool_name,
+            planning_round,
+            attempt,
+            elapsed_ms,
+        } => ConversationTraceDeltaResponse {
+            id: format!("{}-timeout-{}", call_id, attempt),
+            kind: "timeout".to_string(),
+            title: Some(tool_trace_title(&tool_name)),
+            content: Some(format!("{} timed out.", tool_trace_title(&tool_name))),
+            tool_name: Some(tool_name),
+            status: Some("timed_out".to_string()),
+            metadata: json!({
+                "phase": "timeout",
+                "call_id": call_id,
+                "round": planning_round,
+                "attempt": attempt,
+                "duration_ms": elapsed_ms,
+            }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
         AgentTraceEvent::ModelStepStarted { step, attempt } => ConversationTraceDeltaResponse {
             id: trace_delta_id("model-step", &format!("{}-{}-started", step, attempt)),
             kind: "model_step".to_string(),
@@ -1676,6 +1976,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
     }
 }
 
+#[cfg(test)]
 fn turn_timing_trace_delta(elapsed_ms: u128) -> ConversationTraceDeltaResponse {
     ConversationTraceDeltaResponse {
         id: trace_delta_id("timing", "turn"),
@@ -1684,7 +1985,14 @@ fn turn_timing_trace_delta(elapsed_ms: u128) -> ConversationTraceDeltaResponse {
         content: Some("Conversation turn completed.".to_string()),
         tool_name: None,
         status: Some("succeeded".to_string()),
-        metadata: json!({ "duration_ms": elapsed_ms }),
+        metadata: json!({
+            "phase": ConversationTimingPhase::TotalTurn.as_str(),
+            "round": null,
+            "attempt": 1,
+            "outcome": "succeeded",
+            "duration_ms": elapsed_ms,
+            "provider_wait_proxy": false,
+        }),
         created_at: Some(chrono::Utc::now().to_rfc3339()),
     }
 }
@@ -1735,19 +2043,16 @@ fn build_conversation_tool_registry_with_context(
         .iter()
         .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID)
     {
-        registry.register(traced_tool(
-            Arc::new(KnowledgeSearchTool {
-                internal: internal.clone(),
-                user: auth.clone(),
-                top_k,
-                job_ids: request.job_ids.clone(),
-                jurisdiction: jurisdiction.clone(),
-                situation_details: situation_details.clone(),
-                sources: sinks.sources.clone(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(KnowledgeSearchTool {
+            internal: internal.clone(),
+            user: auth.clone(),
+            top_k,
+            job_ids: request.job_ids.clone(),
+            jurisdiction: jurisdiction.clone(),
+            situation_details: situation_details.clone(),
+            sources: sinks.sources.clone(),
+            traces: sinks.traces.clone(),
+        }));
     }
 
     if request
@@ -1755,47 +2060,35 @@ fn build_conversation_tool_registry_with_context(
         .iter()
         .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID)
     {
-        registry.register(traced_tool(
-            Arc::new(FindResourcesTool {
-                internal: internal.clone(),
-                jurisdiction: jurisdiction.clone(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(FindResourcesTool {
+            internal: internal.clone(),
+            jurisdiction: jurisdiction.clone(),
+            traces: sinks.traces.clone(),
+        }));
     }
 
     if request.tools.iter().any(|tool| tool == "web-search") {
-        registry.register(traced_tool(
-            Arc::new(SearxWebSearchTool {
-                http: http.clone(),
-                searxng_url: searxng_url.to_string(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(SearxWebSearchTool {
+            http: http.clone(),
+            searxng_url: searxng_url.to_string(),
+            traces: sinks.traces.clone(),
+        }));
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "db-query") {
-        registry.register(traced_tool(
-            Arc::new(AdminDbQueryTool {
-                internal: internal.clone(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(AdminDbQueryTool {
+            internal: internal.clone(),
+            traces: sinks.traces.clone(),
+        }));
     }
 
     if auth.kind == "admin" && request.tools.iter().any(|tool| tool == "admin-config") {
-        registry.register(traced_tool(
-            Arc::new(AdminConfigSetupSummaryTool {
-                internal: internal.clone(),
-                state: state.cloned(),
-                auth: auth.clone(),
-                traces: sinks.traces.clone(),
-            }),
-            &sinks.trace_deltas,
-        ));
+        registry.register(Arc::new(AdminConfigSetupSummaryTool {
+            internal: internal.clone(),
+            state: state.cloned(),
+            auth: auth.clone(),
+            traces: sinks.traces.clone(),
+        }));
         for (name, endpoint, description) in [
             (
                 "read_instance_settings",
@@ -1835,28 +2128,22 @@ fn build_conversation_tool_registry_with_context(
         ] {
             if name == "read_agent_settings" {
                 if let Some(state) = state.cloned() {
-                    registry.register(traced_tool(
-                        Arc::new(AdminAgentSettingsReadTool {
-                            state,
-                            auth: auth.clone(),
-                            traces: sinks.traces.clone(),
-                        }),
-                        &sinks.trace_deltas,
-                    ));
+                    registry.register(Arc::new(AdminAgentSettingsReadTool {
+                        state,
+                        auth: auth.clone(),
+                        traces: sinks.traces.clone(),
+                    }));
                     continue;
                 }
             }
-            registry.register(traced_tool(
-                Arc::new(AdminConfigReadTool {
-                    internal: internal.clone(),
-                    auth: auth.clone(),
-                    name: name.to_string(),
-                    endpoint: endpoint.to_string(),
-                    description: description.to_string(),
-                    traces: sinks.traces.clone(),
-                }),
-                &sinks.trace_deltas,
-            ));
+            registry.register(Arc::new(AdminConfigReadTool {
+                internal: internal.clone(),
+                auth: auth.clone(),
+                name: name.to_string(),
+                endpoint: endpoint.to_string(),
+                description: description.to_string(),
+                traces: sinks.traces.clone(),
+            }));
         }
         for (name, endpoint, description, args_schema) in [
             (
@@ -1908,7 +2195,7 @@ fn build_conversation_tool_registry_with_context(
                 r#"{"key":"secret Deployment Setting name explicitly requested by the Admin"}"#,
             ),
         ] {
-            registry.register(traced_tool(
+            registry.register(
                 Arc::new(AdminConfigDirectTool {
                     internal: internal.clone(),
                     auth: auth.clone(),
@@ -1920,8 +2207,7 @@ fn build_conversation_tool_registry_with_context(
                     traces: sinks.traces.clone(),
                     affected_areas: sinks.admin_config_affected_areas.clone(),
                 }),
-                &sinks.trace_deltas,
-            ));
+            );
         }
     }
 
@@ -1941,6 +2227,10 @@ impl Tool for KnowledgeSearchTool {
 
     fn args_schema(&self) -> &str {
         r#"{"query":"search query","top_k":"optional result count"}"#
+    }
+
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        ToolRetryPolicy::knowledge_search()
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -1979,6 +2269,7 @@ impl Tool for KnowledgeSearchTool {
                 query: Some(query.clone()),
                 output_summary: Some(output_summary),
                 warnings,
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2015,12 +2306,21 @@ impl Tool for FindResourcesTool {
          conversation escalates from information to action - when someone needs to be put in \
          touch with a real organization or person who can help. Also use this for inventory \
          questions like 'what resources do you have?' or 'list available resources'; omit \
-         help_type in that case. Referral results are filtered by region and the type of help \
-         needed and ranked from most-local to global."
+         help_type in that case. For any current contact request or follow-up asking for an \
+         email, phone, website/URL, address, secure channel, or equivalent contact detail, \
+         make a fresh find_resources call when enabled and use only its returned contact data. \
+         Use recent Conversation context for the organization, jurisdiction, language, and help \
+         type instead of relying on earlier assistant contact prose. Referral results are filtered \
+         by region and the type of help needed and ranked from most-local to global. If the fresh \
+         result has no matching contact, say so honestly and do not invent or reconstruct one."
     }
 
     fn args_schema(&self) -> &str {
-        r#"{"help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es"}"#
+        r#"{"query":"optional organization name or exact contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es","offset":"optional continuation offset from a previous result page"}"#
+    }
+
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        ToolRetryPolicy::curated_resources()
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -2031,15 +2331,21 @@ impl Tool for FindResourcesTool {
             .map(str::to_string)
             .or_else(|| self.jurisdiction.clone());
         let language = tool_string_arg(args, "language").map(str::to_string);
+        let query = tool_string_arg(args, "query")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let offset: i32 = tool_parse_arg(args, "offset").unwrap_or(0).max(0);
         let is_inventory_lookup = help_type.is_none();
 
         let response = self
             .internal
             .resources_search(&InternalResourceSearchRequest {
+                query: query.clone(),
                 help_type: help_type.clone(),
                 jurisdiction: region.clone(),
                 language,
                 limit: if is_inventory_lookup { 10 } else { 5 },
+                offset,
             })
             .await?;
         let response_help_type = response
@@ -2063,8 +2369,13 @@ impl Tool for FindResourcesTool {
                 None => format!("{} resources", response_help_type),
             }
         };
+        let trace_query = if let Some(query) = response.query.as_deref().or(query.as_deref()) {
+            format!("{} matching {}", trace_query, query)
+        } else {
+            trace_query
+        };
 
-        if response.resources.is_empty() {
+        if response.resources.is_empty() && response.total_count == 0 {
             let where_label = response_region.unwrap_or("the requested region");
             let empty_summary = if is_inventory_lookup {
                 "No ready curated resources were found."
@@ -2078,6 +2389,12 @@ impl Tool for FindResourcesTool {
                     query: Some(trace_query),
                     output_summary: Some(empty_summary.to_string()),
                     warnings: vec!["no_curated_resources".to_string()],
+                    metadata: json!({
+                        "returned_count": 0,
+                        "total_count": 0,
+                        "has_more": false,
+                        "next_offset": Value::Null,
+                    }),
                     guarded: false,
                 });
             }
@@ -2095,26 +2412,77 @@ impl Tool for FindResourcesTool {
             )));
         }
 
+        let returned_count = response.returned_count.max(response.resources.len());
+        let total_count = response.total_count.max(response.resources.len());
+        let output_summary = if response.has_more {
+            match response.next_offset {
+                Some(next_offset) => format!(
+                    "Returned {} of {} matching ready Curated Resources; more results are available at offset {}.",
+                    returned_count, total_count, next_offset
+                ),
+                None => format!(
+                    "Returned {} of {} matching ready Curated Resources; more results are available.",
+                    returned_count, total_count
+                ),
+            }
+        } else {
+            format!(
+                "Returned {} of {} matching ready Curated Resources on this page; no remaining results.",
+                returned_count, total_count
+            )
+        };
         if let Ok(mut sink) = self.traces.lock() {
             sink.push(ToolCallInfoResponse {
                 tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                 tool_name: "Curated Resources".to_string(),
                 query: Some(trace_query),
-                output_summary: Some(if is_inventory_lookup {
-                    "Listed ready curated resources for the answer.".to_string()
+                output_summary: Some(output_summary),
+                warnings: if response.has_more {
+                    vec!["curated_resources_truncated".to_string()]
                 } else {
-                    "Found vetted curated resources for the answer.".to_string()
+                    Vec::new()
+                },
+                metadata: json!({
+                    "returned_count": returned_count,
+                    "total_count": total_count,
+                    "has_more": response.has_more,
+                    "next_offset": response.next_offset,
                 }),
-                warnings: Vec::new(),
                 guarded: false,
             });
         }
 
-        let mut output = if is_inventory_lookup {
+        let effective_offset = response.offset;
+        let effective_limit = response.limit;
+        let mut output = format!(
+            "Showing {} of {} matching ready Curated Resources (offset {}, limit {}).\n",
+            returned_count, total_count, effective_offset, effective_limit,
+        );
+        if response.has_more {
+            if let Some(next_offset) = response.next_offset {
+                output.push_str(&format!(
+                    "more results are available; continue with next offset {}.\n",
+                    next_offset
+                ));
+            } else {
+                output.push_str("more results are available; ask for the next page.\n");
+            }
+        } else if effective_offset == 0 && returned_count == total_count {
+            output.push_str(
+                "This is the complete set of matching ready Curated Resources for the supplied filters.\n",
+            );
+        } else {
+            output.push_str(
+                "This is the final page of matching ready Curated Resources for the supplied filters; \
+                 no matching results remain after this page.\n",
+            );
+        }
+        output.push('\n');
+        output.push_str(&if is_inventory_lookup {
             "Available curated resources".to_string()
         } else {
             format!("Trusted {} resources", response_help_type)
-        };
+        });
         if let Some(region) = response_region {
             output.push_str(&format!(" for {}", region));
         }
@@ -2221,6 +2589,7 @@ impl Tool for SearxWebSearchTool {
                     "Web search results were prepared for the answer.".to_string(),
                 ),
                 warnings: Vec::new(),
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2293,6 +2662,7 @@ impl Tool for AdminConfigReadTool {
                 query: Some(self.name.clone()),
                 output_summary: Some(format!("Read {}.", self.name)),
                 warnings: response.warnings.clone(),
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2389,6 +2759,7 @@ impl Tool for AdminConfigSetupSummaryTool {
                     status, missing_count
                 )),
                 warnings: warnings.clone(),
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2537,6 +2908,7 @@ impl Tool for AdminAgentSettingsReadTool {
                 query: Some("read_agent_settings".to_string()),
                 output_summary: Some("Read read_agent_settings.".to_string()),
                 warnings: warnings.clone(),
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2796,6 +3168,7 @@ impl Tool for AdminConfigDirectTool {
                 query: Some(self.name.clone()),
                 output_summary: Some(format!("{}: {} {}", self.name, outcome, changed_summary)),
                 warnings,
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2820,6 +3193,22 @@ impl Tool for AdminDbQueryTool {
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        Ok(self.execute_db_query_with_outcome(args).await?.0)
+    }
+
+    async fn execute_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(ToolResult, ConversationTimingOutcome)> {
+        self.execute_db_query_with_outcome(args).await
+    }
+}
+
+impl AdminDbQueryTool {
+    async fn execute_db_query_with_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(ToolResult, ConversationTimingOutcome)> {
         let sql = tool_string_arg(args, "sql")
             .map(str::to_string)
             .ok_or_else(|| anyhow!("db_query requires sql"))?;
@@ -2837,10 +3226,11 @@ impl Tool for AdminDbQueryTool {
                     query: Some(sql),
                     output_summary: Some(error.clone()),
                     warnings: vec!["db_query_rejected".to_string()],
+                    metadata: json!({}),
                     guarded: true,
                 });
             }
-            return Ok(ToolResult::error(error));
+            return Ok((ToolResult::error(error), ConversationTimingOutcome::Guarded));
         }
 
         if let Ok(mut sink) = self.traces.lock() {
@@ -2850,11 +3240,15 @@ impl Tool for AdminDbQueryTool {
                 query: Some(sql.clone()),
                 output_summary: Some("Database results were redacted from the trace.".to_string()),
                 warnings: vec!["raw_results_redacted".to_string()],
+                metadata: json!({}),
                 guarded: false,
             });
         }
 
-        Ok(ToolResult::success(serde_json::to_string_pretty(&value)?))
+        Ok((
+            ToolResult::success(serde_json::to_string_pretty(&value)?),
+            ConversationTimingOutcome::Succeeded,
+        ))
     }
 }
 
@@ -2954,6 +3348,36 @@ struct ChatStreamEmission {
     payload: ChatStreamEventPayload,
 }
 
+fn chat_stream_terminal_emissions(
+    message_id: &str,
+    session_id: &Option<String>,
+    model: String,
+    tools_used: Vec<ToolCallInfoResponse>,
+    trace: Option<ConversationTraceResponse>,
+    admin_config_affected_areas: Vec<String>,
+) -> Vec<ChatStreamEmission> {
+    let mut emissions = Vec::new();
+    if trace.is_some() {
+        let mut payload = ChatStreamEventPayload::new(message_id, session_id.clone());
+        payload.trace = trace;
+        payload.admin_config_affected_areas = admin_config_affected_areas.clone();
+        emissions.push(ChatStreamEmission {
+            event: "trace_final",
+            payload,
+        });
+    }
+    let mut done = ChatStreamEventPayload::new(message_id, session_id.clone());
+    done.model = Some(model);
+    done.provider = Some("sage".to_string());
+    done.tools_used = tools_used;
+    done.admin_config_affected_areas = admin_config_affected_areas;
+    emissions.push(ChatStreamEmission {
+        event: "done",
+        payload: done,
+    });
+    emissions
+}
+
 #[derive(Default)]
 struct ChatStreamAnswerEmissionState {
     activity_steps_sent: bool,
@@ -3034,11 +3458,29 @@ fn chat_stream_emissions_for_signal(
         ConversationStreamSignal::Trace(trace_delta) => {
             let mut payload =
                 ChatStreamEventPayload::new(message_id.to_string(), session_id.clone());
+            let timing_activity =
+                if answer_state.activity_steps_sent && trace_delta.kind == "timing" {
+                    conversation_activity_steps_from_trace_deltas(&[(*trace_delta).clone()])
+                        .into_iter()
+                        .next()
+                } else {
+                    None
+                };
             payload.trace_delta = Some(*trace_delta);
-            vec![ChatStreamEmission {
+            let mut emissions = vec![ChatStreamEmission {
                 event: "trace_delta",
                 payload,
-            }]
+            }];
+            if let Some(activity_step) = timing_activity {
+                let mut activity_payload =
+                    ChatStreamEventPayload::new(message_id.to_string(), session_id.clone());
+                activity_payload.activity_step = Some(activity_step);
+                emissions.push(ChatStreamEmission {
+                    event: "activity_step",
+                    payload: activity_payload,
+                });
+            }
+            emissions
         }
         ConversationStreamSignal::Answer(delta) => answer_state.before_answer_delta(
             message_id,
@@ -3224,16 +3666,21 @@ async fn chat(
         Some(memory),
         build_chat_agent_instruction(&ai_config.compiled_prompt, &request, &auth),
     );
-    let agent_trace_sink = tool_sinks.trace_deltas.clone();
-    agent.set_trace_hook(Arc::new(move |event| {
-        agent_trace_sink.emit(agent_trace_event_delta(event));
-    }));
+    install_conversation_trace_hook(
+        &mut agent,
+        tool_sinks.trace_deltas.clone(),
+        session.id.to_string(),
+        format!("msg_{}", Uuid::new_v4().simple()),
+        auth.kind.clone(),
+        auth.id,
+    );
 
     let input =
         build_conversation_turn_input(&auth, &profile, &request, persisted_context.as_ref());
     let tool_loop = run_conversation_tool_loop(
         &mut agent,
         &input,
+        &request.message,
         &tool_sinks,
         Some(&memory_user_id),
         &lm_settings,
@@ -3542,10 +3989,14 @@ async fn chat_stream(
             Some(memory),
             build_chat_agent_instruction(&ai_config.compiled_prompt, &request, &auth),
         );
-        let agent_trace_sink = tool_sinks.trace_deltas.clone();
-        agent.set_trace_hook(Arc::new(move |event| {
-            agent_trace_sink.emit(agent_trace_event_delta(event));
-        }));
+        install_conversation_trace_hook(
+            &mut agent,
+            tool_sinks.trace_deltas.clone(),
+            session.id.to_string(),
+            message_id.clone(),
+            auth.kind.clone(),
+            auth.id,
+        );
         let input = build_conversation_turn_input(
             &auth,
             &profile,
@@ -3556,6 +4007,7 @@ async fn chat_stream(
             let tool_loop_future = run_conversation_tool_loop(
                 &mut agent,
                 &input,
+                &request.message,
                 &tool_sinks,
                 Some(&memory_user_id),
                 &lm_settings,
@@ -3650,20 +4102,16 @@ async fn chat_stream(
         )
         .await;
 
-        if trace.is_some() {
-            let mut payload = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-            payload.trace = trace;
-            payload.admin_config_affected_areas =
-                tool_loop.admin_config_affected_areas.clone();
-            yield Ok(chat_stream_sse_event("trace_final", &payload));
+        for emission in chat_stream_terminal_emissions(
+            &message_id,
+            &session_id,
+            state.config.tinfoil_model.clone(),
+            tool_loop.tools_used,
+            trace,
+            tool_loop.admin_config_affected_areas,
+        ) {
+            yield Ok(chat_stream_sse_event(emission.event, &emission.payload));
         }
-
-        let mut done = ChatStreamEventPayload::new(message_id.clone(), session_id.clone());
-        done.model = Some(state.config.tinfoil_model.clone());
-        done.provider = Some("sage".to_string());
-        done.tools_used = tool_loop.tools_used;
-        done.admin_config_affected_areas = tool_loop.admin_config_affected_areas;
-        yield Ok(chat_stream_sse_event("done", &done));
     };
     Ok(Sse::new(stream))
 }
@@ -3768,15 +4216,20 @@ async fn query(
                 .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
         ),
     );
-    let agent_trace_sink = tool_sinks.trace_deltas.clone();
-    agent.set_trace_hook(Arc::new(move |event| {
-        agent_trace_sink.emit(agent_trace_event_delta(event));
-    }));
+    install_conversation_trace_hook(
+        &mut agent,
+        tool_sinks.trace_deltas.clone(),
+        session.id.to_string(),
+        format!("msg_{}", Uuid::new_v4().simple()),
+        auth.kind.clone(),
+        auth.id,
+    );
 
     let input = build_query_conversation_turn_input(&auth, &profile, &request, &chat_request, None);
     let tool_loop = run_conversation_tool_loop(
         &mut agent,
         &input,
+        &request.question,
         &tool_sinks,
         Some(&memory_user_id),
         &lm_settings,
@@ -6162,8 +6615,9 @@ impl<'a> EnclaveWebRuntimeProfile<'a> {
         }
         if self.include_curated_resources_tool {
             instruction.push_str(
-                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Only share contact details returned by find_resources.\n",
+                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Do not claim all, every, or a complete list when the Tool reports more results or completeness is unknown. When it reports no more results, scope completeness claims to matching ready Curated Resources and the supplied filters.\n- Only share contact details returned by find_resources.\n",
             );
+            instruction.push_str(CURATED_RESOURCES_CONTACT_POLICY);
         }
         instruction.push_str("\nAgent Settings profile:\n");
         instruction.push_str(self.compiled_prompt);
@@ -6425,9 +6879,16 @@ where
                 let prompt = planner.plain_answer_prompt(input);
                 let trace_step = planner.plain_answer_trace_started();
                 let reasoning_trace_hook = planner.plain_answer_reasoning_trace_hook(trace_step);
+                let timing_hook = planner.plain_answer_provider_timing_hook(trace_step);
                 let started_at = Instant::now();
                 let generation = answer_generator
-                    .generate(&prompt, model, delta_sender.clone(), reasoning_trace_hook)
+                    .generate_with_timing(
+                        &prompt,
+                        model,
+                        delta_sender.clone(),
+                        reasoning_trace_hook,
+                        timing_hook,
+                    )
                     .await;
                 let answer = generation.map_err(|error| {
                     planner.plain_answer_trace_failed(
@@ -6570,16 +7031,40 @@ struct ConversationToolLoopOutput {
 async fn run_conversation_tool_loop(
     agent: &mut SageAgent,
     input: &str,
+    raw_user_message: &str,
     sinks: &ConversationToolLoopSinks,
     memory_user_id: Option<&str>,
     lm: &RequestLmSettings,
     answer_delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> AppResult<ConversationToolLoopOutput> {
     let turn_started_at = Instant::now();
-    let answer = run_agent_turn(agent, input, memory_user_id, lm, answer_delta_sender).await?;
-    sinks.trace_deltas.emit(turn_timing_trace_delta(
-        turn_started_at.elapsed().as_millis(),
-    ));
+    agent.set_contact_lookup_expected(expects_curated_resource_lookup(raw_user_message));
+    let answer = match run_agent_turn(agent, input, memory_user_id, lm, answer_delta_sender).await {
+        Ok(answer) => answer,
+        Err(error) => {
+            let elapsed_ms = turn_started_at.elapsed().as_millis();
+            agent.emit_trace_event(AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::TotalTurn,
+                planning_round: None,
+                tool_name: None,
+                call_id: None,
+                attempt: 1,
+                outcome: ConversationTimingOutcome::Failed,
+                elapsed_ms,
+            });
+            return Err(error);
+        }
+    };
+    let elapsed_ms = turn_started_at.elapsed().as_millis();
+    agent.emit_trace_event(AgentTraceEvent::Timing {
+        phase: ConversationTimingPhase::TotalTurn,
+        planning_round: None,
+        tool_name: None,
+        call_id: None,
+        attempt: 1,
+        outcome: ConversationTimingOutcome::Succeeded,
+        elapsed_ms,
+    });
     let tools_used = sinks
         .traces
         .lock()
@@ -6617,10 +7102,12 @@ fn dedupe_tool_calls(tools: Vec<ToolCallInfoResponse>) -> Vec<ToolCallInfoRespon
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for tool in tools {
+        let metadata = serde_json::to_string(&tool.metadata).unwrap_or_default();
         let key = format!(
-            "{}::{}",
+            "{}::{}::{}",
             tool.tool_id,
-            tool.query.clone().unwrap_or_default()
+            tool.query.clone().unwrap_or_default(),
+            metadata,
         );
         if seen.insert(key) {
             deduped.push(tool);
@@ -6696,7 +7183,7 @@ fn build_conversation_trace(
                 } else if is_db_query {
                     json!({ "redacted": true })
                 } else {
-                    json!({})
+                    tool.metadata
                 },
             }
         })
@@ -6741,7 +7228,8 @@ fn build_conversation_trace(
     let tools = detailed_tools;
     let retrieval = detailed_retrieval;
 
-    let activity_steps = conversation_activity_steps_from_tool_traces(&tools);
+    let mut activity_steps = conversation_activity_steps_from_tool_traces(&tools);
+    activity_steps.extend(conversation_activity_steps_from_trace_deltas(&trace_deltas));
 
     Some(ConversationTraceResponse {
         visibility: "detailed".to_string(),
@@ -6773,7 +7261,11 @@ fn conversation_activity_steps_from_sinks(
         .lock()
         .map(|traces| dedupe_tool_calls(traces.clone()))
         .unwrap_or_default();
-    conversation_activity_steps_from_tools(&tools)
+    let mut steps = conversation_activity_steps_from_tools(&tools);
+    steps.extend(conversation_activity_steps_from_trace_deltas(
+        &sinks.trace_deltas.snapshot(),
+    ));
+    steps
 }
 
 fn conversation_activity_steps_from_tool_traces(
@@ -6782,6 +7274,93 @@ fn conversation_activity_steps_from_tool_traces(
     tools
         .iter()
         .map(conversation_activity_step_from_tool_trace)
+        .collect()
+}
+
+fn conversation_activity_steps_from_trace_deltas(
+    deltas: &[ConversationTraceDeltaResponse],
+) -> Vec<ConversationActivityStepResponse> {
+    deltas
+        .iter()
+        .filter(|delta| {
+            matches!(
+                delta.kind.as_str(),
+                "tool_selection_observation"
+                    | "tool_call"
+                    | "tool_result"
+                    | "tool_retry"
+                    | "timeout"
+                    | "timing"
+            )
+        })
+        .map(|delta| {
+            if delta.kind == "timing" {
+                return ConversationActivityStepResponse {
+                    id: format!("activity-{}", delta.id),
+                    kind: "timing".to_string(),
+                    title: delta.title.clone().unwrap_or_else(|| "Timing".to_string()),
+                    status: delta
+                        .status
+                        .clone()
+                        .unwrap_or_else(|| "succeeded".to_string()),
+                    summary: delta.content.clone(),
+                    warnings: Vec::new(),
+                };
+            }
+            if matches!(
+                delta.kind.as_str(),
+                "tool_call" | "tool_result" | "tool_retry" | "timeout"
+            ) {
+                return ConversationActivityStepResponse {
+                    id: format!("activity-{}", delta.id),
+                    kind: "tool".to_string(),
+                    title: delta.title.clone().unwrap_or_else(|| "Tool".to_string()),
+                    status: delta
+                        .status
+                        .clone()
+                        .unwrap_or_else(|| "running".to_string()),
+                    summary: delta.content.clone(),
+                    warnings: Vec::new(),
+                };
+            }
+            let missed = delta
+                .metadata
+                .get("missed_expected_curated_resources")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let selected = delta
+                .metadata
+                .get("selected_tools")
+                .and_then(Value::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(tool_trace_title)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let summary = if missed {
+                "Curated Resources was expected but not selected.".to_string()
+            } else if delta.metadata.get("outcome").and_then(Value::as_str) == Some("failed") {
+                "Tool planning failed before a selection was recorded.".to_string()
+            } else if selected.is_empty() {
+                "No Tools were selected.".to_string()
+            } else {
+                format!("Selected: {}.", selected.join(", "))
+            };
+            ConversationActivityStepResponse {
+                id: format!("activity-{}", delta.id),
+                kind: "tool_selection_observation".to_string(),
+                title: "Tool Selection".to_string(),
+                status: delta
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| "succeeded".to_string()),
+                summary: Some(summary),
+                warnings: Vec::new(),
+            }
+        })
         .collect()
 }
 
@@ -6850,6 +7429,7 @@ fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
         query: Some(query),
         output_summary: None,
         warnings: Vec::new(),
+        metadata: json!({}),
         guarded: false,
     }
 }
@@ -6937,6 +7517,18 @@ trait PlainAnswerGenerator: Send + Sync {
         delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
         reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
     ) -> std::result::Result<String, PlainAnswerGenerationError>;
+
+    async fn generate_with_timing(
+        &self,
+        prompt: &PlainAnswerPrompt,
+        model: &str,
+        delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
+        _timing_hook: Option<ProviderTimingTraceHook>,
+    ) -> std::result::Result<String, PlainAnswerGenerationError> {
+        self.generate(prompt, model, delta_sender, reasoning_trace_hook)
+            .await
+    }
 }
 
 /// OpenAI-compatible Chat Completions adapter. Provider wire types remain
@@ -6971,12 +7563,14 @@ enum PlainAnswerOpeningDisposition {
 }
 
 impl PlainAnswerStreamState {
-    const STRUCTURAL_START_MARKERS: [&'static str; 18] = [
+    const STRUCTURAL_START_MARKERS: [&'static str; 20] = [
         "[[ ##",
         "<tool_call",
         "</tool_call",
         "<|tool_call",
         "tool_calls:",
+        "tool:",
+        "tool decision:",
         "function_call:",
         "\"tool_calls\"",
         "'tool_calls'",
@@ -6992,10 +7586,10 @@ impl PlainAnswerStreamState {
         "```",
     ];
 
-    fn push(
+    fn push_staged(
         &mut self,
         delta: &str,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        answer_deltas: &mut Vec<String>,
     ) -> std::result::Result<(), PlainAnswerGenerationError> {
         if delta.is_empty() {
             return Ok(());
@@ -7016,16 +7610,16 @@ impl PlainAnswerStreamState {
             self.reject_tool_intent(&self.pending)?;
             return Ok(());
         }
-        self.flush_safe_candidates(delta_sender)
+        self.flush_safe_candidates_staged(answer_deltas)
     }
 
-    fn finish(
+    fn finish_staged(
         &mut self,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        answer_deltas: &mut Vec<String>,
     ) -> std::result::Result<(), PlainAnswerGenerationError> {
         self.reject_repetition()?;
         self.reject_tool_intent(&self.pending)?;
-        self.emit_pending_prefix(self.pending.len(), delta_sender);
+        self.emit_pending_prefix_staged(self.pending.len(), answer_deltas);
         Ok(())
     }
 
@@ -7159,9 +7753,9 @@ impl PlainAnswerStreamState {
         PlainAnswerOpeningDisposition::Stream
     }
 
-    fn flush_safe_candidates(
+    fn flush_safe_candidates_staged(
         &mut self,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        answer_deltas: &mut Vec<String>,
     ) -> std::result::Result<(), PlainAnswerGenerationError> {
         loop {
             if self.pending.is_empty() {
@@ -7174,18 +7768,18 @@ impl PlainAnswerStreamState {
             let candidate_start = Self::structural_candidate_start(&self.pending);
             let Some(candidate_start) = candidate_start.filter(|start| *start < suffix_start)
             else {
-                self.emit_pending_prefix(suffix_start, delta_sender);
+                self.emit_pending_prefix_staged(suffix_start, answer_deltas);
                 return Ok(());
             };
             if candidate_start > 0 {
-                self.emit_pending_prefix(candidate_start, delta_sender);
+                self.emit_pending_prefix_staged(candidate_start, answer_deltas);
             }
             self.reject_tool_intent(&self.pending)?;
             let Some(candidate_end) = Self::structural_candidate_end(&self.pending) else {
                 return Ok(());
             };
             self.reject_tool_intent(&self.pending[..candidate_end])?;
-            self.emit_pending_prefix(candidate_end, delta_sender);
+            self.emit_pending_prefix_staged(candidate_end, answer_deltas);
         }
     }
 
@@ -7215,6 +7809,8 @@ impl PlainAnswerStreamState {
             lowercase.find("</tool_call"),
             lowercase.find("<|tool_call"),
             lowercase.find("tool calls:"),
+            lowercase.find("tool:"),
+            lowercase.find("tool decision:"),
         ]
         .into_iter()
         .flatten()
@@ -7233,6 +7829,8 @@ impl PlainAnswerStreamState {
             let indent = line.len() - trimmed.len();
             if [
                 "tool_calls:",
+                "tool:",
+                "tool decision:",
                 "function_call:",
                 "\"tool_calls\"",
                 "'tool_calls'",
@@ -7270,6 +7868,11 @@ impl PlainAnswerStreamState {
         {
             return None;
         }
+        if Self::provider_neutral_tool_label_is_definitive_prose(candidate) {
+            return Some(
+                Self::next_provider_neutral_tool_label(candidate).unwrap_or(candidate.len()),
+            );
+        }
         let newline = candidate.find('\n')?;
         let next_line = candidate[newline + 1..].trim_start_matches(char::is_whitespace);
         if next_line.is_empty()
@@ -7280,6 +7883,46 @@ impl PlainAnswerStreamState {
             return None;
         }
         Some(newline + 1)
+    }
+
+    fn provider_neutral_tool_label_is_definitive_prose(candidate: &str) -> bool {
+        let lowercase = candidate.to_ascii_lowercase();
+        let Some(value) = lowercase
+            .strip_prefix("tool:")
+            .or_else(|| lowercase.strip_prefix("tool decision:"))
+        else {
+            return false;
+        };
+        let first_line = value.lines().next().unwrap_or(value).trim();
+        let name_end = first_line
+            .find(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+            })
+            .unwrap_or(first_line.len());
+        if name_end == 0 {
+            return false;
+        }
+        let name = &first_line[..name_end];
+        let suffix = first_line[name_end..].trim_start();
+        if !candidate.contains('\n')
+            && (name.contains('_') || name.contains('-') || name.contains('.'))
+        {
+            return false;
+        }
+        !suffix.is_empty() && !suffix.starts_with('(') && !suffix.starts_with('{')
+    }
+
+    fn next_provider_neutral_tool_label(candidate: &str) -> Option<usize> {
+        let lowercase = candidate.to_ascii_lowercase();
+        let search_start = 1.min(lowercase.len());
+        ["tool:", "tool decision:"]
+            .iter()
+            .filter_map(|label| {
+                lowercase[search_start..]
+                    .find(label)
+                    .map(|index| search_start + index)
+            })
+            .min()
     }
 
     fn balanced_structure_end(candidate: &str) -> Option<usize> {
@@ -7313,19 +7956,41 @@ impl PlainAnswerStreamState {
         None
     }
 
-    fn emit_pending_prefix(
-        &mut self,
-        end: usize,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-    ) {
+    fn emit_pending_prefix_staged(&mut self, end: usize, answer_deltas: &mut Vec<String>) {
         if end == 0 {
             return;
         }
         let delta: String = self.pending.drain(..end).collect();
-        if let Some(sender) = delta_sender {
-            self.emitted_any = true;
-            let _ = sender.send(ConversationStreamSignal::Answer(delta));
+        answer_deltas.push(delta);
+    }
+
+    #[cfg(test)]
+    fn push(
+        &mut self,
+        delta: &str,
+        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<(), PlainAnswerGenerationError> {
+        let mut answer_deltas = Vec::new();
+        let result = self.push_staged(delta, &mut answer_deltas);
+        if result.is_ok() {
+            self.emitted_any |= !answer_deltas.is_empty();
+            release_answer_deltas(answer_deltas, delta_sender);
         }
+        result
+    }
+
+    #[cfg(test)]
+    fn finish(
+        &mut self,
+        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    ) -> std::result::Result<(), PlainAnswerGenerationError> {
+        let mut answer_deltas = Vec::new();
+        let result = self.finish_staged(&mut answer_deltas);
+        if result.is_ok() {
+            self.emitted_any |= !answer_deltas.is_empty();
+            release_answer_deltas(answer_deltas, delta_sender);
+        }
+        result
     }
 }
 
@@ -7342,8 +8007,12 @@ impl OpenAiPlainAnswerGenerator {
     fn consume_sse_line(
         line: &str,
         state: &mut PlainAnswerStreamState,
-        delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-        reasoning_trace_hook: &Option<ProviderReasoningTraceHook>,
+        answer_deltas: &mut Vec<String>,
+        reasoning_deltas: &mut Vec<String>,
+        first_provider_event_observed: &mut bool,
+        timing_hook: &Option<ProviderTimingTraceHook>,
+        attempt: u32,
+        request_started_at: Instant,
     ) -> std::result::Result<bool, PlainAnswerGenerationError> {
         let line = line.trim_end_matches('\r');
         let Some(data) = line.strip_prefix("data:") else {
@@ -7351,8 +8020,21 @@ impl OpenAiPlainAnswerGenerator {
         };
         let data = data.trim_start();
         if data == "[DONE]" {
-            state.finish(delta_sender)?;
-            return Ok(true);
+            let result = state.finish_staged(answer_deltas);
+            if result.is_ok() {
+                mark_first_provider_event(
+                    first_provider_event_observed,
+                    timing_hook,
+                    attempt,
+                    request_started_at,
+                    if *first_provider_event_observed {
+                        ConversationTimingOutcome::Succeeded
+                    } else {
+                        ConversationTimingOutcome::Failed
+                    },
+                );
+            }
+            return result.map(|_| true);
         }
         if data.is_empty() {
             return Ok(false);
@@ -7367,6 +8049,101 @@ impl OpenAiPlainAnswerGenerator {
                 state.emitted_any,
             )
         })?;
+        let choices = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                PlainAnswerGenerationError::new(
+                    PlainAnswerFailureKind::Other,
+                    "invalid Chat Completions stream event: choices must be an array",
+                    state.emitted_any,
+                )
+            })?;
+        if choices.is_empty() {
+            if value.get("usage").is_some_and(Value::is_object) {
+                // This adapter does not request or persist provider usage, but
+                // OpenAI-compatible endpoints may still send a usage-only
+                // metadata chunk. It is not a user-visible answer event.
+                return Ok(false);
+            }
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "invalid Chat Completions stream event: empty choices require usage metadata",
+                state.emitted_any,
+            ));
+        }
+        if !choices[0].is_object() {
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "invalid Chat Completions stream event: first choice must be an object",
+                state.emitted_any,
+            ));
+        }
+        let choice = &choices[0];
+        let has_delta = choice.get("delta").is_some_and(Value::is_object);
+        if choice
+            .get("delta")
+            .is_some_and(|delta| !delta.is_null() && !delta.is_object())
+        {
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "invalid Chat Completions stream event: delta must be an object",
+                state.emitted_any,
+            ));
+        }
+        let has_finish_reason = choice
+            .get("finish_reason")
+            .is_some_and(|reason| !reason.is_null());
+        if !has_delta && !has_finish_reason {
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "invalid Chat Completions stream event: choice has no delta or finish reason",
+                state.emitted_any,
+            ));
+        }
+        if let Some(delta) = choice.get("delta").filter(|value| value.is_object()) {
+            let recognized_delta_field = [
+                "content",
+                "role",
+                "reasoning",
+                "reasoning_content",
+                "tool_calls",
+                "function_call",
+            ]
+            .iter()
+            .any(|field| delta.get(*field).is_some());
+            if !recognized_delta_field && !has_finish_reason {
+                return Err(PlainAnswerGenerationError::new(
+                    PlainAnswerFailureKind::Other,
+                    "invalid Chat Completions stream event: delta has no recognized fields",
+                    state.emitted_any,
+                ));
+            }
+            for field in ["content", "reasoning", "reasoning_content"] {
+                if delta
+                    .get(field)
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+                {
+                    return Err(PlainAnswerGenerationError::new(
+                        PlainAnswerFailureKind::Other,
+                        format!(
+                            "invalid Chat Completions stream event: delta.{field} must be a string"
+                        ),
+                        state.emitted_any,
+                    ));
+                }
+            }
+            if delta
+                .get("role")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
+                return Err(PlainAnswerGenerationError::new(
+                    PlainAnswerFailureKind::Other,
+                    "invalid Chat Completions stream event: delta.role must be a string",
+                    state.emitted_any,
+                ));
+            }
+        }
         let has_native_tool_calls =
             value
                 .pointer("/choices/0/delta/tool_calls")
@@ -7387,32 +8164,47 @@ impl OpenAiPlainAnswerGenerator {
                 state.emitted_any,
             ));
         }
-        if let Some(reasoning) = value
-            .pointer("/choices/0/delta/reasoning")
-            .or_else(|| value.pointer("/choices/0/delta/reasoning_content"))
-            .and_then(Value::as_str)
-            .filter(|reasoning| !reasoning.is_empty())
-        {
-            if let Some(trace_hook) = reasoning_trace_hook {
-                trace_hook(reasoning.to_string());
+        for field in ["reasoning", "reasoning_content"] {
+            if let Some(reasoning) = value
+                .pointer(&format!("/choices/0/delta/{field}"))
+                .and_then(Value::as_str)
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                reasoning_deltas.push(reasoning.to_string());
             }
         }
         if let Some(delta) = value
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
         {
-            state.push(delta, delta_sender)?;
+            state.push_staged(delta, answer_deltas)?;
         }
         let Some(finish_reason) = value
             .pointer("/choices/0/finish_reason")
             .filter(|reason| !reason.is_null())
         else {
+            mark_first_provider_event(
+                first_provider_event_observed,
+                timing_hook,
+                attempt,
+                request_started_at,
+                ConversationTimingOutcome::Succeeded,
+            );
             return Ok(false);
         };
         match finish_reason.as_str().unwrap_or("unknown") {
             "stop" => {
-                state.finish(delta_sender)?;
-                Ok(true)
+                let result = state.finish_staged(answer_deltas);
+                if result.is_ok() {
+                    mark_first_provider_event(
+                        first_provider_event_observed,
+                        timing_hook,
+                        attempt,
+                        request_started_at,
+                        ConversationTimingOutcome::Succeeded,
+                    );
+                }
+                result.map(|_| true)
             }
             "length" => Err(PlainAnswerGenerationError::new(
                 PlainAnswerFailureKind::TokenLimit,
@@ -7432,10 +8224,14 @@ impl OpenAiPlainAnswerGenerator {
         &self,
         prompt: &PlainAnswerPrompt,
         model: &str,
+        attempt: u32,
         delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
         reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
+        timing_hook: Option<ProviderTimingTraceHook>,
     ) -> std::result::Result<String, PlainAnswerGenerationError> {
-        let response = self
+        let request_started_at = Instant::now();
+        let mut first_provider_event_observed = false;
+        let response = match self
             .client
             .post(format!(
                 "{}/chat/completions",
@@ -7454,17 +8250,53 @@ impl OpenAiPlainAnswerGenerator {
             }))
             .send()
             .await
-            .map_err(|error| {
-                PlainAnswerGenerationError::new(
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let elapsed_ms = request_started_at.elapsed().as_millis();
+                if let Some(timing_hook) = &timing_hook {
+                    timing_hook(ProviderTimingEvent::ResponseHeaders {
+                        attempt,
+                        elapsed_ms,
+                        outcome: ConversationTimingOutcome::Failed,
+                    });
+                }
+                mark_first_provider_event(
+                    &mut first_provider_event_observed,
+                    &timing_hook,
+                    attempt,
+                    request_started_at,
+                    ConversationTimingOutcome::Failed,
+                );
+                return Err(PlainAnswerGenerationError::new(
                     PlainAnswerFailureKind::Other,
                     format!("plain answer request failed: {error}"),
                     false,
-                )
-            })?;
+                ));
+            }
+        };
 
         let status = response.status();
+        if let Some(timing_hook) = &timing_hook {
+            timing_hook(ProviderTimingEvent::ResponseHeaders {
+                attempt,
+                elapsed_ms: request_started_at.elapsed().as_millis(),
+                outcome: if status.is_success() {
+                    ConversationTimingOutcome::Succeeded
+                } else {
+                    ConversationTimingOutcome::Failed
+                },
+            });
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            mark_first_provider_event(
+                &mut first_provider_event_observed,
+                &timing_hook,
+                attempt,
+                request_started_at,
+                ConversationTimingOutcome::Failed,
+            );
             return Err(PlainAnswerGenerationError::new(
                 PlainAnswerFailureKind::Other,
                 format!(
@@ -7481,23 +8313,57 @@ impl OpenAiPlainAnswerGenerator {
         let mut stream = response.bytes_stream();
         let mut done = false;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                PlainAnswerGenerationError::new(
-                    PlainAnswerFailureKind::Other,
-                    format!("plain answer stream failed: {error}"),
-                    answer_state.emitted_any,
-                )
-            })?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    mark_first_provider_event(
+                        &mut first_provider_event_observed,
+                        &timing_hook,
+                        attempt,
+                        request_started_at,
+                        ConversationTimingOutcome::Failed,
+                    );
+                    return Err(PlainAnswerGenerationError::new(
+                        PlainAnswerFailureKind::Other,
+                        format!("plain answer stream failed: {error}"),
+                        answer_state.emitted_any,
+                    ));
+                }
+            };
             buffer.extend_from_slice(&chunk);
             while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line = String::from_utf8_lossy(&buffer[..newline]).to_string();
                 buffer.drain(..=newline);
-                done = Self::consume_sse_line(
+                let mut staged_answer_deltas = Vec::new();
+                let mut staged_reasoning_deltas = Vec::new();
+                done = match Self::consume_sse_line(
                     &line,
                     &mut answer_state,
-                    &delta_sender,
-                    &reasoning_trace_hook,
-                )?;
+                    &mut staged_answer_deltas,
+                    &mut staged_reasoning_deltas,
+                    &mut first_provider_event_observed,
+                    &timing_hook,
+                    attempt,
+                    request_started_at,
+                ) {
+                    Ok(done) => {
+                        release_reasoning_deltas(staged_reasoning_deltas, &reasoning_trace_hook);
+                        answer_state.emitted_any |=
+                            delta_sender.is_some() && !staged_answer_deltas.is_empty();
+                        release_answer_deltas(staged_answer_deltas, &delta_sender);
+                        done
+                    }
+                    Err(error) => {
+                        mark_first_provider_event(
+                            &mut first_provider_event_observed,
+                            &timing_hook,
+                            attempt,
+                            request_started_at,
+                            ConversationTimingOutcome::Failed,
+                        );
+                        return Err(error);
+                    }
+                };
                 if done {
                     break;
                 }
@@ -7508,14 +8374,45 @@ impl OpenAiPlainAnswerGenerator {
         }
         if !buffer.is_empty() && !done {
             let line = String::from_utf8_lossy(&buffer).to_string();
-            done = Self::consume_sse_line(
+            let mut staged_answer_deltas = Vec::new();
+            let mut staged_reasoning_deltas = Vec::new();
+            done = match Self::consume_sse_line(
                 &line,
                 &mut answer_state,
-                &delta_sender,
-                &reasoning_trace_hook,
-            )?;
+                &mut staged_answer_deltas,
+                &mut staged_reasoning_deltas,
+                &mut first_provider_event_observed,
+                &timing_hook,
+                attempt,
+                request_started_at,
+            ) {
+                Ok(done) => {
+                    release_reasoning_deltas(staged_reasoning_deltas, &reasoning_trace_hook);
+                    answer_state.emitted_any |=
+                        delta_sender.is_some() && !staged_answer_deltas.is_empty();
+                    release_answer_deltas(staged_answer_deltas, &delta_sender);
+                    done
+                }
+                Err(error) => {
+                    mark_first_provider_event(
+                        &mut first_provider_event_observed,
+                        &timing_hook,
+                        attempt,
+                        request_started_at,
+                        ConversationTimingOutcome::Failed,
+                    );
+                    return Err(error);
+                }
+            };
         }
         if !done {
+            mark_first_provider_event(
+                &mut first_provider_event_observed,
+                &timing_hook,
+                attempt,
+                request_started_at,
+                ConversationTimingOutcome::Failed,
+            );
             return Err(PlainAnswerGenerationError::new(
                 PlainAnswerFailureKind::Other,
                 "plain answer stream ended without a finish terminator",
@@ -7542,12 +8439,26 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
         delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
         reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
     ) -> std::result::Result<String, PlainAnswerGenerationError> {
+        self.generate_with_timing(prompt, model, delta_sender, reasoning_trace_hook, None)
+            .await
+    }
+
+    async fn generate_with_timing(
+        &self,
+        prompt: &PlainAnswerPrompt,
+        model: &str,
+        delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+        reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
+        timing_hook: Option<ProviderTimingTraceHook>,
+    ) -> std::result::Result<String, PlainAnswerGenerationError> {
         let first_attempt = self
             .generate_attempt(
                 prompt,
                 model,
+                1,
                 delta_sender.clone(),
                 reasoning_trace_hook.clone(),
+                timing_hook.clone(),
             )
             .await;
         let error = match first_attempt {
@@ -7568,8 +8479,59 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
             ),
             user: prompt.user.clone(),
         };
-        self.generate_attempt(&retry_prompt, model, delta_sender, reasoning_trace_hook)
-            .await
+        self.generate_attempt(
+            &retry_prompt,
+            model,
+            2,
+            delta_sender,
+            reasoning_trace_hook,
+            timing_hook,
+        )
+        .await
+    }
+}
+
+fn mark_first_provider_event(
+    observed: &mut bool,
+    timing_hook: &Option<ProviderTimingTraceHook>,
+    attempt: u32,
+    request_started_at: Instant,
+    outcome: ConversationTimingOutcome,
+) {
+    if *observed {
+        return;
+    }
+    *observed = true;
+    if let Some(timing_hook) = timing_hook {
+        timing_hook(ProviderTimingEvent::FirstProviderEvent {
+            attempt,
+            elapsed_ms: request_started_at.elapsed().as_millis(),
+            outcome,
+        });
+    }
+}
+
+fn release_answer_deltas(
+    answer_deltas: Vec<String>,
+    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) {
+    let Some(sender) = delta_sender else {
+        return;
+    };
+    for delta in answer_deltas {
+        let _ = sender.send(ConversationStreamSignal::Answer(delta));
+    }
+}
+
+fn release_reasoning_deltas(
+    reasoning_deltas: Vec<String>,
+    reasoning_trace_hook: &Option<ProviderReasoningTraceHook>,
+) {
+    let Some(hook) = reasoning_trace_hook else {
+        return;
+    };
+    for delta in reasoning_deltas {
+        hook(delta);
     }
 }
 
@@ -7810,12 +8772,13 @@ fn auth_error(error: anyhow::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sage_agent::ToolDecision;
+    use crate::sage_agent::{ToolCall, ToolDecision};
     use flate2::{write::ZlibEncoder, Compression};
     use itsdangerous::{default_builder, timed_serializer_with_signer, TimestampSigner};
     use serde_json::json;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
 
     fn answer_signal(signal: ConversationStreamSignal) -> String {
         match signal {
@@ -7824,6 +8787,219 @@ mod tests {
                 panic!("expected answer signal, received trace {}", delta.id)
             }
         }
+    }
+
+    fn contact_replay_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[derive(Clone)]
+    struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_structured_log_with_ids(
+        event: AgentTraceEvent,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Value {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer_bytes = bytes.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_ansi(false)
+            .with_target(true)
+            .with_writer(move || LogCaptureWriter(writer_bytes.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_agent_trace_event(&event, conversation_id, message_id, "user", 7);
+        });
+        let bytes = bytes.lock().unwrap().clone();
+        serde_json::from_slice(bytes.trim_ascii_end()).expect("captured tracing event is JSON")
+    }
+
+    fn capture_structured_log(event: AgentTraceEvent) -> Value {
+        capture_structured_log_with_ids(event, "conversation-1", "msg_test")
+    }
+
+    #[test]
+    fn structured_trace_events_correlate_turns_without_collapsing_same_conversation() {
+        let event = AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::TotalTurn,
+            planning_round: None,
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 42,
+        };
+        let first =
+            capture_structured_log_with_ids(event.clone(), "conversation-shared", "msg-one");
+        let second = capture_structured_log_with_ids(event, "conversation-shared", "msg-two");
+        assert_eq!(first["conversation_id"], json!("conversation-shared"));
+        assert_eq!(second["conversation_id"], json!("conversation-shared"));
+        assert_eq!(first["message_id"], json!("msg-one"));
+        assert_eq!(second["message_id"], json!("msg-two"));
+        assert_ne!(first["message_id"], second["message_id"]);
+    }
+
+    #[test]
+    fn latency_phase_timing_is_named_and_content_free() {
+        let delta = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
+            planning_round: Some(2),
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 37,
+        });
+        assert_eq!(delta.kind, "timing");
+        assert_eq!(
+            delta.title.as_deref(),
+            Some("Final-answer provider first-event wait")
+        );
+        assert_eq!(
+            delta.metadata["phase"],
+            json!("final_answer_first_provider_event_wait")
+        );
+        assert_eq!(delta.metadata["duration_ms"], json!(37));
+        let delta_json = serde_json::to_string(&delta).unwrap();
+        assert!(!delta_json.contains("contact@example"));
+
+        let log = capture_structured_log(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ResourceDirectoryLookup,
+            planning_round: Some(2),
+            tool_name: Some("find_resources".to_string()),
+            call_id: Some("call-1".to_string()),
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 12,
+        });
+        assert_eq!(log["phase"], json!("resource_directory_lookup"));
+        assert_eq!(log["duration_ms"], json!(12));
+        let serialized = log.to_string();
+        for forbidden in [
+            "prompt",
+            "answer",
+            "contact",
+            "args",
+            "output",
+            "secret",
+            "reasoning",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn timing_activity_rows_have_human_labels_and_duration_only() {
+        let delta = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::RetryDelay,
+            planning_round: Some(2),
+            tool_name: Some("find_resources".to_string()),
+            call_id: Some("call-1".to_string()),
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 101,
+        });
+        let rows = conversation_activity_steps_from_trace_deltas(&[delta]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Retry delay");
+        assert!(rows[0].summary.as_deref().unwrap().contains("101 ms"));
+        assert!(!rows[0].summary.as_deref().unwrap().contains("call-1"));
+    }
+
+    #[test]
+    fn guarded_timing_outcome_remains_guarded_in_transport_delta() {
+        let delta = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ToolExecution,
+            planning_round: Some(1),
+            tool_name: Some("db_query".to_string()),
+            call_id: Some("call-guarded".to_string()),
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Guarded,
+            elapsed_ms: 9,
+        });
+        assert_eq!(delta.status.as_deref(), Some("guarded"));
+        assert_eq!(delta.metadata["outcome"], json!("guarded"));
+    }
+
+    #[test]
+    fn timing_deltas_keep_planning_rounds_distinct_and_logs_allowlist_metadata() {
+        let first = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ToolPlanningModelDuration,
+            planning_round: Some(1),
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 4,
+        });
+        let second = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ToolPlanningModelDuration,
+            planning_round: Some(2),
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 7,
+        });
+        assert_ne!(first.id, second.id);
+        assert!(first.id.contains("tool-planning-model-duration-1-1-turn"));
+        assert!(second.id.contains("tool-planning-model-duration-2-1-turn"));
+
+        let log = capture_structured_log(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
+            planning_round: Some(3),
+            tool_name: None,
+            call_id: None,
+            attempt: 2,
+            outcome: ConversationTimingOutcome::Failed,
+            elapsed_ms: 19,
+        });
+        let keys = log
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "timestamp",
+                "level",
+                "target",
+                "event_name",
+                "conversation_id",
+                "message_id",
+                "actor_kind",
+                "actor_id",
+                "phase",
+                "round",
+                "attempt",
+                "call_id",
+                "tool_name",
+                "outcome",
+                "duration_ms",
+                "provider_wait_proxy",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(log["provider_wait_proxy"], json!(true));
+        assert_eq!(log["outcome"], json!("failed"));
     }
 
     #[test]
@@ -8012,6 +9188,251 @@ mod tests {
         assert_eq!(emissions[4].payload.delta.as_deref(), Some("second"));
     }
 
+    #[test]
+    fn public_transport_orders_selection_retry_result_provider_wait_answer_and_terminal_events() {
+        let message_id = "msg_transport-order";
+        let session_id = Some("44444444-4444-4444-4444-444444444444".to_string());
+        let selection = AgentTraceEvent::ToolSelectionObservation {
+            round: 1,
+            attempt: 1,
+            enabled_tools: vec!["find_resources".to_string()],
+            selected_tools: vec!["find_resources".to_string()],
+            expected_curated_resources: true,
+            missed_expected_curated_resources: false,
+            outcome: "planned".to_string(),
+        };
+        let attempted = AgentTraceEvent::ToolAttempted {
+            call_id: "call-transport".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 1,
+        };
+        let retry = AgentTraceEvent::ToolRetryScheduled {
+            call_id: "call-transport".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 1,
+            reason: "connection_failure".to_string(),
+        };
+        let terminal = AgentTraceEvent::ToolTerminal {
+            call_id: "call-transport".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 2,
+            status: "succeeded".to_string(),
+            elapsed_ms: 12,
+        };
+        let traces = [
+            selection,
+            attempted,
+            retry,
+            terminal,
+            AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::FinalAnswerResponseHeaderWait,
+                planning_round: Some(2),
+                tool_name: None,
+                call_id: None,
+                attempt: 1,
+                outcome: ConversationTimingOutcome::Succeeded,
+                elapsed_ms: 4,
+            },
+            AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
+                planning_round: Some(2),
+                tool_name: None,
+                call_id: None,
+                attempt: 1,
+                outcome: ConversationTimingOutcome::Succeeded,
+                elapsed_ms: 8,
+            },
+        ];
+        let mut answer_state = ChatStreamAnswerEmissionState::default();
+        let mut emissions = Vec::new();
+        for trace in traces {
+            emissions.extend(chat_stream_emissions_for_signal(
+                &mut answer_state,
+                ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(trace))),
+                message_id,
+                &session_id,
+                Vec::new(),
+                Instant::now(),
+                false,
+            ));
+        }
+        emissions.extend(chat_stream_emissions_for_signal(
+            &mut answer_state,
+            ConversationStreamSignal::Answer("answer".to_string()),
+            message_id,
+            &session_id,
+            Vec::new(),
+            Instant::now(),
+            false,
+        ));
+        emissions.extend(chat_stream_emissions_for_signal(
+            &mut answer_state,
+            ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
+                AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::FinalAnswerModelDuration,
+                    planning_round: Some(2),
+                    tool_name: None,
+                    call_id: None,
+                    attempt: 1,
+                    outcome: ConversationTimingOutcome::Succeeded,
+                    elapsed_ms: 16,
+                },
+            ))),
+            message_id,
+            &session_id,
+            Vec::new(),
+            Instant::now(),
+            false,
+        ));
+        emissions.extend(chat_stream_emissions_for_signal(
+            &mut answer_state,
+            ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
+                AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::TotalTurn,
+                    planning_round: None,
+                    tool_name: None,
+                    call_id: None,
+                    attempt: 1,
+                    outcome: ConversationTimingOutcome::Succeeded,
+                    elapsed_ms: 20,
+                },
+            ))),
+            message_id,
+            &session_id,
+            Vec::new(),
+            Instant::now(),
+            false,
+        ));
+        emissions.extend(chat_stream_terminal_emissions(
+            message_id,
+            &session_id,
+            "test-model".to_string(),
+            vec![ToolCallInfoResponse {
+                tool_id: "find-resources".to_string(),
+                tool_name: "Find Resources".to_string(),
+                query: Some("Acme Legal Aid".to_string()),
+                output_summary: Some("Fresh result".to_string()),
+                warnings: Vec::new(),
+                metadata: json!({}),
+                guarded: false,
+            }],
+            Some(ConversationTraceResponse {
+                visibility: "detailed".to_string(),
+                reasoning: ReasoningTraceResponse {
+                    summary: "Completed transport trace".to_string(),
+                },
+                trace_deltas: Vec::new(),
+                tools: Vec::new(),
+                retrieval: Vec::new(),
+                activity_steps: Vec::new(),
+                suppressed: false,
+            }),
+            Vec::new(),
+        ));
+        let event_names = emissions
+            .iter()
+            .map(|emission| emission.event)
+            .collect::<Vec<_>>();
+        assert_eq!(event_names.first(), Some(&"trace_delta"));
+        let trace_position = |kind: &str| {
+            emissions
+                .iter()
+                .position(|emission| {
+                    emission.event == "trace_delta"
+                        && emission
+                            .payload
+                            .trace_delta
+                            .as_ref()
+                            .is_some_and(|delta| delta.kind == kind)
+                })
+                .expect("trace kind should be transported")
+        };
+        assert!(trace_position("tool_selection_observation") < trace_position("tool_call"));
+        assert!(trace_position("tool_retry") < trace_position("tool_result"));
+        let answer_index = event_names
+            .iter()
+            .position(|event| *event == "answer_delta")
+            .unwrap();
+        let late_final_timing_index = emissions
+            .iter()
+            .position(|emission| {
+                emission.event == "trace_delta"
+                    && emission.payload.trace_delta.as_ref().is_some_and(|delta| {
+                        delta.metadata["phase"] == json!("final_answer_model_duration")
+                    })
+            })
+            .unwrap();
+        let timing_position = |phase: &str| {
+            emissions
+                .iter()
+                .position(|emission| {
+                    emission.event == "trace_delta"
+                        && emission
+                            .payload
+                            .trace_delta
+                            .as_ref()
+                            .is_some_and(|delta| delta.metadata["phase"] == json!(phase))
+                })
+                .expect("timing phase should be transported")
+        };
+        assert!(timing_position("final_answer_response_header_wait") < answer_index);
+        assert!(timing_position("final_answer_first_provider_event_wait") < answer_index);
+        assert!(answer_index < late_final_timing_index);
+        assert!(answer_index < timing_position("total_turn"));
+        assert_eq!(
+            event_names[event_names.len() - 2..],
+            ["trace_final", "done"]
+        );
+        assert!(emissions[event_names.len() - 2].payload.trace.is_some());
+        assert_eq!(
+            emissions[event_names.len() - 1].payload.model.as_deref(),
+            Some("test-model")
+        );
+    }
+
+    #[test]
+    fn public_stream_emits_late_timing_activity_after_answer_started() {
+        let message_id = "msg_timing";
+        let session_id = Some("33333333-3333-3333-3333-333333333333".to_string());
+        let mut state = ChatStreamAnswerEmissionState {
+            activity_steps_sent: true,
+            writing_status_sent: true,
+        };
+        let emissions = chat_stream_emissions_for_signal(
+            &mut state,
+            ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
+                AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::FinalAnswerModelDuration,
+                    planning_round: Some(1),
+                    tool_name: None,
+                    call_id: None,
+                    attempt: 1,
+                    outcome: ConversationTimingOutcome::Succeeded,
+                    elapsed_ms: 18,
+                },
+            ))),
+            message_id,
+            &session_id,
+            Vec::new(),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(
+            emissions
+                .iter()
+                .map(|emission| emission.event)
+                .collect::<Vec<_>>(),
+            vec!["trace_delta", "activity_step"]
+        );
+        assert_eq!(
+            emissions[1].payload.activity_step.as_ref().unwrap().title,
+            "Final-answer model duration"
+        );
+    }
+
     #[tokio::test]
     async fn plain_answer_generator_forwards_answer_and_reasoning_sse_deltas() {
         async fn completion(Json(body): Json<Value>) -> impl IntoResponse {
@@ -8059,13 +9480,22 @@ mod tests {
                 .expect("reasoning trace lock should remain available")
                 .push(delta);
         });
+        let provider_timing = Arc::new(Mutex::new(Vec::new()));
+        let provider_timing_sink = provider_timing.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            provider_timing_sink
+                .lock()
+                .expect("timing lock should remain available")
+                .push(event);
+        });
 
         let answer = generator
-            .generate(
+            .generate_with_timing(
                 &prompt,
                 "test-model",
                 Some(delta_tx),
                 Some(reasoning_trace_hook),
+                Some(timing_hook),
             )
             .await
             .expect("streamed completion should succeed");
@@ -8082,6 +9512,231 @@ mod tests {
                 .expect("reasoning trace lock should remain available"),
             vec!["Check ", "facts"]
         );
+        let timing = provider_timing
+            .lock()
+            .expect("timing lock should remain available");
+        assert!(matches!(
+            timing.as_slice(),
+            [
+                ProviderTimingEvent::ResponseHeaders { attempt: 1, outcome, .. },
+                ProviderTimingEvent::FirstProviderEvent { attempt: 1, outcome: first_outcome, .. },
+            ] if *outcome == ConversationTimingOutcome::Succeeded
+                && *first_outcome == ConversationTimingOutcome::Succeeded
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_timing_signals_precede_released_answer_deltas() {
+        let api_url = spawn_plain_answer_provider(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let timing_sender = sender.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            let (phase, elapsed_ms) = match event {
+                ProviderTimingEvent::ResponseHeaders { elapsed_ms, .. } => (
+                    ConversationTimingPhase::FinalAnswerResponseHeaderWait,
+                    elapsed_ms,
+                ),
+                ProviderTimingEvent::FirstProviderEvent { elapsed_ms, .. } => (
+                    ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
+                    elapsed_ms,
+                ),
+            };
+            let _ = timing_sender.send(ConversationStreamSignal::Trace(Box::new(
+                agent_trace_event_delta(AgentTraceEvent::Timing {
+                    phase,
+                    planning_round: Some(1),
+                    tool_name: None,
+                    call_id: None,
+                    attempt: 1,
+                    outcome: ConversationTimingOutcome::Succeeded,
+                    elapsed_ms,
+                }),
+            )));
+        });
+
+        let answer = generator
+            .generate_with_timing(&prompt, "test-model", Some(sender), None, Some(timing_hook))
+            .await
+            .expect("provider stream should complete");
+        assert_eq!(answer, "Hello");
+        let mut signals = Vec::new();
+        while let Ok(signal) = receiver.try_recv() {
+            signals.push(signal);
+        }
+        assert!(matches!(
+            signals.as_slice(),
+            [
+                ConversationStreamSignal::Trace(header),
+                ConversationStreamSignal::Trace(first),
+                ConversationStreamSignal::Answer(delta),
+            ] if header.metadata["phase"] == json!("final_answer_response_header_wait")
+                && first.metadata["phase"] == json!("final_answer_first_provider_event_wait")
+                && delta == "Hello"
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_or_semantically_empty_provider_events_emit_one_failed_first_timing() {
+        let api_url = spawn_plain_answer_provider("data: {}\n\ndata: [DONE]\n\n").await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        });
+        let result = generator
+            .generate_with_timing(&prompt, "test-model", None, None, Some(timing_hook))
+            .await;
+        assert!(result.is_err());
+        let events = events.lock().unwrap();
+        let first_events = events
+            .iter()
+            .filter(|event| matches!(event, ProviderTimingEvent::FirstProviderEvent { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(first_events.len(), 1);
+        assert!(matches!(
+            first_events[0],
+            ProviderTimingEvent::FirstProviderEvent { outcome, .. }
+                if *outcome == ConversationTimingOutcome::Failed
+        ));
+    }
+
+    #[tokio::test]
+    async fn usage_only_provider_event_does_not_fail_plain_answer_stream() {
+        let api_url = spawn_plain_answer_provider(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+
+        let answer = generator
+            .generate_with_timing(&prompt, "test-model", None, None, None)
+            .await
+            .expect("usage-only metadata must not fail an otherwise valid answer stream");
+
+        assert_eq!(answer, "Hello");
+    }
+
+    #[tokio::test]
+    async fn unusable_choice_content_and_reasoning_types_emit_one_failed_first_timing() {
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":123}}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":123}}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{}}]}\n\ndata: [DONE]\n\n",
+        ] {
+            let api_url = spawn_plain_answer_provider(body).await;
+            let generator = OpenAiPlainAnswerGenerator::new(
+                Client::new(),
+                api_url,
+                "test-key".to_string(),
+                0.1,
+            );
+            let prompt = PlainAnswerPrompt {
+                system: "answer plainly".to_string(),
+                user: "say hello".to_string(),
+            };
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            });
+            assert!(generator
+                .generate_with_timing(&prompt, "test-model", None, None, Some(timing_hook))
+                .await
+                .is_err());
+            let events = events.lock().unwrap();
+            let first_events = events
+                .iter()
+                .filter(|event| matches!(event, ProviderTimingEvent::FirstProviderEvent { .. }))
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                first_events.as_slice(),
+                [ProviderTimingEvent::FirstProviderEvent { outcome, .. }]
+                    if *outcome == ConversationTimingOutcome::Failed
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn role_only_provider_event_is_a_valid_first_event() {
+        let api_url = spawn_plain_answer_provider(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        });
+        let answer = generator
+            .generate_with_timing(&prompt, "test-model", None, None, Some(timing_hook))
+            .await
+            .expect("role-only provider event should be accepted");
+        assert_eq!(answer, "Hello");
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ProviderTimingEvent::FirstProviderEvent {
+                outcome: ConversationTimingOutcome::Succeeded,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn done_without_a_valid_provider_event_is_failed_once() {
+        let api_url = spawn_plain_answer_provider("data: [DONE]\n\n").await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        });
+        assert!(generator
+            .generate_with_timing(&prompt, "test-model", None, None, Some(timing_hook))
+            .await
+            .is_err());
+        let events = events.lock().unwrap();
+        let first_events = events
+            .iter()
+            .filter(|event| matches!(event, ProviderTimingEvent::FirstProviderEvent { .. }))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            first_events.as_slice(),
+            [ProviderTimingEvent::FirstProviderEvent { outcome, .. }]
+                if *outcome == ConversationTimingOutcome::Failed
+        ));
     }
 
     async fn spawn_plain_answer_provider(body: &'static str) -> String {
@@ -8212,6 +9867,244 @@ mod tests {
             .expect_err("a serialized Tool transcript must be rejected");
 
         assert!(error.message.contains("textual Tool intent"));
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_provider_neutral_tool_invocation_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("I'll look up the current contact details. To", &sender)
+            .expect("process narration should remain quarantined");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push(
+                "ol: find_resources(help_type=\"legal\", query=\"Issue 539 Legal Aid\")",
+                &sender,
+            )
+            .expect_err("provider-neutral textual Tool syntax must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_provider_neutral_tool_decision_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("Tool deci", &sender)
+            .expect("partial Tool decision marker should remain pending");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push(
+                "sion: find_resources\n\nArgs:\n```json\n{\"offset\":30}\n```",
+                &sender,
+            )
+            .expect_err("provider-neutral Tool decision syntax must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_provider_neutral_tool_args_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("To", &sender)
+            .expect("partial Tool marker should remain pending");
+        assert!(delta_rx.try_recv().is_err());
+        state
+            .push("ol: find_resources\n\nAr", &sender)
+            .expect("Tool label should remain pending until its argument structure arrives");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push("gs:\n{\"query\":\"Issue 539 Inventory\"}", &sender)
+            .expect_err("provider-neutral Tool plus Args syntax must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_provider_neutral_tool_json_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push(
+                "I need to retrieve the final page. Tool: find_resources\n```js",
+                &sender,
+            )
+            .expect("deliberation and partial JSON fence should remain quarantined");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push(
+                "on\n{\"query\":\"Issue 539 Inventory\",\"offset\":30}\n```",
+                &sender,
+            )
+            .expect_err("provider-neutral Tool plus direct JSON syntax must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_streams_ordinary_tool_prose_without_waiting_for_finish() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+        let prose = "The Curated Resources Tool: finds vetted organizations when contact details are requested.";
+
+        state
+            .push(prose, &sender)
+            .expect("ordinary explanatory Tool prose must remain public");
+
+        let mut streamed = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            streamed.push(answer_signal(signal));
+        }
+        assert_eq!(streamed.concat(), prose);
+        state
+            .finish(&sender)
+            .expect("already streamed explanatory prose should finish cleanly");
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_scans_past_benign_labels_in_one_delta() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+        let benign = "The Curated Resources Tool: finds vetted organizations. ";
+
+        let error = state
+            .push(
+                &format!("{benign}Tool: find_resources(query=\"legal aid\")"),
+                &sender,
+            )
+            .expect_err("a later provider-neutral invocation must not hide behind benign prose");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        let mut streamed = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            streamed.push(answer_signal(signal));
+        }
+        let streamed = streamed.concat();
+        assert!(benign.starts_with(&streamed));
+        assert!(!streamed.contains("find_resources"));
+    }
+
+    #[test]
+    fn plain_answer_safety_scans_past_benign_labels_across_deltas() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+        let benign = "The Curated Resources Tool: finds vetted organizations. ";
+
+        state
+            .push(benign, &sender)
+            .expect("ordinary Tool prose should stream");
+        let mut streamed = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            streamed.push(answer_signal(signal));
+        }
+        assert_eq!(streamed.concat(), benign);
+        let error = state
+            .push("Tool: find_resources\nArgs: {\"offset\":10}", &sender)
+            .expect_err("a later split-delta invocation must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_prose_suffix_followed_by_arguments() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        let error = state
+            .push(
+                "Tool: find_resources will run\nArgs: {\"query\":\"legal aid\"}",
+                &sender,
+            )
+            .expect_err("an Args block must override a prose-like same-line suffix");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_holds_incomplete_tool_prose_until_split_arguments_arrive() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("Tool: find_resources will run", &sender)
+            .expect("an unterminated Tool label must remain pending");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push("\nArgs: {\"query\":\"legal aid\"}", &sender)
+            .expect_err("split arguments must reject the entire pending Tool transcript");
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_curly_apostrophe_search_narration_at_finish() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        let error = state
+            .push(
+                "I’m going to search. Tool: find_resources(query=\"legal aid\")",
+                &sender,
+            )
+            .expect_err("textual Tool intent must be rejected before exposure");
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_split_curly_apostrophe_search_narration() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("I’m going to search. To", &sender)
+            .expect("ambiguous prefix should remain quarantined");
+        assert!(delta_rx.try_recv().is_err());
+        let error = state
+            .push("ol: find_resources(query=\"legal aid\")", &sender)
+            .expect_err("split textual Tool intent must be rejected before exposure");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
         assert!(delta_rx.try_recv().is_err());
     }
 
@@ -8727,8 +10620,1330 @@ mod tests {
         assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), "answer");
     }
 
+    #[derive(Clone, Debug)]
+    struct ContactReplayCase {
+        followup: String,
+        context: String,
+        initial_turn: String,
+        language: String,
+        help_type: String,
+        contact_key: String,
+        contact_value: String,
+    }
+
+    impl ContactReplayCase {
+        fn spanish_email() -> Self {
+            Self {
+                followup: "me puedes dar el email?".to_string(),
+                context: "La organización está en México y necesito ayuda legal.".to_string(),
+                initial_turn:
+                    "PRIMER TURNO: Cuéntame sobre Acme Legal Aid en México para ayuda legal."
+                        .to_string(),
+                language: "es".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "email".to_string(),
+                contact_value: "fresh@example.test".to_string(),
+            }
+        }
+
+        fn stale_contact_value(&self) -> String {
+            if self.contact_key == "email" {
+                "stale@example.test".to_string()
+            } else if self.contact_key == "phone" {
+                "+52-555-0000".to_string()
+            } else {
+                format!("stale-{}", self.contact_key)
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ContactReplayState {
+        planner_requests: Arc<Mutex<Vec<Value>>>,
+        final_answer_requests: Arc<Mutex<Vec<Value>>>,
+        resource_requests: Arc<Mutex<Vec<Value>>>,
+        empty_resource: bool,
+        case: ContactReplayCase,
+        two_turn: bool,
+        omit_tool_selection: bool,
+        transient_resource_failure: bool,
+        truncated_resource_failure: bool,
+    }
+
+    #[derive(Clone)]
+    struct TransportFailureState {
+        mode: &'static str,
+        requests: Arc<Mutex<usize>>,
+    }
+
+    async fn transport_failure_provider(
+        State(state): State<TransportFailureState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let stream = body.get("stream").and_then(Value::as_bool) == Some(true);
+        *state.requests.lock().unwrap() += 1;
+        if state.mode == "planner_failure" {
+            return Json(json!({
+                "id": "planner-failure",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "plain prose, not a typed tool plan"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .into_response();
+        }
+        if !stream {
+            return Json(json!({
+                "id": "tool-failure-plan",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "[[ ## tool_calls ## ]]\n[{\"name\":\"web_search\",\"args\":{}}]\n\n[[ ## replan_after_results ## ]]\nfalse\n\n[[ ## completed ## ]]"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .into_response();
+        }
+        (
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Tool failed honestly.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+            .into_response()
+    }
+
+    async fn contact_replay_provider(
+        State(state): State<ContactReplayState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            let final_index = state.final_answer_requests.lock().unwrap().len();
+            state
+                .final_answer_requests
+                .lock()
+                .unwrap()
+                .push(body.clone());
+            let body_text = body.to_string();
+            let answer = if state.two_turn && final_index == 0 {
+                format!(
+                    "The initial Resource Directory contact was {}.",
+                    state.case.stale_contact_value()
+                )
+            } else if body_text.contains("No vetted") {
+                "No matching current contact is currently listed.".to_string()
+            } else if !expects_curated_resource_lookup(&state.case.followup) {
+                "No contact lookup was requested for this turn.".to_string()
+            } else if !body_text.contains("CURATED RESOURCES CONTACT GROUNDING") {
+                "Curated Resources are unavailable for this turn.".to_string()
+            } else if !body_text.contains(&state.case.contact_value) {
+                "No fresh contact result was supplied.".to_string()
+            } else {
+                format!(
+                    "The current Resource Directory contact is {}.",
+                    state.case.contact_value
+                )
+            };
+            let first = answer
+                .split_once(' ')
+                .map(|(prefix, suffix)| (format!("{prefix} "), suffix.to_string()))
+                .unwrap_or_else(|| (answer.to_string(), String::new()));
+            return (
+                [("content-type", "text/event-stream")],
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{\"content\":{}}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                     data: [DONE]\n\n",
+                    serde_json::to_string(&first.0).unwrap(),
+                    serde_json::to_string(&first.1).unwrap(),
+                ),
+            )
+                .into_response();
+        }
+
+        let body_text = body.to_string();
+        let plan_index = state.planner_requests.lock().unwrap().len();
+        let has_contact_policy = body_text.contains("CURATED RESOURCES CONTACT GROUNDING")
+            && expects_curated_resource_lookup(&state.case.followup)
+            && ((state.two_turn && plan_index == 0)
+                || (body_text.contains(&state.case.followup)
+                    && body_text.contains("CURRENT REQUEST")))
+            && body_text.contains("Acme Legal Aid")
+            && (plan_index == 0 || body_text.contains(&state.case.context));
+        state.planner_requests.lock().unwrap().push(body);
+        let tool_calls = if has_contact_policy && !state.omit_tool_selection {
+            json!([{
+                "name": "find_resources",
+                "args": {
+                    "query": "Acme Legal Aid",
+                    "region": "MX",
+                    "language": state.case.language,
+                    "help_type": state.case.help_type,
+                }
+            }])
+            .to_string()
+        } else {
+            "[]".to_string()
+        };
+        let planner_content = format!(
+            "[[ ## tool_calls ## ]]\n{tool_calls}\n\n[[ ## replan_after_results ## ]]\nfalse\n\n[[ ## completed ## ]]"
+        );
+        Json(json!({
+            "id": "contact-plan",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": planner_content
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .into_response()
+    }
+
+    async fn contact_replay_resources(
+        State(state): State<ContactReplayState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let resource_index = {
+            let mut requests = state.resource_requests.lock().unwrap();
+            let index = requests.len();
+            requests.push(body);
+            index
+        };
+        if state.transient_resource_failure && resource_index == 0 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient resource failure",
+            )
+                .into_response();
+        }
+        if state.truncated_resource_failure && resource_index == 0 {
+            let stream = futures_util::stream::iter(vec![
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{")),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "simulated truncated response",
+                )),
+            ]);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(stream))
+                .expect("truncated response should build");
+        }
+        if state.empty_resource {
+            return Json(json!({
+                "resources": [],
+                "query": "Acme Legal Aid",
+                "resolved_country_code": "MX",
+                "help_type": "legal",
+                "total_count": 0,
+                "returned_count": 0,
+                "limit": 5,
+                "offset": 0,
+                "has_more": false,
+                "next_offset": null
+            }))
+            .into_response();
+        }
+        let contact_value = if state.two_turn && resource_index == 0 {
+            state.case.stale_contact_value()
+        } else {
+            state.case.contact_value.clone()
+        };
+        let mut contact = serde_json::Map::new();
+        contact.insert(state.case.contact_key.clone(), Value::String(contact_value));
+        Json(json!({
+            "resources": [{
+                "resource_id": "acme-mx",
+                "name": "Acme Legal Aid",
+                "resource_type": "legal",
+                "description": "Freshly verified contact record.",
+                "contact": contact,
+                "languages": ["es", "en"],
+                "coverage": "Mexico",
+                "help_types": ["legal"],
+                "verified_at": "2026-07-27T00:00:00Z"
+            }],
+            "query": "Acme Legal Aid",
+            "resolved_country_code": "MX",
+            "help_type": "legal",
+            "total_count": 1,
+            "returned_count": 1,
+            "limit": 5,
+            "offset": 0,
+            "has_more": false,
+            "next_offset": null
+        }))
+        .into_response()
+    }
+
+    async fn spawn_contact_replay_servers(
+        empty_resource: bool,
+        case: ContactReplayCase,
+        two_turn: bool,
+        omit_tool_selection: bool,
+        transient_resource_failure: bool,
+        truncated_resource_failure: bool,
+    ) -> (ContactReplayState, String, String) {
+        let state = ContactReplayState {
+            empty_resource,
+            case,
+            planner_requests: Arc::new(Mutex::new(Vec::new())),
+            final_answer_requests: Arc::new(Mutex::new(Vec::new())),
+            resource_requests: Arc::new(Mutex::new(Vec::new())),
+            two_turn,
+            omit_tool_selection,
+            transient_resource_failure,
+            truncated_resource_failure,
+        };
+        let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("provider listener should bind");
+        let provider_address = provider_listener
+            .local_addr()
+            .expect("provider listener has address");
+        let provider_state = state.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                provider_listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(contact_replay_provider))
+                    .with_state(provider_state),
+            )
+            .await
+            .expect("provider replay server should run");
+        });
+
+        let resource_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("resource listener should bind");
+        let resource_address = resource_listener
+            .local_addr()
+            .expect("resource listener has address");
+        let resource_state = state.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                resource_listener,
+                Router::new()
+                    .route(
+                        "/internal/agent/resources/search",
+                        post(contact_replay_resources),
+                    )
+                    .with_state(resource_state),
+            )
+            .await
+            .expect("resource replay server should run");
+        });
+        (
+            state,
+            format!("http://{provider_address}/v1"),
+            format!("http://{resource_address}"),
+        )
+    }
+
+    fn contact_replay_input(case: &ContactReplayCase, previous_answer: Option<&str>) -> String {
+        let previous = previous_answer.unwrap_or("Acme Legal Aid contact was stale@example.test.");
+        format!(
+            "RECENT CONVERSATION\nassistant: {previous}\nuser: Acme Legal Aid — {}\nCURRENT REQUEST\n{}",
+            case.context, case.followup
+        )
+    }
+
+    async fn run_real_contact_replay(
+        empty_resource: bool,
+        stream: bool,
+        enabled: bool,
+        case: ContactReplayCase,
+        two_turn: bool,
+        omit_tool_selection: bool,
+        transient_resource_failure: bool,
+        truncated_resource_failure: bool,
+    ) -> (
+        String,
+        ContactReplayState,
+        Vec<String>,
+        Vec<ConversationTraceDeltaResponse>,
+        Vec<ConversationStreamSignal>,
+    ) {
+        let (state, provider_url, resource_url) = spawn_contact_replay_servers(
+            empty_resource,
+            case.clone(),
+            two_turn,
+            omit_tool_selection,
+            transient_resource_failure,
+            truncated_resource_failure,
+        )
+        .await;
+        let mut registry = ToolRegistry::new();
+        if enabled {
+            registry.register(Arc::new(FindResourcesTool {
+                internal: InternalAgentClient::new(
+                    Client::new(),
+                    resource_url,
+                    "test-internal-token".to_string(),
+                ),
+                jurisdiction: Some("MX".to_string()),
+                traces: Arc::new(Mutex::new(Vec::new())),
+            }));
+        }
+        registry.register(Arc::new(crate::tools::DoneTool));
+        let instruction = build_agent_instruction("PROFILE", false, enabled);
+        let mut agent = SageAgent::new_without_memory(registry, instruction);
+        let (delta_sender, mut delta_receiver) = if stream {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let transport_sender = delta_sender.clone();
+        let captured_trace_deltas = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = captured_trace_deltas.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            let delta = agent_trace_event_delta(event);
+            trace_sink
+                .lock()
+                .expect("trace sink should lock")
+                .push(delta.clone());
+            if let Some(sender) = &transport_sender {
+                let _ = sender.send(ConversationStreamSignal::Trace(Box::new(delta)));
+            }
+        }));
+        agent.set_contact_lookup_expected(expects_curated_resource_lookup(&case.followup));
+        SageAgent::configure_lm_with_temperature(&provider_url, "test-key", "test-model", 0.1)
+            .await
+            .expect("scripted provider should configure");
+        let settings = RequestLmSettings {
+            api_url: provider_url,
+            api_key: "test-key".to_string(),
+            model_chain: vec!["test-model".to_string()],
+            temperature: 0.1,
+        };
+        let initial_answer = if two_turn {
+            Some(
+                run_agent_turn(&mut agent, &case.initial_turn, None, &settings, None)
+                    .await
+                    .expect("initial organization turn should complete"),
+            )
+        } else {
+            None
+        };
+        if let Some(initial) = initial_answer.as_deref() {
+            assert!(
+                initial.contains(&case.stale_contact_value()),
+                "unexpected initial answer: {initial}"
+            );
+        }
+        let input = contact_replay_input(&case, initial_answer.as_deref());
+        let replay_sinks = ConversationToolLoopSinks::new(None);
+        let answer = run_conversation_tool_loop(
+            &mut agent,
+            &input,
+            &case.followup,
+            &replay_sinks,
+            None,
+            &settings,
+            delta_sender,
+        )
+        .await
+        .expect("real planner/tool/final-answer chain should complete")
+        .answer;
+        let mut deltas = Vec::new();
+        let mut transported_trace_deltas = Vec::new();
+        let mut transported_signals = Vec::new();
+        if let Some(receiver) = delta_receiver.as_mut() {
+            let mut saw_answer = false;
+            let mut saw_selection = false;
+            while let Ok(signal) = receiver.try_recv() {
+                transported_signals.push(signal.clone());
+                match signal {
+                    ConversationStreamSignal::Answer(delta) => {
+                        if stream && enabled {
+                            assert!(
+                                saw_selection,
+                                "stream answer must follow the live selection trace_delta"
+                            );
+                        }
+                        saw_answer = true;
+                        deltas.push(delta);
+                    }
+                    ConversationStreamSignal::Trace(delta) => {
+                        if stream && delta.kind == "tool_selection_observation" {
+                            assert!(
+                                !saw_answer,
+                                "selection trace_delta must precede answer chunks"
+                            );
+                            saw_selection = true;
+                        }
+                        transported_trace_deltas.push(*delta);
+                    }
+                }
+            }
+        }
+        let trace_deltas = if stream {
+            transported_trace_deltas
+        } else {
+            captured_trace_deltas
+                .lock()
+                .expect("trace sink should lock")
+                .clone()
+        };
+        (answer, state, deltas, trace_deltas, transported_signals)
+    }
+
+    #[tokio::test]
+    async fn real_contact_replay_uses_sage_planner_tool_and_fresh_final_grounding() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let spanish_email = ContactReplayCase::spanish_email();
+        let (batch_answer, batch_state, batch_deltas, batch_trace_deltas, _) =
+            run_real_contact_replay(
+                false,
+                false,
+                true,
+                spanish_email.clone(),
+                true,
+                false,
+                false,
+                false,
+            )
+            .await;
+        assert_eq!(
+            batch_answer,
+            "The current Resource Directory contact is fresh@example.test."
+        );
+        assert!(batch_deltas.is_empty());
+        assert!(batch_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
+        let batch_attempt = batch_trace_deltas
+            .iter()
+            .find(|delta| delta.kind == "tool_call")
+            .expect("selected Tool should emit an attempted lifecycle delta");
+        let batch_terminal = batch_trace_deltas
+            .iter()
+            .find(|delta| delta.kind == "tool_result")
+            .expect("selected Tool should emit a terminal lifecycle delta");
+        assert_eq!(batch_attempt.metadata["phase"], json!("attempted"));
+        assert_eq!(batch_terminal.metadata["phase"], json!("terminal"));
+        assert_eq!(
+            batch_attempt.metadata["call_id"],
+            batch_terminal.metadata["call_id"]
+        );
+        assert_eq!(batch_terminal.status.as_deref(), Some("succeeded"));
+        let planner_request = batch_state
+            .planner_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("real Sage planner request should reach the provider");
+        let planner_text = planner_request.to_string();
+        assert!(planner_text.contains("CURATED RESOURCES CONTACT GROUNDING"));
+        assert!(planner_text.contains("me puedes dar el email"));
+        assert!(planner_text.contains("Acme Legal Aid"));
+        assert!(planner_text.contains(&spanish_email.context));
+        assert!(planner_text.contains("stale@example.test"));
+        assert!(planner_text.contains(&spanish_email.followup));
+        let resource_request = batch_state
+            .resource_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("real find_resources Tool should call Resource Directory");
+        assert_eq!(resource_request["query"], "Acme Legal Aid");
+        assert_eq!(resource_request["jurisdiction"], "MX");
+        assert_eq!(resource_request["language"], spanish_email.language);
+        assert_eq!(resource_request["help_type"], spanish_email.help_type);
+        let final_request = batch_state
+            .final_answer_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("plain final-answer provider should be called");
+        let final_text = final_request.to_string();
+        assert!(final_text.contains(&spanish_email.contact_value));
+        assert!(final_text.contains("fresh find_resources result"));
+        assert!(final_text.contains("stale@example.test"));
+        assert!(!batch_answer.contains("stale@example.test"));
+
+        let (stream_answer, stream_state, stream_deltas, stream_trace_deltas, _) =
+            run_real_contact_replay(
+                false,
+                true,
+                true,
+                spanish_email.clone(),
+                true,
+                false,
+                false,
+                false,
+            )
+            .await;
+        assert_eq!(stream_answer, batch_answer);
+        assert_eq!(stream_deltas.concat(), stream_answer);
+        assert!(stream_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
+        assert_eq!(
+            stream_state.resource_requests.lock().unwrap().len(),
+            2,
+            "streaming handler seam should execute the real Tool on both turns"
+        );
+
+        let english_phone = ContactReplayCase {
+            followup: "can you give me the phone number?".to_string(),
+            context: "The organization is in Mexico and I need legal help.".to_string(),
+            initial_turn:
+                "INITIAL ORGANIZATION TURN: Tell me about Acme Legal Aid in Mexico for legal help."
+                    .to_string(),
+            language: "en".to_string(),
+            help_type: "legal".to_string(),
+            contact_key: "phone".to_string(),
+            contact_value: "+52-555-0100".to_string(),
+        };
+        let (phone_answer, phone_state, _, _, _) = run_real_contact_replay(
+            false,
+            false,
+            true,
+            english_phone.clone(),
+            true,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(
+            phone_answer,
+            "The current Resource Directory contact is +52-555-0100."
+        );
+        assert_eq!(phone_state.planner_requests.lock().unwrap().len(), 2);
+        assert!(phone_state.planner_requests.lock().unwrap()[1]
+            .to_string()
+            .contains(&english_phone.stale_contact_value()));
+        assert_eq!(phone_state.resource_requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            phone_state.resource_requests.lock().unwrap()[1]["language"],
+            "en"
+        );
+
+        let modality_cases = [
+            ContactReplayCase {
+                followup: "can you give me the email?".to_string(),
+                context: "The organization is in Mexico and I need legal help.".to_string(),
+                initial_turn: "INITIAL ORGANIZATION TURN: Tell me about Acme Legal Aid in Mexico for legal help.".to_string(),
+                language: "en".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "email".to_string(),
+                contact_value: "fresh-en@example.test".to_string(),
+            },
+            ContactReplayCase {
+                followup: "me das el sitio web?".to_string(),
+                context: "La organización está en México y necesito ayuda legal.".to_string(),
+                initial_turn: "PRIMER TURNO: Cuéntame sobre Acme Legal Aid en México para ayuda legal.".to_string(),
+                language: "es".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "url".to_string(),
+                contact_value: "https://fresh.example.test".to_string(),
+            },
+            ContactReplayCase {
+                followup: "what is the address?".to_string(),
+                context: "The organization is in Mexico and I need legal help.".to_string(),
+                initial_turn: "INITIAL ORGANIZATION TURN: Tell me about Acme Legal Aid in Mexico for legal help.".to_string(),
+                language: "en".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "address".to_string(),
+                contact_value: "Fresh Street 42, Mexico City".to_string(),
+            },
+            ContactReplayCase {
+                followup: "me puedes dar el canal seguro?".to_string(),
+                context: "La organización está en México y necesito ayuda legal.".to_string(),
+                initial_turn: "PRIMER TURNO: Cuéntame sobre Acme Legal Aid en México para ayuda legal.".to_string(),
+                language: "es".to_string(),
+                help_type: "legal".to_string(),
+                contact_key: "secure_channel".to_string(),
+                contact_value: "Signal: fresh-contact".to_string(),
+            },
+        ];
+        for (index, case) in modality_cases.into_iter().enumerate() {
+            let stream = index % 2 == 0;
+            let (answer, state, deltas, trace_deltas, _) = run_real_contact_replay(
+                false,
+                stream,
+                true,
+                case.clone(),
+                true,
+                false,
+                false,
+                false,
+            )
+            .await;
+            assert_eq!(
+                answer,
+                format!(
+                    "The current Resource Directory contact is {}.",
+                    case.contact_value
+                )
+            );
+            assert_eq!(state.planner_requests.lock().unwrap().len(), 2);
+            let resource_requests = state.resource_requests.lock().unwrap();
+            assert_eq!(resource_requests.len(), 2);
+            assert_eq!(resource_requests[1]["language"], case.language);
+            assert_eq!(resource_requests[1]["help_type"], case.help_type);
+            assert_eq!(resource_requests[1]["query"], "Acme Legal Aid");
+            if stream {
+                assert_eq!(deltas.concat(), answer);
+            } else {
+                assert!(deltas.is_empty());
+            }
+            assert!(trace_deltas
+                .iter()
+                .any(|delta| delta.kind == "tool_selection_observation"));
+        }
+    }
+
+    #[tokio::test]
+    async fn real_stream_and_nonstream_transport_preserve_the_same_timing_phases() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let case = ContactReplayCase::spanish_email();
+        let (_, _, _, batch_trace, _) =
+            run_real_contact_replay(false, false, true, case.clone(), false, false, false, false)
+                .await;
+        let (_, _, _, stream_trace, _) =
+            run_real_contact_replay(false, true, true, case, false, false, false, false).await;
+        let phases = |trace: &[ConversationTraceDeltaResponse]| {
+            trace
+                .iter()
+                .filter(|delta| delta.kind == "timing")
+                .filter_map(|delta| delta.metadata["phase"].as_str().map(str::to_string))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let batch_phases = phases(&batch_trace);
+        let stream_phases = phases(&stream_trace);
+        assert!(batch_phases.contains("final_answer_response_header_wait"));
+        assert!(batch_phases.contains("final_answer_first_provider_event_wait"));
+        assert!(batch_phases.contains("final_answer_model_duration"));
+        assert_eq!(batch_phases, stream_phases);
+    }
+
+    #[tokio::test]
+    async fn real_contact_replay_retry_trace_preserves_attempt_order_and_call_id() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let case = ContactReplayCase::spanish_email();
+        for stream in [false, true] {
+            let (answer, state, answer_deltas, trace_deltas, _) = run_real_contact_replay(
+                false,
+                stream,
+                true,
+                case.clone(),
+                false,
+                false,
+                true,
+                false,
+            )
+            .await;
+            assert_eq!(
+                answer,
+                "The current Resource Directory contact is fresh@example.test."
+            );
+            if stream {
+                assert_eq!(answer_deltas.concat(), answer);
+            } else {
+                assert!(answer_deltas.is_empty());
+            }
+            assert_eq!(state.resource_requests.lock().unwrap().len(), 2);
+
+            let lifecycle = trace_deltas
+                .iter()
+                .filter(|delta| {
+                    matches!(
+                        delta.kind.as_str(),
+                        "tool_call" | "tool_retry" | "tool_result" | "timeout"
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                lifecycle
+                    .iter()
+                    .map(|delta| delta.kind.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["tool_call", "tool_retry", "tool_call", "tool_result"]
+            );
+            assert_eq!(
+                lifecycle[0].metadata["call_id"],
+                lifecycle[1].metadata["call_id"]
+            );
+            assert_eq!(
+                lifecycle[1].metadata["call_id"],
+                lifecycle[2].metadata["call_id"]
+            );
+            assert_eq!(
+                lifecycle[2].metadata["call_id"],
+                lifecycle[3].metadata["call_id"]
+            );
+            assert_eq!(lifecycle[0].metadata["attempt"], json!(1));
+            assert_eq!(lifecycle[1].metadata["attempt"], json!(1));
+            assert_eq!(lifecycle[2].metadata["attempt"], json!(2));
+            assert_eq!(lifecycle[3].metadata["attempt"], json!(2));
+            assert_ne!(lifecycle[0].id, lifecycle[2].id);
+            assert_eq!(lifecycle[3].status.as_deref(), Some("succeeded"));
+        }
+    }
+
+    #[tokio::test]
+    async fn real_stream_replay_drives_full_public_lifecycle_transport() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let case = ContactReplayCase::spanish_email();
+        let (answer, _state, answer_deltas, trace_deltas, signals) =
+            run_real_contact_replay(false, true, true, case, false, false, true, false).await;
+        assert_eq!(answer_deltas.concat(), answer);
+        assert!(
+            !signals.is_empty(),
+            "real streaming replay should emit signals"
+        );
+
+        let message_id = "msg-real-replay";
+        let session_id = Some("55555555-5555-5555-5555-555555555555".to_string());
+        let activity_steps = conversation_activity_steps_from_trace_deltas(&trace_deltas);
+        let mut answer_state = ChatStreamAnswerEmissionState::default();
+        let mut emissions = Vec::new();
+        for signal in signals {
+            emissions.extend(chat_stream_emissions_for_signal(
+                &mut answer_state,
+                signal,
+                message_id,
+                &session_id,
+                activity_steps.clone(),
+                Instant::now(),
+                false,
+            ));
+        }
+        emissions.extend(chat_stream_terminal_emissions(
+            message_id,
+            &session_id,
+            "test-model".to_string(),
+            vec![ToolCallInfoResponse {
+                tool_id: "find-resources".to_string(),
+                tool_name: "Find Resources".to_string(),
+                query: Some("Acme Legal Aid".to_string()),
+                output_summary: Some("Fresh result".to_string()),
+                warnings: Vec::new(),
+                metadata: json!({}),
+                guarded: false,
+            }],
+            Some(ConversationTraceResponse {
+                visibility: "detailed".to_string(),
+                reasoning: ReasoningTraceResponse {
+                    summary: "Completed real replay trace".to_string(),
+                },
+                trace_deltas: trace_deltas.clone(),
+                tools: Vec::new(),
+                retrieval: Vec::new(),
+                activity_steps,
+                suppressed: false,
+            }),
+            Vec::new(),
+        ));
+
+        let trace_position = |kind: &str| {
+            emissions
+                .iter()
+                .position(|emission| {
+                    emission.event == "trace_delta"
+                        && emission
+                            .payload
+                            .trace_delta
+                            .as_ref()
+                            .is_some_and(|delta| delta.kind == kind)
+                })
+                .expect("real trace kind should be transported")
+        };
+        let answer_position = emissions
+            .iter()
+            .position(|emission| emission.event == "answer_delta")
+            .expect("real answer should be transported");
+        let final_model_position = trace_position("timing");
+        let selection_position = trace_position("tool_selection_observation");
+        let retry_position = trace_position("tool_retry");
+        let result_position = trace_position("tool_result");
+        assert!(selection_position < retry_position);
+        assert!(retry_position < result_position);
+        assert!(result_position < answer_position);
+        assert!(emissions[..answer_position].iter().any(|emission| emission
+            .payload
+            .trace_delta
+            .as_ref()
+            .is_some_and(|delta| {
+                delta.kind == "timing"
+                    && delta.metadata["phase"] == json!("final_answer_response_header_wait")
+            })));
+        assert!(emissions[..answer_position].iter().any(|emission| emission
+            .payload
+            .trace_delta
+            .as_ref()
+            .is_some_and(|delta| {
+                delta.kind == "timing"
+                    && delta.metadata["phase"] == json!("final_answer_first_provider_event_wait")
+            })));
+        assert!(emissions[answer_position + 1..]
+            .iter()
+            .any(
+                |emission| emission.payload.trace_delta.as_ref().is_some_and(|delta| {
+                    delta.kind == "timing"
+                        && delta.metadata["phase"] == json!("final_answer_model_duration")
+                })
+            ));
+        assert!(emissions[answer_position + 1..]
+            .iter()
+            .any(
+                |emission| emission.payload.trace_delta.as_ref().is_some_and(|delta| {
+                    delta.kind == "timing" && delta.metadata["phase"] == json!("total_turn")
+                })
+            ));
+        assert_eq!(emissions[emissions.len() - 2].event, "trace_final");
+        assert!(emissions[emissions.len() - 2].payload.trace.is_some());
+        assert_eq!(
+            emissions.last().map(|emission| emission.event),
+            Some("done")
+        );
+        assert_eq!(
+            emissions
+                .last()
+                .and_then(|emission| emission.payload.model.as_deref()),
+            Some("test-model")
+        );
+        assert!(final_model_position < answer_position);
+    }
+
+    #[tokio::test]
+    async fn real_contact_replay_is_honest_for_empty_results_and_disabled_resources() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let default_case = ContactReplayCase::spanish_email();
+        let (empty_answer, empty_state, _, empty_trace_deltas, _) = run_real_contact_replay(
+            true,
+            false,
+            true,
+            default_case.clone(),
+            false,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(
+            empty_answer,
+            "No matching current contact is currently listed."
+        );
+        assert!(!empty_answer.contains("stale@example.test"));
+        assert_eq!(empty_state.resource_requests.lock().unwrap().len(), 1);
+        assert!(empty_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
+        assert!(empty_state
+            .final_answer_requests
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(|request| request.to_string().contains("No vetted")));
+
+        let (disabled_answer, disabled_state, _, disabled_trace_deltas, _) =
+            run_real_contact_replay(
+                false,
+                false,
+                false,
+                default_case,
+                false,
+                false,
+                false,
+                false,
+            )
+            .await;
+        assert_eq!(
+            disabled_answer,
+            "Curated Resources are unavailable for this turn."
+        );
+        assert!(disabled_state.planner_requests.lock().unwrap().is_empty());
+        assert!(disabled_state.resource_requests.lock().unwrap().is_empty());
+        let disabled_final = disabled_state
+            .final_answer_requests
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("disabled turn should use plain answer path");
+        assert!(!disabled_final
+            .to_string()
+            .contains("CURATED RESOURCES CONTACT GROUNDING"));
+        assert!(!disabled_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
+        let (
+            disabled_stream_answer,
+            disabled_stream_state,
+            disabled_stream_deltas,
+            disabled_stream_trace_deltas,
+            _,
+        ) = run_real_contact_replay(
+            false,
+            true,
+            false,
+            ContactReplayCase::spanish_email(),
+            false,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(disabled_stream_answer, disabled_answer);
+        assert!(!disabled_stream_deltas.is_empty());
+        assert!(disabled_stream_state
+            .resource_requests
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(!disabled_stream_trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_selection_observation"));
+
+        let benign_case = ContactReplayCase {
+            followup: "Please address my concern.".to_string(),
+            context: "The organization is in Mexico and I need legal help.".to_string(),
+            initial_turn:
+                "INITIAL ORGANIZATION TURN: Tell me about Acme Legal Aid in Mexico for legal help."
+                    .to_string(),
+            language: "en".to_string(),
+            help_type: "legal".to_string(),
+            contact_key: "email".to_string(),
+            contact_value: "unused@example.test".to_string(),
+        };
+        let (benign_answer, benign_state, _, benign_trace_deltas, _) =
+            run_real_contact_replay(false, false, true, benign_case, false, false, false, false)
+                .await;
+        assert_eq!(
+            benign_answer,
+            "No contact lookup was requested for this turn."
+        );
+        assert!(benign_state.resource_requests.lock().unwrap().is_empty());
+        let benign_selection = benign_trace_deltas
+            .iter()
+            .find(|delta| delta.kind == "tool_selection_observation")
+            .expect("benign Conversation turn should expose its planning observation");
+        assert_eq!(
+            benign_selection.metadata["expected_curated_resources"],
+            json!(false)
+        );
+        assert_eq!(
+            benign_selection.metadata["missed_expected_curated_resources"],
+            json!(false)
+        );
+        assert_eq!(benign_selection.metadata["selected_tools"], json!([]));
+
+        let (_, omitted_state, _, omitted_trace_deltas, _) = run_real_contact_replay(
+            false,
+            false,
+            true,
+            ContactReplayCase::spanish_email(),
+            false,
+            true,
+            false,
+            false,
+        )
+        .await;
+        assert!(omitted_state.resource_requests.lock().unwrap().is_empty());
+        let omitted = omitted_trace_deltas
+            .iter()
+            .find(|delta| delta.kind == "tool_selection_observation")
+            .expect("omitted planning round should emit an observation");
+        assert_eq!(omitted.metadata["expected_curated_resources"], json!(true));
+        assert_eq!(omitted.metadata["selected_tools"], json!([]));
+        assert_eq!(omitted.metadata["selection_count"], json!(0));
+        assert_eq!(omitted.metadata["outcome"], json!("planned"));
+        assert_eq!(
+            omitted.metadata["missed_expected_curated_resources"],
+            json!(true)
+        );
+
+        let (_, _, omitted_stream_deltas, omitted_stream_trace_deltas, _) =
+            run_real_contact_replay(
+                false,
+                true,
+                true,
+                ContactReplayCase::spanish_email(),
+                false,
+                true,
+                false,
+                false,
+            )
+            .await;
+        assert!(!omitted_stream_deltas.is_empty());
+        assert!(omitted_stream_trace_deltas.iter().any(|delta| {
+            delta.kind == "tool_selection_observation"
+                && delta.metadata["missed_expected_curated_resources"] == json!(true)
+        }));
+    }
+
+    #[tokio::test]
+    async fn truncated_read_only_response_retries_as_connection_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("truncated endpoint should bind");
+        let address = listener
+            .local_addr()
+            .expect("truncated endpoint address should resolve");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let body = serde_json::to_vec(&json!({
+            "resources": [{
+                "resource_id": "r1",
+                "name": "Trusted Aid",
+                "resource_type": "ngo",
+                "contact": {},
+                "languages": [],
+                "help_types": ["legal"],
+                "verified_at": null
+            }],
+            "query": "aid",
+            "resolved_country_code": "MX",
+            "help_type": "legal",
+            "total_count": 1,
+            "returned_count": 1,
+            "limit": 5,
+            "offset": 0,
+            "has_more": false,
+            "next_offset": null
+        }))
+        .expect("response body should serialize");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("truncated endpoint should accept");
+                let request_number = seen.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                if request_number == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{",
+                        )
+                        .await
+                        .expect("truncated response should write");
+                } else {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket
+                        .write_all(header.as_bytes())
+                        .await
+                        .expect("recovered response headers should write");
+                    socket
+                        .write_all(&body)
+                        .await
+                        .expect("recovered response body should write");
+                }
+            }
+        });
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{address}"),
+                "test-internal-token".to_string(),
+            ),
+            jurisdiction: Some("MX".to_string()),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "find_resources".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        let server_result = tokio::time::timeout(Duration::from_secs(10), server).await;
+        assert!(
+            server_result.is_ok(),
+            "truncated endpoint should receive the retry request"
+        );
+        server_result
+            .expect("truncated endpoint join should complete")
+            .expect("truncated endpoint should finish");
+        assert!(result.executed_tools[0].result.success);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolRetryScheduled { reason, .. }
+                if reason == "connection_failure"
+        )));
+    }
+
+    #[tokio::test]
+    async fn conversation_transport_reports_planner_and_tool_failures() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (mode, stream) in [
+            ("planner_failure", false),
+            ("tool_failure", false),
+            ("planner_failure", true),
+            ("tool_failure", true),
+        ] {
+            let state = TransportFailureState {
+                mode,
+                requests: Arc::new(Mutex::new(0)),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn({
+                let state = state.clone();
+                async move {
+                    axum::serve(
+                        listener,
+                        Router::new()
+                            .route("/v1/chat/completions", post(transport_failure_provider))
+                            .with_state(state),
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(TestTraceTool {
+                name: "web_search",
+                result: if mode == "tool_failure" {
+                    ToolResult::error("network failure")
+                } else {
+                    ToolResult::success("unused")
+                },
+                outcome: None,
+            }));
+            registry.register(Arc::new(crate::tools::DoneTool));
+            let mut agent = SageAgent::new_without_memory(registry, "test");
+            agent.set_contact_lookup_expected(false);
+            let settings = RequestLmSettings {
+                api_url: format!("http://{address}/v1"),
+                api_key: "test-key".to_string(),
+                model_chain: vec!["test-model".to_string()],
+                temperature: 0.1,
+            };
+            SageAgent::configure_lm_with_temperature(
+                &settings.api_url,
+                &settings.api_key,
+                &settings.model_chain[0],
+                settings.temperature,
+            )
+            .await
+            .unwrap();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let captured_trace_deltas = Arc::new(Mutex::new(Vec::new()));
+            let captured = captured_trace_deltas.clone();
+            let trace_sender = sender.clone();
+            agent.set_trace_hook(Arc::new(move |event| {
+                let delta = agent_trace_event_delta(event);
+                captured.lock().unwrap().push(delta.clone());
+                if stream {
+                    let _ = trace_sender.send(ConversationStreamSignal::Trace(Box::new(delta)));
+                }
+            }));
+            let result = run_agent_turn(
+                &mut agent,
+                "test request",
+                None,
+                &settings,
+                stream.then_some(sender),
+            )
+            .await;
+            let mut signals = Vec::new();
+            while let Ok(signal) = receiver.try_recv() {
+                signals.push(signal);
+            }
+            let streamed_trace_deltas = signals
+                .iter()
+                .filter_map(|signal| match signal {
+                    ConversationStreamSignal::Trace(delta) => Some(delta.as_ref()),
+                    ConversationStreamSignal::Answer(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let captured_trace_deltas = captured_trace_deltas.lock().unwrap().clone();
+            let trace_deltas = if stream {
+                streamed_trace_deltas
+            } else {
+                captured_trace_deltas.iter().collect()
+            };
+            if mode == "planner_failure" {
+                assert!(result.is_err());
+                let failed = trace_deltas
+                    .iter()
+                    .find(|delta| delta.kind == "tool_selection_observation")
+                    .expect("exhausted planner should transport a failed selection observation");
+                assert_eq!(failed.status.as_deref(), Some("failed"));
+                assert_eq!(failed.metadata["attempt"], json!(3));
+                assert!(!signals
+                    .iter()
+                    .any(|signal| matches!(signal, ConversationStreamSignal::Answer(_))));
+            } else {
+                assert_eq!(result.unwrap(), "Tool failed honestly.");
+                let attempted = trace_deltas
+                    .iter()
+                    .find(|delta| delta.kind == "tool_call")
+                    .expect("failed Tool should transport attempted evidence");
+                let terminal = trace_deltas
+                    .iter()
+                    .find(|delta| delta.kind == "tool_result")
+                    .expect("failed Tool should transport terminal evidence");
+                assert_eq!(terminal.status.as_deref(), Some("failed"));
+                assert_eq!(attempted.metadata["call_id"], terminal.metadata["call_id"]);
+                if stream {
+                    let first_answer = signals
+                        .iter()
+                        .position(|signal| matches!(signal, ConversationStreamSignal::Answer(_)))
+                        .expect("final answer should be transported");
+                    let terminal_index = signals
+                        .iter()
+                        .position(|signal| matches!(signal, ConversationStreamSignal::Trace(delta) if delta.kind == "tool_result"))
+                        .unwrap();
+                    assert!(terminal_index < first_answer);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn tool_free_turn_falls_back_before_the_first_answer_chunk() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         async fn completion(
             State(requested_models): State<Arc<Mutex<Vec<String>>>>,
             Json(body): Json<Value>,
@@ -8790,6 +12005,9 @@ mod tests {
 
     #[tokio::test]
     async fn partial_answer_failure_never_restarts_on_a_fallback_model() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         async fn completion(
             State(requested_models): State<Arc<Mutex<Vec<String>>>>,
             Json(body): Json<Value>,
@@ -9220,7 +12438,14 @@ mod tests {
                                 }
                             ],
                             "resolved_country_code": "MX",
-                            "help_type": "legal"
+                            "help_type": "legal",
+                            "query": "mexico legal aid network",
+                            "total_count": 6,
+                            "returned_count": 1,
+                            "limit": 5,
+                            "offset": 5,
+                            "has_more": true,
+                            "next_offset": 6
                         }))
                     }
                 }
@@ -9249,6 +12474,8 @@ mod tests {
         };
         let args = ToolArgs::from([
             ("help_type".to_string(), json!("legal")),
+            ("query".to_string(), json!("Mexico Legal Aid Network")),
+            ("offset".to_string(), json!(5)),
             ("language".to_string(), json!("es")),
         ]);
 
@@ -9268,6 +12495,11 @@ mod tests {
             .output
             .contains("secure_channel: Signal: +52-555-0100"));
         assert!(result.output.contains("never invent contact details"));
+        assert!(result
+            .output
+            .contains("Showing 1 of 6 matching ready Curated Resources"));
+        assert!(result.output.contains("more results are available"));
+        assert!(result.output.contains("next offset 6"));
 
         let traces = tool.traces.lock().expect("trace sink should lock");
         assert_eq!(traces.len(), 1);
@@ -9275,7 +12507,18 @@ mod tests {
         assert_eq!(traces[0].tool_name, "Curated Resources");
         assert_eq!(
             traces[0].output_summary.as_deref(),
-            Some("Found vetted curated resources for the answer.")
+            Some(
+                "Returned 1 of 6 matching ready Curated Resources; more results are available at offset 6."
+            )
+        );
+        assert_eq!(
+            traces[0].metadata,
+            json!({
+                "returned_count": 1,
+                "total_count": 6,
+                "has_more": true,
+                "next_offset": 6,
+            })
         );
 
         let (token, payload) = seen_rx
@@ -9285,6 +12528,8 @@ mod tests {
         assert_eq!(payload["help_type"], "legal");
         assert_eq!(payload["jurisdiction"], "Mexico");
         assert_eq!(payload["language"], "es");
+        assert_eq!(payload["query"], "Mexico Legal Aid Network");
+        assert_eq!(payload["offset"], 5);
         assert_eq!(payload["limit"], 5);
     }
 
@@ -9328,7 +12573,14 @@ mod tests {
                                 }
                             ],
                             "resolved_country_code": null,
-                            "help_type": null
+                            "help_type": null,
+                            "query": null,
+                            "total_count": 11,
+                            "returned_count": 1,
+                            "limit": 7,
+                            "offset": 10,
+                            "has_more": false,
+                            "next_offset": null
                         }))
                     }
                 }
@@ -9357,13 +12609,14 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::new())
+            .execute(&ToolArgs::from([("offset".to_string(), json!(10))]))
             .await
             .expect("resource inventory should succeed");
         server.abort();
 
         assert!(result.success);
         assert!(result.output.contains("Available curated resources"));
+        assert!(result.output.contains("(offset 10, limit 7)"));
         assert!(result.output.contains("Demo Test Resource (ngo)"));
         assert!(result
             .output
@@ -9371,6 +12624,10 @@ mod tests {
         assert!(result.output.contains("Helps with: legal, humanitarian"));
         assert!(result.output.contains("email: demo-test@example.test"));
         assert!(result.output.contains("never invent contact details"));
+        assert!(result.output.contains(
+            "This is the final page of matching ready Curated Resources for the supplied filters; no matching results remain after this page."
+        ));
+        assert!(!result.output.contains("This is the complete set"));
 
         let traces = tool.traces.lock().expect("trace sink should lock");
         assert_eq!(traces.len(), 1);
@@ -9380,7 +12637,18 @@ mod tests {
         );
         assert_eq!(
             traces[0].output_summary.as_deref(),
-            Some("Listed ready curated resources for the answer.")
+            Some(
+                "Returned 1 of 11 matching ready Curated Resources on this page; no remaining results."
+            )
+        );
+        assert_eq!(
+            traces[0].metadata,
+            json!({
+                "returned_count": 1,
+                "total_count": 11,
+                "has_more": false,
+                "next_offset": Value::Null,
+            })
         );
 
         let (token, payload) = seen_rx
@@ -9390,6 +12658,7 @@ mod tests {
         assert!(payload.get("help_type").is_none());
         assert_eq!(payload["jurisdiction"], Value::Null);
         assert_eq!(payload["limit"], 10);
+        assert_eq!(payload["offset"], 10);
     }
 
     #[test]
@@ -9454,6 +12723,93 @@ mod tests {
         assert!(
             instruction.contains("Final-answer generation returns only plain user-visible prose")
         );
+    }
+
+    #[test]
+    fn curated_resources_contact_followups_require_fresh_grounding_in_both_modes() {
+        let request = ChatRequest {
+            message: "me puedes dar el email de la organización?".to_string(),
+            session_id: Some("session-123".to_string()),
+            conversation_surface: None,
+            tools: vec![CURATED_RESOURCES_TOOL_SET_ID.to_string()],
+            conversation_history: Vec::new(),
+            job_ids: None,
+            conversation_channel: None,
+            client_decrypted_context: None,
+        };
+        let user = InternalAuthContext {
+            id: 7,
+            kind: "user".to_string(),
+            approved: true,
+            pubkey: None,
+            email: Some("user@example.test".to_string()),
+            name: None,
+            user_type_id: Some(3),
+            dev_mode: false,
+        };
+
+        let instruction = build_chat_agent_instruction("PROFILE", &request, &user);
+
+        assert!(instruction.contains("fresh find_resources decision"));
+        assert!(instruction.contains("recent Conversation context"));
+        assert!(instruction.contains("organization, jurisdiction, language, and help type"));
+        assert!(instruction.contains("me puedes dar el email"));
+        for contact_kind in [
+            "email",
+            "phone number",
+            "website or URL",
+            "address",
+            "secure channel",
+            "correo electrónico",
+            "teléfono",
+            "sitio web",
+            "dirección",
+            "canal seguro",
+        ] {
+            assert!(
+                instruction.contains(contact_kind),
+                "contact policy should cover {contact_kind}"
+            );
+        }
+        assert!(instruction.contains("earlier assistant prose"));
+        assert!(instruction.contains("no matching contact"));
+
+        let contact_tool = FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                "http://resource-directory.test".to_string(),
+                "test-token".to_string(),
+            ),
+            jurisdiction: None,
+            traces: Arc::new(Mutex::new(Vec::new())),
+        };
+        let tool_description = contact_tool.description();
+        for shared_rule in [
+            "fresh find_resources call",
+            "Use recent Conversation context",
+            "organization, jurisdiction, language, and help type",
+            "only its returned contact data",
+            "instead of relying on earlier assistant contact prose",
+            "If the fresh result has no matching contact",
+            "do not invent or reconstruct one",
+        ] {
+            assert!(
+                tool_description.contains(shared_rule),
+                "Tool contract must retain the shared contact-grounding rule: {shared_rule}"
+            );
+        }
+
+        let disabled = build_chat_agent_instruction(
+            "PROFILE",
+            &ChatRequest {
+                tools: Vec::new(),
+                ..request
+            },
+            &user,
+        );
+        assert!(!disabled.contains("CURATED RESOURCES CONTACT GROUNDING"));
+        assert!(!disabled.contains("fresh find_resources decision"));
+        assert!(!disabled.contains("me puedes dar el email"));
     }
 
     #[test]
@@ -9557,6 +12913,7 @@ mod tests {
     struct TestTraceTool {
         name: &'static str,
         result: ToolResult,
+        outcome: Option<ConversationTimingOutcome>,
     }
 
     #[async_trait::async_trait]
@@ -9576,114 +12933,854 @@ mod tests {
         async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
             Ok(self.result.clone())
         }
+
+        async fn execute_with_timing_outcome(
+            &self,
+            args: &ToolArgs,
+        ) -> Result<(ToolResult, ConversationTimingOutcome)> {
+            let result = self.execute(args).await?;
+            let outcome = self.outcome.clone().unwrap_or(if result.success {
+                ConversationTimingOutcome::Succeeded
+            } else {
+                ConversationTimingOutcome::Failed
+            });
+            Ok((result, outcome))
+        }
     }
 
-    struct FailingTraceTool {
-        name: &'static str,
+    #[tokio::test]
+    async fn sage_execution_emits_one_attempt_and_terminal_for_each_selected_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TestTraceTool {
+            name: "web_search",
+            result: ToolResult::error("network failure"),
+            outcome: None,
+        }));
+        registry.register(Arc::new(TestTraceTool {
+            name: "db_query",
+            result: ToolResult::error("read-only guard rejected the query"),
+            outcome: Some(ConversationTimingOutcome::Guarded),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            event_sink
+                .lock()
+                .expect("event sink should lock")
+                .push(event);
+        }));
+        let decision = crate::sage_agent::ToolDecision {
+            tool_calls: vec![
+                crate::sage_agent::ToolCall {
+                    name: "web_search".to_string(),
+                    args: ToolArgs::new(),
+                },
+                crate::sage_agent::ToolCall {
+                    name: "db_query".to_string(),
+                    args: ToolArgs::new(),
+                },
+            ],
+            replan_after_results: false,
+            planning_round: 3,
+        };
+        let result = agent.execute_tool_decision(&decision).await;
+        assert_eq!(result.executed_tools.len(), 2);
+        let events = events.lock().expect("event sink should lock");
+        let lifecycle = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentTraceEvent::ToolAttempted {
+                    call_id,
+                    tool_name,
+                    planning_round,
+                    attempt,
+                } => Some((
+                    "attempted",
+                    call_id.clone(),
+                    tool_name.clone(),
+                    *planning_round,
+                    *attempt,
+                    None,
+                )),
+                AgentTraceEvent::ToolTerminal {
+                    call_id,
+                    tool_name,
+                    planning_round,
+                    attempt,
+                    status,
+                    ..
+                } => Some((
+                    "terminal",
+                    call_id.clone(),
+                    tool_name.clone(),
+                    *planning_round,
+                    *attempt,
+                    Some(status.clone()),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 4);
+        assert_eq!(lifecycle[0].0, "attempted");
+        assert_eq!(lifecycle[1].0, "terminal");
+        assert_eq!(lifecycle[2].0, "attempted");
+        assert_eq!(lifecycle[3].0, "terminal");
+        assert_eq!(lifecycle[0].2, "web_search");
+        assert_eq!(lifecycle[1].5.as_deref(), Some("failed"));
+        assert_eq!(lifecycle[3].5.as_deref(), Some("guarded"));
+        assert_eq!(lifecycle[0].3, 3);
+        assert_eq!(lifecycle[0].4, 1);
+        assert_ne!(lifecycle[0].1, lifecycle[2].1);
+        assert_eq!(lifecycle[0].1, lifecycle[1].1);
+        assert_eq!(lifecycle[2].1, lifecycle[3].1);
+    }
+
+    struct EndpointLookupTool {
+        url: String,
+        policy: ToolRetryPolicy,
     }
 
     #[async_trait::async_trait]
-    impl Tool for FailingTraceTool {
+    impl Tool for EndpointLookupTool {
         fn name(&self) -> &str {
-            self.name
+            "endpoint_lookup"
         }
 
         fn description(&self) -> &str {
-            "Failing test trace tool"
+            "test endpoint lookup"
         }
 
         fn args_schema(&self) -> &str {
-            r#"{"query":"test"}"#
+            "{}"
+        }
+
+        fn retry_policy(&self) -> ToolRetryPolicy {
+            self.policy.clone()
         }
 
         async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
-            Err(anyhow::anyhow!("network failure"))
+            let response = reqwest::Client::new()
+                .get(&self.url)
+                .send()
+                .await
+                .map_err(|error| {
+                    if error.is_connect() {
+                        anyhow::Error::new(ToolExecutionError::Connection)
+                    } else if error.is_timeout() {
+                        anyhow::Error::new(ToolExecutionError::Timeout)
+                    } else {
+                        anyhow::Error::new(ToolExecutionError::Other(
+                            "endpoint request failed".to_string(),
+                        ))
+                    }
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
+                    status.as_u16(),
+                )));
+            }
+            let body = response.bytes().await?;
+            let payload = serde_json::from_slice::<Value>(&body)
+                .map_err(|_| anyhow::Error::new(ToolExecutionError::MalformedContract))?;
+            Ok(ToolResult::success(
+                payload.get("output").and_then(Value::as_str).unwrap_or(""),
+            ))
         }
     }
 
-    #[tokio::test]
-    async fn traced_tool_emits_call_and_result_trace_deltas() {
-        let sink = ConversationTraceDeltaSink::new(None);
-        let tool = traced_tool(
-            Arc::new(TestTraceTool {
-                name: "read_instance_settings",
-                result: ToolResult::success("raw tool output should not enter trace"),
-            }),
-            &sink,
-        );
+    struct WriteConfigTool {
+        url: String,
+    }
 
-        let result = tool.execute(&ToolArgs::new()).await.expect("tool runs");
+    #[async_trait::async_trait]
+    impl Tool for WriteConfigTool {
+        fn name(&self) -> &str {
+            "write_config"
+        }
 
-        assert!(result.success);
-        let deltas = sink.deltas.lock().expect("trace deltas should lock");
-        assert_eq!(deltas.len(), 2);
-        assert_eq!(deltas[0].kind, "tool_call");
-        assert_eq!(deltas[0].title.as_deref(), Some("Admin Config"));
-        assert_eq!(
-            deltas[0].tool_name.as_deref(),
-            Some("read_instance_settings")
-        );
-        assert_eq!(deltas[0].status.as_deref(), Some("running"));
-        assert_eq!(deltas[1].kind, "tool_result");
-        assert_eq!(deltas[1].content.as_deref(), Some("Tool completed."));
-        assert_eq!(deltas[1].status.as_deref(), Some("succeeded"));
-        assert!(!serde_json::to_string(&*deltas)
-            .expect("trace deltas serialize")
-            .contains("raw tool output"));
+        fn description(&self) -> &str {
+            "test state-changing write"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            let response = reqwest::Client::new().get(&self.url).send().await?;
+            if !response.status().is_success() {
+                return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
+                    response.status().as_u16(),
+                )));
+            }
+            Ok(ToolResult::success("written"))
+        }
+    }
+
+    async fn run_endpoint_lookup(
+        mode: &'static str,
+        policy: ToolRetryPolicy,
+    ) -> (ToolResult, Vec<AgentTraceEvent>, usize) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let requests = count.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("endpoint listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("endpoint address should resolve");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    get(move || {
+                        let requests = requests.clone();
+                        async move {
+                            let attempt = requests.fetch_add(1, Ordering::SeqCst);
+                            match mode {
+                                "recover" if attempt == 0 => {
+                                    (StatusCode::SERVICE_UNAVAILABLE, "busy".to_string())
+                                        .into_response()
+                                }
+                                "exhaust" | "504" | "4xx" => (
+                                    if mode == "4xx" {
+                                        StatusCode::BAD_REQUEST
+                                    } else if mode == "504" {
+                                        StatusCode::GATEWAY_TIMEOUT
+                                    } else {
+                                        StatusCode::SERVICE_UNAVAILABLE
+                                    },
+                                    "failure".to_string(),
+                                )
+                                    .into_response(),
+                                "malformed" => {
+                                    (StatusCode::OK, "not-json".to_string()).into_response()
+                                }
+                                "timeout" => {
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    (StatusCode::OK, r#"{"output":"late"}"#.to_string())
+                                        .into_response()
+                                }
+                                "empty" => {
+                                    (StatusCode::OK, r#"{"output":""}"#.to_string()).into_response()
+                                }
+                                _ => (StatusCode::OK, r#"{"output":"ok"}"#.to_string())
+                                    .into_response(),
+                            }
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("endpoint server should run");
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EndpointLookupTool {
+            url: format!("http://{address}/"),
+            policy,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            event_sink
+                .lock()
+                .expect("event sink should lock")
+                .push(event);
+        }));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "endpoint_lookup".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await
+            .executed_tools
+            .into_iter()
+            .next()
+            .expect("endpoint Tool should execute")
+            .result;
+        server.abort();
+        let snapshot = events.lock().expect("events should unlock").clone();
+        (result, snapshot, count.load(Ordering::SeqCst))
     }
 
     #[tokio::test]
-    async fn traced_tool_emits_failed_guarded_and_timed_result_deltas() {
-        let failed_sink = ConversationTraceDeltaSink::new(None);
-        let failing_tool = traced_tool(
-            Arc::new(FailingTraceTool { name: "web_search" }),
-            &failed_sink,
+    async fn endpoint_retry_contract_covers_transient_failure_timeout_and_non_retryable_results() {
+        let (result, events, requests) = run_endpoint_lookup(
+            "recover",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
+        assert!(result.success);
+        assert_eq!(requests, 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
         );
 
-        let error = failing_tool
-            .execute(&ToolArgs::new())
-            .await
-            .expect_err("tool should fail");
-
-        assert!(error.to_string().contains("network failure"));
-        let failed_deltas = failed_sink
-            .deltas
-            .lock()
-            .expect("failed trace deltas should lock");
-        assert_eq!(failed_deltas.len(), 2);
-        assert_eq!(failed_deltas[1].kind, "tool_result");
-        assert_eq!(failed_deltas[1].title.as_deref(), Some("Web Search"));
-        assert_eq!(failed_deltas[1].status.as_deref(), Some("failed"));
-        assert!(failed_deltas[1].metadata["duration_ms"].is_number());
-
-        let guarded_sink = ConversationTraceDeltaSink::new(None);
-        let guarded_tool = traced_tool(
-            Arc::new(TestTraceTool {
-                name: "db_query",
-                result: ToolResult::error("Query guard blocked api_key=sk-test-secret"),
-            }),
-            &guarded_sink,
-        );
-
-        let result = guarded_tool
-            .execute(&ToolArgs::new())
-            .await
-            .expect("guarded tool returns a ToolResult");
-
+        let (result, events, requests) = run_endpoint_lookup(
+            "exhaust",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
         assert!(!result.success);
-        let guarded_deltas = guarded_sink
-            .deltas
-            .lock()
-            .expect("guarded trace deltas should lock");
-        assert_eq!(guarded_deltas.len(), 2);
-        assert_eq!(guarded_deltas[1].kind, "tool_result");
-        assert_eq!(guarded_deltas[1].title.as_deref(), Some("Database Query"));
-        assert_eq!(guarded_deltas[1].status.as_deref(), Some("guarded"));
-        assert_eq!(guarded_deltas[1].content.as_deref(), Some("[redacted]"));
-        assert!(guarded_deltas[1].metadata["duration_ms"].is_number());
-        assert!(!serde_json::to_string(&*guarded_deltas)
-            .expect("guarded trace deltas serialize")
-            .contains("sk-test-secret"));
+        assert_eq!(requests, 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+
+        let (result, events, requests) = run_endpoint_lookup(
+            "504",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
+        assert!(!result.success);
+        assert_eq!(requests, 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+
+        for (mode, expected_requests) in [("4xx", 1), ("malformed", 1)] {
+            let (result, events, requests) = run_endpoint_lookup(
+                mode,
+                ToolRetryPolicy::read_only(
+                    Duration::from_millis(50),
+                    2,
+                    Duration::from_millis(500),
+                ),
+            )
+            .await;
+            assert!(!result.success);
+            assert_eq!(requests, expected_requests);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                    .count(),
+                1
+            );
+        }
+
+        let (result, events, requests) = run_endpoint_lookup(
+            "empty",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
+        assert!(result.success);
+        assert!(result.output.is_empty());
+        assert_eq!(requests, 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            0
+        );
+
+        let (result, events, requests) = run_endpoint_lookup(
+            "success",
+            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+        )
+        .await;
+        assert!(result.success);
+        assert_eq!(requests, 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            0
+        );
+
+        let (result, events, requests) = run_endpoint_lookup(
+            "timeout",
+            ToolRetryPolicy::read_only(Duration::from_millis(25), 2, Duration::from_millis(300)),
+        )
+        .await;
+        assert!(!result.success);
+        assert_eq!(requests, 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTimedOut { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn default_tool_policy_guards_state_changing_write_from_retry() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("write endpoint should bind");
+        let address = listener
+            .local_addr()
+            .expect("write endpoint address should resolve");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    get(move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::SERVICE_UNAVAILABLE, "write rejected").into_response()
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("write endpoint should run");
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(WriteConfigTool {
+            url: format!("http://{address}/"),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "write_config".to_string(),
+                    args: ToolArgs::new(),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        server.abort();
+        assert!(!result.executed_tools[0].result.success);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn production_read_tools_use_typed_retry_path_and_preserve_valid_empty_success() {
+        let resource_requests = Arc::new(AtomicUsize::new(0));
+        let seen_resources = resource_requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("resource endpoint should bind");
+        let address = listener
+            .local_addr()
+            .expect("resource endpoint address should resolve");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/internal/agent/resources/search", post(move || {
+                let seen_resources = seen_resources.clone();
+                async move {
+                    let attempt = seen_resources.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response();
+                    }
+                    Json(json!({
+                        "resources": [{"resource_id":"r1","name":"Trusted Aid","resource_type":"ngo","contact":{},"languages":[],"help_types":["legal"],"verified_at":null}],
+                        "query":"aid","resolved_country_code":"MX","help_type":"legal","total_count":1,"returned_count":1,"limit":5,"offset":0,"has_more":false,"next_offset":null
+                    })).into_response()
+                }
+            }))).await.expect("resource endpoint should run");
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{address}"),
+                "token".to_string(),
+            ),
+            jurisdiction: Some("MX".to_string()),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "find_resources".to_string(),
+                    args: ToolArgs::from([
+                        ("query".to_string(), json!("aid")),
+                        ("help_type".to_string(), json!("legal")),
+                    ]),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        server.abort();
+        assert!(result.executed_tools[0].result.success);
+        assert_eq!(resource_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolTerminal { .. }))
+                .count(),
+            1
+        );
+
+        let empty_requests = Arc::new(AtomicUsize::new(0));
+        let seen_empty = empty_requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("empty endpoint should bind");
+        let empty_address = listener
+            .local_addr()
+            .expect("empty endpoint address should resolve");
+        let empty_server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/internal/agent/resources/search", post(move || {
+                let seen_empty = seen_empty.clone();
+                async move {
+                    seen_empty.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"resources":[],"query":"none","resolved_country_code":"MX","help_type":"legal","total_count":0,"returned_count":0,"limit":5,"offset":0,"has_more":false,"next_offset":null})).into_response()
+                }
+            }))).await.expect("empty endpoint should run");
+        });
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{empty_address}"),
+                "token".to_string(),
+            ),
+            jurisdiction: Some("MX".to_string()),
+            traces,
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "find_resources".to_string(),
+                    args: ToolArgs::from([("help_type".to_string(), json!("legal"))]),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        empty_server.abort();
+        assert!(result.executed_tools[0].result.success);
+        assert_eq!(empty_requests.load(Ordering::SeqCst), 1);
+
+        let knowledge_requests = Arc::new(AtomicUsize::new(0));
+        let seen_knowledge = knowledge_requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("knowledge endpoint should bind");
+        let knowledge_address = listener
+            .local_addr()
+            .expect("knowledge endpoint address should resolve");
+        let knowledge_server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/internal/agent/document-search", post(move || {
+                let seen_knowledge = seen_knowledge.clone();
+                async move {
+                    let attempt = seen_knowledge.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        return (StatusCode::BAD_GATEWAY, "busy").into_response();
+                    }
+                    Json(json!({"sources":[],"context":"","search_query":"handbook","top_k":3})).into_response()
+                }
+            }))).await.expect("knowledge endpoint should run");
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(KnowledgeSearchTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{knowledge_address}"),
+                "token".to_string(),
+            ),
+            user: InternalAuthContext {
+                id: 1,
+                kind: "user".to_string(),
+                approved: true,
+                pubkey: None,
+                email: None,
+                name: None,
+                user_type_id: None,
+                dev_mode: false,
+            },
+            top_k: 3,
+            job_ids: None,
+            jurisdiction: None,
+            situation_details: None,
+            sources: Arc::new(Mutex::new(Vec::new())),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "knowledge_search".to_string(),
+                    args: ToolArgs::from([("query".to_string(), json!("handbook"))]),
+                }],
+                replan_after_results: false,
+                planning_round: 1,
+            })
+            .await;
+        knowledge_server.abort();
+        assert!(result.executed_tools[0].result.success);
+        assert_eq!(knowledge_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn emitted_tool_logs_have_exact_native_structured_keys() {
+        let events = [
+            AgentTraceEvent::ToolSelectionObservation {
+                round: 2,
+                attempt: 2,
+                enabled_tools: vec!["find_resources".to_string()],
+                selected_tools: vec!["find_resources".to_string()],
+                expected_curated_resources: true,
+                missed_expected_curated_resources: false,
+                outcome: "planned".to_string(),
+            },
+            AgentTraceEvent::ToolAttempted {
+                call_id: "call-1".to_string(),
+                tool_name: "find_resources".to_string(),
+                planning_round: 2,
+                attempt: 1,
+            },
+            AgentTraceEvent::ToolTerminal {
+                call_id: "call-1".to_string(),
+                tool_name: "find_resources".to_string(),
+                planning_round: 2,
+                attempt: 1,
+                status: "failed".to_string(),
+                elapsed_ms: 9,
+            },
+        ];
+        let expected: [&[&str]; 3] = [
+            &[
+                "timestamp",
+                "level",
+                "target",
+                "event_name",
+                "conversation_id",
+                "message_id",
+                "actor_kind",
+                "actor_id",
+                "phase",
+                "round",
+                "attempt",
+                "enabled_tools",
+                "selected_tools",
+                "selection_count",
+                "expected_curated_resources",
+                "missed_expected_curated_resources",
+                "outcome",
+            ],
+            &[
+                "timestamp",
+                "level",
+                "target",
+                "event_name",
+                "conversation_id",
+                "message_id",
+                "actor_kind",
+                "actor_id",
+                "phase",
+                "call_id",
+                "tool_name",
+                "round",
+                "attempt",
+            ],
+            &[
+                "timestamp",
+                "level",
+                "target",
+                "event_name",
+                "conversation_id",
+                "message_id",
+                "actor_kind",
+                "actor_id",
+                "phase",
+                "call_id",
+                "tool_name",
+                "round",
+                "attempt",
+                "outcome",
+                "duration_ms",
+            ],
+        ];
+        for (event, expected_keys) in events.into_iter().zip(expected) {
+            let value = capture_structured_log(event);
+            let keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                expected_keys
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+            );
+            assert!(!value.to_string().contains("fields"));
+            let serialized = value.to_string();
+            for forbidden in [
+                "prompt",
+                "answer",
+                "email@example",
+                "api_key",
+                "secret",
+                "args",
+                "output",
+                "reasoning",
+            ] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
+
+        for (event, expected_keys) in [
+            (
+                AgentTraceEvent::ToolRetryScheduled {
+                    call_id: "call-1".to_string(),
+                    tool_name: "find_resources".to_string(),
+                    planning_round: 2,
+                    attempt: 1,
+                    reason: "http_503".to_string(),
+                },
+                [
+                    "timestamp",
+                    "level",
+                    "target",
+                    "event_name",
+                    "conversation_id",
+                    "message_id",
+                    "actor_kind",
+                    "actor_id",
+                    "phase",
+                    "call_id",
+                    "tool_name",
+                    "round",
+                    "attempt",
+                    "reason",
+                ],
+            ),
+            (
+                AgentTraceEvent::ToolTimedOut {
+                    call_id: "call-1".to_string(),
+                    tool_name: "find_resources".to_string(),
+                    planning_round: 2,
+                    attempt: 1,
+                    elapsed_ms: 5000,
+                },
+                [
+                    "timestamp",
+                    "level",
+                    "target",
+                    "event_name",
+                    "conversation_id",
+                    "message_id",
+                    "actor_kind",
+                    "actor_id",
+                    "phase",
+                    "call_id",
+                    "tool_name",
+                    "round",
+                    "attempt",
+                    "duration_ms",
+                ],
+            ),
+        ] {
+            let value = capture_structured_log(event);
+            let keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                expected_keys
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+            );
+            let serialized = value.to_string();
+            for forbidden in [
+                "prompt",
+                "answer",
+                "email@example",
+                "api_key",
+                "secret",
+                "args",
+                "output",
+                "reasoning",
+            ] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
     }
 
     #[test]
@@ -9724,6 +13821,121 @@ mod tests {
         assert_eq!(correction.status.as_deref(), Some("running"));
         assert_eq!(timing.kind, "timing");
         assert_eq!(timing.metadata["duration_ms"], json!(1234));
+
+        let selection = agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
+            round: 2,
+            attempt: 1,
+            enabled_tools: vec!["find_resources".to_string(), "knowledge_search".to_string()],
+            selected_tools: Vec::new(),
+            expected_curated_resources: true,
+            missed_expected_curated_resources: true,
+            outcome: "planned".to_string(),
+        });
+        assert_eq!(selection.kind, "tool_selection_observation");
+        assert_eq!(selection.status.as_deref(), Some("failed"));
+        assert_eq!(selection.metadata["selection_count"], json!(0));
+        assert_eq!(
+            selection.metadata["missed_expected_curated_resources"],
+            json!(true)
+        );
+        assert!(!serde_json::to_string(&selection).unwrap().contains("email"));
+
+        let retried_selection =
+            agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
+                round: 2,
+                attempt: 2,
+                enabled_tools: vec!["find_resources".to_string()],
+                selected_tools: vec!["find_resources".to_string()],
+                expected_curated_resources: true,
+                missed_expected_curated_resources: false,
+                outcome: "planned".to_string(),
+            });
+        assert_ne!(selection.id, retried_selection.id);
+        assert_eq!(retried_selection.metadata["round"], json!(2));
+        assert_eq!(retried_selection.metadata["attempt"], json!(2));
+
+        let attempted = agent_trace_event_delta(AgentTraceEvent::ToolAttempted {
+            call_id: "call-1".to_string(),
+            tool_name: "unknown_tool".to_string(),
+            planning_round: 1,
+            attempt: 1,
+        });
+        let terminal = agent_trace_event_delta(AgentTraceEvent::ToolTerminal {
+            call_id: "call-1".to_string(),
+            tool_name: "unknown_tool".to_string(),
+            planning_round: 1,
+            attempt: 1,
+            status: "failed".to_string(),
+            elapsed_ms: 3,
+        });
+        assert_eq!(attempted.kind, "tool_call");
+        assert_eq!(attempted.metadata["phase"], json!("attempted"));
+        assert_eq!(terminal.kind, "tool_result");
+        assert_eq!(terminal.status.as_deref(), Some("failed"));
+
+        let retry = agent_trace_event_delta(AgentTraceEvent::ToolRetryScheduled {
+            call_id: "call-1".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 1,
+            reason: "http_503".to_string(),
+        });
+        assert_eq!(retry.kind, "tool_retry");
+        assert_eq!(retry.metadata["phase"], json!("retry"));
+        assert_eq!(retry.metadata["call_id"], json!("call-1"));
+        let timeout = agent_trace_event_delta(AgentTraceEvent::ToolTimedOut {
+            call_id: "call-1".to_string(),
+            tool_name: "find_resources".to_string(),
+            planning_round: 1,
+            attempt: 2,
+            elapsed_ms: 5000,
+        });
+        assert_eq!(timeout.kind, "timeout");
+        assert_eq!(timeout.status.as_deref(), Some("timed_out"));
+        assert_eq!(timeout.metadata["phase"], json!("timeout"));
+    }
+
+    #[test]
+    fn selection_observation_activity_is_accessible_and_content_free() {
+        let delta = agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
+            round: 1,
+            attempt: 1,
+            enabled_tools: vec!["find_resources".to_string()],
+            selected_tools: vec!["find_resources".to_string()],
+            expected_curated_resources: true,
+            missed_expected_curated_resources: false,
+            outcome: "planned".to_string(),
+        });
+        let activity = conversation_activity_steps_from_trace_deltas(&[delta]);
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].title, "Tool Selection");
+        assert_eq!(activity[0].kind, "tool_selection_observation");
+        assert_eq!(
+            activity[0].summary.as_deref(),
+            Some("Selected: Curated Resources.")
+        );
+
+        let activity = conversation_activity_steps_from_trace_deltas(&[
+            agent_trace_event_delta(AgentTraceEvent::ToolRetryScheduled {
+                call_id: "call-1".to_string(),
+                tool_name: "find_resources".to_string(),
+                planning_round: 1,
+                attempt: 1,
+                reason: "http_503".to_string(),
+            }),
+            agent_trace_event_delta(AgentTraceEvent::ToolTimedOut {
+                call_id: "call-1".to_string(),
+                tool_name: "find_resources".to_string(),
+                planning_round: 1,
+                attempt: 2,
+                elapsed_ms: 5000,
+            }),
+        ]);
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0].kind, "tool");
+        assert_eq!(activity[0].status, "running");
+        assert_eq!(activity[1].kind, "tool");
+        assert_eq!(activity[1].status, "timed_out");
     }
 
     #[test]
@@ -9820,6 +14032,7 @@ mod tests {
         };
         let tool = ToolCallInfoResponse {
             output_summary: Some("Read the current admin configuration.".to_string()),
+            metadata: json!({"allowlisted": true}),
             ..tool_call_info_for_id("admin-config", "Check setup status.".to_string())
         };
 
@@ -9842,11 +14055,39 @@ mod tests {
                 trace.tools[0].output_summary.as_deref(),
                 Some("Read the current admin configuration.")
             );
+            assert_eq!(trace.tools[0].metadata, json!({"allowlisted": true}));
             assert_eq!(
                 trace.activity_steps[0].summary.as_deref(),
                 Some("Read the current admin configuration.")
             );
         }
+    }
+
+    #[test]
+    fn tool_trace_deduplication_preserves_distinct_resource_pages() {
+        let mut first = tool_call_info_for_id(
+            "curated-resources",
+            "curated resources inventory matching Issue 539 Inventory".to_string(),
+        );
+        first.metadata = json!({
+            "returned_count": 10,
+            "total_count": 11,
+            "has_more": true,
+            "next_offset": 10,
+        });
+        let mut final_page = first.clone();
+        final_page.metadata = json!({
+            "returned_count": 1,
+            "total_count": 11,
+            "has_more": false,
+            "next_offset": Value::Null,
+        });
+
+        let deduped = dedupe_tool_calls(vec![first.clone(), final_page.clone(), first.clone()]);
+
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].metadata, first.metadata);
+        assert_eq!(deduped[1].metadata, final_page.metadata);
     }
 
     #[test]
@@ -9960,6 +14201,7 @@ mod tests {
                     query: Some("SELECT encrypted_value FROM settings".to_string()),
                     output_summary: None,
                     warnings: Vec::new(),
+                    metadata: json!({}),
                     guarded: false,
                 },
             ],
@@ -10009,6 +14251,7 @@ mod tests {
                 query: Some("DROP TABLE users".to_string()),
                 output_summary: Some("Only SELECT queries are allowed.".to_string()),
                 warnings: vec!["db_query_rejected".to_string()],
+                metadata: json!({}),
                 guarded: true,
             }],
             Vec::new(),
@@ -10063,6 +14306,7 @@ mod tests {
                 query: Some("current compliance references".to_string()),
                 output_summary: Some("Optional tool could not be prepared.".to_string()),
                 warnings: vec!["optional_tool_failed".to_string()],
+                metadata: json!({}),
                 guarded: true,
             }],
             Vec::new(),
@@ -10293,6 +14537,153 @@ mod tests {
         assert_eq!(traces[0].tool_id, "db-query");
         assert!(traces[0].guarded);
         assert_eq!(traces[0].warnings, vec!["db_query_rejected".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn database_tool_rejection_emits_guarded_timing_in_batch_and_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test backend should expose local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/internal/agent/admin-db-query",
+                    post(|| async {
+                        Json(json!({
+                            "success": false,
+                            "columns": [],
+                            "rows": [],
+                            "executionTimeMs": 0,
+                            "error": "Only SELECT queries are allowed."
+                        }))
+                    }),
+                ),
+            )
+            .await
+            .expect("test backend should serve");
+        });
+        let tool = AdminDbQueryTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{addr}"),
+                "test-token".to_string(),
+            ),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(tool));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let batch_events = Arc::new(Mutex::new(Vec::new()));
+        let batch_sink = batch_events.clone();
+        let (stream_sender, mut stream_receiver) = mpsc::unbounded_channel();
+        agent.set_trace_hook(Arc::new(move |event| {
+            batch_sink.lock().unwrap().push(event.clone());
+            let _ = stream_sender.send(ConversationStreamSignal::Trace(Box::new(
+                agent_trace_event_delta(event),
+            )));
+        }));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "db_query".to_string(),
+                    args: ToolArgs::from([("sql".to_string(), json!("DROP TABLE users"))]),
+                }],
+                replan_after_results: false,
+                planning_round: 3,
+            })
+            .await;
+        server.abort();
+
+        assert!(!result.executed_tools[0].result.success);
+        assert!(batch_events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::ToolExecution,
+                outcome: ConversationTimingOutcome::Guarded,
+                planning_round: Some(3),
+                ..
+            }
+        )));
+        assert!(batch_events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolTerminal { status, .. } if status == "guarded"
+        )));
+        let mut streamed = Vec::new();
+        while let Ok(signal) = stream_receiver.try_recv() {
+            if let ConversationStreamSignal::Trace(delta) = signal {
+                streamed.push(delta);
+            }
+        }
+        assert!(streamed
+            .iter()
+            .any(|delta| { delta.kind == "timing" && delta.status.as_deref() == Some("guarded") }));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_emits_correlated_failed_timing_in_batch_and_stream() {
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "test");
+        let batch_events = Arc::new(Mutex::new(Vec::new()));
+        let batch_sink = batch_events.clone();
+        let (stream_sender, mut stream_receiver) = mpsc::unbounded_channel();
+        agent.set_trace_hook(Arc::new(move |event| {
+            batch_sink.lock().unwrap().push(event.clone());
+            let _ = stream_sender.send(ConversationStreamSignal::Trace(Box::new(
+                agent_trace_event_delta(event),
+            )));
+        }));
+        let result = agent
+            .execute_tool_decision(&ToolDecision {
+                tool_calls: vec![ToolCall {
+                    name: "unregistered_tool".to_string(),
+                    args: ToolArgs::default(),
+                }],
+                replan_after_results: false,
+                planning_round: 4,
+            })
+            .await;
+        assert!(!result.executed_tools[0].result.success);
+        let batch = batch_events.lock().unwrap();
+        let timing = batch
+            .iter()
+            .find_map(|event| match event {
+                AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::ToolExecution,
+                    outcome: ConversationTimingOutcome::Failed,
+                    planning_round: Some(4),
+                    tool_name: Some(tool_name),
+                    call_id: Some(call_id),
+                    attempt: 1,
+                    ..
+                } => Some((tool_name.clone(), call_id.clone())),
+                _ => None,
+            })
+            .expect("unknown Tool should emit failed execution timing");
+        assert!(batch.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolTerminal {
+                tool_name,
+                call_id,
+                status,
+                attempt: 1,
+                ..
+            } if tool_name == &timing.0 && call_id == &timing.1 && status == "failed"
+        )));
+        let mut streamed = Vec::new();
+        while let Ok(signal) = stream_receiver.try_recv() {
+            if let ConversationStreamSignal::Trace(delta) = signal {
+                streamed.push(delta);
+            }
+        }
+        assert!(streamed.iter().any(|delta| {
+            delta.kind == "timing"
+                && delta.status.as_deref() == Some("failed")
+                && delta.metadata["phase"] == json!("tool_execution")
+                && delta.metadata["call_id"] == json!(timing.1)
+        }));
     }
 
     #[tokio::test]
