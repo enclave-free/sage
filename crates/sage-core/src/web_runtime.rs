@@ -46,11 +46,12 @@ use crate::memory::MemoryManager;
 #[cfg(test)]
 use crate::sage_agent::StepResult;
 use crate::sage_agent::{
-    expects_curated_resource_lookup, has_syntactic_tool_intent, tool_parse_arg, tool_string_arg,
-    AgentTraceEvent, ConversationTimingOutcome, ConversationTimingPhase, ExecutedTool,
-    PlainAnswerPrompt, ProviderReasoningTraceHook, ProviderTimingEvent, ProviderTimingTraceHook,
-    SageAgent, Tool, ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry,
-    ToolResult, ToolRetryPolicy,
+    expects_curated_resource_lookup, has_syntactic_tool_intent, lookup_process_narration_opening,
+    tool_parse_arg, tool_string_arg, AgentTraceEvent, ConversationTimingOutcome,
+    ConversationTimingPhase, ExecutedTool, PlainAnswerPrompt, ProcessNarrationOpeningMatch,
+    ProviderReasoningTraceHook, ProviderTimingEvent, ProviderTimingTraceHook, SageAgent, Tool,
+    ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
+    ToolRetryPolicy,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -7678,12 +7679,11 @@ impl PlainAnswerStreamState {
             "the user is asking",
             "we need to answer",
         ];
-        const PROCESS_NARRATION_OPENERS: [&str; 5] = [
+        const PROCESS_NARRATION_OPENERS: [&str; 4] = [
             "i want to make sure",
             "i'm going to search",
             "i am going to search",
             "before i answer",
-            "looking up",
         ];
         const PROCESS_NARRATION_SUBJECTS: [&str; 8] = [
             "i ",
@@ -7720,6 +7720,15 @@ impl PlainAnswerStreamState {
             .replace('‘', "'");
         if opening.is_empty() {
             return PlainAnswerOpeningDisposition::Undecided;
+        }
+        match lookup_process_narration_opening(&opening) {
+            ProcessNarrationOpeningMatch::Complete => {
+                return PlainAnswerOpeningDisposition::Quarantine;
+            }
+            ProcessNarrationOpeningMatch::Partial => {
+                return PlainAnswerOpeningDisposition::Undecided;
+            }
+            ProcessNarrationOpeningMatch::None => {}
         }
         if DELIBERATION_OPENERS
             .iter()
@@ -9918,6 +9927,47 @@ mod tests {
     }
 
     #[test]
+    fn plain_answer_safety_quarantines_split_spanish_lookup_narration() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("Bus", &sender)
+            .expect("a partial Spanish lookup opener should remain pending");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push(
+                "cando el email para Issue 539 Legal Aid. Tool decision: find_resources with query=\"Issue 539 Legal Aid\"",
+                &sender,
+            )
+            .expect_err("Spanish lookup narration plus Tool syntax must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_named_tool_argument_with_malformed_trailing_item() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        let error = state
+            .push(
+                "Tool decision: find_resources with query=\"Issue 539 Legal Aid\", then summarize it",
+                &sender,
+            )
+            .expect_err("one credible named argument is sufficient Tool intent");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn plain_answer_safety_rejects_provider_neutral_tool_args_before_exposure() {
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
         let sender = Some(delta_tx);
@@ -10467,6 +10517,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plain_answer_retry_stops_after_two_unsafe_attempts_without_exposure() {
+        async fn completion(
+            State(attempts): State<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> impl IntoResponse {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Buscando el email para Issue 539 Legal Aid. \"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Tool decision: find_resources with query=\\\"Issue 539 Legal Aid\\\"\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_attempts),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = PlainAnswerPrompt {
+            system: "answer from the completed Resource Directory result".to_string(),
+            user: "give me the current email".to_string(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let timing_events = Arc::new(Mutex::new(Vec::new()));
+        let timing_sink = timing_events.clone();
+        let timing_hook: ProviderTimingTraceHook = Arc::new(move |event| {
+            timing_sink.lock().unwrap().push(event);
+        });
+
+        let error = generator
+            .generate_with_timing(
+                &prompt,
+                "test-model",
+                Some(delta_tx),
+                None,
+                Some(timing_hook),
+            )
+            .await
+            .expect_err("a second unsafe final answer must terminate without a third attempt");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+        let timing_events = timing_events.lock().unwrap();
+        let header_attempts = timing_events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderTimingEvent::ResponseHeaders { attempt, .. } => Some(*attempt),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let first_event_attempts = timing_events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderTimingEvent::FirstProviderEvent { attempt, .. } => Some(*attempt),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(header_attempts, vec![1, 2]);
+        assert_eq!(first_event_attempts, vec![1, 2]);
+    }
+
+    #[tokio::test]
     async fn plain_answer_generator_retries_runaway_search_narration_before_exposure() {
         async fn completion(
             State(attempts): State<Arc<AtomicUsize>>,
@@ -10769,6 +10904,7 @@ mod tests {
         help_type: String,
         contact_key: String,
         contact_value: String,
+        final_answer_fault: ContactReplayFinalAnswerFault,
     }
 
     impl ContactReplayCase {
@@ -10783,7 +10919,13 @@ mod tests {
                 help_type: "legal".to_string(),
                 contact_key: "email".to_string(),
                 contact_value: "fresh@example.test".to_string(),
+                final_answer_fault: ContactReplayFinalAnswerFault::None,
             }
+        }
+
+        fn with_final_answer_fault(mut self, fault: ContactReplayFinalAnswerFault) -> Self {
+            self.final_answer_fault = fault;
+            self
         }
 
         fn stale_contact_value(&self) -> String {
@@ -10797,10 +10939,18 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    enum ContactReplayFinalAnswerFault {
+        #[default]
+        None,
+        LiveToolDecisionOnce,
+    }
+
     #[derive(Clone)]
     struct ContactReplayState {
         planner_requests: Arc<Mutex<Vec<Value>>>,
         final_answer_requests: Arc<Mutex<Vec<Value>>>,
+        final_answer_fault_attempts: Arc<AtomicUsize>,
         resource_requests: Arc<Mutex<Vec<Value>>>,
         empty_resource: bool,
         case: ContactReplayCase,
@@ -10869,11 +11019,26 @@ mod tests {
                 .unwrap()
                 .push(body.clone());
             let body_text = body.to_string();
+            let is_grounded_followup = body_text.contains("CURATED RESOURCES CONTACT GROUNDING")
+                && body_text.contains(&state.case.contact_value);
+            let fault_attempt = if is_grounded_followup {
+                state
+                    .final_answer_fault_attempts
+                    .fetch_add(1, Ordering::SeqCst)
+            } else {
+                0
+            };
+            let live_tool_decision_fault = is_grounded_followup
+                && state.case.final_answer_fault
+                    == ContactReplayFinalAnswerFault::LiveToolDecisionOnce
+                && fault_attempt == 0;
             let answer = if state.two_turn && final_index == 0 {
                 format!(
                     "The initial Resource Directory contact was {}.",
                     state.case.stale_contact_value()
                 )
+            } else if live_tool_decision_fault {
+                "Buscando el email para Acme Legal Aid en México. Tool decision: find_resources with help_type=\"legal\", language=\"es\", region=\"Mexico\", query=\"Acme Legal Aid\"".to_string()
             } else if body_text.contains("No vetted") {
                 "No matching current contact is currently listed.".to_string()
             } else if !expects_curated_resource_lookup(&state.case.followup) {
@@ -10888,10 +11053,17 @@ mod tests {
                     state.case.contact_value
                 )
             };
-            let first = answer
-                .split_once(' ')
-                .map(|(prefix, suffix)| (format!("{prefix} "), suffix.to_string()))
-                .unwrap_or_else(|| (answer.to_string(), String::new()));
+            let first = if live_tool_decision_fault {
+                answer
+                    .split_once("Tool decision:")
+                    .map(|(prefix, suffix)| (prefix.to_string(), format!("Tool decision:{suffix}")))
+                    .expect("live Tool-decision fixture should contain its split marker")
+            } else {
+                answer
+                    .split_once(' ')
+                    .map(|(prefix, suffix)| (format!("{prefix} "), suffix.to_string()))
+                    .unwrap_or_else(|| (answer.to_string(), String::new()))
+            };
             return (
                 [("content-type", "text/event-stream")],
                 format!(
@@ -11041,6 +11213,7 @@ mod tests {
             case,
             planner_requests: Arc::new(Mutex::new(Vec::new())),
             final_answer_requests: Arc::new(Mutex::new(Vec::new())),
+            final_answer_fault_attempts: Arc::new(AtomicUsize::new(0)),
             resource_requests: Arc::new(Mutex::new(Vec::new())),
             two_turn,
             omit_tool_selection,
@@ -11353,6 +11526,7 @@ mod tests {
             help_type: "legal".to_string(),
             contact_key: "phone".to_string(),
             contact_value: "+52-555-0100".to_string(),
+            final_answer_fault: ContactReplayFinalAnswerFault::None,
         };
         let (phone_answer, phone_state, _, _, _) = run_real_contact_replay(
             false,
@@ -11388,6 +11562,7 @@ mod tests {
                 help_type: "legal".to_string(),
                 contact_key: "email".to_string(),
                 contact_value: "fresh-en@example.test".to_string(),
+                final_answer_fault: ContactReplayFinalAnswerFault::None,
             },
             ContactReplayCase {
                 followup: "me das el sitio web?".to_string(),
@@ -11397,6 +11572,7 @@ mod tests {
                 help_type: "legal".to_string(),
                 contact_key: "url".to_string(),
                 contact_value: "https://fresh.example.test".to_string(),
+                final_answer_fault: ContactReplayFinalAnswerFault::None,
             },
             ContactReplayCase {
                 followup: "what is the address?".to_string(),
@@ -11406,6 +11582,7 @@ mod tests {
                 help_type: "legal".to_string(),
                 contact_key: "address".to_string(),
                 contact_value: "Fresh Street 42, Mexico City".to_string(),
+                final_answer_fault: ContactReplayFinalAnswerFault::None,
             },
             ContactReplayCase {
                 followup: "me puedes dar el canal seguro?".to_string(),
@@ -11415,6 +11592,7 @@ mod tests {
                 help_type: "legal".to_string(),
                 contact_key: "secure_channel".to_string(),
                 contact_value: "Signal: fresh-contact".to_string(),
+                final_answer_fault: ContactReplayFinalAnswerFault::None,
             },
         ];
         for (index, case) in modality_cases.into_iter().enumerate() {
@@ -11478,6 +11656,49 @@ mod tests {
         assert!(batch_phases.contains("final_answer_first_provider_event_wait"));
         assert!(batch_phases.contains("final_answer_model_duration"));
         assert_eq!(batch_phases, stream_phases);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn real_contact_replay_recovers_from_live_tool_decision_without_exposure() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let case = ContactReplayCase::spanish_email()
+            .with_final_answer_fault(ContactReplayFinalAnswerFault::LiveToolDecisionOnce);
+        let (answer, state, answer_deltas, trace_deltas, transported_signals) =
+            run_real_contact_replay(false, true, true, case, true, false, false, false).await;
+
+        assert_eq!(
+            answer,
+            "The current Resource Directory contact is fresh@example.test."
+        );
+        assert_eq!(answer_deltas.concat(), answer);
+        assert!(!answer.contains("Buscando"));
+        assert!(!answer.contains("Tool decision"));
+        assert!(!answer.contains("find_resources"));
+        assert_eq!(
+            state.final_answer_fault_attempts.load(Ordering::SeqCst),
+            2,
+            "the grounded final answer should make one quarantined attempt and one retry"
+        );
+        assert_eq!(state.final_answer_requests.lock().unwrap().len(), 3);
+        assert_eq!(state.resource_requests.lock().unwrap().len(), 2);
+        assert!(trace_deltas.iter().any(|delta| {
+            delta.kind == "tool_result" && delta.status.as_deref() == Some("succeeded")
+        }));
+        assert!(trace_deltas.iter().any(|delta| {
+            delta.kind == "timing"
+                && delta.metadata["phase"] == json!("final_answer_response_header_wait")
+                && delta.metadata["attempt"] == json!(2)
+        }));
+        assert!(!transported_signals.iter().any(|signal| matches!(
+            signal,
+            ConversationStreamSignal::Answer(delta)
+                if delta.contains("Buscando")
+                    || delta.contains("Tool decision")
+                    || delta.contains("find_resources")
+        )));
     }
 
     #[tokio::test]
@@ -11775,6 +11996,7 @@ mod tests {
             help_type: "legal".to_string(),
             contact_key: "email".to_string(),
             contact_value: "unused@example.test".to_string(),
+            final_answer_fault: ContactReplayFinalAnswerFault::None,
         };
         let (benign_answer, benign_state, _, benign_trace_deltas, _) =
             run_real_contact_replay(false, false, true, benign_case, false, false, false, false)

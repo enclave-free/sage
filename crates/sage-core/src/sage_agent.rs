@@ -1311,6 +1311,42 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
     has_name_field && has_args_field
 }
 
+const LOOKUP_PROCESS_NARRATION_OPENERS: [&str; 2] = ["looking up", "buscando"];
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessNarrationOpeningMatch {
+    None,
+    Partial,
+    Complete,
+}
+
+#[allow(dead_code)]
+pub(crate) fn lookup_process_narration_opening(value: &str) -> ProcessNarrationOpeningMatch {
+    let opening = value.trim_start().to_lowercase();
+    if LOOKUP_PROCESS_NARRATION_OPENERS
+        .iter()
+        .any(|candidate| opening.starts_with(candidate))
+    {
+        return ProcessNarrationOpeningMatch::Complete;
+    }
+    if !opening.is_empty()
+        && LOOKUP_PROCESS_NARRATION_OPENERS
+            .iter()
+            .any(|candidate| candidate.starts_with(&opening))
+    {
+        return ProcessNarrationOpeningMatch::Partial;
+    }
+    ProcessNarrationOpeningMatch::None
+}
+
+fn contains_lookup_process_narration(value: &str) -> bool {
+    let normalized = value.to_lowercase();
+    LOOKUP_PROCESS_NARRATION_OPENERS
+        .iter()
+        .any(|candidate| normalized.contains(candidate))
+}
+
 fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
     let value = value.trim_start();
     let (first_line, remaining) = value.split_once('\n').unwrap_or((value, ""));
@@ -1354,6 +1390,9 @@ fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
         || same_line_suffix
             .strip_prefix("with ")
             .is_some_and(|arguments| {
+                // This is fail-closed intent classification, not Tool argument
+                // validation. One credible named argument is sufficient even
+                // when the provider appends malformed or prose-like items.
                 arguments.split(',').any(|argument| {
                     let Some((name, value)) = argument.trim().split_once('=') else {
                         return false;
@@ -1395,12 +1434,12 @@ fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
             "i am going to search",
             "i'm going to look up",
             "i am going to look up",
-            "looking up",
             "i need to ",
             "i should ",
         ]
         .iter()
-        .any(|marker| preamble.contains(marker));
+        .any(|marker| preamble.contains(marker))
+            || contains_lookup_process_narration(preamble);
         if starts_line || has_deliberation_preamble || label_index > 0 {
             return true;
         }
