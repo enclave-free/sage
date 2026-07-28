@@ -1243,6 +1243,36 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
             return true;
         }
     }
+    if let Some(tool_start) = lowercase.find("tool:") {
+        let preamble = &lowercase[..tool_start];
+        let invocation = &lowercase[tool_start + "tool:".len()..];
+        let has_invocation = provider_neutral_tool_label_has_invocation(invocation);
+        let starts_line = preamble.is_empty() || preamble.ends_with('\n');
+        let has_deliberation_preamble = [
+            "let me ",
+            "i'll search",
+            "i will search",
+            "i'll look up",
+            "i will look up",
+            "i need to ",
+            "i should ",
+        ]
+        .iter()
+        .any(|marker| preamble.contains(marker));
+        if has_invocation && (starts_line || has_deliberation_preamble) {
+            return true;
+        }
+    }
+    let tool_decision = lowercase.strip_prefix("tool decision:").or_else(|| {
+        lowercase
+            .find("\ntool decision:")
+            .map(|start| &lowercase[start + "\ntool decision:".len()..])
+    });
+    if let Some(decision) = tool_decision {
+        if provider_neutral_tool_label_has_invocation(decision) {
+            return true;
+        }
+    }
     if lowercase.starts_with("```") {
         let after_open = candidate.strip_prefix("```").unwrap_or(candidate);
         let fenced = after_open
@@ -1303,6 +1333,47 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
         || lowercase.contains("\nargs:")
         || lowercase.contains("\narguments:");
     has_name_field && has_args_field
+}
+
+fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
+    let value = value.trim_start();
+    let first_line = value.lines().next().unwrap_or(value).trim();
+    let name_end = first_line
+        .find(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        })
+        .unwrap_or(first_line.len());
+    if name_end == 0 {
+        return false;
+    }
+    let name = &first_line[..name_end];
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return false;
+    }
+    let same_line_suffix = first_line[name_end..].trim_start();
+    if same_line_suffix.starts_with('(') || same_line_suffix.starts_with('{') {
+        return true;
+    }
+    if !same_line_suffix.is_empty() {
+        return false;
+    }
+
+    let remaining = value[first_line.len()..].trim_start();
+    if remaining.starts_with('{') || remaining.starts_with('[') || remaining.starts_with("```json")
+    {
+        return true;
+    }
+    let Some(arguments) = remaining
+        .strip_prefix("args:")
+        .or_else(|| remaining.strip_prefix("arguments:"))
+    else {
+        return false;
+    };
+    let arguments = arguments.trim_start();
+    arguments.starts_with('{') || arguments.starts_with('[') || arguments.starts_with("```json")
 }
 
 fn json_has_tool_intent(value: &serde_json::Value) -> bool {
@@ -2749,11 +2820,29 @@ mod tests {
         assert!(has_syntactic_tool_intent(
             "I will search now. Tool calls: knowledge_search(query=\"referral\")\nTool Result: found one"
         ));
+        assert!(has_syntactic_tool_intent(
+            "I'll look up the current contact details. Tool: find_resources(help_type=\"legal\")"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool decision: find_resources\n\nArgs:\n```json\n{\"offset\":30}\n```"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool: find_resources\n\nArgs:\n{\"query\":\"Issue 539 Inventory\"}"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool: find_resources\n```json\n{\"query\":\"Issue 539 Inventory\",\"offset\":30}\n```"
+        ));
         assert!(!has_syntactic_tool_intent(
             "The Activity panel labels these sections Tool calls: and Tool Result: so you can audit the turn."
         ));
         assert!(!has_syntactic_tool_intent(
             "For example, the Activity panel may show Tool calls: knowledge_search(query=\"referral\")."
+        ));
+        assert!(!has_syntactic_tool_intent(
+            "The Curated Resources Tool: finds vetted organizations when contact details are requested."
+        ));
+        assert!(!has_syntactic_tool_intent(
+            "The Tool decision: section in Activity explains which lookup ran."
         ));
     }
 

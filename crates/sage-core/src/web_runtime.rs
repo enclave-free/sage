@@ -7526,12 +7526,14 @@ enum PlainAnswerOpeningDisposition {
 }
 
 impl PlainAnswerStreamState {
-    const STRUCTURAL_START_MARKERS: [&'static str; 18] = [
+    const STRUCTURAL_START_MARKERS: [&'static str; 20] = [
         "[[ ##",
         "<tool_call",
         "</tool_call",
         "<|tool_call",
         "tool_calls:",
+        "tool:",
+        "tool decision:",
         "function_call:",
         "\"tool_calls\"",
         "'tool_calls'",
@@ -7770,6 +7772,8 @@ impl PlainAnswerStreamState {
             lowercase.find("</tool_call"),
             lowercase.find("<|tool_call"),
             lowercase.find("tool calls:"),
+            lowercase.find("tool:"),
+            lowercase.find("tool decision:"),
         ]
         .into_iter()
         .flatten()
@@ -7788,6 +7792,8 @@ impl PlainAnswerStreamState {
             let indent = line.len() - trimmed.len();
             if [
                 "tool_calls:",
+                "tool:",
+                "tool decision:",
                 "function_call:",
                 "\"tool_calls\"",
                 "'tool_calls'",
@@ -7825,6 +7831,9 @@ impl PlainAnswerStreamState {
         {
             return None;
         }
+        if Self::provider_neutral_tool_label_is_definitive_prose(candidate) {
+            return Some(candidate.len());
+        }
         let newline = candidate.find('\n')?;
         let next_line = candidate[newline + 1..].trim_start_matches(char::is_whitespace);
         if next_line.is_empty()
@@ -7835,6 +7844,27 @@ impl PlainAnswerStreamState {
             return None;
         }
         Some(newline + 1)
+    }
+
+    fn provider_neutral_tool_label_is_definitive_prose(candidate: &str) -> bool {
+        let lowercase = candidate.to_ascii_lowercase();
+        let Some(value) = lowercase
+            .strip_prefix("tool:")
+            .or_else(|| lowercase.strip_prefix("tool decision:"))
+        else {
+            return false;
+        };
+        let first_line = value.lines().next().unwrap_or(value).trim();
+        let name_end = first_line
+            .find(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+            })
+            .unwrap_or(first_line.len());
+        if name_end == 0 {
+            return false;
+        }
+        let suffix = first_line[name_end..].trim_start();
+        !suffix.is_empty() && !suffix.starts_with('(') && !suffix.starts_with('{')
     }
 
     fn balanced_structure_end(candidate: &str) -> Option<usize> {
@@ -9743,6 +9773,124 @@ mod tests {
             .expect_err("a serialized Tool transcript must be rejected");
 
         assert!(error.message.contains("textual Tool intent"));
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_provider_neutral_tool_invocation_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("I'll look up the current contact details. To", &sender)
+            .expect("process narration should remain quarantined");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push(
+                "ol: find_resources(help_type=\"legal\", query=\"Issue 539 Legal Aid\")",
+                &sender,
+            )
+            .expect_err("provider-neutral textual Tool syntax must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_provider_neutral_tool_decision_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("Tool deci", &sender)
+            .expect("partial Tool decision marker should remain pending");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push(
+                "sion: find_resources\n\nArgs:\n```json\n{\"offset\":30}\n```",
+                &sender,
+            )
+            .expect_err("provider-neutral Tool decision syntax must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_provider_neutral_tool_args_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("To", &sender)
+            .expect("partial Tool marker should remain pending");
+        assert!(delta_rx.try_recv().is_err());
+        state
+            .push("ol: find_resources\n\nAr", &sender)
+            .expect("Tool label should remain pending until its argument structure arrives");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push("gs:\n{\"query\":\"Issue 539 Inventory\"}", &sender)
+            .expect_err("provider-neutral Tool plus Args syntax must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_provider_neutral_tool_json_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push(
+                "I need to retrieve the final page. Tool: find_resources\n```js",
+                &sender,
+            )
+            .expect("deliberation and partial JSON fence should remain quarantined");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push(
+                "on\n{\"query\":\"Issue 539 Inventory\",\"offset\":30}\n```",
+                &sender,
+            )
+            .expect_err("provider-neutral Tool plus direct JSON syntax must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_streams_ordinary_tool_prose_without_waiting_for_finish() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+        let prose = "The Curated Resources Tool: finds vetted organizations when contact details are requested.";
+
+        state
+            .push(prose, &sender)
+            .expect("ordinary explanatory Tool prose must remain public");
+
+        let mut streamed = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            streamed.push(answer_signal(signal));
+        }
+        assert_eq!(streamed.concat(), prose);
+        state
+            .finish(&sender)
+            .expect("already streamed explanatory prose should finish cleanly");
         assert!(delta_rx.try_recv().is_err());
     }
 
