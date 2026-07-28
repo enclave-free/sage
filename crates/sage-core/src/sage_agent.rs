@@ -1397,11 +1397,13 @@ fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
                     let Some((name, value)) = argument.trim().split_once('=') else {
                         return false;
                     };
+                    let name = name.trim();
+                    let value = value.trim();
                     !name.is_empty()
                         && name
                             .chars()
                             .all(|character| character.is_ascii_alphanumeric() || character == '_')
-                        && !value.trim().is_empty()
+                        && !value.is_empty()
                 })
             })
 }

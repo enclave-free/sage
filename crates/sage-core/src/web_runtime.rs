@@ -7713,15 +7713,18 @@ impl PlainAnswerStreamState {
             "for the most relevant",
         ];
 
-        let opening = value
+        let normalized_opening = value
             .trim_start()
             .to_ascii_lowercase()
             .replace('’', "'")
             .replace('‘', "'");
+        let opening = normalized_opening
+            .trim_start_matches(['*', '_', '-', '+', '#', '>', '•'])
+            .trim_start();
         if opening.is_empty() {
             return PlainAnswerOpeningDisposition::Undecided;
         }
-        match lookup_process_narration_opening(&opening) {
+        match lookup_process_narration_opening(opening) {
             ProcessNarrationOpeningMatch::Complete => {
                 return PlainAnswerOpeningDisposition::Quarantine;
             }
@@ -7749,7 +7752,7 @@ impl PlainAnswerStreamState {
         if DELIBERATION_OPENERS
             .iter()
             .chain(PROCESS_NARRATION_OPENERS.iter())
-            .any(|candidate| candidate.starts_with(&opening))
+            .any(|candidate| candidate.starts_with(opening))
         {
             return PlainAnswerOpeningDisposition::Undecided;
         }
@@ -9933,13 +9936,13 @@ mod tests {
         let mut state = PlainAnswerStreamState::default();
 
         state
-            .push("Bus", &sender)
+            .push("- Bus", &sender)
             .expect("a partial Spanish lookup opener should remain pending");
         assert!(delta_rx.try_recv().is_err());
 
         let error = state
             .push(
-                "cando el email para Issue 539 Legal Aid. Tool decision: find_resources with query=\"Issue 539 Legal Aid\"",
+                "cando el email para Issue 539 Legal Aid. Tool decision: find_resources with query = \"Issue 539 Legal Aid\"",
                 &sender,
             )
             .expect_err("Spanish lookup narration plus Tool syntax must be rejected");
@@ -10386,8 +10389,8 @@ mod tests {
             let attempt = attempts.fetch_add(1, Ordering::SeqCst);
             let body = if attempt == 0 {
                 concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"Looking up the email for Issue 539 Legal Aid in Mexico. \"}}]}\n\n",
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"Tool decision: find_resources with help_type=\\\"legal\\\", language=\\\"en\\\", region=\\\"Mexico\\\", query=\\\"Issue 539 Legal Aid\\\"\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"**Loo\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"king up the email for Issue 539 Legal Aid in Mexico.** Tool decision: find_resources with help_type = \\\"legal\\\", language = \\\"en\\\", region = \\\"Mexico\\\", query = \\\"Issue 539 Legal Aid\\\"\"}}]}\n\n",
                     "data: [DONE]\n\n"
                 )
             } else {
@@ -11038,7 +11041,7 @@ mod tests {
                     state.case.stale_contact_value()
                 )
             } else if live_tool_decision_fault {
-                "Buscando el email para Acme Legal Aid en México. Tool decision: find_resources with help_type=\"legal\", language=\"es\", region=\"Mexico\", query=\"Acme Legal Aid\"".to_string()
+                "- Buscando el email para Acme Legal Aid en México. Tool decision: find_resources with help_type = \"legal\", language = \"es\", region = \"Mexico\", query = \"Acme Legal Aid\"".to_string()
             } else if body_text.contains("No vetted") {
                 "No matching current contact is currently listed.".to_string()
             } else if !expects_curated_resource_lookup(&state.case.followup) {
