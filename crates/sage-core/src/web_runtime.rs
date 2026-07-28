@@ -7562,6 +7562,7 @@ enum PlainAnswerOpeningDisposition {
     Undecided,
     Stream,
     Quarantine,
+    QuarantineProcessNarration,
 }
 
 impl PlainAnswerStreamState {
@@ -7604,6 +7605,17 @@ impl PlainAnswerStreamState {
             PlainAnswerOpeningDisposition::Undecided
         ) {
             self.opening_disposition = Self::classify_opening(&self.pending);
+        } else if matches!(
+            self.opening_disposition,
+            PlainAnswerOpeningDisposition::Quarantine
+        ) && matches!(
+            Self::classify_opening(&self.pending),
+            PlainAnswerOpeningDisposition::QuarantineProcessNarration
+        ) {
+            // A held explanatory prefix can become lookup narration only
+            // after a later chunk. Upgrade fail-closed, but never downgrade a
+            // held opening to public streaming before the provider finishes.
+            self.opening_disposition = PlainAnswerOpeningDisposition::QuarantineProcessNarration;
         }
         if !matches!(
             self.opening_disposition,
@@ -7621,8 +7633,48 @@ impl PlainAnswerStreamState {
     ) -> std::result::Result<(), PlainAnswerGenerationError> {
         self.reject_repetition()?;
         self.reject_tool_intent(&self.pending)?;
+        if matches!(
+            self.opening_disposition,
+            PlainAnswerOpeningDisposition::QuarantineProcessNarration
+        ) && !Self::has_only_embedded_tool_identifiers(&self.pending)
+        {
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::ToolIntent,
+                "final plain-answer stream opened with lookup process narration instead of a clean user-facing answer; refusing to expose it",
+                self.emitted_any,
+            ));
+        }
         self.emit_pending_prefix_staged(self.pending.len(), answer_deltas);
         Ok(())
+    }
+
+    /// Preserve ordinary code-like identifiers such as `devtool:build` and
+    /// `namespace.tool:build`. Unlike a textual Tool envelope, these have a
+    /// lower-case embedded `tool:` segment followed immediately by a name.
+    fn has_only_embedded_tool_identifiers(value: &str) -> bool {
+        let lowercase = value.to_ascii_lowercase();
+        let mut labels = lowercase.match_indices("tool:").peekable();
+        if labels.peek().is_none() {
+            return false;
+        }
+        labels.all(|(start, label)| {
+            if &value[start..start + label.len()] != "tool:" {
+                return false;
+            }
+            let has_embedded_prefix = value[..start].chars().next_back().is_some_and(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+            });
+            if !has_embedded_prefix {
+                return false;
+            }
+            let suffix = &value[start + label.len()..];
+            let name_len = suffix
+                .find(|character: char| {
+                    !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+                })
+                .unwrap_or(suffix.len());
+            name_len > 0
+        })
     }
 
     fn reject_repetition(&self) -> std::result::Result<(), PlainAnswerGenerationError> {
@@ -7689,12 +7741,14 @@ impl PlainAnswerStreamState {
             "the user is asking",
             "we need to answer",
         ];
-        const PROCESS_NARRATION_OPENERS: [&str; 4] = [
-            "i want to make sure",
+        const DIRECT_LOOKUP_NARRATION_OPENERS: [&str; 4] = [
             "i'm going to search",
             "i am going to search",
-            "before i answer",
+            "i'll look up",
+            "i will look up",
         ];
+        const HELD_PROCESS_NARRATION_OPENERS: [&str; 2] =
+            ["i want to make sure", "before i answer"];
         const PROCESS_NARRATION_SUBJECTS: [&str; 8] = [
             "i ",
             "i'm ",
@@ -7736,32 +7790,57 @@ impl PlainAnswerStreamState {
         }
         match lookup_process_narration_opening(opening) {
             ProcessNarrationOpeningMatch::Complete => {
-                return PlainAnswerOpeningDisposition::Quarantine;
+                return PlainAnswerOpeningDisposition::QuarantineProcessNarration;
             }
             ProcessNarrationOpeningMatch::Partial => {
                 return PlainAnswerOpeningDisposition::Undecided;
             }
             ProcessNarrationOpeningMatch::None => {}
         }
+        if DIRECT_LOOKUP_NARRATION_OPENERS
+            .iter()
+            .any(|candidate| opening.starts_with(candidate))
+        {
+            return PlainAnswerOpeningDisposition::QuarantineProcessNarration;
+        }
+        let has_process_narration = PROCESS_NARRATION_SUBJECTS.iter().any(|subject| {
+            opening.match_indices(subject).any(|(start, matched)| {
+                let has_word_boundary = start == 0
+                    || opening[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|character| !character.is_alphanumeric());
+                if !has_word_boundary {
+                    return false;
+                }
+                let predicate = opening[start + matched.len()..].trim_start();
+                let predicate = predicate.strip_prefix("to ").unwrap_or(predicate);
+                PROCESS_NARRATION_ACTIONS
+                    .iter()
+                    .any(|action| predicate.starts_with(action))
+            })
+        });
+        if HELD_PROCESS_NARRATION_OPENERS
+            .iter()
+            .any(|candidate| opening.starts_with(candidate))
+            && has_process_narration
+        {
+            return PlainAnswerOpeningDisposition::QuarantineProcessNarration;
+        }
         if DELIBERATION_OPENERS
             .iter()
-            .chain(PROCESS_NARRATION_OPENERS.iter())
+            .chain(HELD_PROCESS_NARRATION_OPENERS.iter())
             .any(|candidate| opening.starts_with(candidate))
         {
             return PlainAnswerOpeningDisposition::Quarantine;
         }
-        if PROCESS_NARRATION_SUBJECTS
-            .iter()
-            .any(|subject| opening.contains(subject))
-            && PROCESS_NARRATION_ACTIONS
-                .iter()
-                .any(|action| opening.contains(action))
-        {
-            return PlainAnswerOpeningDisposition::Quarantine;
+        if has_process_narration {
+            return PlainAnswerOpeningDisposition::QuarantineProcessNarration;
         }
         if DELIBERATION_OPENERS
             .iter()
-            .chain(PROCESS_NARRATION_OPENERS.iter())
+            .chain(DIRECT_LOOKUP_NARRATION_OPENERS.iter())
+            .chain(HELD_PROCESS_NARRATION_OPENERS.iter())
             .any(|candidate| candidate.starts_with(opening))
         {
             return PlainAnswerOpeningDisposition::Undecided;
@@ -8835,6 +8914,51 @@ mod tests {
             ConversationStreamSignal::Trace(delta) => {
                 panic!("expected answer signal, received trace {}", delta.id)
             }
+        }
+    }
+
+    fn assert_plain_answer_rejected_without_exposure_for_every_split(candidate: &str) {
+        for split in candidate.char_indices().map(|(index, _)| index).skip(1) {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            let first_result = state.push(&candidate[..split], &sender);
+            assert!(
+                delta_rx.try_recv().is_err(),
+                "split {split} exposed an unsafe candidate before completion: {candidate:?}"
+            );
+            let error = match first_result {
+                Err(error) => error,
+                Ok(()) => state
+                    .push(&candidate[split..], &sender)
+                    .and_then(|_| state.finish(&sender))
+                    .expect_err("unsafe candidate must be rejected"),
+            };
+
+            assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+            assert!(!error.emitted_any);
+            assert!(delta_rx.try_recv().is_err());
+        }
+    }
+
+    fn assert_plain_answer_preserved_for_every_split(candidate: &str) {
+        for split in candidate.char_indices().map(|(index, _)| index).skip(1) {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::default();
+
+            state
+                .push(&candidate[..split], &sender)
+                .and_then(|_| state.push(&candidate[split..], &sender))
+                .and_then(|_| state.finish(&sender))
+                .expect("ordinary prose must remain a valid plain answer");
+
+            let mut deltas = Vec::new();
+            while let Ok(signal) = delta_rx.try_recv() {
+                deltas.push(answer_signal(signal));
+            }
+            assert_eq!(deltas.concat(), candidate, "split {split}");
         }
     }
 
@@ -10057,6 +10181,34 @@ mod tests {
     }
 
     #[test]
+    fn plain_answer_safety_rejects_period_joined_tool_envelope_for_every_two_chunk_split() {
+        let candidate = concat!(
+            "I'll look up the current contact details for Issue 539 Legal Aid in Mexico.",
+            "Tool: find_resources\n",
+            "Args: {\"query\": \"Issue 539 Legal Aid\", \"help_type\": \"legal\", ",
+            "\"region\": \"Mexico\", \"language\": \"en\"}",
+        );
+        assert_plain_answer_rejected_without_exposure_for_every_split(candidate);
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_lookup_narration_only_for_every_two_chunk_split() {
+        for candidate in [
+            "I'll look up the current contact details for Issue 539 Legal Aid in Mexico.",
+            "Before I answer, I will look up the current contact details.",
+            "I want to make sure I search for the current contact details.",
+            concat!(
+                "I'll look up the contact details for Issue 539 Legal Aid in Mexico right away.",
+                "Tool: find_resources(help_type=\"legal\", language=\"en\", ",
+                "query=\"Issue 539 Legal Aid\", region=\"Mexico\")",
+            ),
+            "I'll look up devtool:build first. Tool: find_resources(query=\"legal aid\")",
+        ] {
+            assert_plain_answer_rejected_without_exposure_for_every_split(candidate);
+        }
+    }
+
+    #[test]
     fn plain_answer_safety_rejects_selected_tool_label_for_every_two_chunk_split() {
         let candidate = "Selected Tool: find_resources";
 
@@ -10234,25 +10386,12 @@ mod tests {
     fn plain_answer_safety_allows_held_explanatory_tool_labels() {
         for candidate in [
             "Before I answer, here is the Curated Resources Tool: overview",
+            "Before I answer, the Search Tool label is Tool: overview",
+            "Before I answer the question about search algorithms, here is the explanation.",
+            "I want to make sure the search field is configured correctly.",
             "To provide you the exact label, the Activity label is Tool: done",
         ] {
-            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
-            let sender = Some(delta_tx);
-            let mut state = PlainAnswerStreamState::default();
-
-            state
-                .push(candidate, &sender)
-                .expect("held explanatory Tool prose should remain a candidate");
-            assert!(delta_rx.try_recv().is_err());
-            state
-                .finish(&sender)
-                .expect("held explanatory Tool prose should be released at finish");
-
-            let mut deltas = Vec::new();
-            while let Ok(signal) = delta_rx.try_recv() {
-                deltas.push(answer_signal(signal));
-            }
-            assert_eq!(deltas.concat(), candidate);
+            assert_plain_answer_preserved_for_every_split(candidate);
         }
     }
 
@@ -10290,24 +10429,13 @@ mod tests {
 
     #[test]
     fn plain_answer_safety_streams_embedded_tool_identifier_for_every_split() {
-        let candidate = "Run devtool:build to compile the local demo.";
-
-        for split in candidate.char_indices().map(|(index, _)| index).skip(1) {
-            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
-            let sender = Some(delta_tx);
-            let mut state = PlainAnswerStreamState::default();
-
-            state
-                .push(&candidate[..split], &sender)
-                .and_then(|_| state.push(&candidate[split..], &sender))
-                .and_then(|_| state.finish(&sender))
-                .expect("embedded tool: identifier must remain ordinary prose");
-
-            let mut deltas = Vec::new();
-            while let Ok(signal) = delta_rx.try_recv() {
-                deltas.push(answer_signal(signal));
-            }
-            assert_eq!(deltas.concat(), candidate, "split {split}");
+        for candidate in [
+            "Run devtool:build to compile the local demo.",
+            "Run namespace.tool:build to compile the local demo.",
+            "I'll look up devtool:build before answering.",
+            "I'll look up namespace.tool:build before answering.",
+        ] {
+            assert_plain_answer_preserved_for_every_split(candidate);
         }
     }
 
@@ -10869,6 +10997,74 @@ mod tests {
         assert_eq!(deltas.concat(), answer);
         assert!(!answer.contains("Tool decision"));
         assert!(!answer.contains("find_resources"));
+    }
+
+    #[tokio::test]
+    async fn plain_answer_generator_retries_lookup_narration_without_exposure() {
+        async fn completion(
+            State(attempts): State<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> impl IntoResponse {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let body = if attempt == 0 {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"I'll look up the current contact details for Issue 539 Legal Aid in Mexico.\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            } else {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"The current Resource Directory email is fresh-539@example.test.\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            };
+            ([("content-type", "text/event-stream")], body)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_attempts),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = PlainAnswerPrompt {
+            system: "answer from the completed Resource Directory result".to_string(),
+            user: "give me the current email".to_string(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let answer = generator
+            .generate(&prompt, "test-model", Some(delta_tx), None)
+            .await
+            .expect("lookup narration should be quarantined and replaced by a clean retry");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            answer,
+            "The current Resource Directory email is fresh-539@example.test."
+        );
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+        assert_eq!(deltas.concat(), answer);
+        assert!(!answer.contains("I'll look up"));
     }
 
     #[tokio::test]

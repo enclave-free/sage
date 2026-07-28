@@ -1461,6 +1461,14 @@ pub(crate) fn provider_neutral_tool_label_start_at_or_after(
         .min()
 }
 
+fn provider_neutral_tool_label_has_argument_section(value: &str) -> bool {
+    let Some((_, remaining)) = value.split_once('\n') else {
+        return false;
+    };
+    let remaining = remaining.trim_start();
+    remaining.starts_with("args:") || remaining.starts_with("arguments:")
+}
+
 fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
     let candidate = candidate.to_ascii_lowercase();
     let mut labels = Vec::new();
@@ -1474,10 +1482,12 @@ fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
     labels.sort_unstable_by_key(|(start, _)| *start);
 
     for (start, label) in labels {
-        if !provider_neutral_tool_label_has_lexical_boundary(&candidate, start) {
+        let invocation = &candidate[start + label.len()..];
+        if !provider_neutral_tool_label_has_lexical_boundary(&candidate, start)
+            && !provider_neutral_tool_label_has_argument_section(invocation)
+        {
             continue;
         }
-        let invocation = &candidate[start + label.len()..];
         if provider_neutral_tool_label_has_invocation(invocation) {
             return true;
         }
