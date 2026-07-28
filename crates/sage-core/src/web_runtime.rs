@@ -332,6 +332,8 @@ pub struct ToolCallInfoResponse {
     pub output_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub metadata: Value,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guarded: bool,
 }
@@ -2253,6 +2255,7 @@ impl Tool for KnowledgeSearchTool {
                 query: Some(query.clone()),
                 output_summary: Some(output_summary),
                 warnings,
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2372,6 +2375,12 @@ impl Tool for FindResourcesTool {
                     query: Some(trace_query),
                     output_summary: Some(empty_summary.to_string()),
                     warnings: vec!["no_curated_resources".to_string()],
+                    metadata: json!({
+                        "returned_count": 0,
+                        "total_count": 0,
+                        "has_more": false,
+                        "next_offset": Value::Null,
+                    }),
                     guarded: false,
                 });
             }
@@ -2419,6 +2428,12 @@ impl Tool for FindResourcesTool {
                 } else {
                     Vec::new()
                 },
+                metadata: json!({
+                    "returned_count": returned_count,
+                    "total_count": total_count,
+                    "has_more": response.has_more,
+                    "next_offset": response.next_offset,
+                }),
                 guarded: false,
             });
         }
@@ -2556,6 +2571,7 @@ impl Tool for SearxWebSearchTool {
                     "Web search results were prepared for the answer.".to_string(),
                 ),
                 warnings: Vec::new(),
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2628,6 +2644,7 @@ impl Tool for AdminConfigReadTool {
                 query: Some(self.name.clone()),
                 output_summary: Some(format!("Read {}.", self.name)),
                 warnings: response.warnings.clone(),
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2724,6 +2741,7 @@ impl Tool for AdminConfigSetupSummaryTool {
                     status, missing_count
                 )),
                 warnings: warnings.clone(),
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -2872,6 +2890,7 @@ impl Tool for AdminAgentSettingsReadTool {
                 query: Some("read_agent_settings".to_string()),
                 output_summary: Some("Read read_agent_settings.".to_string()),
                 warnings: warnings.clone(),
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -3131,6 +3150,7 @@ impl Tool for AdminConfigDirectTool {
                 query: Some(self.name.clone()),
                 output_summary: Some(format!("{}: {} {}", self.name, outcome, changed_summary)),
                 warnings,
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -3188,6 +3208,7 @@ impl AdminDbQueryTool {
                     query: Some(sql),
                     output_summary: Some(error.clone()),
                     warnings: vec!["db_query_rejected".to_string()],
+                    metadata: json!({}),
                     guarded: true,
                 });
             }
@@ -3201,6 +3222,7 @@ impl AdminDbQueryTool {
                 query: Some(sql.clone()),
                 output_summary: Some("Database results were redacted from the trace.".to_string()),
                 warnings: vec!["raw_results_redacted".to_string()],
+                metadata: json!({}),
                 guarded: false,
             });
         }
@@ -7083,10 +7105,12 @@ fn dedupe_tool_calls(tools: Vec<ToolCallInfoResponse>) -> Vec<ToolCallInfoRespon
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for tool in tools {
+        let metadata = serde_json::to_string(&tool.metadata).unwrap_or_default();
         let key = format!(
-            "{}::{}",
+            "{}::{}::{}",
             tool.tool_id,
-            tool.query.clone().unwrap_or_default()
+            tool.query.clone().unwrap_or_default(),
+            metadata,
         );
         if seen.insert(key) {
             deduped.push(tool);
@@ -7162,7 +7186,7 @@ fn build_conversation_trace(
                 } else if is_db_query {
                     json!({ "redacted": true })
                 } else {
-                    json!({})
+                    tool.metadata
                 },
             }
         })
@@ -7408,6 +7432,7 @@ fn tool_call_info_for_id(tool_id: &str, query: String) -> ToolCallInfoResponse {
         query: Some(query),
         output_summary: None,
         warnings: Vec::new(),
+        metadata: json!({}),
         guarded: false,
     }
 }
@@ -9276,6 +9301,7 @@ mod tests {
                 query: Some("Acme Legal Aid".to_string()),
                 output_summary: Some("Fresh result".to_string()),
                 warnings: Vec::new(),
+                metadata: json!({}),
                 guarded: false,
             }],
             Some(ConversationTraceResponse {
@@ -9983,6 +10009,42 @@ mod tests {
                 &sender,
             )
             .expect_err("an Args block must override a prose-like same-line suffix");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_curly_apostrophe_search_narration_at_finish() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        let error = state
+            .push(
+                "I’m going to search. Tool: find_resources(query=\"legal aid\")",
+                &sender,
+            )
+            .expect_err("textual Tool intent must be rejected before exposure");
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_split_curly_apostrophe_search_narration() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("I’m going to search. To", &sender)
+            .expect("ambiguous prefix should remain quarantined");
+        assert!(delta_rx.try_recv().is_err());
+        let error = state
+            .push("ol: find_resources(query=\"legal aid\")", &sender)
+            .expect_err("split textual Tool intent must be rejected before exposure");
 
         assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
         assert!(!error.emitted_any);
@@ -11327,6 +11389,7 @@ mod tests {
                 query: Some("Acme Legal Aid".to_string()),
                 output_summary: Some("Fresh result".to_string()),
                 warnings: Vec::new(),
+                metadata: json!({}),
                 guarded: false,
             }],
             Some(ConversationTraceResponse {
@@ -12391,6 +12454,15 @@ mod tests {
                 "Returned 1 of 6 matching ready Curated Resources; more results are available at offset 6."
             )
         );
+        assert_eq!(
+            traces[0].metadata,
+            json!({
+                "returned_count": 1,
+                "total_count": 6,
+                "has_more": true,
+                "next_offset": 6,
+            })
+        );
 
         let (token, payload) = seen_rx
             .await
@@ -12504,6 +12576,15 @@ mod tests {
         assert_eq!(
             traces[0].output_summary.as_deref(),
             Some("Returned all 1 matching ready Curated Resources.")
+        );
+        assert_eq!(
+            traces[0].metadata,
+            json!({
+                "returned_count": 1,
+                "total_count": 1,
+                "has_more": false,
+                "next_offset": Value::Null,
+            })
         );
 
         let (token, payload) = seen_rx
@@ -13872,6 +13953,7 @@ mod tests {
         };
         let tool = ToolCallInfoResponse {
             output_summary: Some("Read the current admin configuration.".to_string()),
+            metadata: json!({"allowlisted": true}),
             ..tool_call_info_for_id("admin-config", "Check setup status.".to_string())
         };
 
@@ -13894,11 +13976,39 @@ mod tests {
                 trace.tools[0].output_summary.as_deref(),
                 Some("Read the current admin configuration.")
             );
+            assert_eq!(trace.tools[0].metadata, json!({"allowlisted": true}));
             assert_eq!(
                 trace.activity_steps[0].summary.as_deref(),
                 Some("Read the current admin configuration.")
             );
         }
+    }
+
+    #[test]
+    fn tool_trace_deduplication_preserves_distinct_resource_pages() {
+        let mut first = tool_call_info_for_id(
+            "curated-resources",
+            "curated resources inventory matching Issue 539 Inventory".to_string(),
+        );
+        first.metadata = json!({
+            "returned_count": 10,
+            "total_count": 11,
+            "has_more": true,
+            "next_offset": 10,
+        });
+        let mut final_page = first.clone();
+        final_page.metadata = json!({
+            "returned_count": 1,
+            "total_count": 11,
+            "has_more": false,
+            "next_offset": Value::Null,
+        });
+
+        let deduped = dedupe_tool_calls(vec![first.clone(), final_page.clone(), first.clone()]);
+
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].metadata, first.metadata);
+        assert_eq!(deduped[1].metadata, final_page.metadata);
     }
 
     #[test]
@@ -14012,6 +14122,7 @@ mod tests {
                     query: Some("SELECT encrypted_value FROM settings".to_string()),
                     output_summary: None,
                     warnings: Vec::new(),
+                    metadata: json!({}),
                     guarded: false,
                 },
             ],
@@ -14061,6 +14172,7 @@ mod tests {
                 query: Some("DROP TABLE users".to_string()),
                 output_summary: Some("Only SELECT queries are allowed.".to_string()),
                 warnings: vec!["db_query_rejected".to_string()],
+                metadata: json!({}),
                 guarded: true,
             }],
             Vec::new(),
@@ -14115,6 +14227,7 @@ mod tests {
                 query: Some("current compliance references".to_string()),
                 output_summary: Some("Optional tool could not be prepared.".to_string()),
                 warnings: vec!["optional_tool_failed".to_string()],
+                metadata: json!({}),
                 guarded: true,
             }],
             Vec::new(),

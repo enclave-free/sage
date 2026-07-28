@@ -1224,7 +1224,10 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
         return true;
     }
 
-    let lowercase = candidate.to_ascii_lowercase();
+    // Use the same apostrophe normalization as the opening classifier's
+    // process-narration vocabulary so held text cannot become releasable only
+    // because the provider used a typographic apostrophe.
+    let lowercase = candidate.to_ascii_lowercase().replace(['’', '‘'], "'");
     if let Some(tool_calls_start) = lowercase.find("tool calls:") {
         let preamble = &lowercase[..tool_calls_start];
         let transcript = &lowercase[tool_calls_start + "tool calls:".len()..];
@@ -1373,6 +1376,10 @@ fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
             "i will search",
             "i'll look up",
             "i will look up",
+            "i'm going to search",
+            "i am going to search",
+            "i'm going to look up",
+            "i am going to look up",
             "i need to ",
             "i should ",
         ]
@@ -2861,6 +2868,12 @@ mod tests {
         ));
         assert!(has_syntactic_tool_intent(
             "Tool: find_resources will run\nArgs: {\"query\":\"legal aid\"}"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "I’m going to search. Tool: find_resources(query=\"legal aid\")"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "I'm going to search. Tool: find_resources(query=\"legal aid\")"
         ));
     }
 
