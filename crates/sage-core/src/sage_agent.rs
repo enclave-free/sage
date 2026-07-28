@@ -1437,13 +1437,24 @@ fn provider_neutral_tool_label_is_explanatory(candidate: &str, start: usize, lab
 }
 
 fn provider_neutral_tool_label_has_lexical_boundary(candidate: &str, start: usize) -> bool {
-    start == 0
-        || candidate[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|character| {
-                !character.is_alphanumeric() && !matches!(character, '_' | '-' | '.')
-            })
+    if start == 0 {
+        return true;
+    }
+    let Some(previous) = candidate[..start].chars().next_back() else {
+        return true;
+    };
+    if !previous.is_alphanumeric() && !matches!(previous, '_' | '-' | '.') {
+        return true;
+    }
+
+    // Providers sometimes join a new, capitalized Tool label directly to the
+    // preceding sentence. Keep lower-case code identifiers such as
+    // `namespace.tool:build` embedded, while treating `.Tool:` and
+    // `.Tool decision:` as sentence-level labels.
+    previous == '.'
+        && candidate[start..]
+            .strip_prefix("Tool")
+            .is_some_and(|suffix| suffix.starts_with(':') || suffix.starts_with(" decision:"))
 }
 
 pub(crate) fn provider_neutral_tool_label_start_at_or_after(
@@ -1456,7 +1467,7 @@ pub(crate) fn provider_neutral_tool_label_start_at_or_after(
         .flat_map(|label| lowercase.match_indices(label).map(|(start, _)| start))
         .filter(|start| {
             *start >= minimum_start
-                && provider_neutral_tool_label_has_lexical_boundary(&lowercase, *start)
+                && provider_neutral_tool_label_has_lexical_boundary(candidate, *start)
         })
         .min()
 }
@@ -1470,11 +1481,11 @@ fn provider_neutral_tool_label_has_argument_section(value: &str) -> bool {
 }
 
 fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
-    let candidate = candidate.to_ascii_lowercase();
+    let lowercase = candidate.to_ascii_lowercase();
     let mut labels = Vec::new();
     for label in ["tool:", "tool decision:"] {
         labels.extend(
-            candidate
+            lowercase
                 .match_indices(label)
                 .map(|(start, _)| (start, label)),
         );
@@ -1482,8 +1493,8 @@ fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
     labels.sort_unstable_by_key(|(start, _)| *start);
 
     for (start, label) in labels {
-        let invocation = &candidate[start + label.len()..];
-        if !provider_neutral_tool_label_has_lexical_boundary(&candidate, start)
+        let invocation = &lowercase[start + label.len()..];
+        if !provider_neutral_tool_label_has_lexical_boundary(candidate, start)
             && !provider_neutral_tool_label_has_argument_section(invocation)
         {
             continue;
@@ -1492,7 +1503,7 @@ fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
             return true;
         }
         if provider_neutral_tool_label_is_bare_name(invocation) {
-            if provider_neutral_tool_label_is_explanatory(&candidate, start, label) {
+            if provider_neutral_tool_label_is_explanatory(&lowercase, start, label) {
                 continue;
             }
             return true;
@@ -2998,6 +3009,9 @@ mod tests {
         ));
         assert!(has_syntactic_tool_intent(
             "I'm going to search. Tool: find_resources(query=\"legal aid\")"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "I need to fetch fresh contact details for this resource before sharing them.Tool decision: find_resources with language=\"es\", query=\"Issue 539 Legal Aid\", help_type=\"legal\", region=\"Mexico\""
         ));
     }
 
