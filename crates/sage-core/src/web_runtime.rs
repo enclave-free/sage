@@ -2438,12 +2438,11 @@ impl Tool for FindResourcesTool {
             });
         }
 
+        let effective_offset = response.offset.max(offset as usize);
+        let effective_limit = response.limit.max(if is_inventory_lookup { 10 } else { 5 });
         let mut output = format!(
             "Showing {} of {} matching ready Curated Resources (offset {}, limit {}).\n",
-            returned_count,
-            total_count,
-            response.offset.max(offset as usize),
-            response.limit.max(if is_inventory_lookup { 10 } else { 5 }),
+            returned_count, total_count, effective_offset, effective_limit,
         );
         if response.has_more {
             if let Some(next_offset) = response.next_offset {
@@ -2454,9 +2453,14 @@ impl Tool for FindResourcesTool {
             } else {
                 output.push_str("more results are available; ask for the next page.\n");
             }
-        } else {
+        } else if effective_offset == 0 && returned_count == total_count {
             output.push_str(
                 "This is the complete set of matching ready Curated Resources for the supplied filters.\n",
+            );
+        } else {
+            output.push_str(
+                "This is the final page of matching ready Curated Resources for the supplied filters; \
+                 no matching results remain after this page.\n",
             );
         }
         output.push('\n');
@@ -12566,6 +12570,10 @@ mod tests {
         assert!(result.output.contains("Helps with: legal, humanitarian"));
         assert!(result.output.contains("email: demo-test@example.test"));
         assert!(result.output.contains("never invent contact details"));
+        assert!(result.output.contains(
+            "This is the final page of matching ready Curated Resources for the supplied filters; no matching results remain after this page."
+        ));
+        assert!(!result.output.contains("This is the complete set"));
 
         let traces = tool.traces.lock().expect("trace sink should lock");
         assert_eq!(traces.len(), 1);
