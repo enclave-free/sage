@@ -1349,7 +1349,22 @@ fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
     }
 
     let same_line_suffix = first_line[name_end..].trim_start();
-    same_line_suffix.starts_with('(') || same_line_suffix.starts_with('{')
+    same_line_suffix.starts_with('(')
+        || same_line_suffix.starts_with('{')
+        || same_line_suffix
+            .strip_prefix("with ")
+            .is_some_and(|arguments| {
+                arguments.split(',').any(|argument| {
+                    let Some((name, value)) = argument.trim().split_once('=') else {
+                        return false;
+                    };
+                    !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                        && !value.trim().is_empty()
+                })
+            })
 }
 
 fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
@@ -1380,6 +1395,7 @@ fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
             "i am going to search",
             "i'm going to look up",
             "i am going to look up",
+            "looking up",
             "i need to ",
             "i should ",
         ]

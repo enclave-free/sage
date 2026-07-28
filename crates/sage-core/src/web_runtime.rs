@@ -7678,11 +7678,12 @@ impl PlainAnswerStreamState {
             "the user is asking",
             "we need to answer",
         ];
-        const PROCESS_NARRATION_OPENERS: [&str; 4] = [
+        const PROCESS_NARRATION_OPENERS: [&str; 5] = [
             "i want to make sure",
             "i'm going to search",
             "i am going to search",
             "before i answer",
+            "looking up",
         ];
         const PROCESS_NARRATION_SUBJECTS: [&str; 8] = [
             "i ",
@@ -8474,7 +8475,7 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
         );
         let retry_prompt = PlainAnswerPrompt {
             system: format!(
-                "{}\n\nThe previous final-answer attempt contained internal planning, repetitive process narration, or an incomplete answer. Retry once. Output only the final answer for the user; do not narrate planning, searches, Tool calls, or Tool results.",
+                "{}\n\nThe previous final-answer attempt contained internal planning, repetitive process narration, or an incomplete answer. Retry once. The Tool phase is already complete; do not attempt or describe another lookup. Output only the final answer for the user. Do not write labels such as `Tool decision`, internal Tool names such as `find_resources` or `knowledge_search`, or serialized Tool arguments such as `key=value`. Use the Tool results already supplied as facts; do not narrate planning, searches, Tool calls, or Tool results.",
                 prompt.system
             ),
             user: prompt.user.clone(),
@@ -10324,6 +10325,145 @@ mod tests {
             deltas.push(answer_signal(signal));
         }
         assert_eq!(deltas.concat(), answer);
+    }
+
+    #[tokio::test]
+    async fn plain_answer_generator_retries_live_style_tool_decision_before_exposure() {
+        async fn completion(
+            State(attempts): State<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> impl IntoResponse {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let body = if attempt == 0 {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Looking up the email for Issue 539 Legal Aid in Mexico. \"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Tool decision: find_resources with help_type=\\\"legal\\\", language=\\\"en\\\", region=\\\"Mexico\\\", query=\\\"Issue 539 Legal Aid\\\"\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            } else {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"The current Resource Directory email is fresh-539@example.test.\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            };
+            ([("content-type", "text/event-stream")], body)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_attempts),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = PlainAnswerPrompt {
+            system: "answer from the completed Resource Directory result".to_string(),
+            user: "give me the current email".to_string(),
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let answer = generator
+            .generate(&prompt, "test-model", Some(delta_tx), None)
+            .await
+            .expect("the live-style Tool decision should be quarantined and retried");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            answer,
+            "The current Resource Directory email is fresh-539@example.test."
+        );
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+        assert_eq!(deltas.concat(), answer);
+        assert!(!answer.contains("Tool decision"));
+        assert!(!answer.contains("find_resources"));
+    }
+
+    #[tokio::test]
+    async fn plain_answer_retry_explicitly_forbids_repeating_tool_syntax() {
+        async fn completion(
+            State(attempts): State<Arc<AtomicUsize>>,
+            Json(request): Json<Value>,
+        ) -> impl IntoResponse {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let retry_instruction = request["messages"][0]["content"]
+                .as_str()
+                .unwrap_or_default();
+            let corrected = attempt > 0
+                && retry_instruction.contains("Tool decision")
+                && retry_instruction.contains("find_resources")
+                && retry_instruction.contains("key=value");
+            let answer = if corrected {
+                "The current Resource Directory email is fresh-539@example.test."
+            } else {
+                "Tool decision: find_resources with query=\"Issue 539 Legal Aid\""
+            };
+            (
+                [("content-type", "text/event-stream")],
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
+                     data: [DONE]\n\n",
+                    serde_json::to_string(answer).unwrap(),
+                ),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_attempts),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = PlainAnswerPrompt {
+            system: "answer from the completed Resource Directory result".to_string(),
+            user: "give me the current email".to_string(),
+        };
+
+        let answer = generator
+            .generate(&prompt, "test-model", None, None)
+            .await
+            .expect("the explicit retry contract should produce a clean answer");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            answer,
+            "The current Resource Directory email is fresh-539@example.test."
+        );
     }
 
     #[tokio::test]
