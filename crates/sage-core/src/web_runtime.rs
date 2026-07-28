@@ -2413,8 +2413,8 @@ impl Tool for FindResourcesTool {
             }
         } else {
             format!(
-                "Returned all {} matching ready Curated Resources.",
-                returned_count
+                "Returned {} of {} matching ready Curated Resources on this page; no remaining results.",
+                returned_count, total_count
             )
         };
         if let Ok(mut sink) = self.traces.lock() {
@@ -12518,10 +12518,10 @@ mod tests {
                             "resolved_country_code": null,
                             "help_type": null,
                             "query": null,
-                            "total_count": 1,
+                            "total_count": 11,
                             "returned_count": 1,
                             "limit": 10,
-                            "offset": 0,
+                            "offset": 10,
                             "has_more": false,
                             "next_offset": null
                         }))
@@ -12552,7 +12552,7 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::new())
+            .execute(&ToolArgs::from([("offset".to_string(), json!(10))]))
             .await
             .expect("resource inventory should succeed");
         server.abort();
@@ -12575,13 +12575,15 @@ mod tests {
         );
         assert_eq!(
             traces[0].output_summary.as_deref(),
-            Some("Returned all 1 matching ready Curated Resources.")
+            Some(
+                "Returned 1 of 11 matching ready Curated Resources on this page; no remaining results."
+            )
         );
         assert_eq!(
             traces[0].metadata,
             json!({
                 "returned_count": 1,
-                "total_count": 1,
+                "total_count": 11,
                 "has_more": false,
                 "next_offset": Value::Null,
             })
@@ -12594,6 +12596,7 @@ mod tests {
         assert!(payload.get("help_type").is_none());
         assert_eq!(payload["jurisdiction"], Value::Null);
         assert_eq!(payload["limit"], 10);
+        assert_eq!(payload["offset"], 10);
     }
 
     #[test]
