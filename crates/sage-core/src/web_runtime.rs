@@ -10520,6 +10520,17 @@ mod tests {
     }
 
     #[test]
+    fn plain_answer_safety_rejects_inline_tool_decision_arguments_for_every_split() {
+        let candidate = concat!(
+            "I need to fetch fresh contact details for this resource before sharing them.",
+            "Tool decision: find_resources with language=\"es\", ",
+            "query=\"Issue 539 Legal Aid\", help_type=\"legal\", region=\"Mexico\"",
+        );
+
+        assert_plain_answer_rejected_without_exposure_for_every_split(candidate);
+    }
+
+    #[test]
     fn plain_answer_safety_rejects_provider_neutral_tool_args_before_exposure() {
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
         let sender = Some(delta_tx);
