@@ -1967,12 +1967,7 @@ impl SageAgent {
             match execution {
                 Ok((result, outcome)) => {
                     let elapsed_ms = call_started_at.elapsed().as_millis();
-                    let status = match outcome {
-                        ConversationTimingOutcome::Succeeded => "succeeded",
-                        ConversationTimingOutcome::Guarded => "guarded",
-                        ConversationTimingOutcome::TimedOut => "timed_out",
-                        ConversationTimingOutcome::Failed => "failed",
-                    };
+                    let status = outcome.as_str();
                     if let Some(phase) = phase {
                         self.emit_trace(AgentTraceEvent::Timing {
                             phase,
@@ -2755,9 +2750,10 @@ impl ToolPlanner for SageAgent {
     }
 
     fn plain_answer_trace_completed(&self, step: usize, elapsed_ms: u128) {
+        let attempt = self.final_answer_attempt.load(Ordering::Relaxed);
         self.emit_trace(AgentTraceEvent::ModelStepCompleted {
             step,
-            attempt: self.final_answer_attempt.load(Ordering::Relaxed),
+            attempt,
             elapsed_ms,
         });
         self.emit_trace(AgentTraceEvent::Timing {
@@ -2765,16 +2761,17 @@ impl ToolPlanner for SageAgent {
             planning_round: Some(step),
             tool_name: None,
             call_id: None,
-            attempt: self.final_answer_attempt.load(Ordering::Relaxed),
+            attempt,
             outcome: ConversationTimingOutcome::Succeeded,
             elapsed_ms,
         });
     }
 
     fn plain_answer_trace_failed(&self, step: usize, elapsed_ms: u128, error: &str) {
+        let attempt = self.final_answer_attempt.load(Ordering::Relaxed);
         self.emit_trace(AgentTraceEvent::ModelStepFailed {
             step,
-            attempt: self.final_answer_attempt.load(Ordering::Relaxed),
+            attempt,
             elapsed_ms,
             error: error.to_string(),
         });
@@ -2783,7 +2780,7 @@ impl ToolPlanner for SageAgent {
             planning_round: Some(step),
             tool_name: None,
             call_id: None,
-            attempt: self.final_answer_attempt.load(Ordering::Relaxed),
+            attempt,
             outcome: ConversationTimingOutcome::Failed,
             elapsed_ms,
         });

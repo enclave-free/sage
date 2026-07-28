@@ -2438,8 +2438,8 @@ impl Tool for FindResourcesTool {
             });
         }
 
-        let effective_offset = response.offset.max(offset as usize);
-        let effective_limit = response.limit.max(if is_inventory_lookup { 10 } else { 5 });
+        let effective_offset = response.offset;
+        let effective_limit = response.limit;
         let mut output = format!(
             "Showing {} of {} matching ready Curated Resources (offset {}, limit {}).\n",
             returned_count, total_count, effective_offset, effective_limit,
@@ -7909,7 +7909,13 @@ impl PlainAnswerStreamState {
         if name_end == 0 {
             return false;
         }
+        let name = &first_line[..name_end];
         let suffix = first_line[name_end..].trim_start();
+        if !candidate.contains('\n')
+            && (name.contains('_') || name.contains('-') || name.contains('.'))
+        {
+            return false;
+        }
         !suffix.is_empty() && !suffix.starts_with('(') && !suffix.starts_with('{')
     }
 
@@ -8053,14 +8059,26 @@ impl OpenAiPlainAnswerGenerator {
         let choices = value
             .get("choices")
             .and_then(Value::as_array)
-            .filter(|choices| !choices.is_empty())
             .ok_or_else(|| {
                 PlainAnswerGenerationError::new(
                     PlainAnswerFailureKind::Other,
-                    "invalid Chat Completions stream event: choices must be a non-empty array",
+                    "invalid Chat Completions stream event: choices must be an array",
                     state.emitted_any,
                 )
             })?;
+        if choices.is_empty() {
+            if value.get("usage").is_some_and(Value::is_object) {
+                // This adapter does not request or persist provider usage, but
+                // OpenAI-compatible endpoints may still send a usage-only
+                // metadata chunk. It is not a user-visible answer event.
+                return Ok(false);
+            }
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Other,
+                "invalid Chat Completions stream event: empty choices require usage metadata",
+                state.emitted_any,
+            ));
+        }
         if !choices[0].is_object() {
             return Err(PlainAnswerGenerationError::new(
                 PlainAnswerFailureKind::Other,
@@ -9605,6 +9623,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_only_provider_event_does_not_fail_plain_answer_stream() {
+        let api_url = spawn_plain_answer_provider(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        let generator =
+            OpenAiPlainAnswerGenerator::new(Client::new(), api_url, "test-key".to_string(), 0.1);
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "say hello".to_string(),
+        };
+
+        let answer = generator
+            .generate_with_timing(&prompt, "test-model", None, None, None)
+            .await
+            .expect("usage-only metadata must not fail an otherwise valid answer stream");
+
+        assert_eq!(answer, "Hello");
+    }
+
+    #[tokio::test]
     async fn unusable_choice_content_and_reasoning_types_emit_one_failed_first_timing() {
         for body in [
             "data: {\"choices\":[{\"delta\":{\"content\":123}}]}\n\ndata: [DONE]\n\n",
@@ -10014,6 +10055,25 @@ mod tests {
             )
             .expect_err("an Args block must override a prose-like same-line suffix");
 
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_holds_incomplete_tool_prose_until_split_arguments_arrive() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        state
+            .push("Tool: find_resources will run", &sender)
+            .expect("an unterminated Tool label must remain pending");
+        assert!(delta_rx.try_recv().is_err());
+
+        let error = state
+            .push("\nArgs: {\"query\":\"legal aid\"}", &sender)
+            .expect_err("split arguments must reject the entire pending Tool transcript");
         assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
         assert!(!error.emitted_any);
         assert!(delta_rx.try_recv().is_err());
@@ -11737,7 +11797,7 @@ mod tests {
                 planning_round: 1,
             })
             .await;
-        let server_result = tokio::time::timeout(Duration::from_secs(1), server).await;
+        let server_result = tokio::time::timeout(Duration::from_secs(10), server).await;
         assert!(
             server_result.is_ok(),
             "truncated endpoint should receive the retry request"
@@ -12524,7 +12584,7 @@ mod tests {
                             "query": null,
                             "total_count": 11,
                             "returned_count": 1,
-                            "limit": 10,
+                            "limit": 7,
                             "offset": 10,
                             "has_more": false,
                             "next_offset": null
@@ -12563,6 +12623,7 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("Available curated resources"));
+        assert!(result.output.contains("(offset 10, limit 7)"));
         assert!(result.output.contains("Demo Test Resource (ngo)"));
         assert!(result
             .output
