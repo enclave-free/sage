@@ -2389,16 +2389,31 @@ impl Tool for FindResourcesTool {
             )));
         }
 
+        let returned_count = response.returned_count.max(response.resources.len());
+        let total_count = response.total_count.max(response.resources.len());
+        let output_summary = if response.has_more {
+            match response.next_offset {
+                Some(next_offset) => format!(
+                    "Returned {} of {} matching ready Curated Resources; more results are available at offset {}.",
+                    returned_count, total_count, next_offset
+                ),
+                None => format!(
+                    "Returned {} of {} matching ready Curated Resources; more results are available.",
+                    returned_count, total_count
+                ),
+            }
+        } else {
+            format!(
+                "Returned all {} matching ready Curated Resources.",
+                returned_count
+            )
+        };
         if let Ok(mut sink) = self.traces.lock() {
             sink.push(ToolCallInfoResponse {
                 tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                 tool_name: "Curated Resources".to_string(),
                 query: Some(trace_query),
-                output_summary: Some(if is_inventory_lookup {
-                    "Listed ready curated resources for the answer.".to_string()
-                } else {
-                    "Found vetted curated resources for the answer.".to_string()
-                }),
+                output_summary: Some(output_summary),
                 warnings: if response.has_more {
                     vec!["curated_resources_truncated".to_string()]
                 } else {
@@ -2410,8 +2425,8 @@ impl Tool for FindResourcesTool {
 
         let mut output = format!(
             "Showing {} of {} matching ready Curated Resources (offset {}, limit {}).\n",
-            response.returned_count.max(response.resources.len()),
-            response.total_count.max(response.resources.len()),
+            returned_count,
+            total_count,
             response.offset.max(offset as usize),
             response.limit.max(if is_inventory_lookup { 10 } else { 5 }),
         );
@@ -7832,7 +7847,9 @@ impl PlainAnswerStreamState {
             return None;
         }
         if Self::provider_neutral_tool_label_is_definitive_prose(candidate) {
-            return Some(candidate.len());
+            return Some(
+                Self::next_provider_neutral_tool_label(candidate).unwrap_or(candidate.len()),
+            );
         }
         let newline = candidate.find('\n')?;
         let next_line = candidate[newline + 1..].trim_start_matches(char::is_whitespace);
@@ -7865,6 +7882,19 @@ impl PlainAnswerStreamState {
         }
         let suffix = first_line[name_end..].trim_start();
         !suffix.is_empty() && !suffix.starts_with('(') && !suffix.starts_with('{')
+    }
+
+    fn next_provider_neutral_tool_label(candidate: &str) -> Option<usize> {
+        let lowercase = candidate.to_ascii_lowercase();
+        let search_start = 1.min(lowercase.len());
+        ["tool:", "tool decision:"]
+            .iter()
+            .filter_map(|label| {
+                lowercase[search_start..]
+                    .find(label)
+                    .map(|index| search_start + index)
+            })
+            .min()
     }
 
     fn balanced_structure_end(candidate: &str) -> Option<usize> {
@@ -9891,6 +9921,71 @@ mod tests {
         state
             .finish(&sender)
             .expect("already streamed explanatory prose should finish cleanly");
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_scans_past_benign_labels_in_one_delta() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+        let benign = "The Curated Resources Tool: finds vetted organizations. ";
+
+        let error = state
+            .push(
+                &format!("{benign}Tool: find_resources(query=\"legal aid\")"),
+                &sender,
+            )
+            .expect_err("a later provider-neutral invocation must not hide behind benign prose");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        let mut streamed = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            streamed.push(answer_signal(signal));
+        }
+        let streamed = streamed.concat();
+        assert!(benign.starts_with(&streamed));
+        assert!(!streamed.contains("find_resources"));
+    }
+
+    #[test]
+    fn plain_answer_safety_scans_past_benign_labels_across_deltas() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+        let benign = "The Curated Resources Tool: finds vetted organizations. ";
+
+        state
+            .push(benign, &sender)
+            .expect("ordinary Tool prose should stream");
+        let mut streamed = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            streamed.push(answer_signal(signal));
+        }
+        assert_eq!(streamed.concat(), benign);
+        let error = state
+            .push("Tool: find_resources\nArgs: {\"offset\":10}", &sender)
+            .expect_err("a later split-delta invocation must be rejected");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_prose_suffix_followed_by_arguments() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        let error = state
+            .push(
+                "Tool: find_resources will run\nArgs: {\"query\":\"legal aid\"}",
+                &sender,
+            )
+            .expect_err("an Args block must override a prose-like same-line suffix");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
         assert!(delta_rx.try_recv().is_err());
     }
 
@@ -12292,7 +12387,9 @@ mod tests {
         assert_eq!(traces[0].tool_name, "Curated Resources");
         assert_eq!(
             traces[0].output_summary.as_deref(),
-            Some("Found vetted curated resources for the answer.")
+            Some(
+                "Returned 1 of 6 matching ready Curated Resources; more results are available at offset 6."
+            )
         );
 
         let (token, payload) = seen_rx
@@ -12406,7 +12503,7 @@ mod tests {
         );
         assert_eq!(
             traces[0].output_summary.as_deref(),
-            Some("Listed ready curated resources for the answer.")
+            Some("Returned all 1 matching ready Curated Resources.")
         );
 
         let (token, payload) = seen_rx

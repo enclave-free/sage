@@ -1243,35 +1243,8 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
             return true;
         }
     }
-    if let Some(tool_start) = lowercase.find("tool:") {
-        let preamble = &lowercase[..tool_start];
-        let invocation = &lowercase[tool_start + "tool:".len()..];
-        let has_invocation = provider_neutral_tool_label_has_invocation(invocation);
-        let starts_line = preamble.is_empty() || preamble.ends_with('\n');
-        let has_deliberation_preamble = [
-            "let me ",
-            "i'll search",
-            "i will search",
-            "i'll look up",
-            "i will look up",
-            "i need to ",
-            "i should ",
-        ]
-        .iter()
-        .any(|marker| preamble.contains(marker));
-        if has_invocation && (starts_line || has_deliberation_preamble) {
-            return true;
-        }
-    }
-    let tool_decision = lowercase.strip_prefix("tool decision:").or_else(|| {
-        lowercase
-            .find("\ntool decision:")
-            .map(|start| &lowercase[start + "\ntool decision:".len()..])
-    });
-    if let Some(decision) = tool_decision {
-        if provider_neutral_tool_label_has_invocation(decision) {
-            return true;
-        }
+    if provider_neutral_labels_have_tool_intent(&lowercase) {
+        return true;
     }
     if lowercase.starts_with("```") {
         let after_open = candidate.strip_prefix("```").unwrap_or(candidate);
@@ -1337,7 +1310,8 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
 
 fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
     let value = value.trim_start();
-    let first_line = value.lines().next().unwrap_or(value).trim();
+    let (first_line, remaining) = value.split_once('\n').unwrap_or((value, ""));
+    let first_line = first_line.trim();
     let name_end = first_line
         .find(|character: char| {
             !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
@@ -1353,27 +1327,62 @@ fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
     {
         return false;
     }
-    let same_line_suffix = first_line[name_end..].trim_start();
-    if same_line_suffix.starts_with('(') || same_line_suffix.starts_with('{') {
-        return true;
-    }
-    if !same_line_suffix.is_empty() {
-        return false;
-    }
-
-    let remaining = value[first_line.len()..].trim_start();
+    let remaining = remaining.trim_start();
     if remaining.starts_with('{') || remaining.starts_with('[') || remaining.starts_with("```json")
     {
         return true;
     }
-    let Some(arguments) = remaining
+    if let Some(arguments) = remaining
         .strip_prefix("args:")
         .or_else(|| remaining.strip_prefix("arguments:"))
-    else {
-        return false;
-    };
-    let arguments = arguments.trim_start();
-    arguments.starts_with('{') || arguments.starts_with('[') || arguments.starts_with("```json")
+    {
+        let arguments = arguments.trim_start();
+        if arguments.starts_with('{')
+            || arguments.starts_with('[')
+            || arguments.starts_with("```json")
+        {
+            return true;
+        }
+    }
+
+    let same_line_suffix = first_line[name_end..].trim_start();
+    same_line_suffix.starts_with('(') || same_line_suffix.starts_with('{')
+}
+
+fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
+    let mut labels = Vec::new();
+    for label in ["tool:", "tool decision:"] {
+        labels.extend(
+            candidate
+                .match_indices(label)
+                .map(|(start, _)| (start, label)),
+        );
+    }
+    labels.sort_unstable_by_key(|(start, _)| *start);
+
+    for (label_index, (start, label)) in labels.iter().enumerate() {
+        let preamble = &candidate[..*start];
+        let invocation = &candidate[*start + label.len()..];
+        if !provider_neutral_tool_label_has_invocation(invocation) {
+            continue;
+        }
+        let starts_line = preamble.is_empty() || preamble.ends_with('\n');
+        let has_deliberation_preamble = [
+            "let me ",
+            "i'll search",
+            "i will search",
+            "i'll look up",
+            "i will look up",
+            "i need to ",
+            "i should ",
+        ]
+        .iter()
+        .any(|marker| preamble.contains(marker));
+        if starts_line || has_deliberation_preamble || label_index > 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn json_has_tool_intent(value: &serde_json::Value) -> bool {
@@ -2843,6 +2852,15 @@ mod tests {
         ));
         assert!(!has_syntactic_tool_intent(
             "The Tool decision: section in Activity explains which lookup ran."
+        ));
+        assert!(has_syntactic_tool_intent(
+            "The Curated Resources Tool: finds vetted organizations. Tool: find_resources(query=\"legal aid\")"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "The Tool decision: section is explanatory.\nTool decision: find_resources\nArgs: {\"offset\":10}"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool: find_resources will run\nArgs: {\"query\":\"legal aid\"}"
         ));
     }
 
