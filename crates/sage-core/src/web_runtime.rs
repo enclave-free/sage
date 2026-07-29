@@ -51,7 +51,7 @@ use crate::sage_agent::{
     CuratedResourceContinuation, ExecutedTool, PlainAnswerPrompt, ProcessNarrationOpeningMatch,
     ProviderReasoningTraceHook, ProviderTimingEvent, ProviderTimingTraceHook, SageAgent, Tool,
     ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
-    ToolRetryPolicy,
+    ToolRetryPolicy, UserSafeToolFallbackKind,
 };
 #[cfg(test)]
 use crate::sage_agent::{expects_curated_resource_lookup, StepResult};
@@ -2567,11 +2567,17 @@ impl Tool for FindResourcesTool {
                 });
             }
             if is_inventory_lookup {
-                return Ok(ToolResult::success_with_metadata(
-                    "No ready curated resources are currently listed. Do not invent referrals; \
-                     say that the curated resource directory is empty or still being configured."
-                        .to_string(),
+                let user_safe_output =
+                    "No ready curated resources are currently listed.".to_string();
+                return Ok(ToolResult::success_with_user_safe_fallback(
+                    format!(
+                        "{} Do not invent referrals; say that the curated resource directory is \
+                         empty or still being configured.",
+                        user_safe_output
+                    ),
                     json!({"has_more": false}),
+                    UserSafeToolFallbackKind::CuratedResourceInventory,
+                    user_safe_output,
                 ));
             }
             return Ok(ToolResult::success_with_metadata(
@@ -2714,15 +2720,25 @@ impl Tool for FindResourcesTool {
             }
             output.push('\n');
         }
+        let user_safe_inventory_output = is_inventory_lookup.then(|| output.trim_end().to_string());
         output.push_str(
             "Relay these to the person plainly. Only share what is listed here — never invent \
              contact details. Encourage them to verify before acting where possible.",
         );
 
-        Ok(ToolResult::success_with_metadata(
-            output,
-            json!({"has_more": has_more}),
-        ))
+        if let Some(user_safe_output) = user_safe_inventory_output {
+            Ok(ToolResult::success_with_user_safe_fallback(
+                output,
+                json!({"has_more": has_more}),
+                UserSafeToolFallbackKind::CuratedResourceInventory,
+                user_safe_output,
+            ))
+        } else {
+            Ok(ToolResult::success_with_metadata(
+                output,
+                json!({"has_more": has_more}),
+            ))
+        }
     }
 }
 
@@ -7166,17 +7182,35 @@ where
                         timing_hook,
                     )
                     .await;
-                let answer = generation.map_err(|error| {
-                    planner.plain_answer_trace_failed(
-                        trace_step,
-                        started_at.elapsed().as_millis(),
-                        &error.to_string(),
-                    );
-                    AdapterTurnFailure {
-                        progressed: !executed_tools.is_empty() || error.emitted_any,
-                        error: model_provider_error(error),
+                let answer = match generation {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        planner.plain_answer_trace_failed(
+                            trace_step,
+                            started_at.elapsed().as_millis(),
+                            &error.to_string(),
+                        );
+                        if let Some(answer) =
+                            exhausted_inventory_answer_fallback(&executed_tools, &error)
+                        {
+                            warn!(
+                                "Using safe Curated Resources output after final-answer quarantine"
+                            );
+                            if let Some(sender) = &delta_sender {
+                                let _ =
+                                    sender.send(ConversationStreamSignal::Answer(answer.clone()));
+                            }
+                            return Ok(AdapterTurnOutput {
+                                answer,
+                                executed_tools,
+                            });
+                        }
+                        return Err(AdapterTurnFailure {
+                            progressed: !executed_tools.is_empty() || error.emitted_any,
+                            error: model_provider_error(error),
+                        });
                     }
-                })?;
+                };
                 planner.plain_answer_trace_completed(trace_step, started_at.elapsed().as_millis());
                 return Ok(AdapterTurnOutput {
                     answer,
@@ -7191,6 +7225,25 @@ where
             }
         }
     }
+}
+
+fn exhausted_inventory_answer_fallback(
+    executed_tools: &[ExecutedTool],
+    error: &PlainAnswerGenerationError,
+) -> Option<String> {
+    if !error.quarantine_retry_exhausted
+        || !error.retryable_before_exposure()
+        || executed_tools.len() != 1
+    {
+        return None;
+    }
+    let executed = &executed_tools[0];
+    let user_safe_fallback = executed.result.user_safe_fallback.as_ref()?;
+    (executed.tool_call.name == "find_resources"
+        && executed.result.success
+        && user_safe_fallback.kind == UserSafeToolFallbackKind::CuratedResourceInventory)
+        .then(|| user_safe_fallback.output.trim().to_string())
+        .filter(|output| !output.is_empty())
 }
 
 /// Run one bounded Tool-planning phase followed by plain answer generation
@@ -7773,6 +7826,7 @@ struct PlainAnswerGenerationError {
     kind: PlainAnswerFailureKind,
     message: String,
     emitted_any: bool,
+    quarantine_retry_exhausted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7790,7 +7844,13 @@ impl PlainAnswerGenerationError {
             kind,
             message: message.into(),
             emitted_any,
+            quarantine_retry_exhausted: false,
         }
+    }
+
+    fn after_quarantine_retry(mut self) -> Self {
+        self.quarantine_retry_exhausted = self.retryable_before_exposure();
+        self
     }
 
     fn retryable_before_exposure(&self) -> bool {
@@ -9121,6 +9181,7 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
             timing_hook,
         )
         .await
+        .map_err(PlainAnswerGenerationError::after_quarantine_retry)
     }
 }
 
@@ -11988,6 +12049,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
         assert!(!error.emitted_any);
+        assert!(error.quarantine_retry_exhausted);
         assert!(delta_rx.try_recv().is_err());
         let timing_events = timing_events.lock().unwrap();
         let header_attempts = timing_events
@@ -12205,6 +12267,74 @@ mod tests {
                 let _ = sender.send(ConversationStreamSignal::Answer("answer".to_string()));
             }
             Ok("A trusted answer".to_string())
+        }
+    }
+
+    struct QuarantinedAnswerGenerator;
+
+    #[async_trait::async_trait]
+    impl PlainAnswerGenerator for QuarantinedAnswerGenerator {
+        async fn generate(
+            &self,
+            _prompt: &PlainAnswerPrompt,
+            _model: &str,
+            _delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+            _reasoning_trace_hook: Option<ProviderReasoningTraceHook>,
+        ) -> std::result::Result<String, PlainAnswerGenerationError> {
+            Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Repetition,
+                "unsafe final answer",
+                false,
+            )
+            .after_quarantine_retry())
+        }
+    }
+
+    struct CuratedResourcePlanner;
+
+    #[async_trait::async_trait]
+    impl ToolPlanner for CuratedResourcePlanner {
+        fn has_actionable_tools(&self) -> bool {
+            true
+        }
+
+        async fn plan_tools(
+            &mut self,
+            _user_message: &str,
+            _is_first_plan: bool,
+        ) -> Result<ToolPlanningOutcome> {
+            Ok(ToolPlanningOutcome::Decision(ToolDecision::new(
+                vec![crate::sage_agent::ToolCall {
+                    name: "find_resources".to_string(),
+                    args: ToolArgs::from([("lookup_mode".to_string(), json!("inventory"))]),
+                }],
+                false,
+            )))
+        }
+
+        async fn execute_tool_decision(&mut self, decision: &ToolDecision) -> StepResult {
+            StepResult {
+                messages: Vec::new(),
+                tool_calls: decision.tool_calls.clone(),
+                executed_tools: vec![ExecutedTool {
+                    tool_call: decision.tool_calls[0].clone(),
+                    result: ToolResult::success_with_user_safe_fallback(
+                        "INTERNAL: relay the trusted inventory result plainly.",
+                        json!({"has_more": true}),
+                        UserSafeToolFallbackKind::CuratedResourceInventory,
+                        "Showing 10 of 11 matching ready Curated Resources; more results are available at offset 10.",
+                    ),
+                }],
+                done: false,
+            }
+        }
+
+        fn plain_answer_prompt(&self, _user_message: &str) -> PlainAnswerPrompt {
+            PlainAnswerPrompt {
+                system: "answer plainly".to_string(),
+                user: "trusted Curated Resources result".to_string(),
+                incomplete_curated_resource_page: true,
+            }
         }
     }
 
@@ -14440,6 +14570,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quarantined_final_answer_falls_back_to_safe_curated_resource_output() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let turn = run_turn_with_adapters(
+            &mut CuratedResourcePlanner,
+            &QuarantinedAnswerGenerator,
+            "list the matching resources",
+            "test-model",
+            Some(delta_tx),
+        )
+        .await
+        .expect("safe Tool output should survive a quarantined final answer");
+
+        let expected =
+            "Showing 10 of 11 matching ready Curated Resources; more results are available at offset 10.";
+        assert_eq!(turn.answer, expected);
+        assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), expected);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn inventory_answer_fallback_requires_exhausted_retry_and_explicit_safe_output() {
+        let curated = ExecutedTool {
+            tool_call: crate::sage_agent::ToolCall {
+                name: "find_resources".to_string(),
+                args: ToolArgs::new(),
+            },
+            result: ToolResult::success_with_user_safe_fallback(
+                "internal resource result",
+                json!({"has_more": true}),
+                UserSafeToolFallbackKind::CuratedResourceInventory,
+                "trusted resource result",
+            ),
+        };
+        let one_quarantined_attempt = PlainAnswerGenerationError::new(
+            PlainAnswerFailureKind::Repetition,
+            "unsafe final answer",
+            false,
+        );
+        assert!(exhausted_inventory_answer_fallback(
+            std::slice::from_ref(&curated),
+            &one_quarantined_attempt
+        )
+        .is_none());
+
+        let quarantined = one_quarantined_attempt.after_quarantine_retry();
+        assert_eq!(
+            exhausted_inventory_answer_fallback(std::slice::from_ref(&curated), &quarantined),
+            Some("trusted resource result".to_string())
+        );
+
+        let partially_exposed = PlainAnswerGenerationError::new(
+            PlainAnswerFailureKind::Repetition,
+            "unsafe final answer",
+            true,
+        )
+        .after_quarantine_retry();
+        assert!(exhausted_inventory_answer_fallback(
+            std::slice::from_ref(&curated),
+            &partially_exposed
+        )
+        .is_none());
+
+        let provider_failure = PlainAnswerGenerationError::new(
+            PlainAnswerFailureKind::Other,
+            "provider unavailable",
+            false,
+        )
+        .after_quarantine_retry();
+        assert!(exhausted_inventory_answer_fallback(
+            std::slice::from_ref(&curated),
+            &provider_failure
+        )
+        .is_none());
+
+        let contact = ExecutedTool {
+            tool_call: crate::sage_agent::ToolCall {
+                name: "find_resources".to_string(),
+                args: ToolArgs::from([("lookup_mode".to_string(), json!("contact"))]),
+            },
+            result: ToolResult::success("internal contact result"),
+        };
+        assert!(exhausted_inventory_answer_fallback(&[contact], &quarantined).is_none());
+
+        let knowledge = ExecutedTool {
+            tool_call: crate::sage_agent::ToolCall {
+                name: "knowledge_search".to_string(),
+                args: ToolArgs::new(),
+            },
+            result: ToolResult::success("document result"),
+        };
+        assert!(exhausted_inventory_answer_fallback(
+            &[curated.clone(), knowledge.clone()],
+            &quarantined
+        )
+        .is_none());
+        assert!(exhausted_inventory_answer_fallback(&[knowledge], &quarantined).is_none());
+    }
+
+    #[tokio::test]
     async fn non_streaming_turn_collects_the_same_plain_answer() {
         let mut streaming_planner = OneToolPlanner {
             planned: false,
@@ -14849,6 +15079,7 @@ mod tests {
             .contains("Showing 1 of 6 matching ready Curated Resources"));
         assert!(result.output.contains("more results are available"));
         assert!(result.output.contains("next offset 6"));
+        assert!(result.user_safe_fallback.is_none());
 
         let traces = tool.traces.lock().expect("trace sink should lock");
         assert_eq!(traces.len(), 1);
@@ -14998,6 +15229,18 @@ mod tests {
             "This is the final page of matching ready Curated Resources for the supplied filters; no matching results remain after this page."
         ));
         assert!(!result.output.contains("This is the complete set"));
+        let fallback = result
+            .user_safe_fallback
+            .as_ref()
+            .expect("inventory results should include an explicit user-safe fallback");
+        assert_eq!(
+            fallback.kind,
+            UserSafeToolFallbackKind::CuratedResourceInventory
+        );
+        assert!(fallback.output.contains("Demo Test Resource (ngo)"));
+        assert!(fallback.output.contains("no matching results remain"));
+        assert!(!fallback.output.contains("Relay these to the person"));
+        assert!(!fallback.output.contains("never invent contact details"));
 
         let traces = tool.traces.lock().expect("trace sink should lock");
         assert_eq!(traces.len(), 1);

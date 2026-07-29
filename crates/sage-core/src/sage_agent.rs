@@ -2105,6 +2105,21 @@ pub struct ToolResult {
     /// Structured, Tool-owned execution facts used by runtime policy. Raw
     /// prompt text is never authoritative for these values.
     pub metadata: serde_json::Value,
+    /// Optional Tool-owned text that is already safe to show without another
+    /// model pass. This is intentionally separate from the internal Tool
+    /// output, which can contain instructions for the final-answer model.
+    pub user_safe_fallback: Option<UserSafeToolFallback>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserSafeToolFallbackKind {
+    CuratedResourceInventory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSafeToolFallback {
+    pub kind: UserSafeToolFallbackKind,
+    pub output: String,
 }
 
 /// Failure categories that the shared Tool executor can safely classify.
@@ -2205,6 +2220,7 @@ impl ToolResult {
             output: output.into(),
             error: None,
             metadata: serde_json::Value::Null,
+            user_safe_fallback: None,
         }
     }
 
@@ -2214,6 +2230,25 @@ impl ToolResult {
             output: output.into(),
             error: None,
             metadata,
+            user_safe_fallback: None,
+        }
+    }
+
+    pub fn success_with_user_safe_fallback(
+        output: impl Into<String>,
+        metadata: serde_json::Value,
+        kind: UserSafeToolFallbackKind,
+        user_safe_output: impl Into<String>,
+    ) -> Self {
+        Self {
+            success: true,
+            output: output.into(),
+            error: None,
+            metadata,
+            user_safe_fallback: Some(UserSafeToolFallback {
+                kind,
+                output: user_safe_output.into(),
+            }),
         }
     }
 
@@ -2223,6 +2258,7 @@ impl ToolResult {
             output: String::new(),
             error: Some(error.into()),
             metadata: serde_json::Value::Null,
+            user_safe_fallback: None,
         }
     }
 }
