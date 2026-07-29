@@ -116,7 +116,7 @@ Output style:
 const CURATED_RESOURCES_GROUNDING_POLICY: &str = r#"
 
 === CURATED RESOURCES GROUNDING ===
-- In Tool-planning mode, a current request or follow-up asking for an email, phone number, website or URL, address, secure channel, or equivalent contact detail requires a fresh find_resources decision whenever Curated Resources is enabled. This includes English and Spanish phrasing such as "me puedes dar el email...", "correo electrónico", "teléfono", "sitio web", "dirección", or "canal seguro".
+- In Tool-planning mode, a current request or follow-up asking for an email, phone number, website or URL, address, secure channel, or equivalent contact detail requires a fresh find_resources decision with lookup_mode=contact whenever Curated Resources is enabled. This includes English and Spanish phrasing such as "me puedes dar el email...", "correo electrónico", "teléfono", "sitio web", "dirección", or "canal seguro".
 - Use recent Conversation context to carry the organization, jurisdiction, language, and help type already established into the fresh find_resources arguments. Do not make the user repeat that context unless it is genuinely missing or ambiguous.
 - A request to list or inventory Curated Resources requires find_resources. Preserve an explicit organization or name filter in query; do not replace a filtered inventory with an unfiltered lookup.
 - A request for the next page requires a fresh find_resources call carrying the previous query and the positive next offset shown by the prior result.
@@ -826,11 +826,19 @@ fn conservative_resource_pagination(
     let next_offset = has_more
         .then(|| {
             reported_next_offset
-                .filter(|next_offset| *next_offset > offset)
+                .filter(|next_offset| page_item_count > 0 && *next_offset >= consumed_count)
                 .or_else(|| (page_item_count > 0).then_some(consumed_count))
         })
         .flatten();
     (has_more, next_offset)
+}
+
+fn conservative_resource_total_count(
+    offset: usize,
+    page_item_count: usize,
+    reported_total_count: usize,
+) -> usize {
+    reported_total_count.max(offset.saturating_add(page_item_count))
 }
 
 fn resource_page_is_definitively_empty(
@@ -2407,10 +2415,12 @@ impl Tool for FindResourcesTool {
          lawyers, NGOs, UN bodies, clinics, shelters, food, financial aid. Use this when a \
          conversation escalates from information to action - when someone needs to be put in \
          touch with a real organization or person who can help. Also use this for inventory \
-         questions like 'what resources do you have?' or 'list available resources'; omit \
-         help_type in that case. For any current contact request or follow-up asking for an \
+         questions like 'what resources do you have?' or 'list available resources'; use \
+         lookup_mode=inventory and omit help_type in that case. For any current contact request \
+         or follow-up asking for an \
          email, phone, website/URL, address, secure channel, or equivalent contact detail, \
-         make a fresh find_resources call when enabled and use only its returned contact data. \
+         make a fresh find_resources call with lookup_mode=contact when enabled and use only its \
+         returned contact data. \
          Use recent Conversation context for the organization, jurisdiction, language, and help \
          type instead of relying on earlier assistant contact prose. Referral results are filtered \
          by region and the type of help needed and ranked from most-local to global. If the fresh \
@@ -2418,7 +2428,7 @@ impl Tool for FindResourcesTool {
     }
 
     fn args_schema(&self) -> &str {
-        r#"{"query":"optional organization name or exact contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; referral lookups default to the user's jurisdiction, inventory lookups remain global when omitted","language":"optional preferred language code, e.g. es","offset":"optional continuation offset from a previous result page"}"#
+        r#"{"lookup_mode":"contact for contact-detail follow-ups; inventory for list/inventory requests; omit for ordinary referrals","query":"optional organization name or exact contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; contact/referral lookups default to the user's jurisdiction, inventory lookups remain global when omitted","language":"optional preferred language code, e.g. es","offset":"optional continuation offset from a previous result page"}"#
     }
 
     fn retry_policy(&self) -> ToolRetryPolicy {
@@ -2429,7 +2439,12 @@ impl Tool for FindResourcesTool {
         let help_type = tool_string_arg(args, "help_type")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let is_inventory_lookup = help_type.is_none();
+        let lookup_mode = tool_string_arg(args, "lookup_mode").map(str::trim);
+        let is_inventory_lookup = match lookup_mode {
+            Some("contact") => false,
+            Some("inventory") => true,
+            _ => help_type.is_none(),
+        };
         let region = tool_string_arg(args, "region")
             .map(str::to_string)
             .or_else(|| {
@@ -2483,7 +2498,11 @@ impl Tool for FindResourcesTool {
 
         let returned_count = response.resources.len();
         let returned_count_mismatch = response.returned_count != returned_count;
-        let total_count = response.total_count.max(returned_count);
+        let total_count = conservative_resource_total_count(
+            response.offset,
+            returned_count,
+            response.total_count,
+        );
         let (has_more, next_offset) = conservative_resource_pagination(
             response.offset,
             returned_count,
@@ -6855,7 +6874,7 @@ impl<'a> EnclaveWebRuntimeProfile<'a> {
         }
         if self.include_curated_resources_tool {
             instruction.push_str(
-                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Do not claim all, every, or a complete list when the Tool reports more results or completeness is unknown. When it reports no more results, scope completeness claims to matching ready Curated Resources and the supplied filters.\n- Only share contact details returned by find_resources.\n",
+                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For contact-detail follow-ups, use lookup_mode=contact so the user's jurisdiction remains the default even when help_type is unavailable.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with lookup_mode=inventory and no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Do not claim all, every, or a complete list when the Tool reports more results or completeness is unknown. When it reports no more results, scope completeness claims to matching ready Curated Resources and the supplied filters.\n- Only share contact details returned by find_resources.\n",
             );
             instruction.push_str(CURATED_RESOURCES_GROUNDING_POLICY);
         }
@@ -12483,6 +12502,7 @@ mod tests {
             json!([{
                 "name": "find_resources",
                 "args": {
+                    "lookup_mode": "contact",
                     "query": tool_query,
                     "region": "MX",
                     "language": state.case.language,
@@ -14987,6 +15007,75 @@ mod tests {
         assert_eq!(payload["offset"], 10);
     }
 
+    #[tokio::test]
+    async fn contact_lookup_without_help_type_preserves_default_jurisdiction() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Value>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/resources/search",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        if let Some(sender) =
+                            seen_tx.lock().expect("request recorder should lock").take()
+                        {
+                            let _ = sender.send(payload);
+                        }
+                        Json(json!({
+                            "resources": [],
+                            "query": "Acme Legal Aid",
+                            "resolved_country_code": "MX",
+                            "help_type": null,
+                            "total_count": 0,
+                            "returned_count": 0,
+                            "limit": 5,
+                            "offset": 0,
+                            "has_more": false,
+                            "next_offset": null
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let tool = FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::builder().build().expect("http client should build"),
+                format!("http://{}", addr),
+                "test-token".to_string(),
+            ),
+            jurisdiction: Some("Mexico".to_string()),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = tool
+            .execute(&ToolArgs::from([
+                ("lookup_mode".to_string(), json!("contact")),
+                ("query".to_string(), json!("Acme Legal Aid")),
+            ]))
+            .await
+            .expect("contact lookup should succeed");
+        server.abort();
+
+        assert!(result.success);
+        let payload = seen_rx.await.expect("backend should record the request");
+        assert!(payload.get("help_type").is_none());
+        assert_eq!(payload["jurisdiction"], "Mexico");
+        assert_eq!(payload["limit"], 5);
+    }
+
     #[test]
     fn resource_pagination_fails_closed_on_inconsistent_backend_counts() {
         assert_eq!(
@@ -15009,6 +15098,12 @@ mod tests {
             (false, None),
             "a stale cursor must not survive a proven final page"
         );
+        assert_eq!(
+            conservative_resource_pagination(10, 5, 20, true, Some(12)),
+            (true, Some(15)),
+            "an overlapping backend cursor must be replaced with the first unseen offset"
+        );
+        assert_eq!(conservative_resource_total_count(10, 2, 11), 12);
         assert!(!resource_page_is_definitively_empty(0, 0, true));
         assert!(resource_page_is_definitively_empty(0, 0, false));
     }
