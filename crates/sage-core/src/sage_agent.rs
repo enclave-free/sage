@@ -778,7 +778,9 @@ const NON_COUNTRY_RESOURCE_REGIONS: &[&str] = &[
 fn iso_country(value: &str) -> Option<CountryCode> {
     let normalized = normalized_lookup_text(value);
     match normalized.as_str() {
-        "usa" | "united states of america" => return CountryCode::for_alpha2("US").ok(),
+        "usa" | "united states" | "united states of america" => {
+            return CountryCode::for_alpha2("US").ok()
+        }
         "uk" | "england" => return CountryCode::for_alpha2("GB").ok(),
         "bolivia" => return CountryCode::for_alpha2("BO").ok(),
         "brunei" => return CountryCode::for_alpha2("BN").ok(),
@@ -1002,6 +1004,17 @@ impl CuratedResourceQueryContext {
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.resources.is_empty()
+    }
+}
+
+fn prefer_structured_resource_context(
+    prose_context: CuratedResourceQueryContext,
+    structured_context: CuratedResourceQueryContext,
+) -> CuratedResourceQueryContext {
+    if structured_context.resources.is_empty() {
+        prose_context
+    } else {
+        structured_context
     }
 }
 
@@ -1750,6 +1763,13 @@ pub(crate) fn curated_resource_lookup_expectation(
     let inventory_subject = inventory
         .then(|| explicit_inventory_subject(input))
         .flatten();
+    let inventory_region = inventory
+        .then(|| explicit_inventory_region(input))
+        .flatten();
+    let inventory_subject_is_region = inventory_subject
+        .as_deref()
+        .and_then(canonical_resource_region)
+        .is_some();
     let filtered_inventory = inventory
         && ([
             "names start",
@@ -1766,7 +1786,8 @@ pub(crate) fn curated_resource_lookup_expectation(
         ]
         .iter()
         .any(|phrase| contains_phrase(&normalized, phrase))
-            || inventory_subject.is_some());
+            || inventory_subject.is_some())
+        && !inventory_subject_is_region;
     let expected_filter = filtered_inventory
         .then(|| explicit_lookup_filter(input).or(inventory_subject))
         .flatten();
@@ -1786,7 +1807,6 @@ pub(crate) fn curated_resource_lookup_expectation(
                 .and_then(|query| split_resource_geographic_qualifier_from_input(query, input))
         })
         .flatten();
-    let fresh_region = explicit_inventory_region(input);
     let expected_region = if is_continuation {
         continuation_cursor.and_then(|cursor| cursor.region.clone())
     } else {
@@ -1795,7 +1815,7 @@ pub(crate) fn curated_resource_lookup_expectation(
                 expected_query = Some(query);
                 region
             })
-            .or(fresh_region)
+            .or(inventory_region)
     };
     let continuation = is_continuation.then_some(continuation_cursor).flatten();
     let unfiltered_inventory = inventory && !filtered_inventory && !is_continuation;
@@ -3347,7 +3367,8 @@ impl SageAgent {
             trusted_text.push('\n');
             trusted_text.push_str(&message.content);
         }
-        let mut context = CuratedResourceQueryContext::from_trusted_text(&trusted_text);
+        let prose_context = CuratedResourceQueryContext::from_trusted_text(&trusted_text);
+        let mut structured_context = CuratedResourceQueryContext::default();
         for message in messages
             .iter()
             .filter(|message| message.role == "assistant")
@@ -3369,23 +3390,25 @@ impl SageAgent {
                 let region = metadata
                     .get("resolved_region")
                     .and_then(serde_json::Value::as_str);
-                if let Some(query) = metadata
-                    .get("continuation_query")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    context.push_structured_resource(query, region);
-                }
-                if let Some(resource_names) = metadata
+                let resource_names = metadata
                     .get("resource_names")
-                    .and_then(serde_json::Value::as_array)
-                {
+                    .and_then(serde_json::Value::as_array);
+                if let Some(resource_names) = resource_names {
                     for name in resource_names.iter().filter_map(serde_json::Value::as_str) {
-                        context.push_structured_resource(name, region);
+                        structured_context.push_structured_resource(name, region);
+                    }
+                }
+                if resource_names.is_none_or(Vec::is_empty) {
+                    if let Some(query) = metadata
+                        .get("continuation_query")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        structured_context.push_structured_resource(query, region);
                     }
                 }
             }
         }
-        context
+        prefer_structured_resource_context(prose_context, structured_context)
     }
 
     /// Build the plain final-answer prompt after the bounded Tool phase.
@@ -4885,13 +4908,18 @@ mod tests {
             "Are there any curated resources?"
         ));
         assert!(expects_curated_resource_lookup("¿Hay recursos curados?"));
-        for prompt in ["List resources for Mexico.", "Lista recursos para México."] {
+        for (prompt, expected_region) in [
+            ("List resources for Mexico.", "MX"),
+            ("Lista recursos para México.", "MX"),
+            ("List resources for United States.", "US"),
+            ("List organizations in Latin America.", "latin america"),
+        ] {
             let expectation = curated_resource_lookup_expectation(prompt, None);
             assert!(expectation.required, "{prompt}");
             assert_eq!(expectation.expected_query, None, "{prompt}");
             assert_eq!(
                 expectation.expected_region.as_deref(),
-                Some("MX"),
+                Some(expected_region),
                 "{prompt}"
             );
         }
@@ -5023,6 +5051,17 @@ mod tests {
         assert_eq!(
             structured.resources,
             vec![("amnesty".to_string(), Some("MX".to_string()))]
+        );
+
+        let prose = CuratedResourceQueryContext::from_trusted_text(
+            "We discussed Horizon Foundation and an unrelated support project.",
+        );
+        let mut returned_resources = CuratedResourceQueryContext::default();
+        returned_resources.push_structured_resource("Acme", Some("Mexico"));
+        assert_eq!(
+            prefer_structured_resource_context(prose, returned_resources).resources,
+            vec![("acme".to_string(), Some("MX".to_string()))],
+            "structured returned resources must replace ambiguous prose candidates"
         );
     }
 

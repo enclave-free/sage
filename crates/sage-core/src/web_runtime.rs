@@ -816,21 +816,29 @@ struct InternalResourceSearchResponse {
 
 fn conservative_resource_pagination(
     offset: usize,
-    returned_count: usize,
+    page_item_count: usize,
     total_count: usize,
     reported_has_more: bool,
     reported_next_offset: Option<usize>,
 ) -> (bool, Option<usize>) {
-    let consumed_count = offset.saturating_add(returned_count);
+    let consumed_count = offset.saturating_add(page_item_count);
     let has_more = reported_has_more || consumed_count < total_count;
     let next_offset = has_more
         .then(|| {
             reported_next_offset
                 .filter(|next_offset| *next_offset > offset)
-                .or_else(|| (returned_count > 0).then_some(consumed_count))
+                .or_else(|| (page_item_count > 0).then_some(consumed_count))
         })
         .flatten();
     (has_more, next_offset)
+}
+
+fn resource_page_is_definitively_empty(
+    page_item_count: usize,
+    total_count: usize,
+    has_more: bool,
+) -> bool {
+    page_item_count == 0 && total_count == 0 && !has_more
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2469,7 +2477,29 @@ impl Tool for FindResourcesTool {
             trace_query
         };
 
-        if response.resources.is_empty() && response.total_count == 0 {
+        let returned_count = response.resources.len();
+        let returned_count_mismatch = response.returned_count != returned_count;
+        let total_count = response.total_count.max(returned_count);
+        let (has_more, next_offset) = conservative_resource_pagination(
+            response.offset,
+            returned_count,
+            total_count,
+            response.has_more,
+            response.next_offset,
+        );
+        let continuation_available = !has_more || next_offset.is_some();
+        let resource_names = response
+            .resources
+            .iter()
+            .map(|resource| {
+                resource
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| resource.resource_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        if resource_page_is_definitively_empty(returned_count, total_count, has_more) {
             let where_label = response_region.unwrap_or("the requested region");
             let empty_summary = if is_inventory_lookup {
                 "No ready curated resources were found."
@@ -2516,26 +2546,6 @@ impl Tool for FindResourcesTool {
             ));
         }
 
-        let returned_count = response.returned_count.max(response.resources.len());
-        let total_count = response.total_count.max(response.resources.len());
-        let (has_more, next_offset) = conservative_resource_pagination(
-            response.offset,
-            returned_count,
-            total_count,
-            response.has_more,
-            response.next_offset,
-        );
-        let continuation_available = !has_more || next_offset.is_some();
-        let resource_names = response
-            .resources
-            .iter()
-            .map(|resource| {
-                resource
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| resource.resource_id.clone())
-            })
-            .collect::<Vec<_>>();
         let output_summary = if has_more {
             match next_offset {
                 Some(next_offset) => format!(
@@ -2554,7 +2564,7 @@ impl Tool for FindResourcesTool {
             )
         };
         if let Ok(mut sink) = self.traces.lock() {
-            let warnings = if has_more && continuation_available {
+            let mut warnings = if has_more && continuation_available {
                 vec!["curated_resources_truncated".to_string()]
             } else if has_more {
                 vec![
@@ -2564,6 +2574,9 @@ impl Tool for FindResourcesTool {
             } else {
                 Vec::new()
             };
+            if returned_count_mismatch {
+                warnings.push("curated_resources_count_mismatch".to_string());
+            }
             sink.push(ToolCallInfoResponse {
                 tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                 tool_name: "Curated Resources".to_string(),
@@ -8068,6 +8081,12 @@ impl PlainAnswerStreamState {
             "no other organization",
             "no other organizations",
             "no other orgs",
+            "no more resources",
+            "no more results",
+            "no more entries",
+            "no more items",
+            "no more organizations",
+            "no more orgs",
             "aren t any more",
             "arent any more",
             "nothing else remains",
@@ -11507,6 +11526,8 @@ mod tests {
             "Those are all of them.",
             "That's everything.",
             "No other organizations are available.",
+            "There are no more resources.",
+            "There are no more results.",
             "There aren't any more entries.",
             "Nothing else remains.",
             "None left.",
@@ -14966,6 +14987,11 @@ mod tests {
             "counts prove another page even when the backend flag is false"
         );
         assert_eq!(
+            conservative_resource_pagination(0, 5, 20, false, None),
+            (true, Some(5)),
+            "cursor synthesis must advance by actual records, not an inflated reported count"
+        );
+        assert_eq!(
             conservative_resource_pagination(10, 0, 12, true, None),
             (true, None),
             "an empty page cannot invent a safe cursor"
@@ -14975,6 +15001,8 @@ mod tests {
             (false, None),
             "a stale cursor must not survive a proven final page"
         );
+        assert!(!resource_page_is_definitively_empty(0, 0, true));
+        assert!(resource_page_is_definitively_empty(0, 0, false));
     }
 
     #[test]
