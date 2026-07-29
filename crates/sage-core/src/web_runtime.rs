@@ -45,13 +45,13 @@ use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::sage_agent::{
     curated_resource_lookup_expectation, has_syntactic_tool_intent,
-    lookup_process_narration_opening, normalized_lookup_text,
+    lookup_process_narration_opening, multiline_tool_call_header_match, normalized_lookup_text,
     provider_neutral_tool_label_start_at_or_after, tool_parse_arg, tool_string_arg,
     AgentTraceEvent, ConversationTimingOutcome, ConversationTimingPhase,
-    CuratedResourceContinuation, ExecutedTool, PlainAnswerPrompt, ProcessNarrationOpeningMatch,
-    ProviderReasoningTraceHook, ProviderTimingEvent, ProviderTimingTraceHook, SageAgent, Tool,
-    ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
-    ToolRetryPolicy, UserSafeToolFallbackKind,
+    CuratedResourceContinuation, ExecutedTool, MultilineToolCallHeaderMatch, PlainAnswerPrompt,
+    ProcessNarrationOpeningMatch, ProviderReasoningTraceHook, ProviderTimingEvent,
+    ProviderTimingTraceHook, SageAgent, Tool, ToolArgs, ToolExecutionError, ToolPlanner,
+    ToolPlanningOutcome, ToolRegistry, ToolResult, ToolRetryPolicy, UserSafeToolFallbackKind,
 };
 #[cfg(test)]
 use crate::sage_agent::{expects_curated_resource_lookup, StepResult};
@@ -8347,6 +8347,15 @@ impl PlainAnswerStreamState {
         if opening.is_empty() {
             return PlainAnswerOpeningDisposition::Undecided;
         }
+        match multiline_tool_call_header_match(opening) {
+            MultilineToolCallHeaderMatch::Complete => {
+                return PlainAnswerOpeningDisposition::Quarantine;
+            }
+            MultilineToolCallHeaderMatch::Partial => {
+                return PlainAnswerOpeningDisposition::Undecided;
+            }
+            MultilineToolCallHeaderMatch::None => {}
+        }
         match lookup_process_narration_opening(opening) {
             ProcessNarrationOpeningMatch::Complete => {
                 return PlainAnswerOpeningDisposition::QuarantineProcessNarration;
@@ -10656,6 +10665,27 @@ mod tests {
         assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
         assert!(!error.emitted_any);
         assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_answer_safety_rejects_multiline_plural_tool_call_before_exposure() {
+        for candidate in [
+            "Tool calls\n\nFunction call: find_resources\n\nArguments\n\n{\"query\":\"Issue 539 Inventory\",\"lookup_mode\":\"inventory\",\"offset\":20}",
+            "Tool calls\r\n\r\nFunction call: find_resources\r\n\r\nArguments\r\n\r\n{\"offset\":20}",
+            "Tool calls \r\n\r\nFunction call: find_resources\r\n\r\nArguments:\r\n\r\n{\"offset\":20}",
+        ] {
+            assert_plain_answer_rejected_without_exposure_for_every_split(candidate);
+        }
+    }
+
+    #[test]
+    fn plain_answer_safety_preserves_multiline_tool_call_documentation() {
+        for candidate in [
+            "Tool calls\n\nFunction call: a named section in the Activity panel.\n\nThis page explains the transcript format.",
+            "Tool calls\r\n\r\nFunction call: find_resources\r\n\r\nThis page explains how the Activity panel is formatted.",
+        ] {
+            assert_plain_answer_preserved_for_every_split(candidate);
+        }
     }
 
     #[test]

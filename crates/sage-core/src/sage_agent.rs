@@ -2673,6 +2673,31 @@ impl ConversationTimingPhase {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MultilineToolCallHeaderMatch {
+    None,
+    Partial,
+    Complete,
+}
+
+pub(crate) fn multiline_tool_call_header_match(candidate: &str) -> MultilineToolCallHeaderMatch {
+    let lowercase = candidate.trim_start().to_ascii_lowercase();
+    let first_line = lowercase.lines().next().unwrap_or(&lowercase).trim_end();
+    if first_line.is_empty() {
+        return MultilineToolCallHeaderMatch::None;
+    }
+
+    const HEADER: &str = "tool calls";
+    const COLON_HEADER: &str = "tool calls:";
+    if matches!(first_line, HEADER | COLON_HEADER) {
+        MultilineToolCallHeaderMatch::Complete
+    } else if HEADER.starts_with(first_line) || COLON_HEADER.starts_with(first_line) {
+        MultilineToolCallHeaderMatch::Partial
+    } else {
+        MultilineToolCallHeaderMatch::None
+    }
+}
+
 pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
     let candidate = candidate.trim();
     if candidate.is_empty() {
@@ -2689,6 +2714,29 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
     // process-narration vocabulary so held text cannot become releasable only
     // because the provider used a typographic apostrophe.
     let lowercase = candidate.to_ascii_lowercase().replace(['’', '‘'], "'");
+    let mut nonempty_lines = lowercase
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let has_multiline_header = nonempty_lines.next().is_some_and(|line| {
+        multiline_tool_call_header_match(line) == MultilineToolCallHeaderMatch::Complete
+    });
+    let mut has_function_call = false;
+    let mut has_arguments = false;
+    for line in nonempty_lines {
+        if let Some(name) = line.strip_prefix("function call:") {
+            let name = name.trim();
+            has_function_call = !name.is_empty()
+                && name.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+                });
+        } else if has_function_call && matches!(line, "arguments" | "arguments:") {
+            has_arguments = true;
+        }
+    }
+    if has_multiline_header && has_function_call && has_arguments {
+        return true;
+    }
     if let Some(tool_calls_start) = lowercase.find("tool calls:") {
         let preamble = &lowercase[..tool_calls_start];
         let transcript = &lowercase[tool_calls_start + "tool calls:".len()..];
@@ -5936,6 +5984,18 @@ mod tests {
     fn textual_tool_transcripts_are_distinct_from_explanatory_prose() {
         assert!(has_syntactic_tool_intent(
             "Tool calls: find_resources(lookup_mode=\"inventory\", query=\"Issue 539 Inventory\", offset=10)"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool calls\n\nFunction call: find_resources\n\nArguments\n\n{\"query\":\"Issue 539 Inventory\",\"lookup_mode\":\"inventory\",\"offset\":20}"
+        ));
+        assert!(has_syntactic_tool_intent(
+            "Tool calls \r\n\r\nFunction call: find_resources\r\n\r\nArguments:\r\n\r\n{\"offset\":20}"
+        ));
+        assert!(!has_syntactic_tool_intent(
+            "Tool calls\n\nFunction call: a named section in the Activity panel.\n\nThis page explains the transcript format."
+        ));
+        assert!(!has_syntactic_tool_intent(
+            "Tool calls\n\nFunction call: find_resources\n\nThis page explains how the Activity panel is formatted."
         ));
         assert!(has_syntactic_tool_intent(
             "I will search now. Tool calls: knowledge_search(query=\"referral\")\nTool Result: found one"
