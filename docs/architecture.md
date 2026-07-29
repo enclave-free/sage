@@ -80,6 +80,17 @@ token-limit termination, and unsupported finish reasons fail the answer rather
 than being persisted as success. A quarantined Tool, repetition, or token-limit
 failure may retry once only when no answer text has reached the client.
 
+Conversation traces time total Tool planning, retrieval, Resource Directory
+lookup, Tool execution, retry delay, final-answer generation, and total turn
+duration separately. Final-answer response-header and first-event waits are
+explicit provider-wait proxies: network transit, provider queueing, and model
+startup may all contribute. The current typed Tool-planning provider contract
+does not expose cluster-scheduling or inference-only timings, so Sage emits
+those two phases as `unavailable` instead of fabricating durations or treating
+the combined planning duration as either metric. This preserves an honest
+correlation between slow planning attempts and omitted/rejected Tool selections
+while making the provider instrumentation gap visible.
+
 ## InternalAgentClient Contract
 
 `InternalAgentClient` is the main coupling point between Sage and Enclave Python.
@@ -93,6 +104,7 @@ Active calls:
 - `GET /internal/agent/user-profile-context/{user_id}`
 - `POST /internal/agent/document-search`
 - `POST /internal/agent/resources/search` — accepts optional `query`, `limit`, and `offset`; returns normalized query plus `total_count`, `returned_count`, `limit`, `offset`, `has_more`, and `next_offset` metadata for ready Curated Resources. Query relevance (exact normalized ID/name/contact, then partial name/contact, then description) precedes existing scope, verification, language, display-order, and name ranking.
+- Explicit contact, Curated Resource inventory, and inventory-continuation requests are validated at the model-planning boundary; ordinary questions about how organizations or the directory work are not inventory requests. Each such user turn requires exactly one successful `find_resources` execution: an initial lookup runs on the current turn, while a continuation can run only on a later user turn using the immediately preceding open page's structured query and `next_offset`. Sage does not fetch multiple pages within one turn. Rejected model selections are never executed and do not count toward that one-success limit; Sage retries a plan that omits the required call, adds another resource call after success, changes an explicit inventory/contact query, invents a context-only contact query not present in the server-built Conversation context, uses a stale positive offset for a fresh lookup, or changes the exact continuation query/`next_offset`. Rejected selections include their privacy-safe validation reason in structured trace metadata. A missing or zero continuation cursor and bounded planning exhaustion fail closed without an ungrounded answer; an intervening assistant turn expires an older cursor. The Tool’s structured `has_more` result—not rendered prompt text—controls the incomplete-page final-answer guard. For incomplete pages, final-answer text is held until completion and retried before exposure if it falsely claims all, every, or a complete list, while explicit limitations such as “not a complete list” remain valid. The validator never constructs or executes a Tool call itself.
 - `POST /internal/agent/admin-db-query`
 
 ADR-0023 target calls:

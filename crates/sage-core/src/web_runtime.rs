@@ -43,16 +43,18 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::memory::MemoryManager;
-#[cfg(test)]
-use crate::sage_agent::StepResult;
 use crate::sage_agent::{
-    expects_curated_resource_lookup, has_syntactic_tool_intent, lookup_process_narration_opening,
+    curated_resource_lookup_expectation, has_syntactic_tool_intent,
+    lookup_process_narration_opening, normalized_lookup_text,
     provider_neutral_tool_label_start_at_or_after, tool_parse_arg, tool_string_arg,
-    AgentTraceEvent, ConversationTimingOutcome, ConversationTimingPhase, ExecutedTool,
-    PlainAnswerPrompt, ProcessNarrationOpeningMatch, ProviderReasoningTraceHook,
-    ProviderTimingEvent, ProviderTimingTraceHook, SageAgent, Tool, ToolArgs, ToolExecutionError,
-    ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult, ToolRetryPolicy,
+    AgentTraceEvent, ConversationTimingOutcome, ConversationTimingPhase,
+    CuratedResourceContinuation, ExecutedTool, PlainAnswerPrompt, ProcessNarrationOpeningMatch,
+    ProviderReasoningTraceHook, ProviderTimingEvent, ProviderTimingTraceHook, SageAgent, Tool,
+    ToolArgs, ToolExecutionError, ToolPlanner, ToolPlanningOutcome, ToolRegistry, ToolResult,
+    ToolRetryPolicy,
 };
+#[cfg(test)]
+use crate::sage_agent::{expects_curated_resource_lookup, StepResult};
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
     summaries, user_preferences, web_sessions,
@@ -111,12 +113,14 @@ Output style:
 - Tool planning returns only the typed Tool decision requested by that stage.
 - Final-answer generation returns only plain user-visible prose, with no messages wrapper, Tool call, or done sentinel.
 "#;
-const CURATED_RESOURCES_CONTACT_POLICY: &str = r#"
+const CURATED_RESOURCES_GROUNDING_POLICY: &str = r#"
 
-=== CURATED RESOURCES CONTACT GROUNDING ===
+=== CURATED RESOURCES GROUNDING ===
 - In Tool-planning mode, a current request or follow-up asking for an email, phone number, website or URL, address, secure channel, or equivalent contact detail requires a fresh find_resources decision whenever Curated Resources is enabled. This includes English and Spanish phrasing such as "me puedes dar el email...", "correo electrónico", "teléfono", "sitio web", "dirección", or "canal seguro".
 - Use recent Conversation context to carry the organization, jurisdiction, language, and help type already established into the fresh find_resources arguments. Do not make the user repeat that context unless it is genuinely missing or ambiguous.
-- This is a model-planning requirement inside the existing Model-Driven Tool Loop. Do not add a deterministic intent classifier or router that directly authorizes or executes find_resources.
+- A request to list or inventory Curated Resources requires find_resources. Preserve an explicit organization or name filter in query; do not replace a filtered inventory with an unfiltered lookup.
+- A request for the next page requires a fresh find_resources call carrying the previous query and the positive next offset shown by the prior result.
+- These are model-planning requirements inside the existing Model-Driven Tool Loop. Runtime validation may reject and retry an incomplete model plan, but it must never synthesize, authorize, or execute find_resources itself.
 - In final-answer mode, current contact details must come from the fresh find_resources result for this turn. Never copy a contact detail solely from earlier assistant prose, memory, or a previous Tool result. If the fresh result has no matching contact, say so honestly and do not invent or reconstruct one.
 "#;
 const ADMIN_ONBOARDING_SURFACE: &str = "admin-onboarding";
@@ -453,6 +457,7 @@ pub struct ChatHistoryMessage {
 #[derive(Clone, Debug, Default)]
 struct PersistedConversationContext {
     summary: Option<String>,
+    curated_resource_continuation: Option<CuratedResourceContinuation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1495,6 +1500,7 @@ fn log_agent_trace_event(
             selected_tools,
             expected_curated_resources,
             missed_expected_curated_resources,
+            violation_reason,
             outcome,
         } => tracing::info!(
             target: "sage.tool_selection",
@@ -1511,6 +1517,7 @@ fn log_agent_trace_event(
             selection_count = selected_tools.len(),
             expected_curated_resources = *expected_curated_resources,
             missed_expected_curated_resources = *missed_expected_curated_resources,
+            violation_reason = violation_reason.as_deref().unwrap_or("none"),
             outcome = outcome.as_str(),
         ),
         AgentTraceEvent::ToolAttempted {
@@ -1617,6 +1624,24 @@ fn log_agent_trace_event(
             duration_ms = *elapsed_ms as u64,
             provider_wait_proxy = phase.is_provider_wait_proxy(),
         ),
+        AgentTraceEvent::TimingUnavailable {
+            phase,
+            planning_round,
+            attempt,
+            reason,
+        } => tracing::info!(
+            target: "sage.conversation_timing",
+            event_name = "conversation_phase_timing_unavailable",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = phase.as_str(),
+            round = planning_round.unwrap_or_default(),
+            attempt = *attempt,
+            outcome = "unavailable",
+            reason = *reason,
+        ),
         _ => {}
     }
 }
@@ -1665,6 +1690,10 @@ fn tool_trace_title(tool_name: &str) -> String {
 fn timing_phase_title(phase: ConversationTimingPhase) -> String {
     match phase {
         ConversationTimingPhase::ToolPlanningModelDuration => "Tool-planning model duration",
+        ConversationTimingPhase::ToolPlanningClusterScheduling => {
+            "Tool-planning cluster scheduling"
+        }
+        ConversationTimingPhase::ToolPlanningInference => "Tool-planning model inference",
         ConversationTimingPhase::FinalAnswerModelDuration => "Final-answer model duration",
         ConversationTimingPhase::FinalAnswerResponseHeaderWait => {
             "Final-answer provider response-header wait"
@@ -1734,6 +1763,39 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 created_at: Some(chrono::Utc::now().to_rfc3339()),
             }
         }
+        AgentTraceEvent::TimingUnavailable {
+            phase,
+            planning_round,
+            attempt,
+            reason,
+        } => {
+            let title = timing_phase_title(phase);
+            ConversationTraceDeltaResponse {
+                id: trace_delta_id(
+                    "timing-unavailable",
+                    &format!(
+                        "{}-{}-{}",
+                        phase.as_str(),
+                        planning_round.unwrap_or_default(),
+                        attempt
+                    ),
+                ),
+                kind: "timing".to_string(),
+                title: Some(title.clone()),
+                content: Some(format!("{title}: unavailable from the current provider.")),
+                tool_name: None,
+                status: Some("unavailable".to_string()),
+                metadata: json!({
+                    "phase": phase.as_str(),
+                    "round": planning_round,
+                    "attempt": attempt,
+                    "outcome": "unavailable",
+                    "duration_ms": Value::Null,
+                    "reason": reason,
+                }),
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+            }
+        }
         AgentTraceEvent::ToolSelectionObservation {
             round,
             attempt,
@@ -1741,10 +1803,15 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             selected_tools,
             expected_curated_resources,
             missed_expected_curated_resources,
+            violation_reason,
             outcome,
         } => {
-            let summary = if missed_expected_curated_resources {
-                "Curated Resources was expected but not selected."
+            let selection_rejected =
+                violation_reason.is_some() || matches!(outcome.as_str(), "rejected" | "failed");
+            let summary = if selection_rejected {
+                violation_reason
+                    .as_deref()
+                    .unwrap_or("Curated Resources selection was rejected.")
             } else if selected_tools.is_empty() {
                 "No Tools were selected."
             } else {
@@ -1756,13 +1823,11 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 title: Some("Tool Selection".to_string()),
                 content: Some(summary.to_string()),
                 tool_name: None,
-                status: Some(
-                    if missed_expected_curated_resources || outcome == "failed" {
-                        "failed".to_string()
-                    } else {
-                        "succeeded".to_string()
-                    },
-                ),
+                status: Some(if selection_rejected {
+                    "failed".to_string()
+                } else {
+                    "succeeded".to_string()
+                }),
                 metadata: json!({
                     "round": round,
                     "attempt": attempt,
@@ -1771,6 +1836,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                     "selection_count": selected_tools.len(),
                     "expected_curated_resources": expected_curated_resources,
                     "missed_expected_curated_resources": missed_expected_curated_resources,
+                    "violation_reason": violation_reason,
                     "outcome": outcome,
                 }),
                 created_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -2395,22 +2461,28 @@ impl Tool for FindResourcesTool {
                         "total_count": 0,
                         "has_more": false,
                         "next_offset": Value::Null,
+                        "continuation_query": response.query.as_deref().or(query.as_deref()),
+                        "resolved_region": response_region,
                     }),
                     guarded: false,
                 });
             }
             if is_inventory_lookup {
-                return Ok(ToolResult::success(
+                return Ok(ToolResult::success_with_metadata(
                     "No ready curated resources are currently listed. Do not invent referrals; \
                      say that the curated resource directory is empty or still being configured."
                         .to_string(),
+                    json!({"has_more": false}),
                 ));
             }
-            return Ok(ToolResult::success(format!(
-                "No vetted {} resources are currently listed for {}. Do not invent referrals; \
-                 offer general guidance instead and suggest the person seek a trusted local contact.",
-                response_help_type, where_label
-            )));
+            return Ok(ToolResult::success_with_metadata(
+                format!(
+                    "No vetted {} resources are currently listed for {}. Do not invent referrals; \
+                     offer general guidance instead and suggest the person seek a trusted local contact.",
+                    response_help_type, where_label
+                ),
+                json!({"has_more": false}),
+            ));
         }
 
         let returned_count = response.returned_count.max(response.resources.len());
@@ -2448,6 +2520,8 @@ impl Tool for FindResourcesTool {
                     "total_count": total_count,
                     "has_more": response.has_more,
                     "next_offset": response.next_offset,
+                    "continuation_query": response.query.as_deref().or(query.as_deref()),
+                    "resolved_region": response_region,
                 }),
                 guarded: false,
             });
@@ -2532,7 +2606,10 @@ impl Tool for FindResourcesTool {
              contact details. Encourage them to verify before acting where possible.",
         );
 
-        Ok(ToolResult::success(output))
+        Ok(ToolResult::success_with_metadata(
+            output,
+            json!({"has_more": response.has_more}),
+        ))
     }
 }
 
@@ -3680,8 +3757,13 @@ async fn chat(
         build_conversation_turn_input(&auth, &profile, &request, persisted_context.as_ref());
     let tool_loop = run_conversation_tool_loop(
         &mut agent,
-        &input,
-        &request.message,
+        ConversationToolLoopInput {
+            prompt: &input,
+            raw_user_message: &request.message,
+            continuation: persisted_context
+                .as_ref()
+                .and_then(|context| context.curated_resource_continuation.as_ref()),
+        },
         &tool_sinks,
         Some(&memory_user_id),
         &lm_settings,
@@ -3883,10 +3965,54 @@ fn is_admin_config_tool_name(name: &str) -> bool {
 fn persisted_conversation_context_from_memory(
     memory: &MemoryManager,
 ) -> anyhow::Result<PersistedConversationContext> {
-    let (summary, _) = memory.get_context_messages()?;
+    let (summary, messages) = memory.get_context_messages()?;
+    let curated_resource_continuation = latest_assistant_curated_resource_continuation(
+        messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.tool_results.as_ref())),
+    );
     Ok(PersistedConversationContext {
         summary: summary.map(|summary| summary.content),
+        curated_resource_continuation,
     })
+}
+
+fn latest_assistant_curated_resource_continuation<'a>(
+    messages: impl Iterator<Item = (&'a str, Option<&'a Value>)>,
+) -> Option<CuratedResourceContinuation> {
+    let metadata = messages
+        .filter(|(role, _)| *role == "assistant")
+        .last()
+        .and_then(|(_, metadata)| metadata)?;
+    let trace = conversation_trace_from_message_metadata(Some(metadata))?;
+    let latest_resource_tool = trace
+        .tools
+        .iter()
+        .rev()
+        .find(|tool| tool.id == CURATED_RESOURCES_TOOL_SET_ID)?;
+    curated_resource_continuation_from_tool_trace(latest_resource_tool)
+}
+
+fn curated_resource_continuation_from_tool_trace(
+    tool: &ToolTraceResponse,
+) -> Option<CuratedResourceContinuation> {
+    if tool.metadata.get("has_more").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let next_offset = tool
+        .metadata
+        .get("next_offset")
+        .and_then(Value::as_u64)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .filter(|offset| *offset > 0)?;
+    let query = match tool.metadata.get("continuation_query") {
+        Some(Value::Null) => None,
+        Some(Value::String(query)) if !query.trim().is_empty() => Some(query.trim().to_string()),
+        // Missing or malformed structured state cannot distinguish a filtered
+        // legacy trace from an unfiltered one, so continuation must fail closed.
+        _ => return None,
+    };
+    Some(CuratedResourceContinuation { query, next_offset })
 }
 
 async fn chat_stream(
@@ -4007,8 +4133,13 @@ async fn chat_stream(
         let tool_loop = {
             let tool_loop_future = run_conversation_tool_loop(
                 &mut agent,
-                &input,
-                &request.message,
+                ConversationToolLoopInput {
+                    prompt: &input,
+                    raw_user_message: &request.message,
+                    continuation: persisted_context
+                        .as_ref()
+                        .and_then(|context| context.curated_resource_continuation.as_ref()),
+                },
                 &tool_sinks,
                 Some(&memory_user_id),
                 &lm_settings,
@@ -4171,6 +4302,17 @@ async fn query(
         .update("human", build_human_block(&auth, &profile))
         .map_err(internal_error)?;
 
+    let persisted_context = match persisted_conversation_context_from_memory(&memory) {
+        Ok(context) => Some(context),
+        Err(error) => {
+            warn!(
+                "failed to load persisted conversation context for query session {}: {}",
+                session.id, error
+            );
+            None
+        }
+    };
+
     let memory_user_id = format!("{}:{}", auth.kind, auth.id);
     memory
         .store_message_deferred(&memory_user_id, "user", &request.question)
@@ -4226,11 +4368,22 @@ async fn query(
         auth.id,
     );
 
-    let input = build_query_conversation_turn_input(&auth, &profile, &request, &chat_request, None);
+    let input = build_query_conversation_turn_input(
+        &auth,
+        &profile,
+        &request,
+        &chat_request,
+        persisted_context.as_ref(),
+    );
     let tool_loop = run_conversation_tool_loop(
         &mut agent,
-        &input,
-        &request.question,
+        ConversationToolLoopInput {
+            prompt: &input,
+            raw_user_message: &request.question,
+            continuation: persisted_context
+                .as_ref()
+                .and_then(|context| context.curated_resource_continuation.as_ref()),
+        },
         &tool_sinks,
         Some(&memory_user_id),
         &lm_settings,
@@ -6618,7 +6771,7 @@ impl<'a> EnclaveWebRuntimeProfile<'a> {
             instruction.push_str(
                 "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Do not claim all, every, or a complete list when the Tool reports more results or completeness is unknown. When it reports no more results, scope completeness claims to matching ready Curated Resources and the supplied filters.\n- Only share contact details returned by find_resources.\n",
             );
-            instruction.push_str(CURATED_RESOURCES_CONTACT_POLICY);
+            instruction.push_str(CURATED_RESOURCES_GROUNDING_POLICY);
         }
         instruction.push_str("\nAgent Settings profile:\n");
         instruction.push_str(self.compiled_prompt);
@@ -7029,33 +7182,60 @@ struct ConversationToolLoopOutput {
     admin_config_affected_areas: Vec<String>,
 }
 
+struct ConversationToolLoopInput<'a> {
+    prompt: &'a str,
+    raw_user_message: &'a str,
+    continuation: Option<&'a CuratedResourceContinuation>,
+}
+
 async fn run_conversation_tool_loop(
     agent: &mut SageAgent,
-    input: &str,
-    raw_user_message: &str,
+    input: ConversationToolLoopInput<'_>,
     sinks: &ConversationToolLoopSinks,
     memory_user_id: Option<&str>,
     lm: &RequestLmSettings,
     answer_delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> AppResult<ConversationToolLoopOutput> {
     let turn_started_at = Instant::now();
-    agent.set_contact_lookup_expected(expects_curated_resource_lookup(raw_user_message));
-    let answer = match run_agent_turn(agent, input, memory_user_id, lm, answer_delta_sender).await {
-        Ok(answer) => answer,
-        Err(error) => {
-            let elapsed_ms = turn_started_at.elapsed().as_millis();
-            agent.emit_trace_event(AgentTraceEvent::Timing {
-                phase: ConversationTimingPhase::TotalTurn,
-                planning_round: None,
-                tool_name: None,
-                call_id: None,
-                attempt: 1,
-                outcome: ConversationTimingOutcome::Failed,
-                elapsed_ms,
-            });
-            return Err(error);
+    let query_context = agent.curated_resource_query_context();
+    #[cfg(test)]
+    let query_context = {
+        let mut query_context = query_context;
+        if query_context.is_empty() {
+            // Scripted replay agents intentionally run without persistence. Their
+            // server-built fixture separates earlier context from the current
+            // request with this exact marker.
+            if let Some((trusted_fixture_context, _)) =
+                input.prompt.rsplit_once("\nCURRENT REQUEST\n")
+            {
+                query_context = crate::sage_agent::CuratedResourceQueryContext::from_trusted_text(
+                    trusted_fixture_context,
+                );
+            }
         }
+        query_context
     };
+    agent.set_curated_resource_lookup_expectation(
+        curated_resource_lookup_expectation(input.raw_user_message, input.continuation)
+            .with_query_context(&query_context),
+    );
+    let answer =
+        match run_agent_turn(agent, input.prompt, memory_user_id, lm, answer_delta_sender).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                let elapsed_ms = turn_started_at.elapsed().as_millis();
+                agent.emit_trace_event(AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::TotalTurn,
+                    planning_round: None,
+                    tool_name: None,
+                    call_id: None,
+                    attempt: 1,
+                    outcome: ConversationTimingOutcome::Failed,
+                    elapsed_ms,
+                });
+                return Err(error);
+            }
+        };
     let elapsed_ms = turn_started_at.elapsed().as_millis();
     agent.emit_trace_event(AgentTraceEvent::Timing {
         phase: ConversationTimingPhase::TotalTurn,
@@ -7477,6 +7657,7 @@ struct PlainAnswerGenerationError {
 enum PlainAnswerFailureKind {
     ToolIntent,
     Repetition,
+    Completeness,
     TokenLimit,
     Other,
 }
@@ -7495,6 +7676,7 @@ impl PlainAnswerGenerationError {
             self.kind,
             PlainAnswerFailureKind::ToolIntent
                 | PlainAnswerFailureKind::Repetition
+                | PlainAnswerFailureKind::Completeness
                 | PlainAnswerFailureKind::TokenLimit
         ) && !self.emitted_any
     }
@@ -7554,6 +7736,7 @@ struct PlainAnswerStreamState {
     emitted_any: bool,
     emitted_context: String,
     opening_disposition: PlainAnswerOpeningDisposition,
+    forbid_unscoped_completeness: bool,
 }
 
 #[derive(Default)]
@@ -7588,6 +7771,18 @@ impl PlainAnswerStreamState {
         "arguments:",
         "```",
     ];
+
+    fn new(forbid_unscoped_completeness: bool) -> Self {
+        Self {
+            opening_disposition: if forbid_unscoped_completeness {
+                PlainAnswerOpeningDisposition::Quarantine
+            } else {
+                PlainAnswerOpeningDisposition::Undecided
+            },
+            forbid_unscoped_completeness,
+            ..Default::default()
+        }
+    }
 
     fn push_staged(
         &mut self,
@@ -7633,6 +7828,7 @@ impl PlainAnswerStreamState {
     ) -> std::result::Result<(), PlainAnswerGenerationError> {
         self.reject_repetition()?;
         self.reject_tool_intent(&self.pending)?;
+        self.reject_unscoped_completeness()?;
         if matches!(
             self.opening_disposition,
             PlainAnswerOpeningDisposition::QuarantineProcessNarration
@@ -7645,6 +7841,159 @@ impl PlainAnswerStreamState {
             ));
         }
         self.emit_pending_prefix_staged(self.pending.len(), answer_deltas);
+        Ok(())
+    }
+
+    fn reject_unscoped_completeness(&self) -> std::result::Result<(), PlainAnswerGenerationError> {
+        if !self.forbid_unscoped_completeness {
+            return Ok(());
+        }
+        let normalized = normalized_lookup_text(&self.answer);
+        let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+        let is_explicitly_limited = |index: usize| {
+            let previous = &tokens[index.saturating_sub(6)..index];
+            let articles = ["a", "an", "the", "una", "un", "la", "el"];
+            let previous_without_article = if previous
+                .last()
+                .is_some_and(|token| articles.contains(token))
+            {
+                &previous[..previous.len() - 1]
+            } else {
+                previous
+            };
+            let directly_negated = previous.last().is_some_and(|token| {
+                [
+                    "not", "no", "without", "isn", "isnt", "aren", "arent", "wasn", "wasnt",
+                    "cannot", "cant",
+                ]
+                .contains(token)
+            });
+            let negated_with_article = previous.len() >= 2
+                && ["not", "no"].contains(&previous[previous.len() - 2])
+                && articles.contains(&previous[previous.len() - 1]);
+            let qualified_negation = [
+                ["not", "be"].as_slice(),
+                ["not", "necessarily"].as_slice(),
+                ["not", "necessarily", "be"].as_slice(),
+                ["isn", "t", "necessarily"].as_slice(),
+                ["isnt", "necessarily"].as_slice(),
+                ["aren", "t", "necessarily"].as_slice(),
+                ["arent", "necessarily"].as_slice(),
+                ["wasn", "t", "necessarily"].as_slice(),
+                ["wasnt", "necessarily"].as_slice(),
+            ]
+            .iter()
+            .any(|pattern| previous_without_article.ends_with(pattern));
+            let spanish_limitation = [
+                ["no", "son"].as_slice(),
+                ["no", "es", "la", "lista"].as_slice(),
+                ["no", "es", "una", "lista"].as_slice(),
+                ["no", "es", "el", "inventario"].as_slice(),
+            ]
+            .iter()
+            .any(|pattern| previous.ends_with(pattern));
+            let verbal_limitation = [
+                ["may", "not", "include"].as_slice(),
+                ["may", "not", "have", "listed"].as_slice(),
+                ["might", "not", "include"].as_slice(),
+                ["might", "not", "have", "listed"].as_slice(),
+                ["could", "not", "include"].as_slice(),
+                ["could", "not", "have", "listed"].as_slice(),
+                ["do", "not", "include"].as_slice(),
+                ["does", "not", "include"].as_slice(),
+                ["did", "not", "include"].as_slice(),
+                ["have", "not", "listed"].as_slice(),
+                ["has", "not", "listed"].as_slice(),
+                ["not", "include"].as_slice(),
+                ["not", "have", "listed"].as_slice(),
+            ]
+            .iter()
+            .any(|pattern| previous_without_article.ends_with(pattern));
+            directly_negated
+                || negated_with_article
+                || qualified_negation
+                || spanish_limitation
+                || verbal_limitation
+        };
+        let resource_scope = [
+            "resource",
+            "resources",
+            "organization",
+            "organizations",
+            "list",
+            "lists",
+            "directory",
+            "inventory",
+            "recurso",
+            "recursos",
+            "organizacion",
+            "organizaciones",
+            "lista",
+            "directorio",
+            "inventario",
+        ];
+        let resource_scope_near = |index: usize, distance: usize| {
+            tokens[index.saturating_sub(distance)..tokens.len().min(index + distance + 1)]
+                .iter()
+                .any(|candidate| resource_scope.contains(candidate))
+        };
+        let anaphoric_scope_near = |index: usize, distance: usize| {
+            tokens[index.saturating_sub(distance)..tokens.len().min(index + distance + 1)]
+                .iter()
+                .any(|candidate| {
+                    [
+                        "that", "this", "these", "those", "them", "one", "ones", "set",
+                    ]
+                    .contains(candidate)
+                })
+        };
+        let universal_claim = tokens.iter().enumerate().any(|(index, token)| {
+            ["all", "every", "todos", "todas", "cada"].contains(token)
+                && !is_explicitly_limited(index)
+                && (resource_scope_near(index, 8) || anaphoric_scope_near(index, 4))
+        }) || tokens.iter().enumerate().any(|(index, token)| {
+            token == &"everything"
+                && !is_explicitly_limited(index)
+                && (resource_scope_near(index, 8) || anaphoric_scope_near(index, 4))
+        }) || tokens.iter().enumerate().any(|(index, token)| {
+            ["only", "unico", "unica", "unicos", "unicas"].contains(token)
+                && !is_explicitly_limited(index)
+                && (tokens[index.saturating_sub(1)..index].contains(&"the")
+                    || ["unico", "unica", "unicos", "unicas"].contains(token))
+                && tokens[index + 1..tokens.len().min(index + 4)]
+                    .iter()
+                    .any(|candidate| {
+                        resource_scope.contains(candidate) || ["one", "ones"].contains(candidate)
+                    })
+        });
+        let completeness_claim = tokens.iter().enumerate().any(|(index, token)| {
+            [
+                "full",
+                "complete",
+                "entire",
+                "exhaustive",
+                "completo",
+                "completa",
+                "completos",
+                "completas",
+                "exhaustivo",
+                "exhaustiva",
+            ]
+            .contains(token)
+                && !is_explicitly_limited(index)
+                && tokens[index + 1..tokens.len().min(index + 9)]
+                    .iter()
+                    .chain(tokens[index.saturating_sub(2)..index].iter())
+                    .any(|candidate| resource_scope.contains(candidate) || candidate == &"set")
+        });
+        let claims_complete = universal_claim || completeness_claim;
+        if claims_complete {
+            return Err(PlainAnswerGenerationError::new(
+                PlainAnswerFailureKind::Completeness,
+                "final plain-answer stream claimed completeness for a limited Curated Resources page; refusing to expose it",
+                self.emitted_any,
+            ));
+        }
         Ok(())
     }
 
@@ -8122,6 +8471,10 @@ impl PlainAnswerStreamState {
     }
 }
 
+fn prompt_has_incomplete_curated_resource_page(prompt: &PlainAnswerPrompt) -> bool {
+    prompt.incomplete_curated_resource_page
+}
+
 impl OpenAiPlainAnswerGenerator {
     fn new(client: Client, api_url: String, api_key: String, temperature: f64) -> Self {
         Self {
@@ -8436,7 +8789,8 @@ impl OpenAiPlainAnswerGenerator {
             ));
         }
 
-        let mut answer_state = PlainAnswerStreamState::default();
+        let mut answer_state =
+            PlainAnswerStreamState::new(prompt_has_incomplete_curated_resource_page(prompt));
         let mut buffer = Vec::new();
         let mut stream = response.bytes_stream();
         let mut done = false;
@@ -8602,10 +8956,11 @@ impl PlainAnswerGenerator for OpenAiPlainAnswerGenerator {
         );
         let retry_prompt = PlainAnswerPrompt {
             system: format!(
-                "{}\n\nThe previous final-answer attempt contained internal planning, repetitive process narration, or an incomplete answer. Retry once. The Tool phase is already complete; do not attempt or describe another lookup. Output only the final answer for the user. Do not write labels such as `Tool decision`, internal Tool names such as `find_resources` or `knowledge_search`, or serialized Tool arguments such as `key=value`. Use the Tool results already supplied as facts; do not narrate planning, searches, Tool calls, or Tool results.",
+                "{}\n\nThe previous final-answer attempt contained internal planning, repetitive process narration, an incomplete answer, or an unsupported completeness claim. Retry once. The Tool phase is already complete; do not attempt or describe another lookup. Output only the final answer for the user. Do not write labels such as `Tool decision`, internal Tool names such as `find_resources` or `knowledge_search`, or serialized Tool arguments such as `key=value`. Use the Tool results already supplied as facts; do not narrate planning, searches, Tool calls, or Tool results. If the Curated Resources result says more results are available, describe only the returned page and do not say all, every, complete, entire, or exhaustive.",
                 prompt.system
             ),
             user: prompt.user.clone(),
+            incomplete_curated_resource_page: prompt.incomplete_curated_resource_page,
         };
         self.generate_attempt(
             &retry_prompt,
@@ -9074,6 +9429,26 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+
+        let unavailable = agent_trace_event_delta(AgentTraceEvent::TimingUnavailable {
+            phase: ConversationTimingPhase::ToolPlanningClusterScheduling,
+            planning_round: Some(1),
+            attempt: 2,
+            reason: "provider_contract_does_not_expose_phase_timing",
+        });
+        assert_eq!(unavailable.status.as_deref(), Some("unavailable"));
+        assert_eq!(
+            unavailable.metadata["phase"],
+            json!("tool_planning_cluster_scheduling")
+        );
+        assert_eq!(unavailable.metadata["duration_ms"], Value::Null);
+        assert_eq!(
+            unavailable.metadata["reason"],
+            json!("provider_contract_does_not_expose_phase_timing")
+        );
+        assert!(!serde_json::to_string(&unavailable)
+            .unwrap()
+            .contains("contact@example"));
     }
 
     #[test]
@@ -9372,6 +9747,7 @@ mod tests {
             selected_tools: vec!["find_resources".to_string()],
             expected_curated_resources: true,
             missed_expected_curated_resources: false,
+            violation_reason: None,
             outcome: "planned".to_string(),
         };
         let attempted = AgentTraceEvent::ToolAttempted {
@@ -9643,6 +10019,7 @@ mod tests {
         let prompt = crate::sage_agent::PlainAnswerPrompt {
             system: "Answer plainly".to_string(),
             user: "Say hello".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
         let reasoning = Arc::new(Mutex::new(Vec::new()));
@@ -9709,6 +10086,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "say hello".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let timing_sender = sender.clone();
@@ -9765,6 +10143,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "say hello".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
@@ -9801,6 +10180,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "say hello".to_string(),
+            incomplete_curated_resource_page: false,
         };
 
         let answer = generator
@@ -9828,6 +10208,7 @@ mod tests {
             let prompt = PlainAnswerPrompt {
                 system: "answer plainly".to_string(),
                 user: "say hello".to_string(),
+                incomplete_curated_resource_page: false,
             };
             let events = Arc::new(Mutex::new(Vec::new()));
             let sink = events.clone();
@@ -9862,6 +10243,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "say hello".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
@@ -9890,6 +10272,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "say hello".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
@@ -9950,6 +10333,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "show structured prose".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
@@ -10797,6 +11181,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "hello".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let tool_call_api = spawn_plain_answer_provider(concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"db_query\",\"arguments\":\"{}\"}}]}}]}\n\n",
@@ -10923,6 +11308,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "give safety steps".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
@@ -10938,6 +11324,164 @@ mod tests {
             deltas.push(answer_signal(signal));
         }
         assert_eq!(deltas.concat(), answer);
+    }
+
+    #[tokio::test]
+    async fn incomplete_resource_page_retries_false_completeness_before_exposure() {
+        async fn completion(
+            State(attempts): State<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> impl IntoResponse {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let body = if attempt == 0 {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Here are all resources: Alpha and Beta.\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            } else {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"This page includes Alpha and Beta; more results are available.\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            };
+            ([("content-type", "text/event-stream")], body)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener.local_addr().expect("listener has address");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_attempts),
+            )
+            .await
+            .expect("test completion server should run");
+        });
+
+        let generator = OpenAiPlainAnswerGenerator::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let prompt = PlainAnswerPrompt {
+            system: "answer plainly".to_string(),
+            user: "[Tool Result: find_resources]\nOutput: Showing 2 of 4 matching ready Curated Resources; more results are available.\n\nCURRENT REQUEST\nList resources".to_string(),
+            incomplete_curated_resource_page: true,
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let answer = generator
+            .generate(&prompt, "test-model", Some(delta_tx), None)
+            .await
+            .expect("the qualified retry should succeed");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            answer,
+            "This page includes Alpha and Beta; more results are available."
+        );
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+        assert_eq!(deltas.concat(), answer);
+        assert!(!deltas.concat().contains("all resources"));
+    }
+
+    #[test]
+    fn incomplete_resource_guard_covers_modifiers_and_allows_explicit_hedges() {
+        for candidate in [
+            "Here is the full list.",
+            "These are all 10 organizations.",
+            "This covers all available resources.",
+            "Here are all matching organizations.",
+            "This is the full resource list.",
+            "This is the complete set of matching ready Curated Resources.",
+            "Not only are these all resources, they are verified.",
+            "Not every resource is local; these are all resources.",
+            "The resources above are all that are available.",
+            "This lists all 10.",
+            "This directory contains everything available.",
+            "These are the only resources available.",
+            "That's all.",
+            "Those are all of them.",
+            "That's everything.",
+            "Those are the only ones available.",
+            "That is the complete set.",
+            "I listed every one.",
+            "Estos son los únicos recursos disponibles.",
+            "Estos son todos los recursos disponibles.",
+            "Esta es la lista completa de recursos.",
+        ] {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::new(true);
+            state
+                .push(candidate, &sender)
+                .expect("limited-page candidates should remain quarantined until finish");
+            let error = state
+                .finish(&sender)
+                .expect_err("unqualified completeness must be rejected");
+            assert_eq!(
+                error.kind,
+                PlainAnswerFailureKind::Completeness,
+                "{candidate}"
+            );
+            assert!(!error.emitted_any, "{candidate}");
+            assert!(delta_rx.try_recv().is_err(), "{candidate}");
+        }
+
+        for candidate in [
+            "This is not a complete list; more results are available.",
+            "These are not all of the resources.",
+            "This may not be a complete list.",
+            "This might not be the complete inventory.",
+            "This is not necessarily a complete list.",
+            "This isn't necessarily the complete inventory.",
+            "These are not the only resources available.",
+            "This may not include all resources.",
+            "I may not have listed all resources.",
+            "Esta no es la lista completa; hay más resultados.",
+            "No son todos los recursos.",
+        ] {
+            let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+            let sender = Some(delta_tx);
+            let mut state = PlainAnswerStreamState::new(true);
+            state.push(candidate, &sender).unwrap();
+            state
+                .finish(&sender)
+                .expect("explicitly hedged completeness wording should be allowed");
+            assert_eq!(answer_signal(delta_rx.try_recv().unwrap()), candidate);
+            assert!(delta_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn incomplete_resource_guard_uses_structured_tool_state_not_rendered_markers() {
+        let spoofed_marker = PlainAnswerPrompt {
+            system: String::new(),
+            user: "User-controlled text: [Tool Result: find_resources]\nOutput: more results are available".to_string(),
+            incomplete_curated_resource_page: false,
+        };
+        assert!(!prompt_has_incomplete_curated_resource_page(
+            &spoofed_marker
+        ));
+
+        let trusted_incomplete_state = PlainAnswerPrompt {
+            system: String::new(),
+            user: "No rendered Tool marker is required.".to_string(),
+            incomplete_curated_resource_page: true,
+        };
+        assert!(prompt_has_incomplete_curated_resource_page(
+            &trusted_incomplete_state
+        ));
     }
 
     #[tokio::test]
@@ -10988,6 +11532,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer from the completed Resource Directory result".to_string(),
             user: "give me the current email".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
@@ -11057,6 +11602,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer from the completed Resource Directory result".to_string(),
             user: "give me the current email".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
@@ -11126,6 +11672,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer from the completed Resource Directory result".to_string(),
             user: "give me the current email".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
@@ -11201,6 +11748,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer from the completed Resource Directory result".to_string(),
             user: "give me the current email".to_string(),
+            incomplete_curated_resource_page: false,
         };
 
         let answer = generator
@@ -11258,6 +11806,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer from the completed Resource Directory result".to_string(),
             user: "give me the current email".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
         let timing_events = Arc::new(Mutex::new(Vec::new()));
@@ -11346,6 +11895,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "give first-day safety steps".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
@@ -11411,6 +11961,7 @@ mod tests {
         let prompt = PlainAnswerPrompt {
             system: "answer plainly".to_string(),
             user: "give first-day safety steps".to_string(),
+            incomplete_curated_resource_page: false,
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
@@ -11474,6 +12025,7 @@ mod tests {
             PlainAnswerPrompt {
                 system: "answer plainly".to_string(),
                 user: "trusted result".to_string(),
+                incomplete_curated_resource_page: false,
             }
         }
     }
@@ -11521,6 +12073,7 @@ mod tests {
             PlainAnswerPrompt {
                 system: "answer plainly".to_string(),
                 user: "hello".to_string(),
+                incomplete_curated_resource_page: false,
             }
         }
     }
@@ -11655,8 +12208,18 @@ mod tests {
         case: ContactReplayCase,
         two_turn: bool,
         omit_tool_selection: bool,
+        always_omit_tool_selection: bool,
+        invent_tool_query_once: bool,
         transient_resource_failure: bool,
         truncated_resource_failure: bool,
+    }
+
+    #[derive(Clone)]
+    struct InventoryReplayState {
+        planner_requests: Arc<Mutex<Vec<Value>>>,
+        final_answer_requests: Arc<Mutex<Vec<Value>>>,
+        resource_requests: Arc<Mutex<Vec<Value>>>,
+        language: &'static str,
     }
 
     #[derive(Clone)]
@@ -11718,7 +12281,7 @@ mod tests {
                 .unwrap()
                 .push(body.clone());
             let body_text = body.to_string();
-            let is_grounded_followup = body_text.contains("CURATED RESOURCES CONTACT GROUNDING")
+            let is_grounded_followup = body_text.contains("CURATED RESOURCES GROUNDING")
                 && body_text.contains(&state.case.contact_value);
             let fault_attempt = if is_grounded_followup {
                 state
@@ -11742,7 +12305,7 @@ mod tests {
                 "No matching current contact is currently listed.".to_string()
             } else if !expects_curated_resource_lookup(&state.case.followup) {
                 "No contact lookup was requested for this turn.".to_string()
-            } else if !body_text.contains("CURATED RESOURCES CONTACT GROUNDING") {
+            } else if !body_text.contains("CURATED RESOURCES GROUNDING") {
                 "Curated Resources are unavailable for this turn.".to_string()
             } else if !body_text.contains(&state.case.contact_value) {
                 "No fresh contact result was supplied.".to_string()
@@ -11778,7 +12341,7 @@ mod tests {
 
         let body_text = body.to_string();
         let plan_index = state.planner_requests.lock().unwrap().len();
-        let has_contact_policy = body_text.contains("CURATED RESOURCES CONTACT GROUNDING")
+        let has_contact_policy = body_text.contains("CURATED RESOURCES GROUNDING")
             && expects_curated_resource_lookup(&state.case.followup)
             && ((state.two_turn && plan_index == 0)
                 || (body_text.contains(&state.case.followup)
@@ -11786,11 +12349,18 @@ mod tests {
             && body_text.contains("Acme Legal Aid")
             && (plan_index == 0 || body_text.contains(&state.case.context));
         state.planner_requests.lock().unwrap().push(body);
-        let tool_calls = if has_contact_policy && !state.omit_tool_selection {
+        let omission_active =
+            state.always_omit_tool_selection || (state.omit_tool_selection && plan_index == 0);
+        let tool_query = if state.invent_tool_query_once && plan_index == 0 {
+            "Invented Org"
+        } else {
+            "Acme Legal Aid"
+        };
+        let tool_calls = if has_contact_policy && !omission_active {
             json!([{
                 "name": "find_resources",
                 "args": {
-                    "query": "Acme Legal Aid",
+                    "query": tool_query,
                     "region": "MX",
                     "language": state.case.language,
                     "help_type": state.case.help_type,
@@ -11817,6 +12387,109 @@ mod tests {
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .into_response()
+    }
+
+    async fn inventory_replay_provider(
+        State(state): State<InventoryReplayState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let body_text = body.to_string();
+        if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            state.final_answer_requests.lock().unwrap().push(body);
+            let first_page = body_text.contains("more results are available");
+            let first_page_names = (1..=10)
+                .map(|index| format!("Issue 539 Inventory {index:02}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let answer = match (state.language, first_page) {
+                ("es", true) => format!(
+                    "Mostrando 10 de 11 recursos coincidentes: {first_page_names}. Hay más resultados disponibles."
+                ),
+                ("es", false) => "La página siguiente incluye Issue 539 Inventory 11; no quedan más recursos coincidentes.".to_string(),
+                (_, true) => format!(
+                    "Showing 10 of 11 matching resources: {first_page_names}. More results are available."
+                ),
+                (_, false) => "The next page includes Issue 539 Inventory 11; no matching resources remain.".to_string(),
+            };
+            return (
+                [("content-type", "text/event-stream")],
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+                    serde_json::to_string(&answer).unwrap(),
+                ),
+            )
+                .into_response();
+        }
+
+        let plan_index = state.planner_requests.lock().unwrap().len();
+        let retry = body_text.contains("RUNTIME TOOL-PLAN VALIDATION");
+        let continuation = body_text.contains("Show the next page of those matching resources")
+            || body_text.contains("Muestra la siguiente página de esos recursos coincidentes");
+        state.planner_requests.lock().unwrap().push(body);
+        let query = if retry { "Issue 539 Inventory" } else { "aid" };
+        let mut args = json!({"query": query});
+        if continuation {
+            args["offset"] = json!(if retry { 10 } else { 1 });
+        }
+        let planner_content = format!(
+            "[[ ## tool_calls ## ]]\n{}\n\n[[ ## replan_after_results ## ]]\nfalse\n\n[[ ## completed ## ]]",
+            json!([{"name": "find_resources", "args": args}])
+        );
+        Json(json!({
+            "id": format!("inventory-plan-{plan_index}"),
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": planner_content},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .into_response()
+    }
+
+    async fn inventory_replay_resources(
+        State(state): State<InventoryReplayState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let offset = body.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        state.resource_requests.lock().unwrap().push(body);
+        let indexes: Vec<usize> = if offset == 10 {
+            vec![11]
+        } else {
+            (1..=10).collect()
+        };
+        let resources = indexes
+            .into_iter()
+            .map(|index| {
+                json!({
+                    "resource_id": format!("inventory-{index:02}"),
+                    "name": format!("Issue 539 Inventory {index:02}"),
+                    "resource_type": "legal",
+                    "description": "Inventory replay fixture.",
+                    "contact": {},
+                    "languages": ["en", "es"],
+                    "coverage": "Mexico",
+                    "help_types": ["legal"],
+                    "verified_at": "2026-07-27T00:00:00Z"
+                })
+            })
+            .collect::<Vec<_>>();
+        Json(json!({
+            "resources": resources,
+            "query": "Issue 539 Inventory",
+            "resolved_country_code": "MX",
+            "help_type": null,
+            "total_count": 11,
+            "returned_count": if offset == 10 { 1 } else { 10 },
+            "limit": 10,
+            "offset": offset,
+            "has_more": offset == 0,
+            "next_offset": if offset == 0 { json!(10) } else { Value::Null }
         }))
         .into_response()
     }
@@ -11904,6 +12577,8 @@ mod tests {
         case: ContactReplayCase,
         two_turn: bool,
         omit_tool_selection: bool,
+        always_omit_tool_selection: bool,
+        invent_tool_query_once: bool,
         transient_resource_failure: bool,
         truncated_resource_failure: bool,
     ) -> (ContactReplayState, String, String) {
@@ -11916,6 +12591,8 @@ mod tests {
             resource_requests: Arc::new(Mutex::new(Vec::new())),
             two_turn,
             omit_tool_selection,
+            always_omit_tool_selection,
+            invent_tool_query_once,
             transient_resource_failure,
             truncated_resource_failure,
         };
@@ -11964,6 +12641,51 @@ mod tests {
         )
     }
 
+    async fn spawn_inventory_replay_servers(
+        language: &'static str,
+    ) -> (InventoryReplayState, String, String) {
+        let state = InventoryReplayState {
+            planner_requests: Arc::new(Mutex::new(Vec::new())),
+            final_answer_requests: Arc::new(Mutex::new(Vec::new())),
+            resource_requests: Arc::new(Mutex::new(Vec::new())),
+            language,
+        };
+        let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider_address = provider_listener.local_addr().unwrap();
+        let provider_state = state.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                provider_listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(inventory_replay_provider))
+                    .with_state(provider_state),
+            )
+            .await
+            .unwrap();
+        });
+        let resource_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let resource_address = resource_listener.local_addr().unwrap();
+        let resource_state = state.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                resource_listener,
+                Router::new()
+                    .route(
+                        "/internal/agent/resources/search",
+                        post(inventory_replay_resources),
+                    )
+                    .with_state(resource_state),
+            )
+            .await
+            .unwrap();
+        });
+        (
+            state,
+            format!("http://{provider_address}/v1"),
+            format!("http://{resource_address}"),
+        )
+    }
+
     fn contact_replay_input(case: &ContactReplayCase, previous_answer: Option<&str>) -> String {
         let previous = previous_answer.unwrap_or("Acme Legal Aid contact was stale@example.test.");
         format!(
@@ -11972,15 +12694,35 @@ mod tests {
         )
     }
 
-    async fn run_real_contact_replay(
+    struct ContactReplayOptions {
         empty_resource: bool,
         stream: bool,
         enabled: bool,
-        case: ContactReplayCase,
         two_turn: bool,
         omit_tool_selection: bool,
+        invent_tool_query_once: bool,
         transient_resource_failure: bool,
-        truncated_resource_failure: bool,
+        continuation_cursor: Option<CuratedResourceContinuation>,
+    }
+
+    impl Default for ContactReplayOptions {
+        fn default() -> Self {
+            Self {
+                empty_resource: false,
+                stream: false,
+                enabled: true,
+                two_turn: false,
+                omit_tool_selection: false,
+                invent_tool_query_once: false,
+                transient_resource_failure: false,
+                continuation_cursor: None,
+            }
+        }
+    }
+
+    async fn run_real_contact_replay(
+        case: ContactReplayCase,
+        options: ContactReplayOptions,
     ) -> (
         String,
         ContactReplayState,
@@ -11988,13 +12730,26 @@ mod tests {
         Vec<ConversationTraceDeltaResponse>,
         Vec<ConversationStreamSignal>,
     ) {
+        let ContactReplayOptions {
+            empty_resource,
+            stream,
+            enabled,
+            two_turn,
+            omit_tool_selection,
+            invent_tool_query_once,
+            transient_resource_failure,
+            continuation_cursor,
+        } = options;
+        let continuation_cursor = continuation_cursor.as_ref();
         let (state, provider_url, resource_url) = spawn_contact_replay_servers(
             empty_resource,
             case.clone(),
             two_turn,
             omit_tool_selection,
+            false,
+            invent_tool_query_once,
             transient_resource_failure,
-            truncated_resource_failure,
+            false,
         )
         .await;
         let mut registry = ToolRegistry::new();
@@ -12031,7 +12786,6 @@ mod tests {
                 let _ = sender.send(ConversationStreamSignal::Trace(Box::new(delta)));
             }
         }));
-        agent.set_contact_lookup_expected(expects_curated_resource_lookup(&case.followup));
         SageAgent::configure_lm_with_temperature(&provider_url, "test-key", "test-model", 0.1)
             .await
             .expect("scripted provider should configure");
@@ -12060,8 +12814,11 @@ mod tests {
         let replay_sinks = ConversationToolLoopSinks::new(None);
         let answer = run_conversation_tool_loop(
             &mut agent,
-            &input,
-            &case.followup,
+            ConversationToolLoopInput {
+                prompt: &input,
+                raw_user_message: &case.followup,
+                continuation: continuation_cursor,
+            },
             &replay_sinks,
             None,
             &settings,
@@ -12114,6 +12871,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_contact_lookup_ignores_an_open_inventory_cursor() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stale_inventory_cursor = CuratedResourceContinuation {
+            query: Some("Issue 539 Inventory".to_string()),
+            next_offset: 10,
+        };
+        let (answer, state, _, _, _) = run_real_contact_replay(
+            ContactReplayCase::spanish_email(),
+            ContactReplayOptions {
+                continuation_cursor: Some(stale_inventory_cursor),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            answer,
+            "The current Resource Directory contact is fresh@example.test."
+        );
+        let requests = state.resource_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["query"], "Acme Legal Aid");
+        assert!(requests[0]
+            .get("offset")
+            .is_none_or(|offset| offset.as_u64() == Some(0)));
+    }
+
+    #[tokio::test]
     async fn real_contact_replay_uses_sage_planner_tool_and_fresh_final_grounding() {
         let _guard = contact_replay_lock()
             .lock()
@@ -12121,14 +12908,11 @@ mod tests {
         let spanish_email = ContactReplayCase::spanish_email();
         let (batch_answer, batch_state, batch_deltas, batch_trace_deltas, _) =
             run_real_contact_replay(
-                false,
-                false,
-                true,
                 spanish_email.clone(),
-                true,
-                false,
-                false,
-                false,
+                ContactReplayOptions {
+                    two_turn: true,
+                    ..Default::default()
+                },
             )
             .await;
         assert_eq!(
@@ -12162,7 +12946,7 @@ mod tests {
             .cloned()
             .expect("real Sage planner request should reach the provider");
         let planner_text = planner_request.to_string();
-        assert!(planner_text.contains("CURATED RESOURCES CONTACT GROUNDING"));
+        assert!(planner_text.contains("CURATED RESOURCES GROUNDING"));
         assert!(planner_text.contains("me puedes dar el email"));
         assert!(planner_text.contains("Acme Legal Aid"));
         assert!(planner_text.contains(&spanish_email.context));
@@ -12194,14 +12978,12 @@ mod tests {
 
         let (stream_answer, stream_state, stream_deltas, stream_trace_deltas, _) =
             run_real_contact_replay(
-                false,
-                true,
-                true,
                 spanish_email.clone(),
-                true,
-                false,
-                false,
-                false,
+                ContactReplayOptions {
+                    stream: true,
+                    two_turn: true,
+                    ..Default::default()
+                },
             )
             .await;
         assert_eq!(stream_answer, batch_answer);
@@ -12228,14 +13010,11 @@ mod tests {
             final_answer_fault: ContactReplayFinalAnswerFault::None,
         };
         let (phone_answer, phone_state, _, _, _) = run_real_contact_replay(
-            false,
-            false,
-            true,
             english_phone.clone(),
-            true,
-            false,
-            false,
-            false,
+            ContactReplayOptions {
+                two_turn: true,
+                ..Default::default()
+            },
         )
         .await;
         assert_eq!(
@@ -12297,14 +13076,12 @@ mod tests {
         for (index, case) in modality_cases.into_iter().enumerate() {
             let stream = index % 2 == 0;
             let (answer, state, deltas, trace_deltas, _) = run_real_contact_replay(
-                false,
-                stream,
-                true,
                 case.clone(),
-                true,
-                false,
-                false,
-                false,
+                ContactReplayOptions {
+                    stream,
+                    two_turn: true,
+                    ..Default::default()
+                },
             )
             .await;
             assert_eq!(
@@ -12332,16 +13109,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_contact_replay_accepts_common_named_request_prefixes() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for followup in [
+            "I need Acme Legal Aid's email.",
+            "Can I get the email for Acme Legal Aid?",
+            "Could I get the email for Acme Legal Aid?",
+            "Could I have Acme Legal Aid's email?",
+            "What is Acme Legal Aid's e-mail?",
+            "¿Cuál es el celular de Acme Legal Aid?",
+            "What is the e-mail of Acme Legal Aid?",
+            "Give me the phone number of Acme Legal Aid.",
+            "Share Acme Legal Aid's email and phone number.",
+            "Dame el correo de Acme Legal Aid.",
+            "Acme Legal Aid contact information.",
+            "Acme Legal Aid phone number.",
+            "I need contact information for Acme Legal Aid.",
+            "Can I get the email and phone number for Acme Legal Aid?",
+            "Dame el correo y teléfono de Acme Legal Aid.",
+            "What is the email address for Acme Legal Aid in Mexico?",
+        ] {
+            let mut case = ContactReplayCase::spanish_email();
+            case.followup = followup.to_string();
+            let (answer, state, _, _, _) =
+                run_real_contact_replay(case, ContactReplayOptions::default()).await;
+            assert_eq!(
+                answer, "The current Resource Directory contact is fresh@example.test.",
+                "{followup}"
+            );
+            let requests = state.resource_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{followup}");
+            assert_eq!(requests[0]["query"], json!("Acme Legal Aid"), "{followup}");
+        }
+    }
+
+    #[tokio::test]
+    async fn context_only_contact_replay_rejects_an_invented_organization_query() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (answer, state, _, trace_deltas, _) = run_real_contact_replay(
+            ContactReplayCase::spanish_email(),
+            ContactReplayOptions {
+                invent_tool_query_once: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            answer,
+            "The current Resource Directory contact is fresh@example.test."
+        );
+        assert_eq!(state.planner_requests.lock().unwrap().len(), 2);
+        let resource_requests = state.resource_requests.lock().unwrap();
+        assert_eq!(resource_requests.len(), 1);
+        assert_eq!(resource_requests[0]["query"], json!("Acme Legal Aid"));
+        assert!(trace_deltas.iter().any(|delta| {
+            delta.kind == "tool_selection_observation"
+                && delta.metadata["outcome"] == json!("rejected")
+                && delta.metadata["violation_reason"]
+                    == json!("find_resources query was not grounded in recent conversation")
+        }));
+    }
+
+    #[tokio::test]
     async fn real_stream_and_nonstream_transport_preserve_the_same_timing_phases() {
         let _guard = contact_replay_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let case = ContactReplayCase::spanish_email();
         let (_, _, _, batch_trace, _) =
-            run_real_contact_replay(false, false, true, case.clone(), false, false, false, false)
-                .await;
-        let (_, _, _, stream_trace, _) =
-            run_real_contact_replay(false, true, true, case, false, false, false, false).await;
+            run_real_contact_replay(case.clone(), ContactReplayOptions::default()).await;
+        let (_, _, _, stream_trace, _) = run_real_contact_replay(
+            case,
+            ContactReplayOptions {
+                stream: true,
+                ..Default::default()
+            },
+        )
+        .await;
         let phases = |trace: &[ConversationTraceDeltaResponse]| {
             trace
                 .iter()
@@ -12354,6 +13203,13 @@ mod tests {
         assert!(batch_phases.contains("final_answer_response_header_wait"));
         assert!(batch_phases.contains("final_answer_first_provider_event_wait"));
         assert!(batch_phases.contains("final_answer_model_duration"));
+        assert!(batch_phases.contains("tool_planning_cluster_scheduling"));
+        assert!(batch_phases.contains("tool_planning_inference"));
+        assert!(batch_trace.iter().any(|delta| {
+            delta.metadata["phase"] == json!("tool_planning_cluster_scheduling")
+                && delta.status.as_deref() == Some("unavailable")
+                && delta.metadata["duration_ms"].is_null()
+        }));
         assert_eq!(batch_phases, stream_phases);
     }
 
@@ -12366,7 +13222,15 @@ mod tests {
         let case = ContactReplayCase::spanish_email()
             .with_final_answer_fault(ContactReplayFinalAnswerFault::LiveToolDecisionOnce);
         let (answer, state, answer_deltas, trace_deltas, transported_signals) =
-            run_real_contact_replay(false, true, true, case, true, false, false, false).await;
+            run_real_contact_replay(
+                case,
+                ContactReplayOptions {
+                    stream: true,
+                    two_turn: true,
+                    ..Default::default()
+                },
+            )
+            .await;
 
         assert_eq!(
             answer,
@@ -12408,14 +13272,12 @@ mod tests {
         let case = ContactReplayCase::spanish_email();
         for stream in [false, true] {
             let (answer, state, answer_deltas, trace_deltas, _) = run_real_contact_replay(
-                false,
-                stream,
-                true,
                 case.clone(),
-                false,
-                false,
-                true,
-                false,
+                ContactReplayOptions {
+                    stream,
+                    transient_resource_failure: true,
+                    ..Default::default()
+                },
             )
             .await;
             assert_eq!(
@@ -12472,8 +13334,15 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let case = ContactReplayCase::spanish_email();
-        let (answer, _state, answer_deltas, trace_deltas, signals) =
-            run_real_contact_replay(false, true, true, case, false, false, true, false).await;
+        let (answer, _state, answer_deltas, trace_deltas, signals) = run_real_contact_replay(
+            case,
+            ContactReplayOptions {
+                stream: true,
+                transient_resource_failure: true,
+                ..Default::default()
+            },
+        )
+        .await;
         assert_eq!(answer_deltas.concat(), answer);
         assert!(
             !signals.is_empty(),
@@ -12600,14 +13469,11 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let default_case = ContactReplayCase::spanish_email();
         let (empty_answer, empty_state, _, empty_trace_deltas, _) = run_real_contact_replay(
-            true,
-            false,
-            true,
             default_case.clone(),
-            false,
-            false,
-            false,
-            false,
+            ContactReplayOptions {
+                empty_resource: true,
+                ..Default::default()
+            },
         )
         .await;
         assert_eq!(
@@ -12628,14 +13494,11 @@ mod tests {
 
         let (disabled_answer, disabled_state, _, disabled_trace_deltas, _) =
             run_real_contact_replay(
-                false,
-                false,
-                false,
                 default_case,
-                false,
-                false,
-                false,
-                false,
+                ContactReplayOptions {
+                    enabled: false,
+                    ..Default::default()
+                },
             )
             .await;
         assert_eq!(
@@ -12653,7 +13516,7 @@ mod tests {
             .expect("disabled turn should use plain answer path");
         assert!(!disabled_final
             .to_string()
-            .contains("CURATED RESOURCES CONTACT GROUNDING"));
+            .contains("CURATED RESOURCES GROUNDING"));
         assert!(!disabled_trace_deltas
             .iter()
             .any(|delta| delta.kind == "tool_selection_observation"));
@@ -12664,14 +13527,12 @@ mod tests {
             disabled_stream_trace_deltas,
             _,
         ) = run_real_contact_replay(
-            false,
-            true,
-            false,
             ContactReplayCase::spanish_email(),
-            false,
-            false,
-            false,
-            false,
+            ContactReplayOptions {
+                stream: true,
+                enabled: false,
+                ..Default::default()
+            },
         )
         .await;
         assert_eq!(disabled_stream_answer, disabled_answer);
@@ -12698,8 +13559,7 @@ mod tests {
             final_answer_fault: ContactReplayFinalAnswerFault::None,
         };
         let (benign_answer, benign_state, _, benign_trace_deltas, _) =
-            run_real_contact_replay(false, false, true, benign_case, false, false, false, false)
-                .await;
+            run_real_contact_replay(benign_case, ContactReplayOptions::default()).await;
         assert_eq!(
             benign_answer,
             "No contact lookup was requested for this turn."
@@ -12719,18 +13579,20 @@ mod tests {
         );
         assert_eq!(benign_selection.metadata["selected_tools"], json!([]));
 
-        let (_, omitted_state, _, omitted_trace_deltas, _) = run_real_contact_replay(
-            false,
-            false,
-            true,
+        let (omitted_answer, omitted_state, _, omitted_trace_deltas, _) = run_real_contact_replay(
             ContactReplayCase::spanish_email(),
-            false,
-            true,
-            false,
-            false,
+            ContactReplayOptions {
+                omit_tool_selection: true,
+                ..Default::default()
+            },
         )
         .await;
-        assert!(omitted_state.resource_requests.lock().unwrap().is_empty());
+        assert_eq!(
+            omitted_answer,
+            "The current Resource Directory contact is fresh@example.test."
+        );
+        assert_eq!(omitted_state.planner_requests.lock().unwrap().len(), 2);
+        assert_eq!(omitted_state.resource_requests.lock().unwrap().len(), 1);
         let omitted = omitted_trace_deltas
             .iter()
             .find(|delta| delta.kind == "tool_selection_observation")
@@ -12738,22 +13600,31 @@ mod tests {
         assert_eq!(omitted.metadata["expected_curated_resources"], json!(true));
         assert_eq!(omitted.metadata["selected_tools"], json!([]));
         assert_eq!(omitted.metadata["selection_count"], json!(0));
-        assert_eq!(omitted.metadata["outcome"], json!("planned"));
+        assert_eq!(omitted.metadata["outcome"], json!("rejected"));
         assert_eq!(
             omitted.metadata["missed_expected_curated_resources"],
             json!(true)
         );
+        let recovered = omitted_trace_deltas
+            .iter()
+            .find(|delta| {
+                delta.kind == "tool_selection_observation" && delta.metadata["attempt"] == json!(2)
+            })
+            .expect("the bounded retry should produce a valid second Tool plan");
+        assert_eq!(
+            recovered.metadata["selected_tools"],
+            json!(["find_resources"])
+        );
+        assert_eq!(recovered.metadata["outcome"], json!("planned"));
 
         let (_, _, omitted_stream_deltas, omitted_stream_trace_deltas, _) =
             run_real_contact_replay(
-                false,
-                true,
-                true,
                 ContactReplayCase::spanish_email(),
-                false,
-                true,
-                false,
-                false,
+                ContactReplayOptions {
+                    stream: true,
+                    omit_tool_selection: true,
+                    ..Default::default()
+                },
             )
             .await;
         assert!(!omitted_stream_deltas.is_empty());
@@ -12761,6 +13632,254 @@ mod tests {
             delta.kind == "tool_selection_observation"
                 && delta.metadata["missed_expected_curated_resources"] == json!(true)
         }));
+        assert!(omitted_stream_trace_deltas.iter().any(|delta| {
+            delta.kind == "tool_selection_observation"
+                && delta.metadata["attempt"] == json!(2)
+                && delta.metadata["selected_tools"] == json!(["find_resources"])
+        }));
+    }
+
+    #[tokio::test]
+    async fn explicit_curated_resource_lookup_fails_closed_after_bounded_plan_omissions() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let case = ContactReplayCase::spanish_email();
+        let (state, provider_url, resource_url) = spawn_contact_replay_servers(
+            false,
+            case.clone(),
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        .await;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                resource_url,
+                "test-internal-token".to_string(),
+            ),
+            jurisdiction: Some("MX".to_string()),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        registry.register(Arc::new(crate::tools::DoneTool));
+        let mut agent = SageAgent::new_without_memory(
+            registry,
+            build_agent_instruction("PROFILE", false, true),
+        );
+        let trace_deltas = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_deltas.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink
+                .lock()
+                .unwrap()
+                .push(agent_trace_event_delta(event));
+        }));
+        let settings = RequestLmSettings {
+            api_url: provider_url,
+            api_key: "test-key".to_string(),
+            model_chain: vec!["test-model".to_string()],
+            temperature: 0.1,
+        };
+        SageAgent::configure_lm_with_temperature(
+            &settings.api_url,
+            &settings.api_key,
+            &settings.model_chain[0],
+            settings.temperature,
+        )
+        .await
+        .unwrap();
+        let input = contact_replay_input(&case, None);
+        let result = run_conversation_tool_loop(
+            &mut agent,
+            ConversationToolLoopInput {
+                prompt: &input,
+                raw_user_message: &case.followup,
+                continuation: None,
+            },
+            &ConversationToolLoopSinks::new(None),
+            None,
+            &settings,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an ungrounded answer must not be generated"
+        );
+        assert_eq!(state.planner_requests.lock().unwrap().len(), 3);
+        assert!(state.resource_requests.lock().unwrap().is_empty());
+        assert!(state.final_answer_requests.lock().unwrap().is_empty());
+        let trace_deltas = trace_deltas.lock().unwrap();
+        assert_eq!(
+            trace_deltas
+                .iter()
+                .filter(|delta| {
+                    delta.kind == "tool_selection_observation"
+                        && delta.metadata["outcome"] == json!("rejected")
+                })
+                .count(),
+            3
+        );
+        assert!(!trace_deltas
+            .iter()
+            .any(|delta| delta.kind == "tool_call" || delta.kind == "tool_result"));
+    }
+
+    #[tokio::test]
+    async fn exact_customer_inventory_replays_preserve_filter_and_cursor_in_both_languages() {
+        let _guard = contact_replay_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (language, inventory_prompt, continuation_prompt) in [
+            (
+                "en",
+                "List the ready Curated Resources whose names start with 'Issue 539 Inventory'. This is an inventory request: do not filter by help type and do not assume the first bounded page is complete.",
+                "Show the next page of those matching resources.",
+            ),
+            (
+                "es",
+                "Lista los recursos curados listos cuyos nombres empiezan con 'Issue 539 Inventory'. Esta es una solicitud de inventario: no filtres por tipo de ayuda y no supongas que la primera página limitada está completa. Responde en español.",
+                "Muestra la siguiente página de esos recursos coincidentes.",
+            ),
+        ] {
+            let (state, provider_url, resource_url) =
+                spawn_inventory_replay_servers(language).await;
+            let replay_sinks = ConversationToolLoopSinks::new(None);
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(FindResourcesTool {
+                internal: InternalAgentClient::new(
+                    Client::new(),
+                    resource_url,
+                    "test-internal-token".to_string(),
+                ),
+                jurisdiction: Some("MX".to_string()),
+                traces: replay_sinks.traces.clone(),
+            }));
+            registry.register(Arc::new(crate::tools::DoneTool));
+            let mut agent = SageAgent::new_without_memory(
+                registry,
+                build_agent_instruction("PROFILE", false, true),
+            );
+            let trace_deltas = Arc::new(Mutex::new(Vec::new()));
+            let trace_sink = trace_deltas.clone();
+            agent.set_trace_hook(Arc::new(move |event| {
+                trace_sink
+                    .lock()
+                    .unwrap()
+                    .push(agent_trace_event_delta(event));
+            }));
+            let settings = RequestLmSettings {
+                api_url: provider_url,
+                api_key: "test-key".to_string(),
+                model_chain: vec!["test-model".to_string()],
+                temperature: 0.1,
+            };
+            SageAgent::configure_lm_with_temperature(
+                &settings.api_url,
+                &settings.api_key,
+                &settings.model_chain[0],
+                settings.temperature,
+            )
+            .await
+            .unwrap();
+            let first = run_conversation_tool_loop(
+                &mut agent,
+                ConversationToolLoopInput {
+                    prompt: &format!("CURRENT REQUEST\n{inventory_prompt}"),
+                    raw_user_message: inventory_prompt,
+                    continuation: None,
+                },
+                &replay_sinks,
+                None,
+                &settings,
+                None,
+            )
+            .await
+            .expect("filtered inventory should recover its exact query");
+            assert!(first.answer.contains("10 of 11") || first.answer.contains("10 de 11"));
+            assert!(first.answer.contains("Issue 539 Inventory 10"));
+            let ai_config = InternalEffectiveAiConfig {
+                prompt_sections: HashMap::new(),
+                parameters: HashMap::new(),
+                defaults: HashMap::new(),
+                compiled_prompt: String::new(),
+            };
+            let auth = InternalAuthContext {
+                id: 1,
+                kind: "user".to_string(),
+                approved: true,
+                pubkey: None,
+                email: None,
+                name: None,
+                user_type_id: None,
+                dev_mode: false,
+            };
+            let persisted_trace = build_conversation_trace(
+                &ai_config,
+                &auth,
+                first.tools_used.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("production trace builder should retain the resource Tool");
+            let persisted_metadata = assistant_trace_metadata(&persisted_trace);
+            let restored_cursor = latest_assistant_curated_resource_continuation(
+                [
+                    ("user", None),
+                    ("assistant", Some(&persisted_metadata)),
+                ]
+                .into_iter(),
+            )
+            .expect("persisted first-page trace should restore the exact continuation cursor");
+            assert_eq!(
+                restored_cursor.query.as_deref(),
+                Some("Issue 539 Inventory")
+            );
+            assert_eq!(restored_cursor.next_offset, 10);
+
+            let second = run_conversation_tool_loop(
+                &mut agent,
+                ConversationToolLoopInput {
+                    prompt: &format!(
+                        "RECENT CONVERSATION\nassistant: {}\nCURRENT REQUEST\n{continuation_prompt}",
+                        first.answer
+                    ),
+                    raw_user_message: continuation_prompt,
+                    continuation: Some(&restored_cursor),
+                },
+                &replay_sinks,
+                None,
+                &settings,
+                None,
+            )
+            .await
+            .expect("continuation should recover the exact query and next_offset");
+            assert!(second.answer.contains("Issue 539 Inventory 11"));
+            assert_eq!(state.planner_requests.lock().unwrap().len(), 4);
+            assert_eq!(state.resource_requests.lock().unwrap().len(), 2);
+            let requests = state.resource_requests.lock().unwrap();
+            assert_eq!(requests[0]["query"], json!("Issue 539 Inventory"));
+            assert_eq!(requests[0]["offset"], json!(0));
+            assert_eq!(requests[1]["query"], json!("Issue 539 Inventory"));
+            assert_eq!(requests[1]["offset"], json!(10));
+            drop(requests);
+            assert_eq!(state.final_answer_requests.lock().unwrap().len(), 2);
+            assert_eq!(
+                trace_deltas
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|delta| delta.metadata["outcome"] == json!("rejected"))
+                    .count(),
+                2
+            );
+        }
     }
 
     #[tokio::test]
@@ -12911,7 +14030,7 @@ mod tests {
             }));
             registry.register(Arc::new(crate::tools::DoneTool));
             let mut agent = SageAgent::new_without_memory(registry, "test");
-            agent.set_contact_lookup_expected(false);
+            agent.set_curated_resource_lookup_expectation(Default::default());
             let settings = RequestLmSettings {
                 api_url: format!("http://{address}/v1"),
                 api_key: "test-key".to_string(),
@@ -13243,6 +14362,7 @@ mod tests {
             PlainAnswerPrompt {
                 system: "answer plainly".to_string(),
                 user: "explain the guarded result".to_string(),
+                incomplete_curated_resource_page: false,
             }
         }
     }
@@ -13579,6 +14699,8 @@ mod tests {
                 "total_count": 6,
                 "has_more": true,
                 "next_offset": 6,
+                "continuation_query": "mexico legal aid network",
+                "resolved_region": "MX",
             })
         );
 
@@ -13709,6 +14831,8 @@ mod tests {
                 "total_count": 11,
                 "has_more": false,
                 "next_offset": Value::Null,
+                "continuation_query": Value::Null,
+                "resolved_region": Value::Null,
             })
         );
 
@@ -13868,7 +14992,7 @@ mod tests {
             },
             &user,
         );
-        assert!(!disabled.contains("CURATED RESOURCES CONTACT GROUNDING"));
+        assert!(!disabled.contains("CURATED RESOURCES GROUNDING"));
         assert!(!disabled.contains("fresh find_resources decision"));
         assert!(!disabled.contains("me puedes dar el email"));
     }
@@ -14276,7 +15400,7 @@ mod tests {
     async fn endpoint_retry_contract_covers_transient_failure_timeout_and_non_retryable_results() {
         let (result, events, requests) = run_endpoint_lookup(
             "recover",
-            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+            ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
         assert!(result.success);
@@ -14298,7 +15422,7 @@ mod tests {
 
         let (result, events, requests) = run_endpoint_lookup(
             "exhaust",
-            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+            ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
         assert!(!result.success);
@@ -14320,7 +15444,7 @@ mod tests {
 
         let (result, events, requests) = run_endpoint_lookup(
             "504",
-            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+            ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
         assert!(!result.success);
@@ -14337,7 +15461,7 @@ mod tests {
             let (result, events, requests) = run_endpoint_lookup(
                 mode,
                 ToolRetryPolicy::read_only(
-                    Duration::from_millis(50),
+                    Duration::from_millis(250),
                     2,
                     Duration::from_millis(500),
                 ),
@@ -14363,7 +15487,7 @@ mod tests {
 
         let (result, events, requests) = run_endpoint_lookup(
             "empty",
-            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+            ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
         assert!(result.success);
@@ -14379,7 +15503,7 @@ mod tests {
 
         let (result, events, requests) = run_endpoint_lookup(
             "success",
-            ToolRetryPolicy::read_only(Duration::from_millis(50), 2, Duration::from_millis(500)),
+            ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
         assert!(result.success);
@@ -14661,6 +15785,7 @@ mod tests {
                 selected_tools: vec!["find_resources".to_string()],
                 expected_curated_resources: true,
                 missed_expected_curated_resources: false,
+                violation_reason: None,
                 outcome: "planned".to_string(),
             },
             AgentTraceEvent::ToolAttempted {
@@ -14696,6 +15821,7 @@ mod tests {
                 "selection_count",
                 "expected_curated_resources",
                 "missed_expected_curated_resources",
+                "violation_reason",
                 "outcome",
             ],
             &[
@@ -14890,11 +16016,40 @@ mod tests {
             selected_tools: Vec::new(),
             expected_curated_resources: true,
             missed_expected_curated_resources: true,
+            violation_reason: Some("required find_resources Tool call was omitted".to_string()),
             outcome: "planned".to_string(),
         });
         assert_eq!(selection.kind, "tool_selection_observation");
         assert_eq!(selection.status.as_deref(), Some("failed"));
         assert_eq!(selection.metadata["selection_count"], json!(0));
+        assert_eq!(
+            selection.metadata["violation_reason"],
+            json!("required find_resources Tool call was omitted")
+        );
+        let extra_lookup = agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
+            round: 3,
+            attempt: 1,
+            enabled_tools: vec!["find_resources".to_string()],
+            selected_tools: vec!["find_resources".to_string()],
+            expected_curated_resources: false,
+            missed_expected_curated_resources: false,
+            violation_reason: Some(
+                "additional find_resources call was not allowed after turn success".to_string(),
+            ),
+            outcome: "rejected".to_string(),
+        });
+        assert_eq!(
+            extra_lookup.metadata["missed_expected_curated_resources"],
+            json!(false)
+        );
+        assert_eq!(
+            extra_lookup.content.as_deref(),
+            Some("additional find_resources call was not allowed after turn success")
+        );
+        assert_eq!(
+            selection.content.as_deref(),
+            Some("required find_resources Tool call was omitted")
+        );
         assert_eq!(
             selection.metadata["missed_expected_curated_resources"],
             json!(true)
@@ -14909,6 +16064,7 @@ mod tests {
                 selected_tools: vec!["find_resources".to_string()],
                 expected_curated_resources: true,
                 missed_expected_curated_resources: false,
+                violation_reason: None,
                 outcome: "planned".to_string(),
             });
         assert_ne!(selection.id, retried_selection.id);
@@ -14965,6 +16121,7 @@ mod tests {
             selected_tools: vec!["find_resources".to_string()],
             expected_curated_resources: true,
             missed_expected_curated_resources: false,
+            violation_reason: None,
             outcome: "planned".to_string(),
         });
         let activity = conversation_activity_steps_from_trace_deltas(&[delta]);
@@ -15149,6 +16306,112 @@ mod tests {
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].metadata, first.metadata);
         assert_eq!(deduped[1].metadata, final_page.metadata);
+    }
+
+    #[test]
+    fn curated_resource_trace_restores_only_the_latest_open_cursor() {
+        let mut tool = ToolTraceResponse {
+            id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
+            name: "Curated Resources".to_string(),
+            status: "completed".to_string(),
+            execution: "server".to_string(),
+            input_summary: Some(
+                "curated resources inventory matching Issue 539 Inventory".to_string(),
+            ),
+            output_summary: None,
+            warnings: vec!["curated_resources_truncated".to_string()],
+            metadata: json!({
+                "returned_count": 10,
+                "total_count": 11,
+                "has_more": true,
+                "next_offset": 10,
+                "continuation_query": "Issue 539 Inventory",
+            }),
+        };
+        assert_eq!(
+            curated_resource_continuation_from_tool_trace(&tool),
+            Some(CuratedResourceContinuation {
+                query: Some("Issue 539 Inventory".to_string()),
+                next_offset: 10,
+            })
+        );
+        let open_trace = ConversationTraceResponse {
+            visibility: "detailed".to_string(),
+            reasoning: ReasoningTraceResponse {
+                summary: "Used Curated Resources.".to_string(),
+            },
+            trace_deltas: Vec::new(),
+            tools: vec![tool.clone()],
+            retrieval: Vec::new(),
+            activity_steps: Vec::new(),
+            suppressed: false,
+        };
+        let open_metadata = assistant_trace_metadata(&open_trace);
+        assert_eq!(
+            latest_assistant_curated_resource_continuation(
+                [("assistant", Some(&open_metadata))].into_iter()
+            ),
+            Some(CuratedResourceContinuation {
+                query: Some("Issue 539 Inventory".to_string()),
+                next_offset: 10,
+            })
+        );
+        assert_eq!(
+            latest_assistant_curated_resource_continuation(
+                [
+                    ("assistant", Some(&open_metadata)),
+                    ("user", None),
+                    ("assistant", None),
+                ]
+                .into_iter()
+            ),
+            None,
+            "an unrelated assistant answer must expire the older open cursor"
+        );
+        let long_query = "organization ".repeat(30).trim().to_string();
+        tool.input_summary = Some(format!(
+            "curated resources inventory matching {}",
+            truncate_chars(&long_query, 40)
+        ));
+        tool.metadata["continuation_query"] = json!(long_query);
+        assert_eq!(
+            curated_resource_continuation_from_tool_trace(&tool).and_then(|cursor| cursor.query),
+            Some("organization ".repeat(30).trim().to_string()),
+            "the exact structured query must win over the truncated display summary"
+        );
+        tool.metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("continuation_query");
+        assert_eq!(
+            curated_resource_continuation_from_tool_trace(&tool),
+            None,
+            "a legacy trace without structured query state cannot safely resume"
+        );
+        tool.input_summary = Some("curated resources inventory".to_string());
+        assert_eq!(
+            curated_resource_continuation_from_tool_trace(&tool),
+            None,
+            "display wording cannot prove that a legacy trace was unfiltered"
+        );
+        tool.metadata["continuation_query"] = Value::Null;
+        assert_eq!(
+            curated_resource_continuation_from_tool_trace(&tool),
+            Some(CuratedResourceContinuation {
+                query: None,
+                next_offset: 10,
+            }),
+            "an explicit structured null safely represents an unfiltered query"
+        );
+        tool.metadata["next_offset"] = json!(0);
+        assert_eq!(
+            curated_resource_continuation_from_tool_trace(&tool),
+            None,
+            "a zero next_offset is not a valid continuation cursor"
+        );
+        tool.metadata["has_more"] = json!(false);
+        tool.metadata["next_offset"] = Value::Null;
+        assert_eq!(curated_resource_continuation_from_tool_trace(&tool), None);
     }
 
     #[test]
@@ -15485,6 +16748,7 @@ mod tests {
         };
         let persisted = PersistedConversationContext {
             summary: Some("Persisted summary from Sage Session Memory.".to_string()),
+            ..Default::default()
         };
         let profile = HashMap::new();
 

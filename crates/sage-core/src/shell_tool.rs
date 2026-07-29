@@ -159,6 +159,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: format!("Command blocked: contains dangerous pattern '{}'", pattern),
                 error: Some("Security violation".to_string()),
+                metadata: serde_json::Value::Null,
             });
         }
 
@@ -183,6 +184,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to execute command: {}", e)),
+                    metadata: serde_json::Value::Null,
                 });
             }
         };
@@ -217,12 +219,14 @@ impl Tool for ShellTool {
                     } else {
                         Some(format!("Command exited with code {}", exit_code))
                     },
+                    metadata: serde_json::Value::Null,
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to wait on command: {}", e)),
+                metadata: serde_json::Value::Null,
             }),
             Err(_) => {
                 // Timeout -- kill the entire process group first, then drain
@@ -267,6 +271,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: output_str,
                     error: Some(format!("Command timed out after {}s", timeout_secs)),
+                    metadata: serde_json::Value::Null,
                 })
             }
         }
