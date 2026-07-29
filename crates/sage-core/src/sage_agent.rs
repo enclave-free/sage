@@ -2703,7 +2703,12 @@ pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
         ]
         .iter()
         .any(|marker| preamble.contains(marker));
-        if has_invocation && (has_deliberation_preamble || transcript.contains("tool result:")) {
+        let starts_with_tool_calls = preamble.trim().is_empty();
+        if has_invocation
+            && (starts_with_tool_calls
+                || has_deliberation_preamble
+                || transcript.contains("tool result:"))
+        {
             return true;
         }
     }
@@ -5929,6 +5934,9 @@ mod tests {
 
     #[test]
     fn textual_tool_transcripts_are_distinct_from_explanatory_prose() {
+        assert!(has_syntactic_tool_intent(
+            "Tool calls: find_resources(lookup_mode=\"inventory\", query=\"Issue 539 Inventory\", offset=10)"
+        ));
         assert!(has_syntactic_tool_intent(
             "I will search now. Tool calls: knowledge_search(query=\"referral\")\nTool Result: found one"
         ));

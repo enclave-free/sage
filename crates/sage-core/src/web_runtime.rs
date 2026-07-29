@@ -10641,6 +10641,24 @@ mod tests {
     }
 
     #[test]
+    fn plain_answer_safety_rejects_bare_plural_tool_call_before_exposure() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let sender = Some(delta_tx);
+        let mut state = PlainAnswerStreamState::default();
+
+        let error = state
+            .push(
+                "Tool calls: find_resources(lookup_mode=\"inventory\", query=\"Issue 539 Inventory\", offset=10)",
+                &sender,
+            )
+            .expect_err("a bare plural Tool call must be rejected before exposure");
+
+        assert_eq!(error.kind, PlainAnswerFailureKind::ToolIntent);
+        assert!(!error.emitted_any);
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn plain_answer_safety_rejects_provider_neutral_tool_invocation_before_exposure() {
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
         let sender = Some(delta_tx);
