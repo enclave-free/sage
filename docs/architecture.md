@@ -80,6 +80,14 @@ token-limit termination, and unsupported finish reasons fail the answer rather
 than being persisted as success. A quarantined Tool, repetition, or token-limit
 failure may retry once only when no answer text has reached the client.
 
+One narrow deterministic terminal fallback applies after that retry is
+exhausted: when the turn executed exactly one successful Curated Resources
+inventory lookup and exposed no answer text, Sage may return the Tool adapter's
+separately marked user-safe inventory rendering. Internal Tool output is never
+used for this fallback. Contact lookups, multiple-Tool turns, partial answer
+streams, and ordinary provider or transport failures retain the fail-closed
+behavior above.
+
 Conversation traces time total Tool planning, retrieval, Resource Directory
 lookup, Tool execution, retry delay, final-answer generation, and total turn
 duration separately. Final-answer response-header and first-event waits are
