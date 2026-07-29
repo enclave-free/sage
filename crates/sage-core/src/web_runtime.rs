@@ -814,6 +814,25 @@ struct InternalResourceSearchResponse {
     next_offset: Option<usize>,
 }
 
+fn conservative_resource_pagination(
+    offset: usize,
+    returned_count: usize,
+    total_count: usize,
+    reported_has_more: bool,
+    reported_next_offset: Option<usize>,
+) -> (bool, Option<usize>) {
+    let consumed_count = offset.saturating_add(returned_count);
+    let has_more = reported_has_more || consumed_count < total_count;
+    let next_offset = has_more
+        .then(|| {
+            reported_next_offset
+                .filter(|next_offset| *next_offset > offset)
+                .or_else(|| (returned_count > 0).then_some(consumed_count))
+        })
+        .flatten();
+    (has_more, next_offset)
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct InternalSessionLogTurn {
     role: String,
@@ -1497,8 +1516,10 @@ fn log_agent_trace_event(
             round,
             attempt,
             enabled_tools,
+            raw_selected_tools,
             selected_tools,
             expected_curated_resources,
+            curated_resources_available,
             missed_expected_curated_resources,
             violation_reason,
             outcome,
@@ -1513,9 +1534,11 @@ fn log_agent_trace_event(
             round = *round,
             attempt = *attempt,
             enabled_tools = ?enabled_tools,
+            raw_selected_tools = ?raw_selected_tools,
             selected_tools = ?selected_tools,
             selection_count = selected_tools.len(),
             expected_curated_resources = *expected_curated_resources,
+            curated_resources_available = *curated_resources_available,
             missed_expected_curated_resources = *missed_expected_curated_resources,
             violation_reason = violation_reason.as_deref().unwrap_or("none"),
             outcome = outcome.as_str(),
@@ -1800,8 +1823,10 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             round,
             attempt,
             enabled_tools,
+            raw_selected_tools,
             selected_tools,
             expected_curated_resources,
+            curated_resources_available,
             missed_expected_curated_resources,
             violation_reason,
             outcome,
@@ -1832,9 +1857,11 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                     "round": round,
                     "attempt": attempt,
                     "enabled_tools": enabled_tools,
+                    "raw_selected_tools": raw_selected_tools,
                     "selected_tools": selected_tools,
                     "selection_count": selected_tools.len(),
                     "expected_curated_resources": expected_curated_resources,
+                    "curated_resources_available": curated_resources_available,
                     "missed_expected_curated_resources": missed_expected_curated_resources,
                     "violation_reason": violation_reason,
                     "outcome": outcome,
@@ -2410,7 +2437,7 @@ impl Tool for FindResourcesTool {
                 query: query.clone(),
                 help_type: help_type.clone(),
                 jurisdiction: region.clone(),
-                language,
+                language: language.clone(),
                 limit: if is_inventory_lookup { 10 } else { 5 },
                 offset,
             })
@@ -2462,7 +2489,11 @@ impl Tool for FindResourcesTool {
                         "has_more": false,
                         "next_offset": Value::Null,
                         "continuation_query": response.query.as_deref().or(query.as_deref()),
+                        "continuation_region": response_region,
+                        "continuation_help_type": help_type,
+                        "continuation_language": language,
                         "resolved_region": response_region,
+                        "resource_names": [],
                     }),
                     guarded: false,
                 });
@@ -2487,8 +2518,26 @@ impl Tool for FindResourcesTool {
 
         let returned_count = response.returned_count.max(response.resources.len());
         let total_count = response.total_count.max(response.resources.len());
-        let output_summary = if response.has_more {
-            match response.next_offset {
+        let (has_more, next_offset) = conservative_resource_pagination(
+            response.offset,
+            returned_count,
+            total_count,
+            response.has_more,
+            response.next_offset,
+        );
+        let continuation_available = !has_more || next_offset.is_some();
+        let resource_names = response
+            .resources
+            .iter()
+            .map(|resource| {
+                resource
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| resource.resource_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let output_summary = if has_more {
+            match next_offset {
                 Some(next_offset) => format!(
                     "Returned {} of {} matching ready Curated Resources; more results are available at offset {}.",
                     returned_count, total_count, next_offset
@@ -2505,23 +2554,33 @@ impl Tool for FindResourcesTool {
             )
         };
         if let Ok(mut sink) = self.traces.lock() {
+            let warnings = if has_more && continuation_available {
+                vec!["curated_resources_truncated".to_string()]
+            } else if has_more {
+                vec![
+                    "curated_resources_truncated".to_string(),
+                    "curated_resources_continuation_unavailable".to_string(),
+                ]
+            } else {
+                Vec::new()
+            };
             sink.push(ToolCallInfoResponse {
                 tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                 tool_name: "Curated Resources".to_string(),
                 query: Some(trace_query),
                 output_summary: Some(output_summary),
-                warnings: if response.has_more {
-                    vec!["curated_resources_truncated".to_string()]
-                } else {
-                    Vec::new()
-                },
+                warnings,
                 metadata: json!({
                     "returned_count": returned_count,
                     "total_count": total_count,
-                    "has_more": response.has_more,
-                    "next_offset": response.next_offset,
+                    "has_more": has_more,
+                    "next_offset": next_offset,
                     "continuation_query": response.query.as_deref().or(query.as_deref()),
+                    "continuation_region": response_region,
+                    "continuation_help_type": help_type,
+                    "continuation_language": language,
                     "resolved_region": response_region,
+                    "resource_names": resource_names,
                 }),
                 guarded: false,
             });
@@ -2533,14 +2592,16 @@ impl Tool for FindResourcesTool {
             "Showing {} of {} matching ready Curated Resources (offset {}, limit {}).\n",
             returned_count, total_count, effective_offset, effective_limit,
         );
-        if response.has_more {
-            if let Some(next_offset) = response.next_offset {
+        if has_more {
+            if let Some(next_offset) = next_offset {
                 output.push_str(&format!(
                     "more results are available; continue with next offset {}.\n",
                     next_offset
                 ));
             } else {
-                output.push_str("more results are available; ask for the next page.\n");
+                output.push_str(
+                    "more results are reported, but no safe continuation cursor is available.\n",
+                );
             }
         } else if effective_offset == 0 && returned_count == total_count {
             output.push_str(
@@ -2608,7 +2669,7 @@ impl Tool for FindResourcesTool {
 
         Ok(ToolResult::success_with_metadata(
             output,
-            json!({"has_more": response.has_more}),
+            json!({"has_more": has_more}),
         ))
     }
 }
@@ -4005,14 +4066,22 @@ fn curated_resource_continuation_from_tool_trace(
         .and_then(Value::as_u64)
         .and_then(|offset| usize::try_from(offset).ok())
         .filter(|offset| *offset > 0)?;
-    let query = match tool.metadata.get("continuation_query") {
-        Some(Value::Null) => None,
-        Some(Value::String(query)) if !query.trim().is_empty() => Some(query.trim().to_string()),
+    let parse_filter = |key: &str| match tool.metadata.get(key) {
+        Some(Value::Null) => Some(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Some(Some(value.trim().to_string()))
+        }
         // Missing or malformed structured state cannot distinguish a filtered
         // legacy trace from an unfiltered one, so continuation must fail closed.
-        _ => return None,
+        _ => None,
     };
-    Some(CuratedResourceContinuation { query, next_offset })
+    Some(CuratedResourceContinuation {
+        query: parse_filter("continuation_query")?,
+        region: parse_filter("continuation_region")?,
+        help_type: parse_filter("continuation_help_type")?,
+        language: parse_filter("continuation_language")?,
+        next_offset,
+    })
 }
 
 async fn chat_stream(
@@ -7924,6 +7993,14 @@ impl PlainAnswerStreamState {
             "lists",
             "directory",
             "inventory",
+            "entry",
+            "entries",
+            "item",
+            "items",
+            "result",
+            "results",
+            "org",
+            "orgs",
             "recurso",
             "recursos",
             "organizacion",
@@ -7986,7 +8063,21 @@ impl PlainAnswerStreamState {
                     .chain(tokens[index.saturating_sub(2)..index].iter())
                     .any(|candidate| resource_scope.contains(candidate) || candidate == &"set")
         });
-        let claims_complete = universal_claim || completeness_claim;
+        let normalized_answer = tokens.join(" ");
+        let exhaustion_claim = [
+            "no other organization",
+            "no other organizations",
+            "no other orgs",
+            "aren t any more",
+            "arent any more",
+            "nothing else remains",
+            "none left",
+            "that s it",
+            "thats it",
+        ]
+        .iter()
+        .any(|phrase| normalized_answer.contains(phrase));
+        let claims_complete = universal_claim || completeness_claim || exhaustion_claim;
         if claims_complete {
             return Err(PlainAnswerGenerationError::new(
                 PlainAnswerFailureKind::Completeness,
@@ -9744,8 +9835,10 @@ mod tests {
             round: 1,
             attempt: 1,
             enabled_tools: vec!["find_resources".to_string()],
+            raw_selected_tools: vec!["find_resources".to_string()],
             selected_tools: vec!["find_resources".to_string()],
             expected_curated_resources: true,
+            curated_resources_available: true,
             missed_expected_curated_resources: false,
             violation_reason: None,
             outcome: "planned".to_string(),
@@ -11413,6 +11506,11 @@ mod tests {
             "That's all.",
             "Those are all of them.",
             "That's everything.",
+            "No other organizations are available.",
+            "There aren't any more entries.",
+            "Nothing else remains.",
+            "None left.",
+            "That's it.",
             "Those are the only ones available.",
             "That is the complete set.",
             "I listed every one.",
@@ -12432,6 +12530,9 @@ mod tests {
         let mut args = json!({"query": query});
         if continuation {
             args["offset"] = json!(if retry { 10 } else { 1 });
+            if retry {
+                args["region"] = json!("MX");
+            }
         }
         let planner_content = format!(
             "[[ ## tool_calls ## ]]\n{}\n\n[[ ## replan_after_results ## ]]\nfalse\n\n[[ ## completed ## ]]",
@@ -12877,6 +12978,9 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let stale_inventory_cursor = CuratedResourceContinuation {
             query: Some("Issue 539 Inventory".to_string()),
+            region: None,
+            help_type: None,
+            language: None,
             next_offset: 10,
         };
         let (answer, state, _, _, _) = run_real_contact_replay(
@@ -14700,7 +14804,11 @@ mod tests {
                 "has_more": true,
                 "next_offset": 6,
                 "continuation_query": "mexico legal aid network",
+                "continuation_region": "MX",
+                "continuation_help_type": "legal",
+                "continuation_language": "es",
                 "resolved_region": "MX",
+                "resource_names": ["Mexico Legal Aid Network"],
             })
         );
 
@@ -14832,7 +14940,11 @@ mod tests {
                 "has_more": false,
                 "next_offset": Value::Null,
                 "continuation_query": Value::Null,
+                "continuation_region": Value::Null,
+                "continuation_help_type": Value::Null,
+                "continuation_language": Value::Null,
                 "resolved_region": Value::Null,
+                "resource_names": ["Demo Test Resource"],
             })
         );
 
@@ -14844,6 +14956,25 @@ mod tests {
         assert_eq!(payload["jurisdiction"], Value::Null);
         assert_eq!(payload["limit"], 10);
         assert_eq!(payload["offset"], 10);
+    }
+
+    #[test]
+    fn resource_pagination_fails_closed_on_inconsistent_backend_counts() {
+        assert_eq!(
+            conservative_resource_pagination(0, 5, 12, false, None),
+            (true, Some(5)),
+            "counts prove another page even when the backend flag is false"
+        );
+        assert_eq!(
+            conservative_resource_pagination(10, 0, 12, true, None),
+            (true, None),
+            "an empty page cannot invent a safe cursor"
+        );
+        assert_eq!(
+            conservative_resource_pagination(10, 2, 12, false, Some(99)),
+            (false, None),
+            "a stale cursor must not survive a proven final page"
+        );
     }
 
     #[test]
@@ -15782,8 +15913,10 @@ mod tests {
                 round: 2,
                 attempt: 2,
                 enabled_tools: vec!["find_resources".to_string()],
+                raw_selected_tools: vec!["find_resources".to_string()],
                 selected_tools: vec!["find_resources".to_string()],
                 expected_curated_resources: true,
+                curated_resources_available: true,
                 missed_expected_curated_resources: false,
                 violation_reason: None,
                 outcome: "planned".to_string(),
@@ -15817,9 +15950,11 @@ mod tests {
                 "round",
                 "attempt",
                 "enabled_tools",
+                "raw_selected_tools",
                 "selected_tools",
                 "selection_count",
                 "expected_curated_resources",
+                "curated_resources_available",
                 "missed_expected_curated_resources",
                 "violation_reason",
                 "outcome",
@@ -16013,8 +16148,10 @@ mod tests {
             round: 2,
             attempt: 1,
             enabled_tools: vec!["find_resources".to_string(), "knowledge_search".to_string()],
+            raw_selected_tools: vec!["find_resources".to_string()],
             selected_tools: Vec::new(),
             expected_curated_resources: true,
+            curated_resources_available: true,
             missed_expected_curated_resources: true,
             violation_reason: Some("required find_resources Tool call was omitted".to_string()),
             outcome: "planned".to_string(),
@@ -16023,6 +16160,14 @@ mod tests {
         assert_eq!(selection.status.as_deref(), Some("failed"));
         assert_eq!(selection.metadata["selection_count"], json!(0));
         assert_eq!(
+            selection.metadata["raw_selected_tools"],
+            json!(["find_resources"])
+        );
+        assert_eq!(
+            selection.metadata["curated_resources_available"],
+            json!(true)
+        );
+        assert_eq!(
             selection.metadata["violation_reason"],
             json!("required find_resources Tool call was omitted")
         );
@@ -16030,8 +16175,10 @@ mod tests {
             round: 3,
             attempt: 1,
             enabled_tools: vec!["find_resources".to_string()],
+            raw_selected_tools: vec!["find_resources".to_string()],
             selected_tools: vec!["find_resources".to_string()],
             expected_curated_resources: false,
+            curated_resources_available: true,
             missed_expected_curated_resources: false,
             violation_reason: Some(
                 "additional find_resources call was not allowed after turn success".to_string(),
@@ -16061,8 +16208,10 @@ mod tests {
                 round: 2,
                 attempt: 2,
                 enabled_tools: vec!["find_resources".to_string()],
+                raw_selected_tools: vec!["find_resources".to_string()],
                 selected_tools: vec!["find_resources".to_string()],
                 expected_curated_resources: true,
+                curated_resources_available: true,
                 missed_expected_curated_resources: false,
                 violation_reason: None,
                 outcome: "planned".to_string(),
@@ -16118,8 +16267,10 @@ mod tests {
             round: 1,
             attempt: 1,
             enabled_tools: vec!["find_resources".to_string()],
+            raw_selected_tools: vec!["find_resources".to_string()],
             selected_tools: vec!["find_resources".to_string()],
             expected_curated_resources: true,
+            curated_resources_available: true,
             missed_expected_curated_resources: false,
             violation_reason: None,
             outcome: "planned".to_string(),
@@ -16326,12 +16477,18 @@ mod tests {
                 "has_more": true,
                 "next_offset": 10,
                 "continuation_query": "Issue 539 Inventory",
+                "continuation_region": Value::Null,
+                "continuation_help_type": Value::Null,
+                "continuation_language": Value::Null,
             }),
         };
         assert_eq!(
             curated_resource_continuation_from_tool_trace(&tool),
             Some(CuratedResourceContinuation {
                 query: Some("Issue 539 Inventory".to_string()),
+                region: None,
+                help_type: None,
+                language: None,
                 next_offset: 10,
             })
         );
@@ -16353,6 +16510,9 @@ mod tests {
             ),
             Some(CuratedResourceContinuation {
                 query: Some("Issue 539 Inventory".to_string()),
+                region: None,
+                help_type: None,
+                language: None,
                 next_offset: 10,
             })
         );
@@ -16399,6 +16559,9 @@ mod tests {
             curated_resource_continuation_from_tool_trace(&tool),
             Some(CuratedResourceContinuation {
                 query: None,
+                region: None,
+                help_type: None,
+                language: None,
                 next_offset: 10,
             }),
             "an explicit structured null safely represents an unfiltered query"

@@ -444,8 +444,13 @@ pub struct CuratedResourceLookupExpectation {
     positive_offset_required: bool,
     expected_query: Option<String>,
     expected_region: Option<String>,
+    expected_help_type: Option<String>,
+    expected_language: Option<String>,
     expected_offset: Option<usize>,
     query_must_be_absent: bool,
+    region_must_be_absent: bool,
+    help_type_must_be_absent: bool,
+    language_must_be_absent: bool,
     continuation_cursor_missing: bool,
     exact_filter_missing: bool,
     initial_offset_required: bool,
@@ -461,6 +466,9 @@ pub(crate) struct CuratedResourceQueryContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CuratedResourceContinuation {
     pub query: Option<String>,
+    pub region: Option<String>,
+    pub help_type: Option<String>,
+    pub language: Option<String>,
     pub next_offset: usize,
 }
 
@@ -480,14 +488,9 @@ impl CuratedResourceLookupExpectation {
             return "The current request asks for a filtered Curated Resources inventory, but the exact filter could not be derived safely. Do not invent or broaden a query.".to_string();
         }
         if let Some(offset) = self.expected_offset {
-            return match &self.expected_query {
-                Some(query) => format!(
-                    "The current request explicitly asks for the next Curated Resources page. Return a find_resources Tool call preserving query={query:?} and using the exact prior next_offset {offset}."
-                ),
-                None => format!(
-                    "The current request explicitly asks for the next Curated Resources page. Return a find_resources Tool call with no query and the exact prior next_offset {offset}."
-                ),
-            };
+            return format!(
+                "The current request explicitly asks for the next Curated Resources page. Return exactly one find_resources Tool call using next_offset {offset} and preserving every prior query, region, help_type, and language filter, including fields that were absent."
+            );
         }
         if self.positive_offset_required {
             "The current request explicitly asks for the next Curated Resources page. Return a find_resources Tool call with the non-empty prior query and a positive continuation offset derived from the recent conversation.".to_string()
@@ -893,7 +896,36 @@ fn push_context_resource(
             .chars()
             .filter(|character| character.is_alphabetic())
             .all(char::is_uppercase);
-    if query.is_empty() || (token_count < 2 && !acronym) {
+    let organization_cue = query.split_whitespace().any(|token| {
+        [
+            "aid",
+            "network",
+            "center",
+            "centre",
+            "foundation",
+            "organization",
+            "association",
+            "clinic",
+            "shelter",
+            "services",
+            "service",
+            "council",
+            "coalition",
+            "project",
+            "initiative",
+            "support",
+            "help",
+            "need",
+            "resource",
+            "resources",
+            "relief",
+            "alliance",
+            "society",
+            "fund",
+        ]
+        .contains(&token)
+    });
+    if query.is_empty() || !acronym && (token_count < 2 || !organization_cue) {
         return;
     }
     let region = region.and_then(|region| canonical_resource_region(&region));
@@ -952,7 +984,18 @@ impl CuratedResourceQueryContext {
     }
 
     fn push_structured_resource(&mut self, query: &str, region: Option<&str>) {
-        push_context_resource(&mut self.resources, query, region);
+        let query = query.trim();
+        let normalized = normalized_lookup_text(query);
+        if normalized.is_empty()
+            || canonical_resource_region(query).is_some()
+            || contains_only_contact_methods(&normalized)
+        {
+            return;
+        }
+        let region = region.and_then(canonical_resource_region);
+        self.resources
+            .retain(|(existing, _)| existing != &normalized);
+        self.resources.push((normalized, region));
     }
 
     #[cfg(test)]
@@ -1414,6 +1457,9 @@ fn clean_inventory_subject(candidate: &str) -> Option<String> {
         "myself",
         "my family",
         "all",
+        "all available",
+        "all ready",
+        "all curated",
         "the",
         "ready",
         "available",
@@ -1441,6 +1487,10 @@ fn clean_inventory_subject(candidate: &str) -> Option<String> {
         "ellos",
         "todos",
         "todas",
+        "todos disponibles",
+        "todas disponibles",
+        "todos listos",
+        "todas listas",
         "los",
         "las",
         "listos",
@@ -1558,6 +1608,33 @@ fn explicit_inventory_subject(input: &str) -> Option<String> {
             if let Some(subject) = clean_inventory_subject(&trimmed[start..end]) {
                 return Some(subject);
             }
+        }
+    }
+    None
+}
+
+fn explicit_inventory_region(input: &str) -> Option<String> {
+    let lowercase = input.to_ascii_lowercase();
+    for marker in [
+        "resources for ",
+        "organizations for ",
+        "resources in ",
+        "organizations in ",
+        "recursos para ",
+        "organizaciones para ",
+        "recursos en ",
+        "organizaciones en ",
+    ] {
+        let Some(start) = lowercase.find(marker) else {
+            continue;
+        };
+        let candidate = input[start + marker.len()..]
+            .split(['.', ';', '!', '?', '\n'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if let Some(region) = canonical_resource_region(candidate) {
+            return Some(region);
         }
     }
     None
@@ -1709,10 +1786,20 @@ pub(crate) fn curated_resource_lookup_expectation(
                 .and_then(|query| split_resource_geographic_qualifier_from_input(query, input))
         })
         .flatten();
-    let expected_region = geographic_qualifier.map(|(query, region)| {
-        expected_query = Some(query);
-        region
-    });
+    let fresh_region = explicit_inventory_region(input);
+    let expected_region = if is_continuation {
+        continuation_cursor.and_then(|cursor| cursor.region.clone())
+    } else {
+        geographic_qualifier
+            .map(|(query, region)| {
+                expected_query = Some(query);
+                region
+            })
+            .or(fresh_region)
+    };
+    let continuation = is_continuation.then_some(continuation_cursor).flatten();
+    let unfiltered_inventory = inventory && !filtered_inventory && !is_continuation;
+    let fresh_region_must_be_absent = unfiltered_inventory && expected_region.is_none();
     CuratedResourceLookupExpectation {
         required: contact || inventory,
         query_required: contact
@@ -1722,13 +1809,24 @@ pub(crate) fn curated_resource_lookup_expectation(
         positive_offset_required: is_continuation,
         expected_query,
         expected_region,
+        expected_help_type: continuation.and_then(|cursor| cursor.help_type.clone()),
+        expected_language: continuation.and_then(|cursor| cursor.language.clone()),
         expected_offset: if is_continuation {
             continuation_cursor.map(|cursor| cursor.next_offset)
         } else {
             None
         },
         query_must_be_absent: is_continuation
-            && continuation_cursor.is_some_and(|cursor| cursor.query.is_none()),
+            && continuation.is_some_and(|cursor| cursor.query.is_none())
+            || unfiltered_inventory,
+        region_must_be_absent: is_continuation
+            && continuation.is_some_and(|cursor| cursor.region.is_none())
+            || fresh_region_must_be_absent,
+        help_type_must_be_absent: inventory
+            && (!is_continuation || continuation.is_some_and(|cursor| cursor.help_type.is_none())),
+        language_must_be_absent: is_continuation
+            && continuation.is_some_and(|cursor| cursor.language.is_none())
+            || unfiltered_inventory,
         continuation_cursor_missing: is_continuation && continuation_cursor.is_none(),
         exact_filter_missing: filtered_inventory && !is_continuation && expected_filter.is_none(),
         initial_offset_required: (contact || inventory) && !is_continuation,
@@ -2299,8 +2397,10 @@ pub enum AgentTraceEvent {
         round: usize,
         attempt: u32,
         enabled_tools: Vec<String>,
+        raw_selected_tools: Vec<String>,
         selected_tools: Vec<String>,
         expected_curated_resources: bool,
+        curated_resources_available: bool,
         missed_expected_curated_resources: bool,
         violation_reason: Option<String>,
         outcome: String,
@@ -3266,16 +3366,23 @@ impl SageAgent {
                 let Some(metadata) = tool.get("metadata") else {
                     continue;
                 };
-                let Some(query) = metadata
-                    .get("continuation_query")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
                 let region = metadata
                     .get("resolved_region")
                     .and_then(serde_json::Value::as_str);
-                context.push_structured_resource(query, region);
+                if let Some(query) = metadata
+                    .get("continuation_query")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    context.push_structured_resource(query, region);
+                }
+                if let Some(resource_names) = metadata
+                    .get("resource_names")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for name in resource_names.iter().filter_map(serde_json::Value::as_str) {
+                        context.push_structured_resource(name, region);
+                    }
+                }
             }
         }
         context
@@ -3578,9 +3685,12 @@ impl SageAgent {
     }
 
     fn expected_curated_resources(&self, enabled_tools: &[String]) -> bool {
-        enabled_tools.iter().any(|name| name == "find_resources")
-            && self.curated_resource_lookup_expectation.required
-            && !self.curated_resource_lookup_succeeded
+        self.curated_resources_requested()
+            && enabled_tools.iter().any(|name| name == "find_resources")
+    }
+
+    fn curated_resources_requested(&self) -> bool {
+        self.curated_resource_lookup_expectation.required && !self.curated_resource_lookup_succeeded
     }
 
     fn curated_resource_plan_violation(
@@ -3652,6 +3762,54 @@ impl SageAgent {
         }
         if self
             .curated_resource_lookup_expectation
+            .expected_query
+            .is_none()
+        {
+            if let Some(expected_region) = &self.curated_resource_lookup_expectation.expected_region
+            {
+                let actual_region = tool_string_arg(&call.args, "region");
+                if actual_region.is_none_or(|actual_region| {
+                    !resource_regions_match(expected_region, actual_region)
+                }) {
+                    return Some("find_resources region did not preserve the requested location");
+                }
+            }
+        }
+        for (field, expected, must_be_absent, mismatch) in [
+            (
+                "help_type",
+                self.curated_resource_lookup_expectation
+                    .expected_help_type
+                    .as_deref(),
+                self.curated_resource_lookup_expectation
+                    .help_type_must_be_absent,
+                "find_resources help_type did not preserve the prior filter",
+            ),
+            (
+                "language",
+                self.curated_resource_lookup_expectation
+                    .expected_language
+                    .as_deref(),
+                self.curated_resource_lookup_expectation
+                    .language_must_be_absent,
+                "find_resources language did not preserve the prior filter",
+            ),
+        ] {
+            let actual =
+                tool_string_arg(&call.args, field).filter(|value| !value.trim().is_empty());
+            if expected.is_some_and(|expected| {
+                actual.is_none_or(|actual| {
+                    normalized_lookup_text(actual) != normalized_lookup_text(expected)
+                })
+            }) {
+                return Some(mismatch);
+            }
+            if must_be_absent && actual.is_some() {
+                return Some(mismatch);
+            }
+        }
+        if self
+            .curated_resource_lookup_expectation
             .contact_query_from_context
         {
             let actual_query = tool_string_arg(&call.args, "query").map(normalized_lookup_text);
@@ -3680,6 +3838,13 @@ impl SageAgent {
             && tool_string_arg(&call.args, "query").is_some_and(|query| !query.trim().is_empty())
         {
             return Some("find_resources added a query that was absent from the prior page");
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .region_must_be_absent
+            && tool_string_arg(&call.args, "region").is_some_and(|region| !region.trim().is_empty())
+        {
+            return Some("find_resources added a region that was absent from the prior page");
         }
         if self
             .curated_resource_lookup_expectation
@@ -3830,6 +3995,13 @@ impl SageAgent {
                     let mut decision = decision;
                     decision.planning_round = step_index;
                     let enabled_tools = self.tools.names();
+                    let curated_resources_available =
+                        enabled_tools.iter().any(|name| name == "find_resources");
+                    let raw_selected_tools = decision
+                        .tool_calls
+                        .iter()
+                        .map(|tool_call| tool_call.name.clone())
+                        .collect::<Vec<_>>();
                     let expected_curated_resources =
                         self.expected_curated_resources(&enabled_tools);
                     self.sanitize_curated_resource_calls(&mut decision, expected_curated_resources);
@@ -3840,14 +4012,16 @@ impl SageAgent {
                         .collect::<Vec<_>>();
                     let violation =
                         self.curated_resource_plan_violation(&decision, expected_curated_resources);
-                    let missed_expected_curated_resources =
-                        expected_curated_resources && violation.is_some();
+                    let missed_expected_curated_resources = self.curated_resources_requested()
+                        && (!expected_curated_resources || violation.is_some());
                     self.emit_trace(AgentTraceEvent::ToolSelectionObservation {
                         round: step_index,
                         attempt,
                         enabled_tools,
+                        raw_selected_tools,
                         selected_tools,
-                        expected_curated_resources,
+                        expected_curated_resources: self.curated_resources_requested(),
+                        curated_resources_available,
                         missed_expected_curated_resources,
                         violation_reason: violation.map(str::to_string),
                         outcome: if violation.is_some() {
@@ -3933,14 +4107,17 @@ impl SageAgent {
 
         if !terminal_selection_rejection_emitted {
             let enabled_tools = self.tools.names();
-            let expected_curated_resources = self.expected_curated_resources(&enabled_tools);
+            let curated_resources_available =
+                enabled_tools.iter().any(|name| name == "find_resources");
             self.emit_trace(AgentTraceEvent::ToolSelectionObservation {
                 round: step_index,
                 attempt: MAX_TOOL_PLAN_ATTEMPTS,
                 enabled_tools,
+                raw_selected_tools: Vec::new(),
                 selected_tools: Vec::new(),
-                expected_curated_resources,
-                missed_expected_curated_resources: expected_curated_resources,
+                expected_curated_resources: self.curated_resources_requested(),
+                curated_resources_available,
+                missed_expected_curated_resources: self.curated_resources_requested(),
                 violation_reason: last_error.as_ref().map(ToString::to_string),
                 outcome: "failed".to_string(),
             });
@@ -4708,6 +4885,16 @@ mod tests {
             "Are there any curated resources?"
         ));
         assert!(expects_curated_resource_lookup("¿Hay recursos curados?"));
+        for prompt in ["List resources for Mexico.", "Lista recursos para México."] {
+            let expectation = curated_resource_lookup_expectation(prompt, None);
+            assert!(expectation.required, "{prompt}");
+            assert_eq!(expectation.expected_query, None, "{prompt}");
+            assert_eq!(
+                expectation.expected_region.as_deref(),
+                Some("MX"),
+                "{prompt}"
+            );
+        }
         assert_eq!(
             curated_resource_lookup_expectation(
                 "List ready Curated Resources matching Acme Legal Aid.",
@@ -4746,6 +4933,9 @@ mod tests {
 
         let continuation = CuratedResourceContinuation {
             query: Some("Issue 539 Inventory".to_string()),
+            region: None,
+            help_type: None,
+            language: None,
             next_offset: 10,
         };
         for prompt in [
@@ -4823,6 +5013,17 @@ mod tests {
         );
         assert_eq!(split_resource_geographic_qualifier("Women in us"), None);
         assert_eq!(split_resource_geographic_qualifier("Women in Need"), None);
+
+        let false_names = CuratedResourceQueryContext::from_trusted_text(
+            "The people mentioned were John Smith and New York.",
+        );
+        assert!(false_names.resources.is_empty());
+        let mut structured = CuratedResourceQueryContext::default();
+        structured.push_structured_resource("Amnesty", Some("Mexico"));
+        assert_eq!(
+            structured.resources,
+            vec![("amnesty".to_string(), Some("MX".to_string()))]
+        );
     }
 
     #[test]
@@ -4942,6 +5143,9 @@ mod tests {
 
         let continuation = CuratedResourceContinuation {
             query: Some("Issue 539 Inventory".to_string()),
+            region: None,
+            help_type: None,
+            language: None,
             next_offset: 10,
         };
         agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
@@ -4983,6 +5187,60 @@ mod tests {
                 expected,
             )
             .is_none());
+
+        let full_filter_continuation = CuratedResourceContinuation {
+            query: Some("Atlas Aid".to_string()),
+            region: Some("MX".to_string()),
+            help_type: Some("legal".to_string()),
+            language: Some("es".to_string()),
+            next_offset: 5,
+        };
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "Show the next page of those resources.",
+            Some(&full_filter_continuation),
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        let full_filter_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Atlas Aid")),
+                ("region".to_string(), serde_json::json!("Mexico")),
+                ("help_type".to_string(), serde_json::json!("legal")),
+                ("language".to_string(), serde_json::json!("es")),
+                ("offset".to_string(), serde_json::json!(5)),
+            ]
+            .into(),
+        };
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![full_filter_call.clone()], false),
+                expected,
+            )
+            .is_none());
+        let mut dropped_language = full_filter_call.clone();
+        dropped_language.args.remove("language");
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![dropped_language], false),
+                expected,
+            ),
+            Some("find_resources language did not preserve the prior filter")
+        );
+
+        agent.curated_resource_lookup_expectation =
+            curated_resource_lookup_expectation("List all available resources.", None);
+        let expected = agent.expected_curated_resources(&enabled);
+        let narrowed_inventory = ToolCall {
+            name: "find_resources".to_string(),
+            args: [("help_type".to_string(), serde_json::json!("legal"))].into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![narrowed_inventory], false),
+                expected,
+            ),
+            Some("find_resources help_type did not preserve the prior filter")
+        );
 
         agent.curated_resource_lookup_expectation =
             curated_resource_lookup_expectation("What is Acme Legal Aid's email?", None);
