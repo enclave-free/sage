@@ -11,6 +11,7 @@ use baml_bridge::{
     BamlAdapter, BamlConvertError,
 };
 use dspy_rs::{configure, BamlType, ChatAdapter, Predict, LM};
+use isocountry::CountryCode;
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::io::Write;
@@ -365,9 +366,14 @@ pub enum ToolPlanningOutcome {
 pub trait ToolPlanner: Send {
     fn has_actionable_tools(&self) -> bool;
 
-    /// Supply the current raw User message's diagnostic contact cue. The
-    /// planner must not infer this from synthesized context.
-    fn set_contact_lookup_expected(&mut self, _expected: bool) {}
+    /// Supply the current raw User message's Curated Resources requirement.
+    /// This validates the model's Tool plan; it never authorizes or executes a
+    /// Tool call by itself.
+    fn set_curated_resource_lookup_expectation(
+        &mut self,
+        _expectation: CuratedResourceLookupExpectation,
+    ) {
+    }
 
     async fn plan_tools(
         &mut self,
@@ -405,6 +411,10 @@ pub trait ToolPlanner: Send {
 pub struct PlainAnswerPrompt {
     pub system: String,
     pub user: String,
+    /// Trusted runtime state from the executed Curated Resources Tool. This
+    /// must not be reconstructed from rendered prompt text, which can contain
+    /// user-controlled strings that resemble Tool-result markers.
+    pub incomplete_curated_resource_page: bool,
 }
 
 const TOOL_PLANNING_INSTRUCTION: &str = r#"
@@ -427,10 +437,103 @@ Do not emit JSON, schema field markers, tool_calls, function calls, or internal 
 The Tool phase is complete. Use the supplied Tool results as facts, respect their warnings and failures, and do not claim that a failed Tool succeeded.
 "#;
 
-/// Detect only explicit contact-detail cues. The result is diagnostic metadata
-/// for Tool planning; it never creates or authorizes a Tool decision.
-pub(crate) fn expects_curated_resource_lookup(input: &str) -> bool {
-    let normalized = input
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CuratedResourceLookupExpectation {
+    required: bool,
+    query_required: bool,
+    positive_offset_required: bool,
+    expected_query: Option<String>,
+    expected_region: Option<String>,
+    expected_help_type: Option<String>,
+    expected_language: Option<String>,
+    expected_offset: Option<usize>,
+    query_must_be_absent: bool,
+    region_must_be_absent: bool,
+    help_type_must_be_absent: bool,
+    language_must_be_absent: bool,
+    continuation_cursor_missing: bool,
+    exact_filter_missing: bool,
+    initial_offset_required: bool,
+    expected_lookup_mode: Option<&'static str>,
+    lookup_mode_must_be_absent: bool,
+    contact_query_from_context: bool,
+    context_grounded_resources: Vec<(String, Option<String>)>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CuratedResourceQueryContext {
+    resources: Vec<(String, Option<String>)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CuratedResourceContinuation {
+    pub query: Option<String>,
+    pub region: Option<String>,
+    pub help_type: Option<String>,
+    pub language: Option<String>,
+    pub lookup_mode: Option<String>,
+    pub next_offset: usize,
+}
+
+impl CuratedResourceLookupExpectation {
+    pub(crate) fn with_query_context(mut self, context: &CuratedResourceQueryContext) -> Self {
+        if self.contact_query_from_context {
+            self.context_grounded_resources = context.resources.clone();
+        }
+        self
+    }
+
+    fn retry_instruction(&self) -> String {
+        if self.continuation_cursor_missing {
+            return "The current request asks for another Curated Resources page, but the exact prior query and next_offset are unavailable. Do not invent a query or offset.".to_string();
+        }
+        if self.exact_filter_missing {
+            return "The current request asks for a filtered Curated Resources inventory, but the exact filter could not be derived safely. Do not invent or broaden a query.".to_string();
+        }
+        if let Some(offset) = self.expected_offset {
+            return format!(
+                "The current request explicitly asks for the next Curated Resources page. Return exactly one find_resources Tool call using next_offset {offset} and preserving every prior query, region, help_type, and language filter, including fields that were absent."
+            );
+        }
+        if self.positive_offset_required {
+            "The current request explicitly asks for the next Curated Resources page. Return a find_resources Tool call with the non-empty prior query and a positive continuation offset derived from the recent conversation.".to_string()
+        } else if let Some(query) = &self.expected_query {
+            format!(
+                "The current request explicitly asks for a filtered Curated Resources lookup. Return a find_resources Tool call preserving query={query:?}."
+            )
+        } else if self.query_required {
+            "The current request explicitly requires a targeted Curated Resources lookup. Return a find_resources Tool call with the organization/name from the current or recent-conversation context in a non-empty query argument.".to_string()
+        } else {
+            "The current request explicitly requires a fresh Curated Resources lookup. Return a find_resources Tool call using the relevant current and recent-conversation context.".to_string()
+        }
+    }
+
+    fn retry_instruction_for_violation(&self, violation: &str) -> String {
+        if violation == "additional find_resources call was not allowed after turn success" {
+            return "A Curated Resources lookup already succeeded for this turn. Do not call find_resources again; use the completed Tool results to write the final answer."
+                .to_string();
+        }
+        if violation == "find_resources query was not grounded in recent conversation" {
+            return "Use the organization or name established in the current or recent Conversation as the find_resources query. Do not invent or substitute a name."
+                .to_string();
+        }
+        if violation == "find_resources region did not preserve the requested location" {
+            return "Preserve both the requested organization/name and location in the find_resources query and region arguments. Do not omit, invent, or substitute either value."
+                .to_string();
+        }
+        if violation == "find_resources lookup mode did not match the current request" {
+            return match self.expected_lookup_mode {
+                Some("contact") => "This is a contact-detail follow-up. Return one find_resources Tool call with lookup_mode=contact so the lookup preserves the user's jurisdiction even when help_type is unavailable.".to_string(),
+                Some("inventory") => "This is a resource inventory request. Return one find_resources Tool call with lookup_mode=inventory so an omitted region remains global.".to_string(),
+                _ => self.retry_instruction(),
+            };
+        }
+        self.retry_instruction()
+    }
+}
+
+pub(crate) fn normalized_lookup_text(input: &str) -> String {
+    input
         .to_lowercase()
         .chars()
         .map(|character| match character {
@@ -446,13 +549,24 @@ pub(crate) fn expects_curated_resource_lookup(input: &str) -> bool {
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
+
+pub(crate) fn contains_phrase(normalized: &str, phrase: &str) -> bool {
+    normalized == phrase
+        || normalized.starts_with(&format!("{} ", phrase))
+        || normalized.ends_with(&format!(" {}", phrase))
+        || normalized.contains(&format!(" {} ", phrase))
+}
+
+fn has_contact_lookup_cue(normalized: &str) -> bool {
     [
         "email",
         "e mail",
         "correo",
         "correo electronico",
         "phone",
+        "phone number",
         "telephone",
         "telefono",
         "celular",
@@ -471,16 +585,18 @@ pub(crate) fn expects_curated_resource_lookup(input: &str) -> bool {
         "secure channel",
         "secure contact",
         "encrypted channel",
+        "contact information",
+        "contact info",
+        "contact details",
         "canal seguro",
         "contacto seguro",
         "canal cifrado",
+        "informacion de contacto",
+        "datos de contacto",
     ]
     .iter()
     .any(|cue| {
-        let present = normalized == *cue
-            || normalized.starts_with(&format!("{} ", cue))
-            || normalized.ends_with(&format!(" {}", cue))
-            || normalized.contains(&format!(" {} ", cue));
+        let present = contains_phrase(normalized, cue);
         if !present {
             return false;
         }
@@ -510,6 +626,1288 @@ pub(crate) fn expects_curated_resource_lookup(input: &str) -> bool {
         }
         true
     })
+}
+
+fn contains_only_contact_methods(value: &str) -> bool {
+    let mut remainder = value.to_string();
+    let mut removed_method = false;
+    for method in [
+        "contact information",
+        "informacion de contacto",
+        "contact details",
+        "contact info",
+        "datos de contacto",
+        "physical address",
+        "mailing address",
+        "postal address",
+        "email address",
+        "e mail",
+        "phone number",
+        "correo electronico",
+        "secure channel",
+        "canal seguro",
+        "web site",
+        "sitio web",
+        "telephone",
+        "telefono",
+        "celular",
+        "website",
+        "direccion",
+        "address",
+        "correo",
+        "phone",
+        "email",
+        "url",
+    ] {
+        if contains_phrase(&remainder, method) {
+            removed_method = true;
+            remainder = remainder.replace(method, " ");
+        }
+    }
+    removed_method
+        && remainder.split_whitespace().all(|word| {
+            [
+                "the", "their", "its", "and", "or", "el", "la", "los", "las", "su", "sus", "y", "o",
+            ]
+            .contains(&word)
+        })
+}
+
+fn is_contact_lookup_request(normalized: &str) -> bool {
+    if !has_contact_lookup_cue(normalized) {
+        return false;
+    }
+    if contact_lookup_subject(normalized).is_some() {
+        return true;
+    }
+    let methods = [
+        "email",
+        "e mail",
+        "email address",
+        "correo",
+        "correo electronico",
+        "phone",
+        "phone number",
+        "telephone",
+        "telefono",
+        "celular",
+        "website",
+        "web site",
+        "url",
+        "sitio web",
+        "address",
+        "physical address",
+        "mailing address",
+        "postal address",
+        "direccion",
+        "secure channel",
+        "canal seguro",
+        "contact information",
+        "contact info",
+        "contact details",
+        "informacion de contacto",
+        "datos de contacto",
+    ];
+    if methods.contains(&normalized) {
+        return true;
+    }
+    if ["need the", "necesito"]
+        .iter()
+        .any(|phrase| contains_phrase(normalized, phrase))
+        && methods.iter().any(|method| normalized.ends_with(method))
+    {
+        return true;
+    }
+    let requests_context_value = [
+        "what is",
+        "what s",
+        "what are",
+        "where is",
+        "give me",
+        "can you give me",
+        "could you give me",
+        "can you share",
+        "could you share",
+        "can i have",
+        "can i get",
+        "could i have",
+        "could i get",
+        "need the",
+        "do you have",
+        "share",
+        "share the",
+        "share their",
+        "please share",
+        "please send",
+        "send me",
+        "is listed",
+        "are listed",
+        "cual es",
+        "cuales son",
+        "donde esta",
+        "me das",
+        "me puedes dar",
+        "puedes darme",
+        "puedes dar",
+        "necesito",
+        "tienes",
+    ];
+    if requests_context_value.iter().any(|request| {
+        normalized.match_indices(request).any(|(start, matched)| {
+            let starts_at_word = start == 0
+                || normalized[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| !character.is_alphanumeric());
+            let remainder = normalized[start + matched.len()..].trim_start();
+            starts_at_word && contains_only_contact_methods(remainder)
+        })
+    }) {
+        return true;
+    }
+    methods.iter().any(|method| {
+        ["the", "their", "its", "el", "la", "su", "sus"]
+            .iter()
+            .any(|reference| {
+                normalized
+                    .strip_suffix(&format!(" {reference} {method}"))
+                    .is_some_and(|prefix| requests_context_value.contains(&prefix.trim()))
+            })
+    })
+}
+
+const NON_COUNTRY_RESOURCE_REGIONS: &[&str] = &[
+    "mexico city",
+    "england",
+    "europe",
+    "latin america",
+    "central america",
+    "south america",
+];
+
+fn iso_country(value: &str) -> Option<CountryCode> {
+    let normalized = normalized_lookup_text(value);
+    match normalized.as_str() {
+        "usa" | "united states" | "united states of america" => {
+            return CountryCode::for_alpha2("US").ok()
+        }
+        "uk" | "england" => return CountryCode::for_alpha2("GB").ok(),
+        "bolivia" => return CountryCode::for_alpha2("BO").ok(),
+        "brunei" => return CountryCode::for_alpha2("BN").ok(),
+        "iran" => return CountryCode::for_alpha2("IR").ok(),
+        "laos" => return CountryCode::for_alpha2("LA").ok(),
+        "moldova" => return CountryCode::for_alpha2("MD").ok(),
+        "north korea" => return CountryCode::for_alpha2("KP").ok(),
+        "palestine" => return CountryCode::for_alpha2("PS").ok(),
+        "russia" => return CountryCode::for_alpha2("RU").ok(),
+        "south korea" => return CountryCode::for_alpha2("KR").ok(),
+        "syria" => return CountryCode::for_alpha2("SY").ok(),
+        "tanzania" => return CountryCode::for_alpha2("TZ").ok(),
+        "venezuela" => return CountryCode::for_alpha2("VE").ok(),
+        "vietnam" => return CountryCode::for_alpha2("VN").ok(),
+        value if value.len() == 2 => return CountryCode::for_alpha2_caseless(value).ok(),
+        value if value.len() == 3 => return CountryCode::for_alpha3_caseless(value).ok(),
+        _ => {}
+    }
+    CountryCode::iter()
+        .find(|country| normalized_lookup_text(country.name()) == normalized)
+        .copied()
+}
+
+fn canonical_resource_region(value: &str) -> Option<String> {
+    let normalized = normalized_lookup_text(value);
+    if let Some(country) = iso_country(&normalized) {
+        return Some(country.alpha2().to_string());
+    }
+    NON_COUNTRY_RESOURCE_REGIONS
+        .contains(&normalized.as_str())
+        .then_some(normalized)
+}
+
+fn split_resource_geographic_qualifier(query: &str) -> Option<(String, String)> {
+    for separator in [" in ", " en "] {
+        let Some((subject, region)) = query.rsplit_once(separator) else {
+            continue;
+        };
+        let subject = subject.trim();
+        let region = region.trim();
+        let unambiguous_alpha2 = region.len() != 2
+            || region
+                .chars()
+                .filter(|character| character.is_alphabetic())
+                .all(char::is_uppercase);
+        if !subject.is_empty() && unambiguous_alpha2 && canonical_resource_region(region).is_some()
+        {
+            return Some((subject.to_string(), region.to_string()));
+        }
+    }
+    None
+}
+
+fn split_resource_geographic_qualifier_from_input(
+    query: &str,
+    source_input: &str,
+) -> Option<(String, String)> {
+    if let Some(qualifier) = split_resource_geographic_qualifier(query) {
+        return Some(qualifier);
+    }
+    for separator in [" in ", " en "] {
+        let Some((subject, region)) = query.rsplit_once(separator) else {
+            continue;
+        };
+        let region = region.trim();
+        if subject.trim().is_empty() || region.len() != 2 {
+            continue;
+        }
+        let uppercase_region = region.to_uppercase();
+        if source_input.contains(&format!("{separator}{uppercase_region}"))
+            && canonical_resource_region(&uppercase_region).is_some()
+        {
+            return Some((subject.trim().to_string(), uppercase_region));
+        }
+    }
+    None
+}
+
+fn context_entity_token(value: &str) -> &str {
+    value.trim_matches(|character: char| {
+        !character.is_alphanumeric() && character != '\'' && character != '’' && character != '-'
+    })
+}
+
+fn is_capitalized_entity_token(value: &str) -> bool {
+    context_entity_token(value)
+        .chars()
+        .find(|character| character.is_alphabetic())
+        .is_some_and(char::is_uppercase)
+}
+
+fn push_context_resource(
+    resources: &mut Vec<(String, Option<String>)>,
+    candidate: &str,
+    explicit_region: Option<&str>,
+) {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return;
+    }
+    let (query, region) =
+        if let Some((query, region)) = split_resource_geographic_qualifier(candidate) {
+            (query, Some(region))
+        } else {
+            (candidate.to_string(), explicit_region.map(str::to_string))
+        };
+    let query = normalized_lookup_text(&query);
+    let token_count = query.split_whitespace().count();
+    let acronym = candidate
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .count()
+        >= 2
+        && candidate
+            .chars()
+            .filter(|character| character.is_alphabetic())
+            .all(char::is_uppercase);
+    let organization_cue = query.split_whitespace().any(|token| {
+        [
+            "aid",
+            "network",
+            "center",
+            "centre",
+            "foundation",
+            "organization",
+            "association",
+            "clinic",
+            "shelter",
+            "services",
+            "service",
+            "council",
+            "coalition",
+            "project",
+            "initiative",
+            "support",
+            "help",
+            "need",
+            "resource",
+            "resources",
+            "relief",
+            "alliance",
+            "society",
+            "fund",
+        ]
+        .contains(&token)
+    });
+    if query.is_empty() || !acronym && (token_count < 2 || !organization_cue) {
+        return;
+    }
+    let region = region.and_then(|region| canonical_resource_region(&region));
+    resources.retain(|(existing, _)| existing != &query);
+    resources.push((query, region));
+}
+
+fn context_resources_from_text(text: &str) -> Vec<(String, Option<String>)> {
+    let mut resources = Vec::new();
+    for segment in text.split(['\n', '.', '?', '!', ';', ',']) {
+        let mut sequence = Vec::new();
+        let flush = |sequence: &mut Vec<&str>, resources: &mut Vec<(String, Option<String>)>| {
+            if !sequence.is_empty() {
+                push_context_resource(resources, &sequence.join(" "), None);
+                sequence.clear();
+            }
+        };
+        for raw_token in segment.split_whitespace() {
+            let token = context_entity_token(raw_token);
+            let normalized_token = normalized_lookup_text(token);
+            if sequence.is_empty()
+                && [
+                    "a",
+                    "an",
+                    "the",
+                    "then",
+                    "earlier",
+                    "previously",
+                    "user",
+                    "assistant",
+                    "i",
+                    "we",
+                ]
+                .contains(&normalized_token.as_str())
+            {
+                continue;
+            }
+            let connector = ["and", "of", "the", "in", "for", "de", "del", "la", "en"]
+                .contains(&normalized_token.as_str());
+            if is_capitalized_entity_token(token) || (connector && !sequence.is_empty()) {
+                sequence.push(token);
+            } else {
+                flush(&mut sequence, &mut resources);
+            }
+        }
+        flush(&mut sequence, &mut resources);
+    }
+    resources
+}
+
+impl CuratedResourceQueryContext {
+    pub(crate) fn from_trusted_text(text: &str) -> Self {
+        Self {
+            resources: context_resources_from_text(text),
+        }
+    }
+
+    fn push_structured_resource(&mut self, query: &str, region: Option<&str>) {
+        let query = query.trim();
+        let normalized = normalized_lookup_text(query);
+        if normalized.is_empty()
+            || canonical_resource_region(query).is_some()
+            || contains_only_contact_methods(&normalized)
+        {
+            return;
+        }
+        let region = region.and_then(canonical_resource_region);
+        self.resources
+            .retain(|(existing, _)| existing != &normalized);
+        self.resources.push((normalized, region));
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.resources.is_empty()
+    }
+}
+
+fn prefer_structured_resource_context(
+    prose_context: CuratedResourceQueryContext,
+    structured_context: CuratedResourceQueryContext,
+) -> CuratedResourceQueryContext {
+    if structured_context.resources.is_empty() {
+        prose_context
+    } else {
+        structured_context
+    }
+}
+
+fn resource_regions_match(expected: &str, actual: &str) -> bool {
+    match (
+        canonical_resource_region(expected),
+        canonical_resource_region(actual),
+    ) {
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => normalized_lookup_text(expected) == normalized_lookup_text(actual),
+    }
+}
+
+fn strip_contact_request_prefixes(mut candidate: &str) -> &str {
+    for request_prefix in [
+        "what is the ",
+        "what s the ",
+        "what is ",
+        "what s ",
+        "do you have the ",
+        "do you have ",
+        "where is the ",
+        "where is ",
+        "give me the ",
+        "give me ",
+        "please give me the ",
+        "please give me ",
+        "can you give me the ",
+        "can you give me ",
+        "could you give me the ",
+        "could you give me ",
+        "can i have the ",
+        "can i have ",
+        "can i get the ",
+        "can i get ",
+        "could i have the ",
+        "could i have ",
+        "could i get the ",
+        "could i get ",
+        "i need the ",
+        "i need ",
+        "can you share the ",
+        "can you share ",
+        "could you share the ",
+        "could you share ",
+        "please share the ",
+        "please share ",
+        "share the ",
+        "share ",
+        "send me the ",
+        "send me ",
+        "cual es el ",
+        "cual es la ",
+        "cual es ",
+        "cuales son los ",
+        "cuales son las ",
+        "cuales son ",
+        "donde esta el ",
+        "donde esta la ",
+        "donde esta ",
+        "me das el ",
+        "me das la ",
+        "me das ",
+        "me puedes dar el ",
+        "me puedes dar la ",
+        "me puedes dar ",
+        "puedes darme el ",
+        "puedes darme la ",
+        "puedes darme ",
+        "dame el ",
+        "dame la ",
+        "dame ",
+        "necesito el ",
+        "necesito la ",
+        "necesito ",
+        "tienes el ",
+        "tienes la ",
+        "tienes ",
+    ] {
+        candidate = candidate.strip_prefix(request_prefix).unwrap_or(candidate);
+    }
+    candidate.trim()
+}
+
+fn contact_lookup_subject(normalized: &str) -> Option<String> {
+    let is_context_reference = |candidate: &str| {
+        [
+            "",
+            "a",
+            "an",
+            "the",
+            "their",
+            "its",
+            "my",
+            "your",
+            "this",
+            "that",
+            "it",
+            "the organization",
+            "this organization",
+            "that organization",
+            "un",
+            "una",
+            "el",
+            "la",
+            "los",
+            "las",
+            "su",
+            "sus",
+            "esta",
+            "este",
+            "esa",
+            "ese",
+            "la organizacion",
+            "esta organizacion",
+            "esa organizacion",
+        ]
+        .contains(&candidate.trim())
+    };
+    let trim_context = |candidate: &str| {
+        let mut candidate = candidate.trim();
+        for suffix in [" please", " por favor"] {
+            candidate = candidate.strip_suffix(suffix).unwrap_or(candidate).trim();
+        }
+        (!is_context_reference(candidate)).then(|| candidate.to_string())
+    };
+
+    // Method-first requests may combine several contact fields before the
+    // organization: “Can I get the email and phone number for WLC?”
+    for separator in [" for ", " of ", " de ", " para "] {
+        let Some((methods, candidate)) = normalized.split_once(separator) else {
+            continue;
+        };
+        if contains_only_contact_methods(strip_contact_request_prefixes(methods)) {
+            if let Some(candidate) = trim_context(candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let marker_request_prefixes = [
+        "",
+        "what is the",
+        "what s the",
+        "do you have the",
+        "where is the",
+        "give me the",
+        "please give me the",
+        "can you give me the",
+        "could you give me the",
+        "can you share the",
+        "could you share the",
+        "can i have the",
+        "can i get the",
+        "could i have the",
+        "could i get the",
+        "i need the",
+        "please share the",
+        "share the",
+        "send me the",
+        "cual es el",
+        "cual es la",
+        "cuales son los",
+        "cuales son las",
+        "donde esta el",
+        "donde esta la",
+        "me das el",
+        "me das la",
+        "me puedes dar el",
+        "me puedes dar la",
+        "puedes darme el",
+        "puedes darme la",
+        "dame el",
+        "dame la",
+        "necesito el",
+        "necesito la",
+        "tienes el",
+        "tienes la",
+    ];
+    for marker in [
+        "contact information for ",
+        "contact details for ",
+        "contact info for ",
+        "email address for ",
+        "email address of ",
+        "e mail for ",
+        "e mail of ",
+        "email for ",
+        "email of ",
+        "phone number for ",
+        "phone number of ",
+        "phone for ",
+        "phone of ",
+        "website for ",
+        "website of ",
+        "url for ",
+        "url of ",
+        "correo electronico de ",
+        "correo de ",
+        "email de ",
+        "telefono de ",
+        "celular de ",
+        "sitio web de ",
+        "direccion de ",
+        "canal seguro de ",
+        "informacion de contacto de ",
+        "datos de contacto de ",
+        "email para ",
+        "correo electronico para ",
+        "correo para ",
+        "telefono para ",
+        "celular para ",
+    ] {
+        if let Some((prefix, candidate)) = normalized.rsplit_once(marker) {
+            if !marker_request_prefixes.contains(&prefix.trim()) {
+                continue;
+            }
+            return trim_context(candidate);
+        }
+    }
+
+    for request_prefix in [
+        "how can i contact ",
+        "how do i contact ",
+        "como puedo contactar a ",
+        "como contacto a ",
+    ] {
+        let Some(mut candidate) = normalized.strip_prefix(request_prefix) else {
+            continue;
+        };
+        for method_suffix in [
+            " by email",
+            " via email",
+            " by phone",
+            " by telephone",
+            " through their website",
+            " por correo",
+            " por telefono",
+            " mediante su sitio web",
+        ] {
+            candidate = candidate.strip_suffix(method_suffix).unwrap_or(candidate);
+        }
+        return trim_context(candidate);
+    }
+
+    if let Some((prefix, methods)) = normalized.rsplit_once(" s ") {
+        if contains_only_contact_methods(methods) {
+            let mut candidate = prefix.trim();
+            for request_prefix in [
+                "what is ",
+                "what s ",
+                "where is ",
+                "give me ",
+                "please give me ",
+                "can you give me ",
+                "could you give me ",
+                "can i have ",
+                "can i get ",
+                "could i have ",
+                "could i get ",
+                "i need ",
+                "can you share ",
+                "could you share ",
+                "please share ",
+                "share ",
+                "cual es ",
+                "donde esta ",
+                "me das ",
+                "me puedes dar ",
+                "puedes darme ",
+                "dame ",
+                "necesito ",
+            ] {
+                candidate = candidate.strip_prefix(request_prefix).unwrap_or(candidate);
+            }
+            if !is_context_reference(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    // Terse organization-first requests do not need a possessive marker:
+    // “WLC contact information” and “WLC phone number”. Try every word
+    // boundary and accept only a suffix made entirely of contact methods.
+    for (split, _) in normalized.match_indices(' ') {
+        let candidate = strip_contact_request_prefixes(&normalized[..split]);
+        let methods = normalized[split + 1..].trim();
+        let prose_subject = [
+            "what is",
+            "what s",
+            "what are",
+            "where is",
+            "summarize",
+            "share",
+            "send",
+            "give",
+            "draft",
+            "review",
+            "feedback",
+            "wrong",
+            "can you share",
+            "could you share",
+            "can you give me",
+            "could you give me",
+            "can i get",
+            "can i have",
+            "could i get",
+            "could i have",
+            "i need",
+            "their",
+            "its",
+            "this",
+            "that",
+            "my",
+            "your",
+            "me das",
+            "me puedes dar",
+            "puedes darme",
+            "dame",
+            "necesito",
+            "cual es",
+            "cuales son",
+            "donde esta",
+        ]
+        .iter()
+        .any(|stem| candidate == *stem || candidate.starts_with(&format!("{stem} ")));
+        if !prose_subject && contains_only_contact_methods(methods) {
+            if let Some(candidate) = trim_context(candidate.strip_suffix(" s").unwrap_or(candidate))
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn quoted_lookup_filter(input: &str) -> Option<&str> {
+    let input = input.trim_start();
+    for (open, close) in [('\'', '\''), ('"', '"'), ('‘', '’'), ('“', '”')] {
+        let Some(remainder) = input.strip_prefix(open) else {
+            continue;
+        };
+        let Some(end) = remainder.find(close) else {
+            continue;
+        };
+        let value = remainder[..end].trim();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn explicit_lookup_filter(input: &str) -> Option<String> {
+    let lowercase = input.to_ascii_lowercase();
+    let markers = [
+        "names start with ",
+        "name starts with ",
+        "matching ",
+        "matches ",
+        "named ",
+        "nombres empiezan con ",
+        "nombre empieza con ",
+        "coincidentes con ",
+        "coincidente con ",
+        "llamados ",
+        "llamado ",
+    ];
+    if let Some((start, marker)) = markers
+        .iter()
+        .filter_map(|marker| lowercase.find(marker).map(|start| (start, *marker)))
+        .min_by_key(|(start, _)| *start)
+    {
+        let start = start + marker.len();
+        let remainder = input[start..].trim_start();
+        if let Some(filter) = quoted_lookup_filter(remainder) {
+            return Some(filter.to_string());
+        }
+        let punctuation_end = remainder
+            .find(['.', ';', '!', '?', '\n'])
+            .unwrap_or(remainder.len());
+        let mut candidate = remainder[..punctuation_end].trim();
+        let candidate_lower = candidate.to_ascii_lowercase();
+        if let Some(instruction_start) = [
+            " and summarize",
+            " and answer",
+            " and describe",
+            " then summarize",
+            " then answer",
+            " y resume",
+            " y responde",
+            " luego resume",
+            " luego responde",
+        ]
+        .iter()
+        .filter_map(|boundary| candidate_lower.find(boundary))
+        .min()
+        {
+            candidate = candidate[..instruction_start].trim();
+        }
+        let candidate = candidate
+            .strip_suffix(" please")
+            .or_else(|| candidate.strip_suffix(" por favor"))
+            .unwrap_or(candidate)
+            .trim();
+        if !candidate.is_empty() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn clean_inventory_subject(candidate: &str) -> Option<String> {
+    let punctuation_end = candidate
+        .find(['.', ';', '!', '?', '\n'])
+        .unwrap_or(candidate.len());
+    let mut candidate = candidate[..punctuation_end].trim();
+    if let Some(quoted) = quoted_lookup_filter(candidate) {
+        return Some(quoted.to_string());
+    }
+    let candidate_lower = candidate.to_ascii_lowercase();
+    if let Some(instruction_start) = [
+        " and summarize",
+        " and answer",
+        " and describe",
+        " then summarize",
+        " then answer",
+        " y resume",
+        " y responde",
+        " luego resume",
+        " luego responde",
+    ]
+    .iter()
+    .filter_map(|boundary| candidate_lower.find(boundary))
+    .min()
+    {
+        candidate = candidate[..instruction_start].trim();
+    }
+    let candidate = candidate
+        .strip_suffix(" please")
+        .or_else(|| candidate.strip_suffix(" por favor"))
+        .unwrap_or(candidate)
+        .trim();
+    let normalized = normalized_lookup_text(candidate);
+    let unambiguous_alpha2 = candidate.len() != 2
+        || candidate
+            .chars()
+            .filter(|character| character.is_alphabetic())
+            .all(char::is_uppercase);
+    if unambiguous_alpha2 && canonical_resource_region(candidate).is_some() {
+        return Some(candidate.to_string());
+    }
+    let generic_recipient_or_help_type = [
+        "me",
+        "us",
+        "them",
+        "everyone",
+        "anyone",
+        "people",
+        "users",
+        "myself",
+        "my family",
+        "all",
+        "all available",
+        "all ready",
+        "all curated",
+        "the",
+        "ready",
+        "available",
+        "curated",
+        "matching",
+        "help",
+        "support",
+        "assistance",
+        "legal help",
+        "medical help",
+        "humanitarian help",
+        "food help",
+        "shelter help",
+        "financial help",
+        "psychosocial help",
+        "legal",
+        "medical",
+        "humanitarian",
+        "food",
+        "shelter",
+        "financial",
+        "psychosocial",
+        "mi",
+        "nosotros",
+        "ellos",
+        "todos",
+        "todas",
+        "todos disponibles",
+        "todas disponibles",
+        "todos listos",
+        "todas listas",
+        "los",
+        "las",
+        "listos",
+        "listas",
+        "disponibles",
+        "curados",
+        "curadas",
+        "coincidentes",
+        "todas las personas",
+        "ayuda",
+        "apoyo",
+        "asistencia",
+        "ayuda legal",
+        "ayuda medica",
+        "ayuda humanitaria",
+        "ayuda financiera",
+        "medica",
+        "humanitaria",
+        "alimentos",
+        "refugio",
+        "financiera",
+        "psicosocial",
+    ]
+    .contains(&normalized.as_str())
+        || [
+            "people who ",
+            "users who ",
+            "someone who ",
+            "those who ",
+            "personas que ",
+            "usuarios que ",
+            "alguien que ",
+        ]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix));
+    let token_count = normalized.split_whitespace().count();
+    let is_acronym = candidate.chars().any(char::is_alphabetic)
+        && candidate
+            .chars()
+            .filter(|character| character.is_alphabetic())
+            .all(char::is_uppercase);
+    (!normalized.is_empty() && !generic_recipient_or_help_type && (token_count > 1 || is_acronym))
+        .then(|| candidate.to_string())
+}
+
+fn explicit_inventory_subject(input: &str) -> Option<String> {
+    let lowercase = input.to_ascii_lowercase();
+    let relation_markers = [
+        "resources for ",
+        "resource for ",
+        "organizations for ",
+        "organization for ",
+        "recursos para ",
+        "recurso para ",
+        "organizaciones para ",
+        "organizacion para ",
+        "recursos de ",
+        "organizaciones de ",
+    ];
+    if let Some((start, marker)) = relation_markers
+        .iter()
+        .filter_map(|marker| lowercase.find(marker).map(|start| (start, *marker)))
+        .min_by_key(|(start, _)| *start)
+    {
+        let candidate = &input[start + marker.len()..];
+        if let Some(subject) = clean_inventory_subject(candidate) {
+            return Some(subject);
+        }
+    }
+
+    let trimmed = input.trim().trim_end_matches(['.', ';', '!', '?']);
+    let lowercase = trimmed.to_ascii_lowercase();
+    for prefix in [
+        "show me the ",
+        "give me the ",
+        "list the ",
+        "show me ",
+        "give me ",
+        "enumerate ",
+        "list ",
+        "show ",
+        "muestrame los ",
+        "muestrame las ",
+        "muéstrame los ",
+        "muéstrame las ",
+        "dame los ",
+        "dame las ",
+        "lista los ",
+        "lista las ",
+        "muestrame ",
+        "muéstrame ",
+        "enumera ",
+        "lista ",
+        "muestra ",
+    ] {
+        let Some(body) = lowercase.strip_prefix(prefix) else {
+            continue;
+        };
+        for suffix in [
+            " curated resources",
+            " resource directory entries",
+            " ready resources",
+            " resources",
+            " organizations",
+            " recursos curados",
+            " recursos listos",
+            " recursos",
+            " organizaciones",
+        ] {
+            let Some(subject) = body.strip_suffix(suffix) else {
+                continue;
+            };
+            let start = prefix.len();
+            let end = start + subject.len();
+            if let Some(subject) = clean_inventory_subject(&trimmed[start..end]) {
+                return Some(subject);
+            }
+        }
+    }
+    None
+}
+
+fn explicit_inventory_region(input: &str) -> Option<String> {
+    let lowercase = input.to_ascii_lowercase();
+    for marker in [
+        " available in ",
+        " disponibles en ",
+        "resources are available in ",
+        "organizations are available in ",
+        "resources available in ",
+        "organizations available in ",
+        "resources for ",
+        "organizations for ",
+        "resources in ",
+        "organizations in ",
+        "recursos están disponibles en ",
+        "organizaciones están disponibles en ",
+        "recursos estan disponibles en ",
+        "organizaciones estan disponibles en ",
+        "recursos disponibles en ",
+        "organizaciones disponibles en ",
+        "recursos para ",
+        "organizaciones para ",
+        "recursos en ",
+        "organizaciones en ",
+    ] {
+        let Some(start) = lowercase.find(marker) else {
+            continue;
+        };
+        let candidate = input[start + marker.len()..]
+            .split(['.', ';', '!', '?', '\n'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if let Some(region) = canonical_resource_region(candidate) {
+            return Some(region);
+        }
+    }
+    None
+}
+
+fn is_resource_explanation_request(normalized: &str) -> bool {
+    if contains_phrase(normalized, "how many") || !contains_phrase(normalized, "how") {
+        return false;
+    }
+    [
+        "work",
+        "works",
+        "operate",
+        "operates",
+        "are selected",
+        "are curated",
+        "can help",
+        "provide help",
+    ]
+    .iter()
+    .any(|phrase| contains_phrase(normalized, phrase))
+}
+
+/// Derive a narrow validation requirement from the raw current User message.
+/// The requirement can reject an incomplete model-generated plan, but it does
+/// not create, authorize, or execute a Tool call.
+pub(crate) fn curated_resource_lookup_expectation(
+    input: &str,
+    continuation_cursor: Option<&CuratedResourceContinuation>,
+) -> CuratedResourceLookupExpectation {
+    let normalized = normalized_lookup_text(input);
+    let contact = is_contact_lookup_request(&normalized);
+    let resource_noun = [
+        "resource",
+        "resources",
+        "curated resource",
+        "curated resources",
+        "recurso",
+        "recursos",
+        "recursos curados",
+        "organization",
+        "organizations",
+        "organizacion",
+        "organizaciones",
+        "resource directory",
+        "directory",
+        "directorio de recursos",
+        "directorio",
+    ]
+    .iter()
+    .any(|phrase| contains_phrase(&normalized, phrase));
+    let inventory_action = [
+        "list",
+        "show",
+        "see",
+        "give me",
+        "all",
+        "inventory",
+        "enumerate",
+        "how many",
+        "available",
+        "ready",
+        "what resources",
+        "which resources",
+        "are there",
+        "next page",
+        "following page",
+        "more resources",
+        "continue",
+        "lista",
+        "listar",
+        "muestra",
+        "mostrar",
+        "ver",
+        "dame",
+        "todos",
+        "todas",
+        "inventario",
+        "enumera",
+        "cuantos",
+        "cuantas",
+        "disponibles",
+        "listos",
+        "siguiente pagina",
+        "pagina siguiente",
+        "mas recursos",
+        "continua",
+        "hay",
+    ]
+    .iter()
+    .any(|phrase| contains_phrase(&normalized, phrase));
+    let continuation_action = [
+        "next page",
+        "following page",
+        "show me more",
+        "show more resources",
+        "more resources",
+        "continue",
+        "continue listing resources",
+        "siguiente pagina",
+        "pagina siguiente",
+        "muestra mas",
+        "muestra mas recursos",
+        "mas recursos",
+        "continua",
+        "continua listando recursos",
+    ]
+    .iter()
+    .any(|phrase| contains_phrase(&normalized, phrase));
+    let is_continuation = continuation_action && (resource_noun || continuation_cursor.is_some());
+    let inventory = ((resource_noun && inventory_action) || is_continuation)
+        && !is_resource_explanation_request(&normalized);
+    let inventory_subject = inventory
+        .then(|| explicit_inventory_subject(input))
+        .flatten();
+    let subject_region = inventory_subject
+        .as_deref()
+        .and_then(canonical_resource_region);
+    let inventory_region = inventory
+        .then(|| explicit_inventory_region(input))
+        .flatten()
+        .or_else(|| subject_region.clone());
+    let inventory_subject_is_region = subject_region.is_some();
+    let filtered_inventory = inventory
+        && ([
+            "names start",
+            "name starts",
+            "named",
+            "matching",
+            "matches",
+            "nombres empiezan",
+            "nombre empieza",
+            "llamado",
+            "llamados",
+            "coincidente",
+            "coincidentes",
+        ]
+        .iter()
+        .any(|phrase| contains_phrase(&normalized, phrase))
+            || inventory_subject.is_some())
+        && !inventory_subject_is_region;
+    let expected_filter = filtered_inventory
+        .then(|| explicit_lookup_filter(input).or(inventory_subject))
+        .flatten();
+    let mut expected_query = if is_continuation {
+        continuation_cursor.and_then(|cursor| cursor.query.clone())
+    } else if filtered_inventory {
+        expected_filter.clone()
+    } else if contact {
+        contact_lookup_subject(&normalized)
+    } else {
+        None
+    };
+    let geographic_qualifier = (!is_continuation)
+        .then(|| {
+            expected_query
+                .as_deref()
+                .and_then(|query| split_resource_geographic_qualifier_from_input(query, input))
+        })
+        .flatten();
+    let expected_region = if is_continuation {
+        continuation_cursor.and_then(|cursor| cursor.region.clone())
+    } else {
+        geographic_qualifier
+            .map(|(query, region)| {
+                expected_query = Some(query);
+                region
+            })
+            .or(inventory_region)
+    };
+    let continuation = is_continuation.then_some(continuation_cursor).flatten();
+    let unfiltered_inventory = inventory && !filtered_inventory && !is_continuation;
+    let fresh_region_must_be_absent = unfiltered_inventory && expected_region.is_none();
+    CuratedResourceLookupExpectation {
+        required: contact || inventory,
+        query_required: contact
+            || filtered_inventory
+            || (is_continuation
+                && continuation_cursor.is_some_and(|cursor| cursor.query.is_some())),
+        positive_offset_required: is_continuation,
+        expected_query,
+        expected_region,
+        expected_help_type: continuation.and_then(|cursor| cursor.help_type.clone()),
+        expected_language: continuation.and_then(|cursor| cursor.language.clone()),
+        expected_offset: if is_continuation {
+            continuation_cursor.map(|cursor| cursor.next_offset)
+        } else {
+            None
+        },
+        query_must_be_absent: is_continuation
+            && continuation.is_some_and(|cursor| cursor.query.is_none())
+            || unfiltered_inventory,
+        region_must_be_absent: is_continuation
+            && continuation.is_some_and(|cursor| cursor.region.is_none())
+            || fresh_region_must_be_absent,
+        help_type_must_be_absent: inventory
+            && (!is_continuation || continuation.is_some_and(|cursor| cursor.help_type.is_none())),
+        language_must_be_absent: is_continuation
+            && continuation.is_some_and(|cursor| cursor.language.is_none())
+            || unfiltered_inventory,
+        continuation_cursor_missing: is_continuation && continuation_cursor.is_none(),
+        exact_filter_missing: filtered_inventory && !is_continuation && expected_filter.is_none(),
+        initial_offset_required: (contact || inventory) && !is_continuation,
+        expected_lookup_mode: if is_continuation {
+            continuation_cursor
+                .and_then(|cursor| cursor.lookup_mode.as_deref())
+                .and_then(|mode| match mode {
+                    "contact" => Some("contact"),
+                    "inventory" => Some("inventory"),
+                    _ => None,
+                })
+        } else if contact {
+            Some("contact")
+        } else if inventory {
+            Some("inventory")
+        } else {
+            None
+        },
+        lookup_mode_must_be_absent: is_continuation
+            && continuation_cursor.is_some_and(|cursor| cursor.lookup_mode.is_none()),
+        contact_query_from_context: contact
+            && !is_continuation
+            && contact_lookup_subject(&normalized).is_none(),
+        context_grounded_resources: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn expects_curated_resource_lookup(input: &str) -> bool {
+    curated_resource_lookup_expectation(input, None).required
 }
 
 /// Correction agent signature for fixing malformed responses
@@ -704,6 +2102,9 @@ pub struct ToolResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+    /// Structured, Tool-owned execution facts used by runtime policy. Raw
+    /// prompt text is never authoritative for these values.
+    pub metadata: serde_json::Value,
 }
 
 /// Failure categories that the shared Tool executor can safely classify.
@@ -760,7 +2161,7 @@ impl ToolRetryPolicy {
     }
 
     pub fn knowledge_search() -> Self {
-        Self::read_only(Duration::from_secs(35), 2, Duration::from_secs(35))
+        Self::read_only(Duration::from_secs(15), 2, Duration::from_secs(35))
     }
 
     fn attempt_timeout(&self, remaining: Duration) -> Option<Duration> {
@@ -803,6 +2204,16 @@ impl ToolResult {
             success: true,
             output: output.into(),
             error: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn success_with_metadata(output: impl Into<String>, metadata: serde_json::Value) -> Self {
+        Self {
+            success: true,
+            output: output.into(),
+            error: None,
+            metadata,
         }
     }
 
@@ -811,6 +2222,7 @@ impl ToolResult {
             success: false,
             output: String::new(),
             error: Some(error.into()),
+            metadata: serde_json::Value::Null,
         }
     }
 }
@@ -1053,9 +2465,12 @@ pub enum AgentTraceEvent {
         round: usize,
         attempt: u32,
         enabled_tools: Vec<String>,
+        raw_selected_tools: Vec<String>,
         selected_tools: Vec<String>,
         expected_curated_resources: bool,
+        curated_resources_available: bool,
         missed_expected_curated_resources: bool,
+        violation_reason: Option<String>,
         outcome: String,
     },
     ToolAttempted {
@@ -1136,6 +2551,12 @@ pub enum AgentTraceEvent {
         outcome: ConversationTimingOutcome,
         elapsed_ms: u128,
     },
+    TimingUnavailable {
+        phase: ConversationTimingPhase,
+        planning_round: Option<usize>,
+        attempt: u32,
+        reason: &'static str,
+    },
 }
 
 pub type AgentTraceHook = Arc<dyn Fn(AgentTraceEvent) + Send + Sync>;
@@ -1160,6 +2581,8 @@ pub type ProviderTimingTraceHook = Arc<dyn Fn(ProviderTimingEvent) + Send + Sync
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConversationTimingPhase {
     ToolPlanningModelDuration,
+    ToolPlanningClusterScheduling,
+    ToolPlanningInference,
     FinalAnswerModelDuration,
     FinalAnswerResponseHeaderWait,
     FinalAnswerFirstProviderEventWait,
@@ -1193,6 +2616,8 @@ impl ConversationTimingPhase {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ToolPlanningModelDuration => "tool_planning_model_duration",
+            Self::ToolPlanningClusterScheduling => "tool_planning_cluster_scheduling",
+            Self::ToolPlanningInference => "tool_planning_inference",
             Self::FinalAnswerModelDuration => "final_answer_model_duration",
             Self::FinalAnswerResponseHeaderWait => "final_answer_response_header_wait",
             Self::FinalAnswerFirstProviderEventWait => "final_answer_first_provider_event_wait",
@@ -1562,7 +2987,9 @@ pub struct SageAgent {
     /// Track what was sent in previous step (messages + tool names) for context
     /// The messages Vec contains the actual message content sent
     previous_step_summary: Option<(Vec<String>, Vec<String>)>,
-    contact_lookup_expected: bool,
+    curated_resource_lookup_expectation: CuratedResourceLookupExpectation,
+    curated_resource_lookup_succeeded: bool,
+    curated_resource_page_incomplete: bool,
     max_steps: usize,
     turn_step_index: usize,
     trace_hook: Option<AgentTraceHook>,
@@ -1592,7 +3019,9 @@ impl SageAgent {
             instruction: instruction.into(),
             current_tool_results: Vec::new(),
             previous_step_summary: None,
-            contact_lookup_expected: false,
+            curated_resource_lookup_expectation: CuratedResourceLookupExpectation::default(),
+            curated_resource_lookup_succeeded: false,
+            curated_resource_page_incomplete: false,
             max_steps: 10,
             turn_step_index: 0,
             trace_hook: None,
@@ -1941,6 +3370,8 @@ impl SageAgent {
         self.current_tool_results.clear();
         self.previous_step_summary = None;
         self.turn_step_index = 0;
+        self.curated_resource_lookup_succeeded = false;
+        self.curated_resource_page_incomplete = false;
     }
 
     pub fn set_trace_hook(&mut self, trace_hook: AgentTraceHook) {
@@ -1957,6 +3388,77 @@ impl SageAgent {
         self.emit_trace(event);
     }
 
+    /// Trusted, server-built text in which a model-selected organization query
+    /// must be grounded for a context-only contact follow-up. This mirrors the
+    /// memory fields shown to Tool planning without making the runtime choose
+    /// a query or a Tool call.
+    pub(crate) fn curated_resource_query_context(&self) -> CuratedResourceQueryContext {
+        let Some(memory) = &self.memory else {
+            return CuratedResourceQueryContext::default();
+        };
+        let Ok((summary, mut messages)) = memory.get_context_messages() else {
+            return CuratedResourceQueryContext::default();
+        };
+        if messages.last().is_none_or(|message| message.role != "user") {
+            // The current user message is persisted immediately before Tool
+            // planning. If that positional invariant is absent, do not risk
+            // grounding a query in the current untrusted request.
+            return CuratedResourceQueryContext::default();
+        }
+        messages.pop();
+
+        let mut trusted_text = summary
+            .as_ref()
+            .map(|summary| summary.content.clone())
+            .unwrap_or_default();
+        for message in &messages {
+            trusted_text.push('\n');
+            trusted_text.push_str(&message.content);
+        }
+        let prose_context = CuratedResourceQueryContext::from_trusted_text(&trusted_text);
+        let mut structured_context = CuratedResourceQueryContext::default();
+        for message in messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+        {
+            let Some(tools) = message
+                .tool_results
+                .as_ref()
+                .and_then(|metadata| metadata.pointer("/conversation_trace/tools"))
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for tool in tools.iter().filter(|tool| {
+                tool.get("id").and_then(serde_json::Value::as_str) == Some("curated-resources")
+            }) {
+                let Some(metadata) = tool.get("metadata") else {
+                    continue;
+                };
+                let region = metadata
+                    .get("resolved_region")
+                    .and_then(serde_json::Value::as_str);
+                let resource_names = metadata
+                    .get("resource_names")
+                    .and_then(serde_json::Value::as_array);
+                if let Some(resource_names) = resource_names {
+                    for name in resource_names.iter().filter_map(serde_json::Value::as_str) {
+                        structured_context.push_structured_resource(name, region);
+                    }
+                }
+                if resource_names.is_none_or(Vec::is_empty) {
+                    if let Some(query) = metadata
+                        .get("continuation_query")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        structured_context.push_structured_resource(query, region);
+                    }
+                }
+            }
+        }
+        prefer_structured_resource_context(prose_context, structured_context)
+    }
+
     /// Build the plain final-answer prompt after the bounded Tool phase.
     pub fn plain_answer_prompt(&self, user_message: &str) -> PlainAnswerPrompt {
         let context = self.build_context();
@@ -1971,7 +3473,11 @@ impl SageAgent {
             context.recent_conversation,
             user_message,
         );
-        PlainAnswerPrompt { system, user }
+        PlainAnswerPrompt {
+            system,
+            user,
+            incomplete_curated_resource_page: self.curated_resource_page_incomplete,
+        }
     }
 
     /// Execute one provider-neutral Tool decision and retain its results for
@@ -1985,6 +3491,14 @@ impl SageAgent {
                 .execute_tool_call(&call_id, planning_round, tool_call)
                 .await;
             self.inject_tool_result(tool_call, &result);
+            if tool_call.name == "find_resources" && result.success {
+                self.curated_resource_lookup_succeeded = true;
+                self.curated_resource_page_incomplete = result
+                    .metadata
+                    .get("has_more")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+            }
             executed_tools.push(ExecutedTool {
                 tool_call: tool_call.clone(),
                 result,
@@ -2241,6 +3755,273 @@ impl SageAgent {
         )
     }
 
+    fn expected_curated_resources(&self, enabled_tools: &[String]) -> bool {
+        self.curated_resources_requested()
+            && enabled_tools.iter().any(|name| name == "find_resources")
+    }
+
+    fn curated_resources_requested(&self) -> bool {
+        self.curated_resource_lookup_expectation.required && !self.curated_resource_lookup_succeeded
+    }
+
+    fn curated_resource_plan_violation(
+        &self,
+        decision: &ToolDecision,
+        expected_curated_resources: bool,
+    ) -> Option<&'static str> {
+        if !expected_curated_resources {
+            if self.curated_resource_lookup_expectation.required
+                && self.curated_resource_lookup_succeeded
+                && decision
+                    .tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.name == "find_resources")
+            {
+                return Some("additional find_resources call was not allowed after turn success");
+            }
+            return None;
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .continuation_cursor_missing
+        {
+            return Some("find_resources continuation cursor was unavailable");
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .exact_filter_missing
+        {
+            return Some("exact find_resources inventory filter was unavailable");
+        }
+        let resource_calls = decision
+            .tool_calls
+            .iter()
+            .filter(|tool_call| tool_call.name == "find_resources")
+            .collect::<Vec<_>>();
+        if resource_calls.is_empty() {
+            return Some("required find_resources Tool call was omitted");
+        }
+        if resource_calls.len() != 1 {
+            return Some("multiple find_resources calls were not allowed in one plan");
+        }
+        let call = resource_calls[0];
+        if self.curated_resource_lookup_expectation.query_required
+            && tool_string_arg(&call.args, "query").is_none_or(|query| query.trim().is_empty())
+        {
+            return Some("required find_resources query was omitted");
+        }
+        if let Some(expected_query) = &self.curated_resource_lookup_expectation.expected_query {
+            let expected_query = normalized_lookup_text(expected_query);
+            let actual_query = tool_string_arg(&call.args, "query").map(normalized_lookup_text);
+            let actual_region = tool_string_arg(&call.args, "region").map(normalized_lookup_text);
+            let primary_query_matches = actual_query.as_deref() == Some(expected_query.as_str());
+            let primary_region_matches = self
+                .curated_resource_lookup_expectation
+                .expected_region
+                .as_deref()
+                .is_none_or(|expected_region| {
+                    actual_region.as_deref().is_some_and(|actual_region| {
+                        resource_regions_match(expected_region, actual_region)
+                    })
+                });
+            if !primary_query_matches {
+                return Some("find_resources query did not preserve the requested filter");
+            }
+            if primary_query_matches && !primary_region_matches {
+                return Some("find_resources region did not preserve the requested location");
+            }
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .expected_query
+            .is_none()
+        {
+            if let Some(expected_region) = &self.curated_resource_lookup_expectation.expected_region
+            {
+                let actual_region = tool_string_arg(&call.args, "region");
+                if actual_region.is_none_or(|actual_region| {
+                    !resource_regions_match(expected_region, actual_region)
+                }) {
+                    return Some("find_resources region did not preserve the requested location");
+                }
+            }
+        }
+        for (field, expected, must_be_absent, mismatch) in [
+            (
+                "help_type",
+                self.curated_resource_lookup_expectation
+                    .expected_help_type
+                    .as_deref(),
+                self.curated_resource_lookup_expectation
+                    .help_type_must_be_absent,
+                "find_resources help_type did not preserve the prior filter",
+            ),
+            (
+                "language",
+                self.curated_resource_lookup_expectation
+                    .expected_language
+                    .as_deref(),
+                self.curated_resource_lookup_expectation
+                    .language_must_be_absent,
+                "find_resources language did not preserve the prior filter",
+            ),
+        ] {
+            let actual =
+                tool_string_arg(&call.args, field).filter(|value| !value.trim().is_empty());
+            if expected.is_some_and(|expected| {
+                actual.is_none_or(|actual| {
+                    normalized_lookup_text(actual) != normalized_lookup_text(expected)
+                })
+            }) {
+                return Some(mismatch);
+            }
+            if must_be_absent && actual.is_some() {
+                return Some(mismatch);
+            }
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .contact_query_from_context
+        {
+            let actual_query = tool_string_arg(&call.args, "query").map(normalized_lookup_text);
+            let actual_region = tool_string_arg(&call.args, "region");
+            let grounded_resource = actual_query.as_deref().and_then(|actual_query| {
+                self.curated_resource_lookup_expectation
+                    .context_grounded_resources
+                    .iter()
+                    .rev()
+                    .find(|(query, _)| query == actual_query)
+            });
+            let Some((_, expected_region)) = grounded_resource else {
+                return Some("find_resources query was not grounded in recent conversation");
+            };
+            if expected_region.as_deref().is_some_and(|expected_region| {
+                actual_region.is_none_or(|actual_region| {
+                    !resource_regions_match(expected_region, actual_region)
+                })
+            }) {
+                return Some("find_resources region did not preserve the requested location");
+            }
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .query_must_be_absent
+            && tool_string_arg(&call.args, "query").is_some_and(|query| !query.trim().is_empty())
+        {
+            return Some("find_resources added a query that was absent from the prior page");
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .region_must_be_absent
+            && tool_string_arg(&call.args, "region").is_some_and(|region| !region.trim().is_empty())
+        {
+            return Some("find_resources added a region that was absent from the prior page");
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .expected_lookup_mode
+            .is_some_and(|expected_mode| {
+                tool_string_arg(&call.args, "lookup_mode")
+                    .is_none_or(|actual_mode| actual_mode.trim() != expected_mode)
+            })
+        {
+            return Some("find_resources lookup mode did not match the current request");
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .lookup_mode_must_be_absent
+            && tool_string_arg(&call.args, "lookup_mode")
+                .is_some_and(|mode| !mode.trim().is_empty())
+        {
+            return Some("find_resources lookup mode did not match the current request");
+        }
+        if self
+            .curated_resource_lookup_expectation
+            .positive_offset_required
+            && tool_parse_arg::<usize>(&call.args, "offset").is_none_or(|offset| offset == 0)
+        {
+            return Some("required positive find_resources continuation offset was omitted");
+        }
+        if let Some(expected_offset) = self.curated_resource_lookup_expectation.expected_offset {
+            if tool_parse_arg::<usize>(&call.args, "offset") != Some(expected_offset) {
+                return Some("find_resources offset did not match the prior next_offset");
+            }
+        } else if self
+            .curated_resource_lookup_expectation
+            .initial_offset_required
+            && tool_parse_arg::<usize>(&call.args, "offset").is_some_and(|offset| offset > 0)
+        {
+            return Some("fresh find_resources lookup used a stale positive offset");
+        }
+        None
+    }
+
+    /// Remove redundant resource calls only when doing so cannot broaden or
+    /// invent a plan. Invalid calls remain untouched so normal validation can
+    /// reject the model output and request a corrected plan.
+    fn sanitize_curated_resource_calls(
+        &self,
+        decision: &mut ToolDecision,
+        expected_curated_resources: bool,
+    ) {
+        if self.curated_resource_lookup_succeeded {
+            decision
+                .tool_calls
+                .retain(|tool_call| tool_call.name != "find_resources");
+            return;
+        }
+
+        let resource_call_indexes = decision
+            .tool_calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tool_call)| (tool_call.name == "find_resources").then_some(index))
+            .collect::<Vec<_>>();
+        if resource_call_indexes.len() <= 1 {
+            return;
+        }
+
+        let valid_index = resource_call_indexes.into_iter().find(|candidate_index| {
+            let mut candidate = decision.clone();
+            candidate.tool_calls = candidate
+                .tool_calls
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, tool_call)| {
+                    (tool_call.name != "find_resources" || index == *candidate_index)
+                        .then_some(tool_call)
+                })
+                .collect();
+            self.curated_resource_plan_violation(&candidate, expected_curated_resources)
+                .is_none()
+        });
+        if let Some(valid_index) = valid_index {
+            decision.tool_calls = decision
+                .tool_calls
+                .drain(..)
+                .enumerate()
+                .filter_map(|(index, tool_call)| {
+                    (tool_call.name != "find_resources" || index == valid_index)
+                        .then_some(tool_call)
+                })
+                .collect();
+        }
+    }
+
+    fn emit_unavailable_tool_planning_latency(&self, step: usize, attempt: u32) {
+        for phase in [
+            ConversationTimingPhase::ToolPlanningClusterScheduling,
+            ConversationTimingPhase::ToolPlanningInference,
+        ] {
+            self.emit_trace(AgentTraceEvent::TimingUnavailable {
+                phase,
+                planning_round: Some(step),
+                attempt,
+                reason: "provider_contract_does_not_expose_phase_timing",
+            });
+        }
+    }
+
     async fn plan_tools_with_dspy(
         &mut self,
         user_message: &str,
@@ -2257,8 +4038,8 @@ impl SageAgent {
         let predictor = Predict::<ToolDecisionResponse>::builder()
             .instruction(format!("{}{}", self.instruction, TOOL_PLANNING_INSTRUCTION))
             .build();
-        let input = ToolDecisionResponseInput {
-            input: input_content,
+        let mut input = ToolDecisionResponseInput {
+            input: input_content.clone(),
             current_time: context.current_time,
             persona_block: context.persona_block,
             human_block: context.human_block,
@@ -2271,6 +4052,7 @@ impl SageAgent {
 
         const MAX_TOOL_PLAN_ATTEMPTS: u32 = 3;
         let mut last_error = None;
+        let mut terminal_selection_rejection_emitted = false;
         for attempt in 1..=MAX_TOOL_PLAN_ATTEMPTS {
             self.emit_trace(AgentTraceEvent::ModelStepStarted {
                 step: step_index,
@@ -2280,6 +4062,7 @@ impl SageAgent {
             match predictor.call(input.clone()).await {
                 Ok(response) => {
                     let elapsed_ms = started_at.elapsed().as_millis();
+                    self.emit_unavailable_tool_planning_latency(step_index, attempt);
                     self.emit_trace(AgentTraceEvent::ModelStepCompleted {
                         step: step_index,
                         attempt,
@@ -2301,29 +4084,74 @@ impl SageAgent {
                     let mut decision = decision;
                     decision.planning_round = step_index;
                     let enabled_tools = self.tools.names();
-                    let selected_tools = decision
+                    let curated_resources_available =
+                        enabled_tools.iter().any(|name| name == "find_resources");
+                    let raw_selected_tools = decision
                         .tool_calls
                         .iter()
                         .map(|tool_call| tool_call.name.clone())
                         .collect::<Vec<_>>();
                     let expected_curated_resources =
-                        enabled_tools.iter().any(|name| name == "find_resources")
-                            && self.contact_lookup_expected;
-                    let missed_expected_curated_resources = expected_curated_resources
-                        && !selected_tools.iter().any(|name| name == "find_resources");
+                        self.expected_curated_resources(&enabled_tools);
+                    self.sanitize_curated_resource_calls(&mut decision, expected_curated_resources);
+                    let selected_tools = decision
+                        .tool_calls
+                        .iter()
+                        .map(|tool_call| tool_call.name.clone())
+                        .collect::<Vec<_>>();
+                    let violation =
+                        self.curated_resource_plan_violation(&decision, expected_curated_resources);
+                    let missed_expected_curated_resources = self.curated_resources_requested()
+                        && (!expected_curated_resources || violation.is_some());
                     self.emit_trace(AgentTraceEvent::ToolSelectionObservation {
                         round: step_index,
                         attempt,
                         enabled_tools,
+                        raw_selected_tools,
                         selected_tools,
-                        expected_curated_resources,
+                        expected_curated_resources: self.curated_resources_requested(),
+                        curated_resources_available,
                         missed_expected_curated_resources,
-                        outcome: "planned".to_string(),
+                        violation_reason: violation.map(str::to_string),
+                        outcome: if violation.is_some() {
+                            "rejected".to_string()
+                        } else {
+                            "planned".to_string()
+                        },
                     });
+                    if let Some(violation) = violation {
+                        last_error = Some(anyhow::anyhow!(violation));
+                        terminal_selection_rejection_emitted = attempt == MAX_TOOL_PLAN_ATTEMPTS;
+                        if attempt < MAX_TOOL_PLAN_ATTEMPTS {
+                            self.emit_trace(AgentTraceEvent::RetryScheduled {
+                                step: step_index,
+                                attempt,
+                            });
+                            input.input = format!(
+                                "{}\n\nRUNTIME TOOL-PLAN VALIDATION\n{}",
+                                input_content,
+                                self.curated_resource_lookup_expectation
+                                    .retry_instruction_for_violation(violation),
+                            );
+                            let delay_started_at = Instant::now();
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            self.emit_trace(AgentTraceEvent::Timing {
+                                phase: ConversationTimingPhase::RetryDelay,
+                                planning_round: Some(step_index),
+                                tool_name: None,
+                                call_id: None,
+                                attempt,
+                                outcome: ConversationTimingOutcome::Succeeded,
+                                elapsed_ms: delay_started_at.elapsed().as_millis(),
+                            });
+                        }
+                        continue;
+                    }
                     return Ok(ToolPlanningOutcome::Decision(decision));
                 }
                 Err(error) => {
                     let elapsed_ms = started_at.elapsed().as_millis();
+                    self.emit_unavailable_tool_planning_latency(step_index, attempt);
                     self.emit_trace(AgentTraceEvent::ModelStepFailed {
                         step: step_index,
                         attempt,
@@ -2344,7 +4172,7 @@ impl SageAgent {
                     // answer: accepting it would let the model bypass the required tool
                     // decision and fabricate an unverified admin response. Keep retrying
                     // the typed contract instead.
-                    last_error = Some(error);
+                    last_error = Some(error.into());
                     if attempt < MAX_TOOL_PLAN_ATTEMPTS {
                         self.emit_trace(AgentTraceEvent::RetryScheduled {
                             step: step_index,
@@ -2366,18 +4194,23 @@ impl SageAgent {
             }
         }
 
-        let enabled_tools = self.tools.names();
-        let expected_curated_resources = enabled_tools.iter().any(|name| name == "find_resources")
-            && self.contact_lookup_expected;
-        self.emit_trace(AgentTraceEvent::ToolSelectionObservation {
-            round: step_index,
-            attempt: MAX_TOOL_PLAN_ATTEMPTS,
-            enabled_tools,
-            selected_tools: Vec::new(),
-            expected_curated_resources,
-            missed_expected_curated_resources: expected_curated_resources,
-            outcome: "failed".to_string(),
-        });
+        if !terminal_selection_rejection_emitted {
+            let enabled_tools = self.tools.names();
+            let curated_resources_available =
+                enabled_tools.iter().any(|name| name == "find_resources");
+            self.emit_trace(AgentTraceEvent::ToolSelectionObservation {
+                round: step_index,
+                attempt: MAX_TOOL_PLAN_ATTEMPTS,
+                enabled_tools,
+                raw_selected_tools: Vec::new(),
+                selected_tools: Vec::new(),
+                expected_curated_resources: self.curated_resources_requested(),
+                curated_resources_available,
+                missed_expected_curated_resources: self.curated_resources_requested(),
+                violation_reason: last_error.as_ref().map(ToString::to_string),
+                outcome: "failed".to_string(),
+            });
+        }
         Err(anyhow::anyhow!(
             "Tool planning failed after {} attempts: {:?}",
             MAX_TOOL_PLAN_ATTEMPTS,
@@ -2790,8 +4623,11 @@ impl ToolPlanner for SageAgent {
         self.tools.has_actionable_tools()
     }
 
-    fn set_contact_lookup_expected(&mut self, expected: bool) {
-        self.contact_lookup_expected = expected;
+    fn set_curated_resource_lookup_expectation(
+        &mut self,
+        expectation: CuratedResourceLookupExpectation,
+    ) {
+        self.curated_resource_lookup_expectation = expectation;
     }
 
     async fn plan_tools(
@@ -2935,6 +4771,1113 @@ mod tests {
             "Please address my concern and share their physical address."
         ));
         assert!(!expects_curated_resource_lookup("Show me a curl example."));
+        assert!(!expects_curated_resource_lookup("Summarize this email."));
+        assert!(!expects_curated_resource_lookup(
+            "Draft an email to my boss."
+        ));
+        assert!(!expects_curated_resource_lookup(
+            "Prepare me for a phone interview."
+        ));
+        assert!(!expects_curated_resource_lookup("What is an email?"));
+        assert!(!expects_curated_resource_lookup(
+            "Give me an email example."
+        ));
+        for prompt in [
+            "What is email authentication?",
+            "Can you give me feedback on this email?",
+            "Can you give me feedback on their email?",
+            "What is wrong with their email?",
+            "Give me advice about email security.",
+            "What is phone banking?",
+            "Draft an email for Acme Legal Aid.",
+            "Review the website for Acme Legal Aid.",
+            "Show me how organizations work.",
+            "Show me how the Resource Directory works.",
+            "Can I see how available organizations are selected?",
+        ] {
+            assert!(!expects_curated_resource_lookup(prompt), "{prompt}");
+        }
+        for (prompt, expected_query) in [
+            (
+                "How can I contact Acme Legal Aid by email?",
+                "acme legal aid",
+            ),
+            (
+                "Please share Acme Legal Aid's phone number.",
+                "acme legal aid",
+            ),
+            ("What is the email for Women in Need?", "women in need"),
+            (
+                "Give me the contact information for Acme Legal Aid.",
+                "acme legal aid",
+            ),
+            ("Can you share Acme Legal Aid's email?", "acme legal aid"),
+            (
+                "Could you give me Acme Legal Aid's phone number?",
+                "acme legal aid",
+            ),
+            ("What's Acme Legal Aid's email?", "acme legal aid"),
+            (
+                "¿Me puedes dar el email de Acme Legal Aid?",
+                "acme legal aid",
+            ),
+            (
+                "¿Me puedes dar el correo electrónico para Acme Legal Aid?",
+                "acme legal aid",
+            ),
+            (
+                "What is The Women's Law Center's email?",
+                "the women s law center",
+            ),
+            (
+                "What is the email for The Women's Law Center?",
+                "the women s law center",
+            ),
+            ("Can I get Acme Legal Aid's email?", "acme legal aid"),
+            ("Can I get the email for Acme Legal Aid?", "acme legal aid"),
+            ("What is Acme Legal Aid's e-mail?", "acme legal aid"),
+            ("¿Cuál es el celular de Acme Legal Aid?", "acme legal aid"),
+            ("What is the e-mail of Acme Legal Aid?", "acme legal aid"),
+            (
+                "Give me the phone number of Acme Legal Aid.",
+                "acme legal aid",
+            ),
+            (
+                "Could I get the email for Acme Legal Aid?",
+                "acme legal aid",
+            ),
+            ("Could I have Acme Legal Aid's email?", "acme legal aid"),
+            ("I need Acme Legal Aid's email.", "acme legal aid"),
+            ("I need the email for Acme Legal Aid.", "acme legal aid"),
+            ("Dame el correo de Acme Legal Aid.", "acme legal aid"),
+            (
+                "Share Acme Legal Aid's email and phone number.",
+                "acme legal aid",
+            ),
+        ] {
+            let expectation = curated_resource_lookup_expectation(prompt, None);
+            assert!(expectation.required, "{prompt}");
+            assert_eq!(
+                expectation.expected_query.as_deref(),
+                Some(expected_query),
+                "{prompt}"
+            );
+        }
+        assert!(expects_curated_resource_lookup(
+            "What is Acme Legal Aid's email?"
+        ));
+        assert_eq!(
+            curated_resource_lookup_expectation(
+                "What is the email address for Acme Legal Aid in Mexico?",
+                None,
+            )
+            .expected_query
+            .as_deref(),
+            Some("acme legal aid")
+        );
+        assert_eq!(
+            curated_resource_lookup_expectation(
+                "What is the email address for Acme Legal Aid in Mexico?",
+                None,
+            )
+            .expected_region
+            .as_deref(),
+            Some("mexico")
+        );
+        let uppercase_alpha2 = curated_resource_lookup_expectation(
+            "What is the email address for Acme Legal Aid in US?",
+            None,
+        );
+        assert_eq!(
+            uppercase_alpha2.expected_query.as_deref(),
+            Some("acme legal aid")
+        );
+        assert_eq!(uppercase_alpha2.expected_region.as_deref(), Some("US"));
+        let lowercase_pronoun =
+            curated_resource_lookup_expectation("What is the email address for Women in us?", None);
+        assert_eq!(
+            lowercase_pronoun.expected_query.as_deref(),
+            Some("women in us")
+        );
+        assert_eq!(lowercase_pronoun.expected_region, None);
+        assert_eq!(
+            curated_resource_lookup_expectation(
+                "¿Cuál es el correo electrónico de Acme Legal Aid en México?",
+                None,
+            )
+            .expected_query
+            .as_deref(),
+            Some("acme legal aid")
+        );
+        for (prompt, expected_query) in [
+            ("WLC contact information", "wlc"),
+            ("WLC phone number", "wlc"),
+            ("I need contact information for WLC", "wlc"),
+            ("Can I get the email and phone number for WLC?", "wlc"),
+            (
+                "Do you have the email for Acme Legal Aid?",
+                "acme legal aid",
+            ),
+            ("Dame el correo y teléfono de WLC", "wlc"),
+            ("¿Tienes el correo de Acme Legal Aid?", "acme legal aid"),
+        ] {
+            let expectation = curated_resource_lookup_expectation(prompt, None);
+            assert!(expectation.required, "{prompt}");
+            assert_eq!(
+                expectation.expected_query.as_deref(),
+                Some(expected_query),
+                "{prompt}"
+            );
+        }
+        for prompt in [
+            "Share their physical address.",
+            "What is the address?",
+            "Where is the address?",
+            "Can you give me the phone number?",
+            "Could I get the email?",
+            "Could I have the phone number?",
+            "What are their contact details?",
+            "Me puedes dar el email?",
+            "¿Cuál es el correo?",
+            "¿Dónde está la dirección?",
+            "¿Cuáles son sus datos de contacto?",
+        ] {
+            let expectation = curated_resource_lookup_expectation(prompt, None);
+            assert!(expectation.required, "{prompt}");
+            assert_eq!(expectation.expected_query, None, "{prompt}");
+        }
+        assert!(expects_curated_resource_lookup(
+            "List the ready Curated Resources whose names start with 'Issue 539 Inventory'."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Show the next page of those matching resources."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Lista los recursos curados listos cuyos nombres empiezan con 'Issue 539 Inventory'."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Muestra la siguiente página de esos recursos coincidentes."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Give me all Curated Resources."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Can I see the available organizations?"
+        ));
+        assert!(expects_curated_resource_lookup(
+            "How many Curated Resources are ready?"
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Enumerate the resource directory."
+        ));
+        assert!(expects_curated_resource_lookup(
+            "Are there any curated resources?"
+        ));
+        assert!(expects_curated_resource_lookup("¿Hay recursos curados?"));
+        for (prompt, expected_region) in [
+            ("List resources for Mexico.", "MX"),
+            ("What resources are available in Mexico?", "MX"),
+            ("Which resources are currently available in Mexico?", "MX"),
+            ("List resources available in Mexico.", "MX"),
+            ("Lista recursos para México.", "MX"),
+            ("¿Qué recursos están disponibles en México?", "MX"),
+            (
+                "¿Qué recursos están actualmente disponibles en México?",
+                "MX",
+            ),
+            ("Lista recursos disponibles en México.", "MX"),
+            ("List resources for United States.", "US"),
+            ("List organizations in Latin America.", "latin america"),
+            ("List Mexico resources.", "MX"),
+            ("Lista recursos de México.", "MX"),
+        ] {
+            let expectation = curated_resource_lookup_expectation(prompt, None);
+            assert!(expectation.required, "{prompt}");
+            assert_eq!(expectation.expected_query, None, "{prompt}");
+            assert_eq!(
+                expectation.expected_region.as_deref(),
+                Some(expected_region),
+                "{prompt}"
+            );
+        }
+        assert_eq!(
+            curated_resource_lookup_expectation(
+                "List ready Curated Resources matching Acme Legal Aid.",
+                None,
+            )
+            .expected_query
+            .as_deref(),
+            Some("Acme Legal Aid")
+        );
+        for (prompt, expected_query) in [
+            ("List resources for Acme Legal Aid.", "Acme Legal Aid"),
+            ("List organizations for Acme Legal Aid.", "Acme Legal Aid"),
+            ("List Acme Legal Aid resources.", "Acme Legal Aid"),
+            ("Lista recursos para Acme Legal Aid.", "Acme Legal Aid"),
+        ] {
+            let expectation = curated_resource_lookup_expectation(prompt, None);
+            assert!(expectation.required, "{prompt}");
+            assert_eq!(
+                expectation.expected_query.as_deref(),
+                Some(expected_query),
+                "{prompt}"
+            );
+        }
+        for prompt in [
+            "List resources for legal help.",
+            "List resources for me.",
+            "List all resources.",
+            "List available organizations.",
+        ] {
+            let expectation = curated_resource_lookup_expectation(prompt, None);
+            assert!(expectation.required, "{prompt}");
+            assert_eq!(expectation.expected_query, None, "{prompt}");
+        }
+
+        let continuation = CuratedResourceContinuation {
+            query: Some("Issue 539 Inventory".to_string()),
+            region: None,
+            help_type: None,
+            language: None,
+            lookup_mode: Some("inventory".to_string()),
+            next_offset: 10,
+        };
+        for prompt in [
+            "Next page please.",
+            "Show me more.",
+            "More resources.",
+            "Show more resources.",
+            "Continue listing resources.",
+            "Siguiente página.",
+            "Muestra más recursos.",
+            "Continúa listando recursos.",
+        ] {
+            let expectation = curated_resource_lookup_expectation(prompt, Some(&continuation));
+            assert!(expectation.required, "{prompt}");
+            assert!(expectation.positive_offset_required, "{prompt}");
+            assert_eq!(expectation.expected_offset, Some(10), "{prompt}");
+        }
+        let explicit_without_cursor = curated_resource_lookup_expectation(
+            "Show the next page of those matching resources.",
+            None,
+        );
+        assert!(explicit_without_cursor.required);
+        assert!(explicit_without_cursor.positive_offset_required);
+        assert_eq!(explicit_without_cursor.expected_offset, None);
+        assert_eq!(
+            curated_resource_lookup_expectation(
+                "List resources matching Acme Legal Aid and summarize them briefly.",
+                None,
+            )
+            .expected_query
+            .as_deref(),
+            Some("Acme Legal Aid")
+        );
+        assert_eq!(
+            curated_resource_lookup_expectation(
+                "List resources matching Acme Legal Aid; answer \"briefly\".",
+                None,
+            )
+            .expected_query
+            .as_deref(),
+            Some("Acme Legal Aid")
+        );
+        assert_eq!(
+            curated_resource_lookup_expectation(
+                "List resources named \"Acme Matching Center\".",
+                None,
+            )
+            .expected_query
+            .as_deref(),
+            Some("Acme Matching Center")
+        );
+    }
+
+    #[test]
+    fn trusted_contact_context_requires_an_exact_entity_and_preserves_country() {
+        let context = CuratedResourceQueryContext::from_trusted_text(
+            "The prior referrals were Atlas Aid in Mexico, Women in Need, and WLC.",
+        );
+        assert_eq!(
+            context.resources,
+            vec![
+                ("atlas aid".to_string(), Some("MX".to_string())),
+                ("women in need".to_string(), None),
+                ("wlc".to_string(), None),
+            ]
+        );
+
+        assert_eq!(
+            split_resource_geographic_qualifier("Atlas Aid in FRA"),
+            Some(("Atlas Aid".to_string(), "FRA".to_string()))
+        );
+        assert_eq!(
+            split_resource_geographic_qualifier("Atlas Aid in Russia"),
+            Some(("Atlas Aid".to_string(), "Russia".to_string()))
+        );
+        assert_eq!(split_resource_geographic_qualifier("Women in us"), None);
+        assert_eq!(split_resource_geographic_qualifier("Women in Need"), None);
+
+        let false_names = CuratedResourceQueryContext::from_trusted_text(
+            "The people mentioned were John Smith and New York.",
+        );
+        assert!(false_names.resources.is_empty());
+        let mut structured = CuratedResourceQueryContext::default();
+        structured.push_structured_resource("Amnesty", Some("Mexico"));
+        assert_eq!(
+            structured.resources,
+            vec![("amnesty".to_string(), Some("MX".to_string()))]
+        );
+
+        let prose = CuratedResourceQueryContext::from_trusted_text(
+            "We discussed Horizon Foundation and an unrelated support project.",
+        );
+        let mut returned_resources = CuratedResourceQueryContext::default();
+        returned_resources.push_structured_resource("Acme", Some("Mexico"));
+        assert_eq!(
+            prefer_structured_resource_context(prose, returned_resources).resources,
+            vec![("acme".to_string(), Some("MX".to_string()))],
+            "structured returned resources must replace ambiguous prose candidates"
+        );
+    }
+
+    #[test]
+    fn context_followup_plan_rejects_partial_entities_and_missing_regions() {
+        let mut registry = ToolRegistry::new();
+        registry.register_descriptor("find_resources", "lookup", r#"{"query":"text"}"#);
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let context = CuratedResourceQueryContext::from_trusted_text(
+            "Earlier we discussed Acme Legal Aid Network in Mexico. Then Atlas Aid in France.",
+        );
+        agent.curated_resource_lookup_expectation =
+            curated_resource_lookup_expectation("What is their email?", None)
+                .with_query_context(&context);
+        let expected = agent.expected_curated_resources(&agent.tools.names());
+
+        for query in ["Acme Legal Aid", "Atlas", "Invented Organization"] {
+            let decision = ToolDecision::new(
+                vec![ToolCall {
+                    name: "find_resources".to_string(),
+                    args: [
+                        ("query".to_string(), serde_json::json!(query)),
+                        ("lookup_mode".to_string(), serde_json::json!("contact")),
+                    ]
+                    .into(),
+                }],
+                false,
+            );
+            assert_eq!(
+                agent.curated_resource_plan_violation(&decision, expected),
+                Some("find_resources query was not grounded in recent conversation"),
+                "{query}"
+            );
+        }
+
+        let exact_without_region = ToolDecision::new(
+            vec![ToolCall {
+                name: "find_resources".to_string(),
+                args: [
+                    ("query".to_string(), serde_json::json!("Atlas Aid")),
+                    ("lookup_mode".to_string(), serde_json::json!("contact")),
+                ]
+                .into(),
+            }],
+            false,
+        );
+        assert_eq!(
+            agent.curated_resource_plan_violation(&exact_without_region, expected),
+            Some("find_resources region did not preserve the requested location")
+        );
+        let exact = ToolDecision::new(
+            vec![ToolCall {
+                name: "find_resources".to_string(),
+                args: [
+                    ("query".to_string(), serde_json::json!("Atlas Aid")),
+                    ("region".to_string(), serde_json::json!("FR")),
+                    ("lookup_mode".to_string(), serde_json::json!("contact")),
+                ]
+                .into(),
+            }],
+            false,
+        );
+        assert!(agent
+            .curated_resource_plan_violation(&exact, expected)
+            .is_none());
+    }
+
+    #[test]
+    fn curated_resource_plan_validation_preserves_inventory_filter_and_continuation() {
+        let mut registry = ToolRegistry::new();
+        registry.register_descriptor("find_resources", "lookup", r#"{"query":"text"}"#);
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let enabled = agent.tools.names();
+
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "List ready Curated Resources whose names start with 'Issue 539 Inventory'.",
+            None,
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        assert!(expected);
+        assert_eq!(
+            agent.curated_resource_plan_violation(&ToolDecision::new(Vec::new(), false), expected),
+            Some("required find_resources Tool call was omitted")
+        );
+        let mut filtered_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [("lookup_mode".to_string(), serde_json::json!("inventory"))].into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![filtered_call.clone()], false),
+                expected,
+            ),
+            Some("required find_resources query was omitted")
+        );
+        filtered_call
+            .args
+            .insert("query".to_string(), serde_json::json!("aid"));
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![filtered_call.clone()], false),
+                expected,
+            ),
+            Some("find_resources query did not preserve the requested filter")
+        );
+        filtered_call.args.insert(
+            "query".to_string(),
+            serde_json::json!("Issue 539 Inventory unrelated"),
+        );
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![filtered_call.clone()], false),
+                expected,
+            ),
+            Some("find_resources query did not preserve the requested filter")
+        );
+        filtered_call.args.insert(
+            "query".to_string(),
+            serde_json::Value::String("Issue 539 Inventory".to_string()),
+        );
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![filtered_call], false),
+                expected,
+            )
+            .is_none());
+
+        let continuation = CuratedResourceContinuation {
+            query: Some("Issue 539 Inventory".to_string()),
+            region: None,
+            help_type: None,
+            language: None,
+            lookup_mode: Some("inventory".to_string()),
+            next_offset: 10,
+        };
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "Show the next page of those matching resources.",
+            Some(&continuation),
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        let mut continuation_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                (
+                    "query".to_string(),
+                    serde_json::json!("Issue 539 Inventory"),
+                ),
+                ("lookup_mode".to_string(), serde_json::json!("inventory")),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![continuation_call.clone()], false),
+                expected,
+            ),
+            Some("required positive find_resources continuation offset was omitted")
+        );
+        continuation_call
+            .args
+            .insert("offset".to_string(), serde_json::json!(1));
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![continuation_call.clone()], false),
+                expected,
+            ),
+            Some("find_resources offset did not match the prior next_offset")
+        );
+        continuation_call
+            .args
+            .insert("offset".to_string(), serde_json::json!(10));
+        let mut wrong_continuation_mode = continuation_call.clone();
+        wrong_continuation_mode
+            .args
+            .insert("lookup_mode".to_string(), serde_json::json!("contact"));
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![wrong_continuation_mode], false),
+                expected,
+            ),
+            Some("find_resources lookup mode did not match the current request")
+        );
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![continuation_call], false),
+                expected,
+            )
+            .is_none());
+
+        let full_filter_continuation = CuratedResourceContinuation {
+            query: Some("Atlas Aid".to_string()),
+            region: Some("MX".to_string()),
+            help_type: Some("legal".to_string()),
+            language: Some("es".to_string()),
+            lookup_mode: None,
+            next_offset: 5,
+        };
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "Show the next page of those resources.",
+            Some(&full_filter_continuation),
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        let full_filter_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Atlas Aid")),
+                ("region".to_string(), serde_json::json!("Mexico")),
+                ("help_type".to_string(), serde_json::json!("legal")),
+                ("language".to_string(), serde_json::json!("es")),
+                ("offset".to_string(), serde_json::json!(5)),
+            ]
+            .into(),
+        };
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![full_filter_call.clone()], false),
+                expected,
+            )
+            .is_none());
+        let mut dropped_language = full_filter_call.clone();
+        dropped_language.args.remove("language");
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![dropped_language], false),
+                expected,
+            ),
+            Some("find_resources language did not preserve the prior filter")
+        );
+
+        agent.curated_resource_lookup_expectation =
+            curated_resource_lookup_expectation("List all available resources.", None);
+        let expected = agent.expected_curated_resources(&enabled);
+        let narrowed_inventory = ToolCall {
+            name: "find_resources".to_string(),
+            args: [("help_type".to_string(), serde_json::json!("legal"))].into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![narrowed_inventory], false),
+                expected,
+            ),
+            Some("find_resources help_type did not preserve the prior filter")
+        );
+        let wrong_inventory_mode = ToolCall {
+            name: "find_resources".to_string(),
+            args: [("lookup_mode".to_string(), serde_json::json!("contact"))].into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![wrong_inventory_mode], false),
+                expected,
+            ),
+            Some("find_resources lookup mode did not match the current request")
+        );
+        let inventory_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [("lookup_mode".to_string(), serde_json::json!("inventory"))].into(),
+        };
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![inventory_call], false),
+                expected,
+            )
+            .is_none());
+
+        agent.curated_resource_lookup_expectation =
+            curated_resource_lookup_expectation("What is Acme Legal Aid's email?", None);
+        let expected = agent.expected_curated_resources(&enabled);
+        let mut wrong_contact_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("aid")),
+                ("lookup_mode".to_string(), serde_json::json!("contact")),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![wrong_contact_call.clone()], false),
+                expected,
+            ),
+            Some("find_resources query did not preserve the requested filter")
+        );
+        wrong_contact_call
+            .args
+            .insert("query".to_string(), serde_json::json!("Acme Legal Aid"));
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![wrong_contact_call], false),
+                expected,
+            )
+            .is_none());
+
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "What is the email address for Acme Legal Aid in Mexico?",
+            None,
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        let mut regional_contact_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Acme Legal Aid")),
+                ("lookup_mode".to_string(), serde_json::json!("contact")),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![regional_contact_call.clone()], false),
+                expected,
+            ),
+            Some("find_resources region did not preserve the requested location")
+        );
+        regional_contact_call
+            .args
+            .insert("region".to_string(), serde_json::json!("Canada"));
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![regional_contact_call.clone()], false),
+                expected,
+            ),
+            Some("find_resources region did not preserve the requested location")
+        );
+        regional_contact_call
+            .args
+            .insert("region".to_string(), serde_json::json!("MX"));
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![regional_contact_call], false),
+                expected,
+            )
+            .is_none());
+        assert!(agent
+            .curated_resource_lookup_expectation
+            .retry_instruction_for_violation(
+                "find_resources region did not preserve the requested location"
+            )
+            .contains("both the requested organization/name and location"));
+
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "What is the email address for Acme Legal Aid in France?",
+            None,
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        let france_contact_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Acme Legal Aid")),
+                ("region".to_string(), serde_json::json!("France")),
+                ("lookup_mode".to_string(), serde_json::json!("contact")),
+            ]
+            .into(),
+        };
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![france_contact_call], false),
+                expected,
+            )
+            .is_none());
+        let france_in_query = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                (
+                    "query".to_string(),
+                    serde_json::json!("Acme Legal Aid in France"),
+                ),
+                ("region".to_string(), serde_json::json!("Canada")),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![france_in_query], false),
+                expected,
+            ),
+            Some("find_resources query did not preserve the requested filter")
+        );
+
+        agent.curated_resource_lookup_expectation =
+            curated_resource_lookup_expectation("What is the email for Women in Need?", None);
+        let expected = agent.expected_curated_resources(&enabled);
+        let organization_with_in = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Women in Need")),
+                ("lookup_mode".to_string(), serde_json::json!("contact")),
+            ]
+            .into(),
+        };
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![organization_with_in], false),
+                expected,
+            )
+            .is_none());
+        let corrupted_organization_with_in = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Women")),
+                ("region".to_string(), serde_json::json!("Need")),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![corrupted_organization_with_in], false),
+                expected,
+            ),
+            Some("find_resources query did not preserve the requested filter")
+        );
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(
+                    vec![ToolCall {
+                        name: "find_resources".to_string(),
+                        args: ToolArgs::new(),
+                    }],
+                    false,
+                ),
+                expected,
+            ),
+            Some("required find_resources query was omitted")
+        );
+
+        let query_context = CuratedResourceQueryContext::from_trusted_text(
+            "RECENT CONVERSATION\nuser: I need Acme Legal Aid in Mexico.",
+        );
+        agent.curated_resource_lookup_expectation =
+            curated_resource_lookup_expectation("What is the address?", None)
+                .with_query_context(&query_context);
+        let expected = agent.expected_curated_resources(&enabled);
+        let mut contextual_contact_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Invented Org")),
+                ("lookup_mode".to_string(), serde_json::json!("contact")),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![contextual_contact_call.clone()], false),
+                expected,
+            ),
+            Some("find_resources query was not grounded in recent conversation")
+        );
+        for invalid_query in [
+            "email",
+            "the",
+            "organization",
+            "legal help",
+            "Mexico",
+            "Acme",
+            "Women",
+            "Acme Legal",
+        ] {
+            contextual_contact_call
+                .args
+                .insert("query".to_string(), serde_json::json!(invalid_query));
+            assert_eq!(
+                agent.curated_resource_plan_violation(
+                    &ToolDecision::new(vec![contextual_contact_call.clone()], false),
+                    expected,
+                ),
+                Some("find_resources query was not grounded in recent conversation"),
+                "{invalid_query}"
+            );
+        }
+        contextual_contact_call
+            .args
+            .insert("query".to_string(), serde_json::json!("Acme Legal Aid"));
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![contextual_contact_call.clone()], false),
+                expected,
+            ),
+            Some("find_resources region did not preserve the requested location")
+        );
+        contextual_contact_call
+            .args
+            .insert("region".to_string(), serde_json::json!("MX"));
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![contextual_contact_call], false),
+                expected,
+            )
+            .is_none());
+        assert!(agent
+            .curated_resource_lookup_expectation
+            .retry_instruction_for_violation(
+                "find_resources query was not grounded in recent conversation"
+            )
+            .contains("Do not invent"));
+
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "What is Acme Legal Aid's email?",
+            Some(&continuation),
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        let fresh_contact_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Acme Legal Aid")),
+                ("lookup_mode".to_string(), serde_json::json!("contact")),
+            ]
+            .into(),
+        };
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![fresh_contact_call], false),
+                expected,
+            )
+            .is_none());
+        let stale_offset_contact_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Acme Legal Aid")),
+                ("lookup_mode".to_string(), serde_json::json!("contact")),
+                ("offset".to_string(), serde_json::json!(10)),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![stale_offset_contact_call], false),
+                expected,
+            ),
+            Some("fresh find_resources lookup used a stale positive offset")
+        );
+
+        let duplicate_resource_calls = vec![
+            ToolCall {
+                name: "find_resources".to_string(),
+                args: [("query".to_string(), serde_json::json!("Acme Legal Aid"))].into(),
+            },
+            ToolCall {
+                name: "find_resources".to_string(),
+                args: [("query".to_string(), serde_json::json!("wrong"))].into(),
+            },
+        ];
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(duplicate_resource_calls, false),
+                expected,
+            ),
+            Some("multiple find_resources calls were not allowed in one plan")
+        );
+        agent.curated_resource_lookup_succeeded = true;
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(
+                    vec![ToolCall {
+                        name: "find_resources".to_string(),
+                        args: [("query".to_string(), serde_json::json!("Acme Legal Aid"))].into(),
+                    }],
+                    false,
+                ),
+                false,
+            ),
+            Some("additional find_resources call was not allowed after turn success")
+        );
+        assert!(agent
+            .curated_resource_lookup_expectation
+            .retry_instruction_for_violation(
+                "additional find_resources call was not allowed after turn success"
+            )
+            .contains("Do not call find_resources again"));
+        agent.curated_resource_lookup_succeeded = false;
+
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "Show the next page of those matching resources.",
+            None,
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        let invented_continuation = ToolCall {
+            name: "find_resources".to_string(),
+            args: [("offset".to_string(), serde_json::json!(1))].into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![invented_continuation], false),
+                expected,
+            ),
+            Some("find_resources continuation cursor was unavailable")
+        );
+
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "List ready Curated Resources matching 'Acme Legal Aid'.",
+            None,
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        let wrong_matching_filter = ToolCall {
+            name: "find_resources".to_string(),
+            args: [("query".to_string(), serde_json::json!("aid"))].into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![wrong_matching_filter], false),
+                expected,
+            ),
+            Some("find_resources query did not preserve the requested filter")
+        );
+        agent.curated_resource_lookup_expectation =
+            curated_resource_lookup_expectation("List resources for Acme Legal Aid.", None);
+        let expected = agent.expected_curated_resources(&enabled);
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(
+                    vec![ToolCall {
+                        name: "find_resources".to_string(),
+                        args: ToolArgs::new(),
+                    }],
+                    false,
+                ),
+                expected,
+            ),
+            Some("required find_resources query was omitted")
+        );
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(
+                    vec![ToolCall {
+                        name: "find_resources".to_string(),
+                        args: [("query".to_string(), serde_json::json!("Other Org"))].into(),
+                    }],
+                    false,
+                ),
+                expected,
+            ),
+            Some("find_resources query did not preserve the requested filter")
+        );
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "List resources for Acme Legal Aid in France.",
+            None,
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(
+                    vec![ToolCall {
+                        name: "find_resources".to_string(),
+                        args: [
+                            ("query".to_string(), serde_json::json!("Acme Legal Aid")),
+                            ("region".to_string(), serde_json::json!("France")),
+                            ("lookup_mode".to_string(), serde_json::json!("inventory")),
+                        ]
+                        .into(),
+                    }],
+                    false,
+                ),
+                expected,
+            )
+            .is_none());
+        agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
+            "List ready Curated Resources matching Acme Legal Aid.",
+            None,
+        );
+        let expected = agent.expected_curated_resources(&enabled);
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(
+                    vec![ToolCall {
+                        name: "find_resources".to_string(),
+                        args: [("query".to_string(), serde_json::json!("aid"))].into(),
+                    }],
+                    false,
+                ),
+                expected,
+            ),
+            Some("find_resources query did not preserve the requested filter")
+        );
+    }
+
+    #[test]
+    fn resource_plan_sanitizer_keeps_one_valid_call_and_drops_post_success_calls() {
+        let mut registry = ToolRegistry::new();
+        registry.register_descriptor("find_resources", "lookup", r#"{"query":"text"}"#);
+        registry.register_descriptor("knowledge_search", "search", r#"{"query":"text"}"#);
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        agent.curated_resource_lookup_expectation =
+            curated_resource_lookup_expectation("What is Acme Legal Aid's email?", None);
+        let expected = agent.expected_curated_resources(&agent.tools.names());
+        let knowledge_call = ToolCall {
+            name: "knowledge_search".to_string(),
+            args: [("query".to_string(), serde_json::json!("manual policy"))].into(),
+        };
+        let wrong_resource_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("wrong")),
+                ("lookup_mode".to_string(), serde_json::json!("contact")),
+            ]
+            .into(),
+        };
+        let valid_resource_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [
+                ("query".to_string(), serde_json::json!("Acme Legal Aid")),
+                ("lookup_mode".to_string(), serde_json::json!("contact")),
+            ]
+            .into(),
+        };
+        let mut decision = ToolDecision::new(
+            vec![
+                knowledge_call.clone(),
+                wrong_resource_call.clone(),
+                valid_resource_call.clone(),
+            ],
+            false,
+        );
+        agent.sanitize_curated_resource_calls(&mut decision, expected);
+        assert_eq!(decision.tool_calls.len(), 2);
+        assert_eq!(decision.tool_calls[0].name, "knowledge_search");
+        assert_eq!(
+            tool_string_arg(&decision.tool_calls[1].args, "query"),
+            Some("Acme Legal Aid")
+        );
+        assert!(agent
+            .curated_resource_plan_violation(&decision, expected)
+            .is_none());
+
+        let mut all_invalid = ToolDecision::new(
+            vec![wrong_resource_call.clone(), wrong_resource_call],
+            false,
+        );
+        agent.sanitize_curated_resource_calls(&mut all_invalid, expected);
+        assert_eq!(all_invalid.tool_calls.len(), 2);
+        assert_eq!(
+            agent.curated_resource_plan_violation(&all_invalid, expected),
+            Some("multiple find_resources calls were not allowed in one plan")
+        );
+
+        agent.curated_resource_lookup_succeeded = true;
+        let mut post_success = ToolDecision::new(vec![valid_resource_call, knowledge_call], false);
+        agent.sanitize_curated_resource_calls(&mut post_success, false);
+        assert_eq!(post_success.tool_calls.len(), 1);
+        assert_eq!(post_success.tool_calls[0].name, "knowledge_search");
+        assert!(agent
+            .curated_resource_plan_violation(&post_success, false)
+            .is_none());
     }
 
     #[test]
@@ -3203,6 +6146,32 @@ mod tests {
         outcomes: Arc<Mutex<std::collections::VecDeque<Result<ToolResult>>>>,
     }
 
+    struct SuccessfulResourceTool {
+        metadata: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SuccessfulResourceTool {
+        fn name(&self) -> &str {
+            "find_resources"
+        }
+
+        fn description(&self) -> &str {
+            "test-only resource lookup"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            Ok(ToolResult::success_with_metadata(
+                "resource result",
+                self.metadata.clone(),
+            ))
+        }
+    }
+
     #[async_trait::async_trait]
     impl Tool for ScriptedRetryTool {
         fn name(&self) -> &str {
@@ -3227,6 +6196,35 @@ mod tests {
                 .expect("scripted outcomes should lock")
                 .pop_front()
                 .expect("test should provide a scripted outcome")
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_resource_metadata_fails_closed_when_pagination_is_unknown() {
+        for (metadata, expected_incomplete) in [
+            (serde_json::Value::Null, true),
+            (serde_json::json!({"has_more": "unknown"}), true),
+            (serde_json::json!({"has_more": true}), true),
+            (serde_json::json!({"has_more": false}), false),
+        ] {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(SuccessfulResourceTool { metadata }));
+            let mut agent = SageAgent::new_without_memory(registry, "test");
+            let result = agent
+                .execute_tool_decision(&ToolDecision::new(
+                    vec![ToolCall {
+                        name: "find_resources".to_string(),
+                        args: ToolArgs::new(),
+                    }],
+                    false,
+                ))
+                .await;
+            assert!(result.executed_tools[0].result.success);
+            assert_eq!(
+                agent.curated_resource_page_incomplete, expected_incomplete,
+                "metadata: {:?}",
+                result.executed_tools[0].result.metadata
+            );
         }
     }
 
@@ -3394,7 +6392,7 @@ mod tests {
         );
         assert_eq!(
             ToolRetryPolicy::knowledge_search(),
-            ToolRetryPolicy::read_only(Duration::from_secs(35), 2, Duration::from_secs(35))
+            ToolRetryPolicy::read_only(Duration::from_secs(15), 2, Duration::from_secs(35))
         );
     }
 
