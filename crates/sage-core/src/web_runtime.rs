@@ -841,6 +841,14 @@ fn conservative_resource_total_count(
     reported_total_count.max(offset.saturating_add(page_item_count))
 }
 
+fn resource_response_offset_matches(requested_offset: i32, response_offset: usize) -> bool {
+    usize::try_from(requested_offset).ok() == Some(response_offset)
+}
+
+fn is_inventory_resource_lookup(help_type: Option<&str>, lookup_mode: Option<&str>) -> bool {
+    help_type.is_none() && lookup_mode == Some("inventory")
+}
+
 fn resource_page_is_definitively_empty(
     page_item_count: usize,
     total_count: usize,
@@ -2440,11 +2448,7 @@ impl Tool for FindResourcesTool {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let lookup_mode = tool_string_arg(args, "lookup_mode").map(str::trim);
-        let is_inventory_lookup = match lookup_mode {
-            Some("contact") => false,
-            Some("inventory") => true,
-            _ => help_type.is_none(),
-        };
+        let is_inventory_lookup = is_inventory_resource_lookup(help_type.as_deref(), lookup_mode);
         let region = tool_string_arg(args, "region")
             .map(str::to_string)
             .or_else(|| {
@@ -2469,6 +2473,9 @@ impl Tool for FindResourcesTool {
                 offset,
             })
             .await?;
+        if !resource_response_offset_matches(offset, response.offset) {
+            return Err(anyhow::Error::new(ToolExecutionError::MalformedContract));
+        }
         let response_help_type = response
             .help_type
             .as_deref()
@@ -14814,6 +14821,7 @@ mod tests {
             traces: Arc::new(Mutex::new(Vec::new())),
         };
         let args = ToolArgs::from([
+            ("lookup_mode".to_string(), json!("inventory")),
             ("help_type".to_string(), json!("legal")),
             ("query".to_string(), json!("Mexico Legal Aid Network")),
             ("offset".to_string(), json!(5)),
@@ -14957,7 +14965,10 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::from([("offset".to_string(), json!(10))]))
+            .execute(&ToolArgs::from([
+                ("lookup_mode".to_string(), json!("inventory")),
+                ("offset".to_string(), json!(10)),
+            ]))
             .await
             .expect("resource inventory should succeed");
         server.abort();
@@ -15122,6 +15133,16 @@ mod tests {
             "a forward-jumping backend cursor must not skip unseen records"
         );
         assert_eq!(conservative_resource_total_count(10, 2, 11), 12);
+        assert!(is_inventory_resource_lookup(None, Some("inventory")));
+        assert!(!is_inventory_resource_lookup(None, None));
+        assert!(!is_inventory_resource_lookup(None, Some("contact")));
+        assert!(!is_inventory_resource_lookup(
+            Some("legal"),
+            Some("inventory")
+        ));
+        assert!(resource_response_offset_matches(10, 10));
+        assert!(!resource_response_offset_matches(10, 0));
+        assert!(!resource_response_offset_matches(10, 20));
         assert!(!resource_page_is_definitively_empty(0, 0, true));
         assert!(resource_page_is_definitively_empty(0, 0, false));
     }
