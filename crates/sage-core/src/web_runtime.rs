@@ -14971,6 +14971,17 @@ mod tests {
             ]))
             .await
             .expect("resource inventory should succeed");
+        let mismatched_offset_error = tool
+            .execute(&ToolArgs::from([
+                ("lookup_mode".to_string(), json!("inventory")),
+                ("offset".to_string(), json!(0)),
+            ]))
+            .await
+            .expect_err("a mismatched backend page offset must fail closed");
+        assert!(matches!(
+            mismatched_offset_error.downcast_ref::<ToolExecutionError>(),
+            Some(ToolExecutionError::MalformedContract)
+        ));
         server.abort();
 
         assert!(result.success);
