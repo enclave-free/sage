@@ -2418,7 +2418,7 @@ impl Tool for FindResourcesTool {
     }
 
     fn args_schema(&self) -> &str {
-        r#"{"query":"optional organization name or exact contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; defaults to the user's jurisdiction","language":"optional preferred language code, e.g. es","offset":"optional continuation offset from a previous result page"}"#
+        r#"{"query":"optional organization name or exact contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; referral lookups default to the user's jurisdiction, inventory lookups remain global when omitted","language":"optional preferred language code, e.g. es","offset":"optional continuation offset from a previous result page"}"#
     }
 
     fn retry_policy(&self) -> ToolRetryPolicy {
@@ -2429,15 +2429,19 @@ impl Tool for FindResourcesTool {
         let help_type = tool_string_arg(args, "help_type")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let is_inventory_lookup = help_type.is_none();
         let region = tool_string_arg(args, "region")
             .map(str::to_string)
-            .or_else(|| self.jurisdiction.clone());
+            .or_else(|| {
+                (!is_inventory_lookup)
+                    .then(|| self.jurisdiction.clone())
+                    .flatten()
+            });
         let language = tool_string_arg(args, "language").map(str::to_string);
         let query = tool_string_arg(args, "query")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let offset: i32 = tool_parse_arg(args, "offset").unwrap_or(0).max(0);
-        let is_inventory_lookup = help_type.is_none();
 
         let response = self
             .internal
@@ -14916,7 +14920,7 @@ mod tests {
                 format!("http://{}", addr),
                 "test-token".to_string(),
             ),
-            jurisdiction: None,
+            jurisdiction: Some("Mexico".to_string()),
             traces: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -14974,7 +14978,11 @@ mod tests {
             .expect("test backend should record the resource request");
         assert_eq!(token.as_deref(), Some("test-token"));
         assert!(payload.get("help_type").is_none());
-        assert_eq!(payload["jurisdiction"], Value::Null);
+        assert_eq!(
+            payload["jurisdiction"],
+            Value::Null,
+            "inventory lookup must not inherit the user's default jurisdiction"
+        );
         assert_eq!(payload["limit"], 10);
         assert_eq!(payload["offset"], 10);
     }

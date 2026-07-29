@@ -1459,6 +1459,14 @@ fn clean_inventory_subject(candidate: &str) -> Option<String> {
         .unwrap_or(candidate)
         .trim();
     let normalized = normalized_lookup_text(candidate);
+    let unambiguous_alpha2 = candidate.len() != 2
+        || candidate
+            .chars()
+            .filter(|character| character.is_alphabetic())
+            .all(char::is_uppercase);
+    if unambiguous_alpha2 && canonical_resource_region(candidate).is_some() {
+        return Some(candidate.to_string());
+    }
     let generic_recipient_or_help_type = [
         "me",
         "us",
@@ -1763,13 +1771,14 @@ pub(crate) fn curated_resource_lookup_expectation(
     let inventory_subject = inventory
         .then(|| explicit_inventory_subject(input))
         .flatten();
+    let subject_region = inventory_subject
+        .as_deref()
+        .and_then(canonical_resource_region);
     let inventory_region = inventory
         .then(|| explicit_inventory_region(input))
-        .flatten();
-    let inventory_subject_is_region = inventory_subject
-        .as_deref()
-        .and_then(canonical_resource_region)
-        .is_some();
+        .flatten()
+        .or_else(|| subject_region.clone());
+    let inventory_subject_is_region = subject_region.is_some();
     let filtered_inventory = inventory
         && ([
             "names start",
@@ -4913,6 +4922,8 @@ mod tests {
             ("Lista recursos para México.", "MX"),
             ("List resources for United States.", "US"),
             ("List organizations in Latin America.", "latin america"),
+            ("List Mexico resources.", "MX"),
+            ("Lista recursos de México.", "MX"),
         ] {
             let expectation = curated_resource_lookup_expectation(prompt, None);
             assert!(expectation.required, "{prompt}");
@@ -4949,8 +4960,6 @@ mod tests {
         for prompt in [
             "List resources for legal help.",
             "List resources for me.",
-            "List resources for Mexico.",
-            "Lista recursos de México.",
             "List all resources.",
             "List available organizations.",
         ] {
