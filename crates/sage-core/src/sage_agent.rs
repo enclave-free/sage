@@ -455,6 +455,7 @@ pub struct CuratedResourceLookupExpectation {
     exact_filter_missing: bool,
     initial_offset_required: bool,
     expected_lookup_mode: Option<&'static str>,
+    lookup_mode_must_be_absent: bool,
     contact_query_from_context: bool,
     context_grounded_resources: Vec<(String, Option<String>)>,
 }
@@ -470,6 +471,7 @@ pub struct CuratedResourceContinuation {
     pub region: Option<String>,
     pub help_type: Option<String>,
     pub language: Option<String>,
+    pub lookup_mode: Option<String>,
     pub next_offset: usize,
 }
 
@@ -1645,6 +1647,8 @@ fn explicit_inventory_subject(input: &str) -> Option<String> {
 fn explicit_inventory_region(input: &str) -> Option<String> {
     let lowercase = input.to_ascii_lowercase();
     for marker in [
+        " available in ",
+        " disponibles en ",
         "resources are available in ",
         "organizations are available in ",
         "resources available in ",
@@ -1877,11 +1881,23 @@ pub(crate) fn curated_resource_lookup_expectation(
         continuation_cursor_missing: is_continuation && continuation_cursor.is_none(),
         exact_filter_missing: filtered_inventory && !is_continuation && expected_filter.is_none(),
         initial_offset_required: (contact || inventory) && !is_continuation,
-        expected_lookup_mode: if !is_continuation && contact {
+        expected_lookup_mode: if is_continuation {
+            continuation_cursor
+                .and_then(|cursor| cursor.lookup_mode.as_deref())
+                .and_then(|mode| match mode {
+                    "contact" => Some("contact"),
+                    "inventory" => Some("inventory"),
+                    _ => None,
+                })
+        } else if contact {
             Some("contact")
+        } else if inventory {
+            Some("inventory")
         } else {
             None
         },
+        lookup_mode_must_be_absent: is_continuation
+            && continuation_cursor.is_some_and(|cursor| cursor.lookup_mode.is_none()),
         contact_query_from_context: contact
             && !is_continuation
             && contact_lookup_subject(&normalized).is_none(),
@@ -3913,6 +3929,14 @@ impl SageAgent {
         }
         if self
             .curated_resource_lookup_expectation
+            .lookup_mode_must_be_absent
+            && tool_string_arg(&call.args, "lookup_mode")
+                .is_some_and(|mode| !mode.trim().is_empty())
+        {
+            return Some("find_resources lookup mode did not match the current request");
+        }
+        if self
+            .curated_resource_lookup_expectation
             .positive_offset_required
             && tool_parse_arg::<usize>(&call.args, "offset").is_none_or(|offset| offset == 0)
         {
@@ -4953,9 +4977,14 @@ mod tests {
         for (prompt, expected_region) in [
             ("List resources for Mexico.", "MX"),
             ("What resources are available in Mexico?", "MX"),
+            ("Which resources are currently available in Mexico?", "MX"),
             ("List resources available in Mexico.", "MX"),
             ("Lista recursos para México.", "MX"),
             ("¿Qué recursos están disponibles en México?", "MX"),
+            (
+                "¿Qué recursos están actualmente disponibles en México?",
+                "MX",
+            ),
             ("Lista recursos disponibles en México.", "MX"),
             ("List resources for United States.", "US"),
             ("List organizations in Latin America.", "latin america"),
@@ -5010,6 +5039,7 @@ mod tests {
             region: None,
             help_type: None,
             language: None,
+            lookup_mode: Some("inventory".to_string()),
             next_offset: 10,
         };
         for prompt in [
@@ -5194,7 +5224,7 @@ mod tests {
         );
         let mut filtered_call = ToolCall {
             name: "find_resources".to_string(),
-            args: ToolArgs::new(),
+            args: [("lookup_mode".to_string(), serde_json::json!("inventory"))].into(),
         };
         assert_eq!(
             agent.curated_resource_plan_violation(
@@ -5240,6 +5270,7 @@ mod tests {
             region: None,
             help_type: None,
             language: None,
+            lookup_mode: Some("inventory".to_string()),
             next_offset: 10,
         };
         agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
@@ -5249,10 +5280,13 @@ mod tests {
         let expected = agent.expected_curated_resources(&enabled);
         let mut continuation_call = ToolCall {
             name: "find_resources".to_string(),
-            args: [(
-                "query".to_string(),
-                serde_json::json!("Issue 539 Inventory"),
-            )]
+            args: [
+                (
+                    "query".to_string(),
+                    serde_json::json!("Issue 539 Inventory"),
+                ),
+                ("lookup_mode".to_string(), serde_json::json!("inventory")),
+            ]
             .into(),
         };
         assert_eq!(
@@ -5275,6 +5309,17 @@ mod tests {
         continuation_call
             .args
             .insert("offset".to_string(), serde_json::json!(10));
+        let mut wrong_continuation_mode = continuation_call.clone();
+        wrong_continuation_mode
+            .args
+            .insert("lookup_mode".to_string(), serde_json::json!("contact"));
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![wrong_continuation_mode], false),
+                expected,
+            ),
+            Some("find_resources lookup mode did not match the current request")
+        );
         assert!(agent
             .curated_resource_plan_violation(
                 &ToolDecision::new(vec![continuation_call], false),
@@ -5287,6 +5332,7 @@ mod tests {
             region: Some("MX".to_string()),
             help_type: Some("legal".to_string()),
             language: Some("es".to_string()),
+            lookup_mode: None,
             next_offset: 5,
         };
         agent.curated_resource_lookup_expectation = curated_resource_lookup_expectation(
@@ -5335,6 +5381,27 @@ mod tests {
             ),
             Some("find_resources help_type did not preserve the prior filter")
         );
+        let wrong_inventory_mode = ToolCall {
+            name: "find_resources".to_string(),
+            args: [("lookup_mode".to_string(), serde_json::json!("contact"))].into(),
+        };
+        assert_eq!(
+            agent.curated_resource_plan_violation(
+                &ToolDecision::new(vec![wrong_inventory_mode], false),
+                expected,
+            ),
+            Some("find_resources lookup mode did not match the current request")
+        );
+        let inventory_call = ToolCall {
+            name: "find_resources".to_string(),
+            args: [("lookup_mode".to_string(), serde_json::json!("inventory"))].into(),
+        };
+        assert!(agent
+            .curated_resource_plan_violation(
+                &ToolDecision::new(vec![inventory_call], false),
+                expected,
+            )
+            .is_none());
 
         agent.curated_resource_lookup_expectation =
             curated_resource_lookup_expectation("What is Acme Legal Aid's email?", None);
@@ -5715,6 +5782,7 @@ mod tests {
                         args: [
                             ("query".to_string(), serde_json::json!("Acme Legal Aid")),
                             ("region".to_string(), serde_json::json!("France")),
+                            ("lookup_mode".to_string(), serde_json::json!("inventory")),
                         ]
                         .into(),
                     }],

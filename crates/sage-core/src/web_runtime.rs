@@ -826,7 +826,7 @@ fn conservative_resource_pagination(
     let next_offset = has_more
         .then(|| {
             reported_next_offset
-                .filter(|next_offset| page_item_count > 0 && *next_offset >= consumed_count)
+                .filter(|next_offset| page_item_count > 0 && *next_offset == consumed_count)
                 .or_else(|| (page_item_count > 0).then_some(consumed_count))
         })
         .flatten();
@@ -2479,6 +2479,13 @@ impl Tool for FindResourcesTool {
             .resolved_country_code
             .as_deref()
             .or(region.as_deref());
+        let continuation_lookup_mode = if is_inventory_lookup {
+            Some("inventory")
+        } else if lookup_mode == Some("contact") {
+            Some("contact")
+        } else {
+            None
+        };
         let trace_query = if is_inventory_lookup {
             match response_region {
                 Some(region) => format!("curated resources inventory for {}", region),
@@ -2545,6 +2552,7 @@ impl Tool for FindResourcesTool {
                         "continuation_region": response_region,
                         "continuation_help_type": help_type,
                         "continuation_language": language,
+                        "continuation_lookup_mode": continuation_lookup_mode,
                         "resolved_region": response_region,
                         "resource_names": [],
                     }),
@@ -2615,6 +2623,7 @@ impl Tool for FindResourcesTool {
                     "continuation_region": response_region,
                     "continuation_help_type": help_type,
                     "continuation_language": language,
+                    "continuation_lookup_mode": continuation_lookup_mode,
                     "resolved_region": response_region,
                     "resource_names": resource_names,
                 }),
@@ -4116,6 +4125,7 @@ fn curated_resource_continuation_from_tool_trace(
         region: parse_filter("continuation_region")?,
         help_type: parse_filter("continuation_help_type")?,
         language: parse_filter("continuation_language")?,
+        lookup_mode: parse_filter("continuation_lookup_mode")?,
         next_offset,
     })
 }
@@ -12572,7 +12582,7 @@ mod tests {
             || body_text.contains("Muestra la siguiente página de esos recursos coincidentes");
         state.planner_requests.lock().unwrap().push(body);
         let query = if retry { "Issue 539 Inventory" } else { "aid" };
-        let mut args = json!({"query": query});
+        let mut args = json!({"query": query, "lookup_mode": "inventory"});
         if continuation {
             args["offset"] = json!(if retry { 10 } else { 1 });
             if retry {
@@ -13026,6 +13036,7 @@ mod tests {
             region: None,
             help_type: None,
             language: None,
+            lookup_mode: Some("inventory".to_string()),
             next_offset: 10,
         };
         let (answer, state, _, _, _) = run_real_contact_replay(
@@ -14852,6 +14863,7 @@ mod tests {
                 "continuation_region": "MX",
                 "continuation_help_type": "legal",
                 "continuation_language": "es",
+                "continuation_lookup_mode": Value::Null,
                 "resolved_region": "MX",
                 "resource_names": ["Mexico Legal Aid Network"],
             })
@@ -14988,6 +15000,7 @@ mod tests {
                 "continuation_region": Value::Null,
                 "continuation_help_type": Value::Null,
                 "continuation_language": Value::Null,
+                "continuation_lookup_mode": "inventory",
                 "resolved_region": Value::Null,
                 "resource_names": ["Demo Test Resource"],
             })
@@ -15102,6 +15115,11 @@ mod tests {
             conservative_resource_pagination(10, 5, 20, true, Some(12)),
             (true, Some(15)),
             "an overlapping backend cursor must be replaced with the first unseen offset"
+        );
+        assert_eq!(
+            conservative_resource_pagination(0, 5, 20, true, Some(20)),
+            (true, Some(5)),
+            "a forward-jumping backend cursor must not skip unseen records"
         );
         assert_eq!(conservative_resource_total_count(10, 2, 11), 12);
         assert!(!resource_page_is_definitively_empty(0, 0, true));
@@ -16611,6 +16629,7 @@ mod tests {
                 "continuation_region": Value::Null,
                 "continuation_help_type": Value::Null,
                 "continuation_language": Value::Null,
+                "continuation_lookup_mode": "inventory",
             }),
         };
         assert_eq!(
@@ -16620,6 +16639,7 @@ mod tests {
                 region: None,
                 help_type: None,
                 language: None,
+                lookup_mode: Some("inventory".to_string()),
                 next_offset: 10,
             })
         );
@@ -16644,6 +16664,7 @@ mod tests {
                 region: None,
                 help_type: None,
                 language: None,
+                lookup_mode: Some("inventory".to_string()),
                 next_offset: 10,
             })
         );
@@ -16693,6 +16714,7 @@ mod tests {
                 region: None,
                 help_type: None,
                 language: None,
+                lookup_mode: Some("inventory".to_string()),
                 next_offset: 10,
             }),
             "an explicit structured null safely represents an unfiltered query"
