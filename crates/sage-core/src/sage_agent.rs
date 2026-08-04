@@ -298,33 +298,9 @@ pub struct AgentResponse {
 /// Provider-neutral prompt passed to plain answer generation.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-pub struct PlainAnswerPrompt {
+pub struct NativeTurnPrompt {
     pub system: String,
     pub user: String,
-    /// Trusted runtime state from the executed Curated Resources Tool. This
-    /// must not be reconstructed from rendered prompt text, which can contain
-    /// user-controlled strings that resemble Tool-result markers.
-    pub incomplete_curated_resource_page: bool,
-}
-
-pub(crate) fn normalized_lookup_text(input: &str) -> String {
-    input
-        .to_lowercase()
-        .chars()
-        .map(|character| match character {
-            'á' | 'à' | 'ä' | 'â' => 'a',
-            'é' | 'è' | 'ë' | 'ê' => 'e',
-            'í' | 'ì' | 'ï' | 'î' => 'i',
-            'ó' | 'ò' | 'ö' | 'ô' => 'o',
-            'ú' | 'ù' | 'ü' | 'û' => 'u',
-            'ñ' => 'n',
-            character if character.is_alphanumeric() => character,
-            _ => ' ',
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[derive(dspy_rs::Signature, Clone, Debug)]
@@ -518,21 +494,6 @@ pub struct ToolResult {
     /// Structured, Tool-owned execution facts used by runtime policy. Raw
     /// prompt text is never authoritative for these values.
     pub metadata: serde_json::Value,
-    /// Optional Tool-owned text that is already safe to show without another
-    /// model pass. This is intentionally separate from the internal Tool
-    /// output, which can contain instructions for the final-answer model.
-    pub user_safe_fallback: Option<UserSafeToolFallback>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UserSafeToolFallbackKind {
-    CuratedResourceInventory,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserSafeToolFallback {
-    pub kind: UserSafeToolFallbackKind,
-    pub output: String,
 }
 
 /// Failure categories that the shared Tool executor can safely classify.
@@ -633,7 +594,6 @@ impl ToolResult {
             output: output.into(),
             error: None,
             metadata: serde_json::Value::Null,
-            user_safe_fallback: None,
         }
     }
 
@@ -643,25 +603,6 @@ impl ToolResult {
             output: output.into(),
             error: None,
             metadata,
-            user_safe_fallback: None,
-        }
-    }
-
-    pub fn success_with_user_safe_fallback(
-        output: impl Into<String>,
-        metadata: serde_json::Value,
-        kind: UserSafeToolFallbackKind,
-        user_safe_output: impl Into<String>,
-    ) -> Self {
-        Self {
-            success: true,
-            output: output.into(),
-            error: None,
-            metadata,
-            user_safe_fallback: Some(UserSafeToolFallback {
-                kind,
-                output: user_safe_output.into(),
-            }),
         }
     }
 
@@ -671,7 +612,6 @@ impl ToolResult {
             output: String::new(),
             error: Some(error.into()),
             metadata: serde_json::Value::Null,
-            user_safe_fallback: None,
         }
     }
 }
@@ -1128,373 +1068,6 @@ impl ConversationTimingPhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MultilineToolCallHeaderMatch {
-    None,
-    Partial,
-    Complete,
-}
-
-pub(crate) fn multiline_tool_call_header_match(candidate: &str) -> MultilineToolCallHeaderMatch {
-    let lowercase = candidate.trim_start().to_ascii_lowercase();
-    let first_line = lowercase.lines().next().unwrap_or(&lowercase).trim_end();
-    if first_line.is_empty() {
-        return MultilineToolCallHeaderMatch::None;
-    }
-
-    const HEADER: &str = "tool calls";
-    const COLON_HEADER: &str = "tool calls:";
-    if matches!(first_line, HEADER | COLON_HEADER) {
-        MultilineToolCallHeaderMatch::Complete
-    } else if HEADER.starts_with(first_line) || COLON_HEADER.starts_with(first_line) {
-        MultilineToolCallHeaderMatch::Partial
-    } else {
-        MultilineToolCallHeaderMatch::None
-    }
-}
-
-pub(crate) fn has_syntactic_tool_intent(candidate: &str) -> bool {
-    let candidate = candidate.trim();
-    if candidate.is_empty() {
-        return false;
-    }
-    if serde_json::from_str::<serde_json::Value>(candidate)
-        .ok()
-        .is_some_and(|value| json_has_tool_intent(&value))
-    {
-        return true;
-    }
-
-    // Use the same apostrophe normalization as the opening classifier's
-    // process-narration vocabulary so held text cannot become releasable only
-    // because the provider used a typographic apostrophe.
-    let lowercase = candidate.to_ascii_lowercase().replace(['’', '‘'], "'");
-    let mut nonempty_lines = lowercase
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-    let has_multiline_header = nonempty_lines.next().is_some_and(|line| {
-        multiline_tool_call_header_match(line) == MultilineToolCallHeaderMatch::Complete
-    });
-    let mut has_function_call = false;
-    let mut has_arguments = false;
-    for line in nonempty_lines {
-        if let Some(name) = line.strip_prefix("function call:") {
-            let name = name.trim();
-            has_function_call = !name.is_empty()
-                && name.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-                });
-        } else if has_function_call && matches!(line, "arguments" | "arguments:") {
-            has_arguments = true;
-        }
-    }
-    if has_multiline_header && has_function_call && has_arguments {
-        return true;
-    }
-    if let Some(tool_calls_start) = lowercase.find("tool calls:") {
-        let preamble = &lowercase[..tool_calls_start];
-        let transcript = &lowercase[tool_calls_start + "tool calls:".len()..];
-        let first_line = transcript.lines().next().unwrap_or(transcript);
-        let has_invocation = first_line.contains('(') || first_line.contains('{');
-        let has_deliberation_preamble = [
-            "let me ",
-            "i'll search",
-            "i will search",
-            "i need to ",
-            "i should ",
-        ]
-        .iter()
-        .any(|marker| preamble.contains(marker));
-        let starts_with_tool_calls = preamble.trim().is_empty();
-        if has_invocation
-            && (starts_with_tool_calls
-                || has_deliberation_preamble
-                || transcript.contains("tool result:"))
-        {
-            return true;
-        }
-    }
-    if provider_neutral_labels_have_tool_intent(candidate) {
-        return true;
-    }
-    if lowercase.starts_with("```") {
-        let after_open = candidate.strip_prefix("```").unwrap_or(candidate);
-        let fenced = after_open
-            .split_once('\n')
-            .map(|(_, body)| body)
-            .unwrap_or(after_open)
-            .strip_suffix("```")
-            .unwrap_or(after_open);
-        return has_syntactic_tool_intent(fenced);
-    }
-
-    if lowercase.starts_with("[[ ##")
-        || lowercase.starts_with("<tool_call")
-        || lowercase.starts_with("</tool_call")
-        || lowercase.starts_with("<|tool_call")
-    {
-        return true;
-    }
-
-    let starts_structured = matches!(candidate.chars().next(), Some('{') | Some('['))
-        || [
-            "tool_calls:",
-            "function_call:",
-            "name:",
-            "args:",
-            "arguments:",
-        ]
-        .iter()
-        .any(|prefix| candidate.starts_with(prefix));
-    if !starts_structured {
-        return false;
-    }
-
-    if [
-        "\"tool_calls\"",
-        "'tool_calls'",
-        "tool_calls:",
-        "\"function_call\"",
-        "'function_call'",
-        "function_call:",
-    ]
-    .iter()
-    .any(|marker| lowercase.contains(marker))
-    {
-        return true;
-    }
-
-    let has_name_field = lowercase.contains("\"name\"")
-        || lowercase.contains("'name'")
-        || lowercase.starts_with("name:")
-        || lowercase.contains("\nname:");
-    let has_args_field = lowercase.contains("\"args\"")
-        || lowercase.contains("\"arguments\"")
-        || lowercase.contains("'args'")
-        || lowercase.contains("'arguments'")
-        || lowercase.starts_with("args:")
-        || lowercase.starts_with("arguments:")
-        || lowercase.contains("\nargs:")
-        || lowercase.contains("\narguments:");
-    has_name_field && has_args_field
-}
-
-const LOOKUP_PROCESS_NARRATION_OPENERS: [&str; 2] = ["looking up", "buscando"];
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProcessNarrationOpeningMatch {
-    None,
-    Partial,
-    Complete,
-}
-
-#[allow(dead_code)]
-pub(crate) fn lookup_process_narration_opening(value: &str) -> ProcessNarrationOpeningMatch {
-    let opening = value.trim_start().to_lowercase();
-    if LOOKUP_PROCESS_NARRATION_OPENERS
-        .iter()
-        .any(|candidate| opening.starts_with(candidate))
-    {
-        return ProcessNarrationOpeningMatch::Complete;
-    }
-    if !opening.is_empty()
-        && LOOKUP_PROCESS_NARRATION_OPENERS
-            .iter()
-            .any(|candidate| candidate.starts_with(&opening))
-    {
-        return ProcessNarrationOpeningMatch::Partial;
-    }
-    ProcessNarrationOpeningMatch::None
-}
-
-fn provider_neutral_tool_label_has_invocation(value: &str) -> bool {
-    let value = value.trim_start();
-    let (first_line, remaining) = value.split_once('\n').unwrap_or((value, ""));
-    let first_line = first_line.trim();
-    let name_end = first_line
-        .find(|character: char| {
-            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
-        })
-        .unwrap_or(first_line.len());
-    if name_end == 0 {
-        return false;
-    }
-    let name = &first_line[..name_end];
-    if !name
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
-    {
-        return false;
-    }
-    let remaining = remaining.trim_start();
-    if remaining.starts_with('{') || remaining.starts_with('[') || remaining.starts_with("```json")
-    {
-        return true;
-    }
-    if remaining
-        .strip_prefix("args:")
-        .or_else(|| remaining.strip_prefix("arguments:"))
-        .is_some()
-    {
-        // A valid Tool label/name followed by an explicit argument label is
-        // itself a serialized invocation envelope. The provider may render
-        // those arguments as JSON, bullets, or key=value prose.
-        return true;
-    }
-
-    let same_line_suffix = first_line[name_end..].trim_start();
-    same_line_suffix.starts_with('(')
-        || same_line_suffix.starts_with('{')
-        || same_line_suffix
-            .strip_prefix("with ")
-            .is_some_and(|arguments| {
-                // This is fail-closed intent classification, not Tool argument
-                // validation. One credible named argument is sufficient even
-                // when the provider appends malformed or prose-like items.
-                arguments.split(',').any(|argument| {
-                    let Some((name, value)) = argument.trim().split_once('=') else {
-                        return false;
-                    };
-                    let name = name.trim();
-                    let value = value.trim();
-                    !name.is_empty()
-                        && name
-                            .chars()
-                            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-                        && !value.is_empty()
-                })
-            })
-}
-
-fn provider_neutral_tool_label_is_bare_name(value: &str) -> bool {
-    let name = value.trim();
-    !name.is_empty()
-        && name.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        })
-}
-
-fn provider_neutral_tool_label_is_explanatory(candidate: &str, start: usize, label: &str) -> bool {
-    if !matches!(label, "tool:" | "tool decision:") {
-        return false;
-    }
-    let same_line_preamble = candidate[..start]
-        .rsplit('\n')
-        .next()
-        .unwrap_or_default()
-        .trim_end();
-    if same_line_preamble.ends_with("curated resources") {
-        return true;
-    }
-
-    // A reporting/copular predicate directly before `Tool:` makes the label
-    // part of documentation prose ("the panel shows Tool: done"). Selection
-    // adjectives and process narration ("Selected Tool: ...") do not.
-    let normalized_preamble = same_line_preamble
-        .trim_end_matches(|character: char| !character.is_alphanumeric() && character != '_');
-    let mut words = normalized_preamble.split_whitespace().rev();
-    let predicate = words.next().unwrap_or_default();
-    let has_subject = words.next().is_some();
-    has_subject
-        && [
-            "is", "are", "reads", "shows", "says", "displays", "uses", "prints", "renders",
-            "appears", "means", "as",
-        ]
-        .contains(&predicate)
-}
-
-fn provider_neutral_tool_label_has_lexical_boundary(candidate: &str, start: usize) -> bool {
-    if start == 0 {
-        return true;
-    }
-    let Some(previous) = candidate[..start].chars().next_back() else {
-        return true;
-    };
-    if !previous.is_alphanumeric() && !matches!(previous, '_' | '-' | '.') {
-        return true;
-    }
-
-    // Providers sometimes join a new, capitalized Tool label directly to the
-    // preceding sentence. Keep lower-case code identifiers such as
-    // `namespace.tool:build` embedded, while treating `.Tool:` and
-    // `.Tool decision:` as sentence-level labels.
-    previous == '.'
-        && candidate[start..]
-            .strip_prefix("Tool")
-            .is_some_and(|suffix| suffix.starts_with(':') || suffix.starts_with(" decision:"))
-}
-
-pub(crate) fn provider_neutral_tool_label_start_at_or_after(
-    candidate: &str,
-    minimum_start: usize,
-) -> Option<usize> {
-    let lowercase = candidate.to_ascii_lowercase();
-    ["tool:", "tool decision:"]
-        .iter()
-        .flat_map(|label| lowercase.match_indices(label).map(|(start, _)| start))
-        .filter(|start| {
-            *start >= minimum_start
-                && provider_neutral_tool_label_has_lexical_boundary(candidate, *start)
-        })
-        .min()
-}
-
-fn provider_neutral_tool_label_has_argument_section(value: &str) -> bool {
-    let Some((_, remaining)) = value.split_once('\n') else {
-        return false;
-    };
-    let remaining = remaining.trim_start();
-    remaining.starts_with("args:") || remaining.starts_with("arguments:")
-}
-
-fn provider_neutral_labels_have_tool_intent(candidate: &str) -> bool {
-    let lowercase = candidate.to_ascii_lowercase();
-    let mut labels = Vec::new();
-    for label in ["tool:", "tool decision:"] {
-        labels.extend(
-            lowercase
-                .match_indices(label)
-                .map(|(start, _)| (start, label)),
-        );
-    }
-    labels.sort_unstable_by_key(|(start, _)| *start);
-
-    for (start, label) in labels {
-        let invocation = &lowercase[start + label.len()..];
-        if !provider_neutral_tool_label_has_lexical_boundary(candidate, start)
-            && !provider_neutral_tool_label_has_argument_section(invocation)
-        {
-            continue;
-        }
-        if provider_neutral_tool_label_has_invocation(invocation) {
-            return true;
-        }
-        if provider_neutral_tool_label_is_bare_name(invocation) {
-            if provider_neutral_tool_label_is_explanatory(&lowercase, start, label) {
-                continue;
-            }
-            return true;
-        }
-    }
-    false
-}
-
-fn json_has_tool_intent(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values.iter().any(json_has_tool_intent),
-        serde_json::Value::Object(object) => {
-            object.contains_key("tool_calls")
-                || object.contains_key("function_call")
-                || (object.contains_key("name")
-                    && (object.contains_key("args") || object.contains_key("arguments")))
-                || object.values().any(json_has_tool_intent)
-        }
-        _ => false,
-    }
-}
-
 #[allow(dead_code)]
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
@@ -1925,7 +1498,7 @@ impl SageAgent {
     /// Build the provider-native Conversation request without forcing either
     /// a Tool decision or a plain answer. The model receives enabled Tools
     /// separately through the provider contract.
-    pub fn native_turn_prompt(&self, user_message: &str) -> PlainAnswerPrompt {
+    pub fn native_turn_prompt(&self, user_message: &str) -> NativeTurnPrompt {
         let context = self.build_context();
         let system = self.instruction.clone();
         let user = format!(
@@ -1938,11 +1511,7 @@ impl SageAgent {
             context.recent_conversation,
             user_message,
         );
-        PlainAnswerPrompt {
-            system,
-            user,
-            incomplete_curated_resource_page: false,
-        }
+        NativeTurnPrompt { system, user }
     }
 
     pub fn native_tool_definitions(&self) -> Result<Vec<NativeToolDefinition>> {
@@ -2668,88 +2237,6 @@ mod tests {
         assert_eq!(definitions[0].parameters, knowledge_schema);
         assert_eq!(definitions[1].name, "update_deployment_settings");
         assert_eq!(definitions[1].parameters, deployment_schema);
-    }
-
-    #[test]
-    fn textual_tool_transcripts_are_distinct_from_explanatory_prose() {
-        assert!(has_syntactic_tool_intent(
-            "Tool calls: find_resources(lookup_mode=\"inventory\", query=\"Issue 539 Inventory\", offset=10)"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "Tool calls\n\nFunction call: find_resources\n\nArguments\n\n{\"query\":\"Issue 539 Inventory\",\"lookup_mode\":\"inventory\",\"offset\":20}"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "Tool calls \r\n\r\nFunction call: find_resources\r\n\r\nArguments:\r\n\r\n{\"offset\":20}"
-        ));
-        assert!(!has_syntactic_tool_intent(
-            "Tool calls\n\nFunction call: a named section in the Activity panel.\n\nThis page explains the transcript format."
-        ));
-        assert!(!has_syntactic_tool_intent(
-            "Tool calls\n\nFunction call: find_resources\n\nThis page explains how the Activity panel is formatted."
-        ));
-        assert!(has_syntactic_tool_intent(
-            "I will search now. Tool calls: knowledge_search(query=\"referral\")\nTool Result: found one"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "I'll look up the current contact details. Tool: find_resources(help_type=\"legal\")"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "Tool decision: find_resources\n\nArgs:\n```json\n{\"offset\":30}\n```"
-        ));
-        assert!(has_syntactic_tool_intent("Tool decision: find_resources"));
-        assert!(has_syntactic_tool_intent("Tool: find_resources"));
-        assert!(has_syntactic_tool_intent("Tool: done"));
-        assert!(has_syntactic_tool_intent(
-            "I will search. Tool: find_resources"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "Internal choice: Tool decision: find_resources"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "Tool: find_resources\n\nArgs:\n{\"query\":\"Issue 539 Inventory\"}"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "Tool decision: find_resources\n\nArgs:\n- region: \"Mexico\"\n- language: \"es\""
-        ));
-        assert!(has_syntactic_tool_intent(
-            "Tool: find_resources\nArgs: help_type=\"legal\", region=\"Mexico\""
-        ));
-        assert!(has_syntactic_tool_intent(
-            "Tool: find_resources\n```json\n{\"query\":\"Issue 539 Inventory\",\"offset\":30}\n```"
-        ));
-        assert!(!has_syntactic_tool_intent(
-            "The Activity panel labels these sections Tool calls: and Tool Result: so you can audit the turn."
-        ));
-        assert!(!has_syntactic_tool_intent(
-            "For example, the Activity panel may show Tool calls: knowledge_search(query=\"referral\")."
-        ));
-        assert!(!has_syntactic_tool_intent(
-            "The Curated Resources Tool: finds vetted organizations when contact details are requested."
-        ));
-        assert!(!has_syntactic_tool_intent(
-            "The Tool decision: section in Activity explains which lookup ran."
-        ));
-        assert!(!has_syntactic_tool_intent(
-            "The Activity label is Tool: done"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "The Curated Resources Tool: finds vetted organizations. Tool: find_resources(query=\"legal aid\")"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "The Tool decision: section is explanatory.\nTool decision: find_resources\nArgs: {\"offset\":10}"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "Tool: find_resources will run\nArgs: {\"query\":\"legal aid\"}"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "I’m going to search. Tool: find_resources(query=\"legal aid\")"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "I'm going to search. Tool: find_resources(query=\"legal aid\")"
-        ));
-        assert!(has_syntactic_tool_intent(
-            "I need to fetch fresh contact details for this resource before sharing them.Tool decision: find_resources with language=\"es\", query=\"Issue 539 Legal Aid\", help_type=\"legal\", region=\"Mexico\""
-        ));
     }
 
     #[test]
