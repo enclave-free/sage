@@ -1190,7 +1190,7 @@ impl InternalAgentClient {
             ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(&json!({ "sql": sql }));
-        self.send_value(request).await
+        self.send_read_only_tool_json(request).await
     }
 
     async fn log_user_session(
@@ -1285,6 +1285,9 @@ impl InternalAgentClient {
     ) -> Result<T> {
         let response = request.send().await?;
         let status = response.status();
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(anyhow::Error::new(ToolExecutionError::Unauthorized));
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(anyhow!("backend returned {}: {}", status, body));
@@ -1308,6 +1311,9 @@ impl InternalAgentClient {
             }
         })?;
         let status = response.status();
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(anyhow::Error::new(ToolExecutionError::Unauthorized));
+        }
         if !status.is_success() {
             return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
                 status.as_u16(),
@@ -1322,19 +1328,6 @@ impl InternalAgentClient {
         })?;
         serde_json::from_slice::<T>(&body)
             .map_err(|_| anyhow::Error::new(ToolExecutionError::MalformedContract))
-    }
-
-    async fn send_value(&self, request: reqwest::RequestBuilder) -> Result<Value> {
-        let (status, value) = self.send_value_with_status(request).await?;
-        if !status.is_success() {
-            let detail = value
-                .get("detail")
-                .and_then(|detail| detail.as_str())
-                .or_else(|| value.get("error").and_then(|error| error.as_str()))
-                .unwrap_or("Backend request failed.");
-            return Err(anyhow!("backend returned {}: {}", status, detail));
-        }
-        Ok(value)
     }
 
     async fn send_value_with_status(
@@ -2423,9 +2416,14 @@ impl Tool for KnowledgeSearchTool {
         &self,
         args: &ToolArgs,
     ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        self.execute_native(args)
-            .await
-            .map(|result| (result, ConversationTimingOutcome::Succeeded))
+        self.execute_native(args).await.map(|result| {
+            let outcome = if result.is_success() {
+                ConversationTimingOutcome::Succeeded
+            } else {
+                ConversationTimingOutcome::Rejected
+            };
+            (result, outcome)
+        })
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -2719,9 +2717,14 @@ impl Tool for SearxWebSearchTool {
         &self,
         args: &ToolArgs,
     ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        self.execute_native(args)
-            .await
-            .map(|result| (result, ConversationTimingOutcome::Succeeded))
+        self.execute_native(args).await.map(|result| {
+            let outcome = if result.is_success() {
+                ConversationTimingOutcome::Succeeded
+            } else {
+                ConversationTimingOutcome::Rejected
+            };
+            (result, outcome)
+        })
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -3552,7 +3555,9 @@ impl AdminDbQueryTool {
                     tool_id: "db-query".to_string(),
                     tool_name: "Database Query".to_string(),
                     query: Some("read-only database query".to_string()),
-                    output_summary: Some(error.clone()),
+                    output_summary: Some(
+                        "Database Query was rejected by the safe SQL executor.".to_string(),
+                    ),
                     warnings: vec!["db_query_rejected".to_string()],
                     metadata: json!({}),
                     guarded: true,
@@ -9147,6 +9152,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn invalid_native_search_arguments_emit_rejected_results_and_timing() {
+        let internal = InternalAgentClient::new(
+            Client::new(),
+            "http://127.0.0.1:1".to_string(),
+            "test-token".to_string(),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(KnowledgeSearchTool {
+            internal,
+            user: InternalAuthContext {
+                id: 1,
+                kind: "user".to_string(),
+                approved: true,
+                pubkey: None,
+                email: None,
+                name: None,
+                user_type_id: None,
+                dev_mode: false,
+            },
+            top_k: 3,
+            job_ids: None,
+            jurisdiction: None,
+            situation_details: None,
+            sources: Arc::new(Mutex::new(Vec::new())),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        registry.register(Arc::new(SearxWebSearchTool {
+            http: Client::new(),
+            searxng_url: "http://127.0.0.1:1".to_string(),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
+
+        let result = agent
+            .execute_native_tool_calls(&[
+                native_test_call("invalid-knowledge", "knowledge_search", ToolArgs::new()),
+                native_test_call("invalid-web", "web_search", ToolArgs::new()),
+            ])
+            .await;
+
+        assert!(result
+            .executed_tools
+            .iter()
+            .all(|executed| executed.result.model_value()["error"]["code"] == "invalid_arguments"));
+        let events = events.lock().unwrap();
+        for call_id in ["invalid-knowledge", "invalid-web"] {
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentTraceEvent::Timing {
+                    call_id: Some(observed),
+                    outcome: ConversationTimingOutcome::Rejected,
+                    ..
+                } if observed == call_id
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentTraceEvent::ToolTerminal { call_id: observed, status, .. }
+                    if observed == call_id && status == "rejected"
+            )));
+        }
+    }
+
     #[test]
     fn native_tool_results_preserve_existing_per_result_and_batch_budgets() {
         let results = (0..4)
@@ -12434,7 +12505,59 @@ mod tests {
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].tool_id, "db-query");
         assert!(traces[0].guarded);
+        assert_eq!(
+            traces[0].output_summary.as_deref(),
+            Some("Database Query was rejected by the safe SQL executor.")
+        );
         assert_eq!(traces[0].warnings, vec!["db_query_rejected".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn database_tool_authorization_failure_is_typed_and_sanitized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener.local_addr().expect("test backend address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/internal/agent/admin-db-query",
+                    post(|| async { (StatusCode::FORBIDDEN, "SENTINEL_PRIVATE_BACKEND_DETAIL") }),
+                ),
+            )
+            .await
+            .expect("test backend should run");
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(AdminDbQueryTool {
+            internal: InternalAgentClient::new(
+                Client::new(),
+                format!("http://{addr}"),
+                "test-token".to_string(),
+            ),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+
+        let result = agent
+            .execute_native_tool_calls(&[native_test_call(
+                "call-db-unauthorized",
+                "db_query",
+                ToolArgs::from([("sql".to_string(), json!("SELECT id FROM users"))]),
+            )])
+            .await;
+        server.abort();
+
+        let model_value = result.executed_tools[0].result.model_value();
+        assert_eq!(model_value["error"]["code"], "unauthorized");
+        assert_eq!(
+            model_value["error"]["message"],
+            "The Tool is not authorized for this conversation."
+        );
+        assert!(!model_value
+            .to_string()
+            .contains("SENTINEL_PRIVATE_BACKEND_DETAIL"));
     }
 
     #[tokio::test]

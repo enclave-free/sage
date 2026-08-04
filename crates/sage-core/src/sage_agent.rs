@@ -566,6 +566,8 @@ impl NativeToolResult {
 /// not depend on parsing provider or backend error strings.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolExecutionError {
+    #[error("Tool request is not authorized")]
+    Unauthorized,
     #[error("connection failure")]
     Connection,
     #[error("request timed out")]
@@ -1845,6 +1847,7 @@ impl SageAgent {
                         &owned_failure
                     };
                     let reason = match failure {
+                        ToolExecutionError::Unauthorized => "unauthorized",
                         ToolExecutionError::Connection => "connection_failure",
                         ToolExecutionError::Timeout => "timeout",
                         ToolExecutionError::HttpStatus(status) => match *status {
@@ -1933,6 +1936,9 @@ impl SageAgent {
                         elapsed_ms,
                     });
                     let message = match failure {
+                        ToolExecutionError::Unauthorized => {
+                            "The Tool is not authorized for this conversation."
+                        }
                         ToolExecutionError::Connection => "The Tool backend could not be reached.",
                         ToolExecutionError::Timeout => "The Tool timed out before returning data.",
                         ToolExecutionError::HttpStatus(_) => {
