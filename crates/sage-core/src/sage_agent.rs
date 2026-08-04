@@ -513,11 +513,13 @@ pub enum ToolExecutionError {
     Other(String),
 }
 
-/// Explicit retry/timeout contract for a Tool. The default is no retry; only
-/// read-only Tools opt into the bounded policy constructors below.
+/// Explicit retry/timeout contract for a Tool. Every Tool attempt is bounded;
+/// only read-only Tools opt into retries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolRetryPolicy {
-    None,
+    NoRetry {
+        per_attempt_timeout: Option<Duration>,
+    },
     ReadOnly {
         per_attempt_timeout: Duration,
         max_attempts: u32,
@@ -527,9 +529,24 @@ pub enum ToolRetryPolicy {
 }
 
 impl ToolRetryPolicy {
+    const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
     const MIN_RETRY_ATTEMPT_BUDGET_CAP: Duration = Duration::from_secs(1);
+
     pub fn none() -> Self {
-        Self::None
+        Self::no_retry(Self::DEFAULT_ATTEMPT_TIMEOUT)
+    }
+
+    pub fn no_retry(per_attempt_timeout: Duration) -> Self {
+        Self::NoRetry {
+            per_attempt_timeout: Some(per_attempt_timeout),
+        }
+    }
+
+    /// Use only when the Tool enforces its own bounded timeout and cleanup.
+    pub fn self_managed_timeout() -> Self {
+        Self::NoRetry {
+            per_attempt_timeout: None,
+        }
     }
 
     pub fn read_only(
@@ -553,9 +570,20 @@ impl ToolRetryPolicy {
         Self::read_only(Duration::from_secs(15), 2, Duration::from_secs(35))
     }
 
+    fn total_budget(&self) -> Option<Duration> {
+        match self {
+            Self::NoRetry {
+                per_attempt_timeout,
+            } => *per_attempt_timeout,
+            Self::ReadOnly { total_budget, .. } => Some(*total_budget),
+        }
+    }
+
     fn attempt_timeout(&self, remaining: Duration) -> Option<Duration> {
         match self {
-            Self::None => None,
+            Self::NoRetry {
+                per_attempt_timeout,
+            } => per_attempt_timeout.map(|timeout| timeout.min(remaining)),
             Self::ReadOnly {
                 per_attempt_timeout,
                 ..
@@ -565,7 +593,7 @@ impl ToolRetryPolicy {
 
     fn can_retry(&self, attempt: u32, remaining: Duration) -> bool {
         match self {
-            Self::None => false,
+            Self::NoRetry { .. } => false,
             Self::ReadOnly {
                 per_attempt_timeout,
                 max_attempts,
@@ -581,7 +609,7 @@ impl ToolRetryPolicy {
 
     fn backoff(&self) -> Duration {
         match self {
-            Self::None => Duration::ZERO,
+            Self::NoRetry { .. } => Duration::ZERO,
             Self::ReadOnly { backoff, .. } => *backoff,
         }
     }
@@ -626,7 +654,7 @@ pub trait Tool: Send + Sync {
         native_parameters_from_contract(self.name(), self.args_schema())
     }
     fn retry_policy(&self) -> ToolRetryPolicy {
-        ToolRetryPolicy::None
+        ToolRetryPolicy::none()
     }
     async fn execute_with_timing_outcome(
         &self,
@@ -958,10 +986,6 @@ pub enum AgentTraceEvent {
         attempt: u32,
         elapsed_ms: u128,
     },
-    ProviderReasoning {
-        step: usize,
-        content: String,
-    },
     ModelStepFailed {
         step: usize,
         attempt: u32,
@@ -1095,8 +1119,8 @@ pub struct SageAgent {
 
 #[allow(dead_code)]
 impl SageAgent {
-    const MAX_CURRENT_TOOL_RESULT_CHARS: usize = 4_000;
-    const MAX_CURRENT_TOOL_CONTEXT_CHARS: usize = 12_000;
+    pub(crate) const MAX_CURRENT_TOOL_RESULT_CHARS: usize = 4_000;
+    pub(crate) const MAX_CURRENT_TOOL_CONTEXT_CHARS: usize = 12_000;
 
     /// Create a new agent with tools and memory
     pub fn new(tools: ToolRegistry, memory: MemoryManager) -> Self {
@@ -1616,12 +1640,10 @@ impl SageAgent {
             });
 
             let elapsed = call_started_at.elapsed();
-            let remaining = match &policy {
-                ToolRetryPolicy::None => Duration::from_secs(365 * 24 * 60 * 60),
-                ToolRetryPolicy::ReadOnly { total_budget, .. } => {
-                    total_budget.saturating_sub(elapsed)
-                }
-            };
+            let remaining = policy
+                .total_budget()
+                .map(|budget| budget.saturating_sub(elapsed))
+                .unwrap_or(Duration::MAX);
             let attempt_started_at = Instant::now();
             let mut timeout_event_emitted = false;
             let execution = if let Some(timeout) = policy.attempt_timeout(remaining) {
@@ -1733,12 +1755,10 @@ impl SageAgent {
                             elapsed_ms: attempt_elapsed_ms,
                         });
                     }
-                    let remaining = match &policy {
-                        ToolRetryPolicy::None => Duration::ZERO,
-                        ToolRetryPolicy::ReadOnly { total_budget, .. } => {
-                            total_budget.saturating_sub(call_started_at.elapsed())
-                        }
-                    };
+                    let remaining = policy
+                        .total_budget()
+                        .map(|budget| budget.saturating_sub(call_started_at.elapsed()))
+                        .unwrap_or(Duration::ZERO);
                     if retryable && policy.can_retry(attempt, remaining) {
                         self.emit_trace(AgentTraceEvent::ToolRetryScheduled {
                             call_id: call_id.to_string(),
@@ -2525,6 +2545,68 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    struct HangingNoRetryTool;
+
+    #[async_trait::async_trait]
+    impl Tool for HangingNoRetryTool {
+        fn name(&self) -> &str {
+            "hanging_write"
+        }
+
+        fn description(&self) -> &str {
+            "test-only hanging write"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        fn retry_policy(&self) -> ToolRetryPolicy {
+            ToolRetryPolicy::no_retry(Duration::from_millis(10))
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn non_retryable_tool_attempt_times_out_and_emits_terminal_evidence() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(HangingNoRetryTool));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            event_sink.lock().expect("event sink").push(event);
+        }));
+
+        let result = execute_native_test_call(&mut agent, "hanging_write").await;
+
+        assert!(!result.executed_tools[0].result.success);
+        let events = events.lock().expect("event sink");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentTraceEvent::ToolAttempted { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolTimedOut { call_id, attempt: 1, .. }
+                if call_id == "native-test-call"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolTerminal { call_id, status, attempt: 1, .. }
+                if call_id == "native-test-call" && status == "timed_out"
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentTraceEvent::ToolRetryScheduled { .. })));
     }
 
     #[test]

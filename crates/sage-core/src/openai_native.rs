@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,8 +98,10 @@ pub enum NativeFinishReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeProviderSignal {
     Content(String),
-    Reasoning(String),
+    Event,
 }
+
+const MAX_NATIVE_TOOL_CALLS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeAssistantTurn {
@@ -292,22 +294,18 @@ fn consume_sse_line(
         .get("delta")
         .and_then(Value::as_object)
         .ok_or_else(|| NativeProviderError::Protocol("choice omitted delta".to_string()))?;
+    let mut emitted_content = false;
     if let Some(content) = optional_string(delta.get("content"), "delta.content")? {
         state.content.push_str(content);
         if !content.is_empty() {
             if let Some(sender) = signal_sender {
                 let _ = sender.send(NativeProviderSignal::Content(content.to_string()));
             }
+            emitted_content = true;
         }
     }
     for field in ["reasoning", "reasoning_content"] {
-        if let Some(reasoning) = optional_string(delta.get(field), field)? {
-            if !reasoning.is_empty() {
-                if let Some(sender) = signal_sender {
-                    let _ = sender.send(NativeProviderSignal::Reasoning(reasoning.to_string()));
-                }
-            }
-        }
+        let _ = optional_string(delta.get(field), field)?;
     }
     if let Some(tool_calls) = delta.get("tool_calls") {
         let tool_calls = tool_calls.as_array().ok_or_else(|| {
@@ -322,6 +320,13 @@ fn consume_sse_line(
                         "streamed Tool call omitted its numeric index".to_string(),
                     )
                 })?;
+            if !state.tool_calls.contains_key(&index)
+                && state.tool_calls.len() == MAX_NATIVE_TOOL_CALLS
+            {
+                return Err(NativeProviderError::Protocol(format!(
+                    "provider selected more than the allowed maximum of {MAX_NATIVE_TOOL_CALLS} Tool calls"
+                )));
+            }
             let partial = state.tool_calls.entry(index).or_default();
             append_optional_string(&mut partial.id, wire_call.get("id"), "tool_call.id")?;
             if let Some(function) = wire_call.get("function") {
@@ -367,6 +372,11 @@ fn consume_sse_line(
             ));
         }
     }
+    if !emitted_content && !delta.is_empty() {
+        if let Some(sender) = signal_sender {
+            let _ = sender.send(NativeProviderSignal::Event);
+        }
+    }
     Ok(())
 }
 
@@ -380,6 +390,7 @@ fn finish_stream(state: NativeStreamState) -> Result<NativeAssistantTurn, Native
         NativeProviderError::Protocol("provider stream omitted a finish reason".to_string())
     })?;
     let mut tool_calls = Vec::with_capacity(state.tool_calls.len());
+    let mut call_ids = HashSet::with_capacity(state.tool_calls.len());
     for (_, call) in state.tool_calls {
         if call.id.trim().is_empty() || call.name.trim().is_empty() {
             return Err(NativeProviderError::Protocol(
@@ -396,6 +407,12 @@ fn finish_stream(state: NativeStreamState) -> Result<NativeAssistantTurn, Native
             return Err(NativeProviderError::Protocol(format!(
                 "Tool '{}' arguments were not a JSON object",
                 call.name
+            )));
+        }
+        if !call_ids.insert(call.id.clone()) {
+            return Err(NativeProviderError::Protocol(format!(
+                "provider returned duplicate Tool call id '{}'",
+                call.id
             )));
         }
         tool_calls.push(NativeToolCall {
@@ -460,8 +477,9 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeAssistantMessage, NativeChatMessage, NativeFinishReason, NativeProviderSignal,
-        NativeToolCall, NativeToolDefinition, NativeTurnRequest, OpenAiNativeClient,
+        consume_sse_line, finish_stream, NativeAssistantMessage, NativeChatMessage,
+        NativeFinishReason, NativeProviderSignal, NativeStreamState, NativeToolCall,
+        NativeToolDefinition, NativeTurnRequest, OpenAiNativeClient,
     };
     use axum::{
         extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
@@ -614,5 +632,62 @@ mod tests {
             Some(&json!("call-1"))
         );
         assert!(requests[1].get("tools").is_none());
+    }
+
+    #[test]
+    fn tool_call_only_delta_emits_a_content_free_provider_event() {
+        let mut state = NativeStreamState::default();
+        let (signal_sender, mut signal_receiver) = mpsc::unbounded_channel();
+
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"knowledge_search","arguments":"{\"query\":\"guide\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut state,
+            &Some(signal_sender),
+        )
+        .expect("Tool-call-only event should parse");
+
+        assert_eq!(
+            signal_receiver.try_recv().expect("provider event signal"),
+            NativeProviderSignal::Event
+        );
+    }
+
+    #[test]
+    fn duplicate_tool_call_ids_are_rejected_before_execution() {
+        let mut state = NativeStreamState::default();
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"duplicate","type":"function","function":{"name":"knowledge_search","arguments":"{}"}},{"index":1,"id":"duplicate","type":"function","function":{"name":"find_resources","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut state,
+            &None,
+        )
+        .expect("stream fragments should parse before correlation validation");
+        consume_sse_line("data: [DONE]", &mut state, &None).expect("DONE marker should parse");
+
+        let error = finish_stream(state).expect_err("duplicate call IDs must be rejected");
+        assert!(error.to_string().contains("duplicate Tool call id"));
+    }
+
+    #[test]
+    fn oversized_native_tool_batch_is_rejected() {
+        let tool_calls = (0..9)
+            .map(|index| {
+                json!({
+                    "index": index,
+                    "id": format!("call-{index}"),
+                    "type": "function",
+                    "function": {"name": "knowledge_search", "arguments": "{}"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let line = format!(
+            "data: {}",
+            json!({"choices": [{"delta": {"tool_calls": tool_calls}, "finish_reason": null}]})
+        );
+        let mut state = NativeStreamState::default();
+
+        let error = consume_sse_line(&line, &mut state, &None)
+            .expect_err("oversized Tool batch must be rejected at the provider boundary");
+
+        assert!(error.to_string().contains("maximum of 8 Tool calls"));
     }
 }

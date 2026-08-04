@@ -810,6 +810,7 @@ fn resource_page_contract_is_consistent(
         && response.returned_count == returned_count
         && returned_count <= response.limit
         && consumed_count <= response.total_count
+        && (!expected_has_more || returned_count > 0)
         && response.has_more == expected_has_more
         && response.next_offset == expected_next_offset
 }
@@ -1735,8 +1736,13 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             selected_tools,
             outcome,
         } => {
-            let selection_rejected = matches!(outcome.as_str(), "rejected" | "failed");
-            let summary = if selection_rejected {
+            let selection_rejected = matches!(
+                outcome.as_str(),
+                "rejected" | "partially_rejected" | "failed"
+            );
+            let summary = if outcome == "partially_rejected" {
+                "Some of the model's Tool selections were rejected."
+            } else if selection_rejected {
                 "The model's Tool selection was rejected."
             } else if selected_tools.is_empty() {
                 "No Tools were selected."
@@ -1880,16 +1886,6 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             tool_name: None,
             status: Some("succeeded".to_string()),
             metadata: json!({ "step": step, "attempt": attempt, "duration_ms": elapsed_ms }),
-            created_at: Some(chrono::Utc::now().to_rfc3339()),
-        },
-        AgentTraceEvent::ProviderReasoning { step, content } => ConversationTraceDeltaResponse {
-            id: trace_delta_id("reasoning", &step.to_string()),
-            kind: "reasoning".to_string(),
-            title: Some("Provider reasoning".to_string()),
-            content: Some(content),
-            tool_name: None,
-            status: Some("succeeded".to_string()),
-            metadata: json!({ "step": step, "source": "provider" }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
         AgentTraceEvent::ModelStepFailed {
@@ -2310,7 +2306,7 @@ impl Tool for FindResourcesTool {
     }
 
     fn args_schema(&self) -> &str {
-        r#"{"query":"optional organization name or contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other","region":"optional country or region","language":"optional preferred language code, e.g. es","offset":"optional continuation offset"}"#
+        r#"{"query":"optional organization name or contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other","region":"optional country or region","scope":"optional; jurisdiction (default) or global","language":"optional preferred language code, e.g. es","offset":"optional continuation offset"}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -2324,6 +2320,11 @@ impl Tool for FindResourcesTool {
                     "description": "Optional help category."
                 },
                 "region": {"type": "string", "description": "Optional country or region."},
+                "scope": {
+                    "type": "string",
+                    "enum": ["jurisdiction", "global"],
+                    "description": "Search the user's jurisdiction by default, or search globally."
+                },
                 "language": {"type": "string", "description": "Optional preferred language code."},
                 "offset": {"type": "integer", "description": "Optional continuation offset.", "minimum": 0}
             },
@@ -2339,9 +2340,15 @@ impl Tool for FindResourcesTool {
         let help_type = tool_string_arg(args, "help_type")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let global_scope = tool_string_arg(args, "scope") == Some("global");
+        let default_region = if global_scope {
+            None
+        } else {
+            self.jurisdiction.clone()
+        };
         let region = tool_string_arg(args, "region")
             .map(str::to_string)
-            .or_else(|| self.jurisdiction.clone());
+            .or(default_region);
         let language = tool_string_arg(args, "language").map(str::to_string);
         let query = tool_string_arg(args, "query")
             .map(|value| value.trim().to_string())
@@ -2355,7 +2362,7 @@ impl Tool for FindResourcesTool {
                 help_type: help_type.clone(),
                 jurisdiction: region.clone(),
                 language: language.clone(),
-                limit: 5,
+                limit: if global_scope { 10 } else { 5 },
                 offset,
             })
             .await?;
@@ -2410,18 +2417,29 @@ impl Tool for FindResourcesTool {
         });
 
         if response.resources.is_empty() {
+            let exhausted_continuation = total_count > 0;
+            let empty_summary = if exhausted_continuation {
+                "No additional curated resources were returned for this page."
+            } else {
+                "No matching curated resources were found."
+            };
+            let warning = if exhausted_continuation {
+                "empty_curated_resources_page"
+            } else {
+                "no_curated_resources"
+            };
             if let Ok(mut sink) = self.traces.lock() {
                 sink.push(ToolCallInfoResponse {
                     tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                     tool_name: "Curated Resources".to_string(),
                     query: Some(trace_query),
-                    output_summary: Some("No matching curated resources were found.".to_string()),
-                    warnings: vec!["no_curated_resources".to_string()],
+                    output_summary: Some(empty_summary.to_string()),
+                    warnings: vec![warning.to_string()],
                     metadata: json!({
-                        "returned_count": 0,
-                        "total_count": 0,
-                        "has_more": false,
-                        "next_offset": Value::Null,
+                        "returned_count": returned_count,
+                        "total_count": total_count,
+                        "has_more": has_more,
+                        "next_offset": next_offset,
                         "continuation_query": response.query.as_deref().or(query.as_deref()),
                         "continuation_region": response_region,
                         "continuation_help_type": help_type,
@@ -2433,7 +2451,11 @@ impl Tool for FindResourcesTool {
                 });
             }
             return Ok(ToolResult::success_with_metadata(
-                "No curated resources matched the supplied filters.",
+                if exhausted_continuation {
+                    "No additional curated resources were returned for this page."
+                } else {
+                    "No curated resources matched the supplied filters."
+                },
                 result_metadata,
             ));
         }
@@ -3533,7 +3555,7 @@ fn chat_stream_terminal_emissions(
 
 #[derive(Default)]
 struct ChatStreamAnswerEmissionState {
-    activity_steps_sent: bool,
+    emitted_activity_ids: HashSet<String>,
     writing_status_sent: bool,
 }
 
@@ -3579,20 +3601,19 @@ impl ChatStreamAnswerEmissionState {
         session_id: &Option<String>,
         activity_steps: Vec<ConversationActivityStepResponse>,
     ) -> Vec<ChatStreamEmission> {
-        if self.activity_steps_sent {
-            return Vec::new();
-        }
-        self.activity_steps_sent = true;
         activity_steps
             .into_iter()
-            .map(|activity_step| {
+            .filter_map(|activity_step| {
+                if !self.emitted_activity_ids.insert(activity_step.id.clone()) {
+                    return None;
+                }
                 let mut payload =
                     ChatStreamEventPayload::new(message_id.to_string(), session_id.clone());
                 payload.activity_step = Some(activity_step);
-                ChatStreamEmission {
+                Some(ChatStreamEmission {
                     event: "activity_step",
                     payload,
-                }
+                })
             })
             .collect()
     }
@@ -3612,7 +3633,7 @@ fn chat_stream_emissions_for_signal(
             let mut payload =
                 ChatStreamEventPayload::new(message_id.to_string(), session_id.clone());
             let timing_activity =
-                if answer_state.activity_steps_sent && trace_delta.kind == "timing" {
+                if answer_state.writing_status_sent && trace_delta.kind == "timing" {
                     conversation_activity_steps_from_trace_deltas(&[(*trace_delta).clone()])
                         .into_iter()
                         .next()
@@ -3625,13 +3646,11 @@ fn chat_stream_emissions_for_signal(
                 payload,
             }];
             if let Some(activity_step) = timing_activity {
-                let mut activity_payload =
-                    ChatStreamEventPayload::new(message_id.to_string(), session_id.clone());
-                activity_payload.activity_step = Some(activity_step);
-                emissions.push(ChatStreamEmission {
-                    event: "activity_step",
-                    payload: activity_payload,
-                });
+                emissions.extend(answer_state.remaining_activity(
+                    message_id,
+                    session_id,
+                    vec![activity_step],
+                ));
             }
             emissions
         }
@@ -6919,26 +6938,14 @@ async fn run_native_turn_with_provider(
             error: model_provider_error(error),
             progressed: emitted_any,
         })?;
-    let selected_tools = first_turn
-        .tool_calls
-        .iter()
-        .map(|call| {
-            enabled_tools
-                .contains(&call.name)
-                .then(|| call.name.clone())
-                .unwrap_or_else(|| "unrecognized_tool".to_string())
-        })
-        .collect::<Vec<_>>();
+    let (selected_tools, selection_outcome) =
+        native_tool_selection_observation(&enabled_tools, &first_turn.tool_calls);
     agent.emit_trace_event(AgentTraceEvent::ToolSelectionObservation {
         step: 0,
         attempt: selection_attempt,
         enabled_tools,
         selected_tools: selected_tools.clone(),
-        outcome: if selected_tools.is_empty() {
-            "none".to_string()
-        } else {
-            "selected".to_string()
-        },
+        outcome: selection_outcome,
     });
 
     let (answer, executed_tools) = match first_turn.finish_reason {
@@ -6946,8 +6953,6 @@ async fn run_native_turn_with_provider(
             if first_answer_state.answer.is_empty() {
                 stage_native_provider_signal(
                     NativeProviderSignal::Content(first_turn.content.clone()),
-                    0,
-                    true,
                     &mut first_answer_state,
                     &delta_sender,
                 )
@@ -6959,14 +6964,7 @@ async fn run_native_turn_with_provider(
             (first_turn.content, Vec::new())
         }
         NativeFinishReason::ToolCalls => {
-            if first_answer_state.emitted_any {
-                return Err(AdapterTurnFailure {
-                    error: model_provider_error(
-                        "native response mixed public answer content with Tool calls",
-                    ),
-                    progressed: true,
-                });
-            }
+            let preamble = first_turn.content.clone();
             messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
                 content: first_turn.content,
                 tool_calls: first_turn.tool_calls.clone(),
@@ -6974,11 +6972,9 @@ async fn run_native_turn_with_provider(
             let batch = agent
                 .execute_native_tool_calls(&first_turn.tool_calls)
                 .await;
-            for (call, executed) in first_turn.tool_calls.iter().zip(&batch.executed_tools) {
-                messages.push(NativeChatMessage::tool_result(
-                    &call.id,
-                    native_tool_result_content(&executed.result),
-                ));
+            let result_contents = bounded_native_tool_result_contents(&batch.executed_tools);
+            for (call, content) in first_turn.tool_calls.iter().zip(result_contents) {
+                messages.push(NativeChatMessage::tool_result(&call.id, content));
             }
             let (final_turn, _final_answer_state, _) = request_native_turn_with_protocol_retry(
                 agent,
@@ -6997,13 +6993,43 @@ async fn run_native_turn_with_provider(
                 error: model_provider_error(error),
                 progressed: true,
             })?;
-            (final_turn.content, batch.executed_tools)
+            (
+                format!("{preamble}{}", final_turn.content),
+                batch.executed_tools,
+            )
         }
     };
     Ok(AdapterTurnOutput {
         answer,
         executed_tools,
     })
+}
+
+fn native_tool_selection_observation(
+    enabled_tools: &[String],
+    calls: &[crate::openai_native::NativeToolCall],
+) -> (Vec<String>, String) {
+    let recognized_count = calls
+        .iter()
+        .filter(|call| enabled_tools.contains(&call.name))
+        .count();
+    let selected_tools = calls
+        .iter()
+        .map(|call| {
+            if enabled_tools.contains(&call.name) {
+                call.name.clone()
+            } else {
+                "unrecognized_tool".to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    let outcome = match (selected_tools.len(), recognized_count) {
+        (0, _) => "none",
+        (selected, recognized) if selected == recognized => "selected",
+        (_, 0) => "rejected",
+        _ => "partially_rejected",
+    };
+    (selected_tools, outcome.to_string())
 }
 
 async fn request_native_turn_with_protocol_retry(
@@ -7085,8 +7111,6 @@ async fn stream_native_turn_attempt(
                     }
                     stage_native_provider_signal(
                         signal,
-                        step,
-                        !tools_enabled,
                         answer_state,
                         delta_sender,
                     )?;
@@ -7108,13 +7132,19 @@ async fn stream_native_turn_attempt(
                 }
                 stage_native_provider_signal(
                     signal,
-                    step,
-                    !tools_enabled,
                     answer_state,
                     delta_sender,
                 )?;
             }
         }
+    };
+    let turn_result = match turn_result {
+        Ok(turn) if !tools_enabled && turn.finish_reason == NativeFinishReason::ToolCalls => {
+            Err(NativeProviderError::Protocol(
+                "provider returned Tool calls when no Tools were supplied".to_string(),
+            ))
+        }
+        result => result,
     };
     agent.emit_trace_event(AgentTraceEvent::Timing {
         phase: ConversationTimingPhase::ModelRequest,
@@ -7130,32 +7160,17 @@ async fn stream_native_turn_attempt(
         elapsed_ms: request_started_at.elapsed().as_millis(),
     });
     let turn = turn_result?;
-    if !tools_enabled && turn.finish_reason == NativeFinishReason::ToolCalls {
-        return Err(NativeProviderError::Protocol(
-            "provider returned Tool calls when no Tools were supplied".to_string(),
-        ));
-    }
     Ok(turn)
 }
 
 fn stage_native_provider_signal(
     signal: NativeProviderSignal,
-    step: usize,
-    stream_answer: bool,
     answer_state: &mut NativeAnswerStreamState,
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> std::result::Result<(), NativeProviderError> {
     let delta = match signal {
-        NativeProviderSignal::Content(delta) if stream_answer => delta,
-        NativeProviderSignal::Content(_) => return Ok(()),
-        NativeProviderSignal::Reasoning(content) => {
-            if let Some(sender) = delta_sender {
-                let _ = sender.send(ConversationStreamSignal::Trace(Box::new(
-                    agent_trace_event_delta(AgentTraceEvent::ProviderReasoning { step, content }),
-                )));
-            }
-            return Ok(());
-        }
+        NativeProviderSignal::Content(delta) => delta,
+        NativeProviderSignal::Event => return Ok(()),
     };
     answer_state.push(&delta);
     release_answer_deltas(vec![delta], delta_sender);
@@ -7170,6 +7185,71 @@ fn native_tool_result_content(result: &ToolResult) -> String {
         "metadata": result.metadata,
     })
     .to_string()
+}
+
+fn bounded_native_tool_result_contents(results: &[ExecutedTool]) -> Vec<String> {
+    if results.is_empty() {
+        return Vec::new();
+    }
+    let per_result_budget = SageAgent::MAX_CURRENT_TOOL_RESULT_CHARS
+        .min(SageAgent::MAX_CURRENT_TOOL_CONTEXT_CHARS / results.len());
+    results
+        .iter()
+        .map(|executed| bounded_native_tool_result_content(&executed.result, per_result_budget))
+        .collect()
+}
+
+fn bounded_native_tool_result_content(result: &ToolResult, max_chars: usize) -> String {
+    let full = native_tool_result_content(result);
+    let full_chars = full.chars().count();
+    if full_chars <= max_chars {
+        return full;
+    }
+
+    let source = if result.success {
+        result.output.as_str()
+    } else {
+        result.error.as_deref().unwrap_or("Tool execution failed")
+    };
+    let render = |content: &str| {
+        json!({
+            "success": result.success,
+            "output": if result.success { content } else { "" },
+            "error": if result.success { None } else { Some(content) },
+            "metadata": result.metadata,
+            "truncated": true,
+            "original_chars": full_chars,
+        })
+        .to_string()
+    };
+    let source_chars = source.chars().count();
+    let mut low = 0;
+    let mut high = source_chars;
+    let mut bounded = render("");
+    if bounded.chars().count() > max_chars {
+        return json!({
+            "success": result.success,
+            "output": "",
+            "error": if result.success { None } else { Some("Tool result exceeded the context budget") },
+            "metadata": {"truncated": true},
+            "truncated": true,
+            "original_chars": full_chars,
+        })
+        .to_string();
+    }
+    while low <= high {
+        let midpoint = low + (high - low) / 2;
+        let candidate = render(&source.chars().take(midpoint).collect::<String>());
+        if candidate.chars().count() <= max_chars {
+            bounded = candidate;
+            low = midpoint.saturating_add(1);
+        } else if midpoint == 0 {
+            break;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+    bounded
 }
 
 #[derive(Debug)]
@@ -8362,6 +8442,144 @@ mod tests {
     }
 
     #[test]
+    fn public_mixed_stream_keeps_tool_activity_pending_until_the_answer_continues() {
+        let message_id = "msg_mixed";
+        let session_id = Some("55555555-5555-5555-5555-555555555555".to_string());
+        let timing_delta = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ProviderFirstEventWait,
+            step: Some(0),
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 7,
+        });
+        let timing_activity =
+            conversation_activity_steps_from_trace_deltas(std::slice::from_ref(&timing_delta))
+                .into_iter()
+                .next()
+                .expect("provider timing should create Activity");
+        let tool_activity = ConversationActivityStepResponse {
+            id: "tool-find-resources".to_string(),
+            kind: "tool".to_string(),
+            title: "Find Resources".to_string(),
+            status: "succeeded".to_string(),
+            summary: Some("Found one resource.".to_string()),
+            warnings: Vec::new(),
+        };
+        let mut state = ChatStreamAnswerEmissionState::default();
+
+        let provider_timing = chat_stream_emissions_for_signal(
+            &mut state,
+            ConversationStreamSignal::Trace(Box::new(timing_delta)),
+            message_id,
+            &session_id,
+            Vec::new(),
+            Instant::now(),
+            false,
+        );
+        let preamble = chat_stream_emissions_for_signal(
+            &mut state,
+            ConversationStreamSignal::Answer("I’ll check. ".to_string()),
+            message_id,
+            &session_id,
+            vec![timing_activity.clone()],
+            Instant::now(),
+            false,
+        );
+        let tool_trace = chat_stream_emissions_for_signal(
+            &mut state,
+            ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
+                AgentTraceEvent::ToolTerminal {
+                    call_id: "call-mixed".to_string(),
+                    tool_name: "find_resources".to_string(),
+                    tool_round: 1,
+                    attempt: 1,
+                    status: "succeeded".to_string(),
+                    elapsed_ms: 12,
+                },
+            ))),
+            message_id,
+            &session_id,
+            vec![timing_activity.clone(), tool_activity.clone()],
+            Instant::now(),
+            false,
+        );
+        let continuation = chat_stream_emissions_for_signal(
+            &mut state,
+            ConversationStreamSignal::Answer("Here is the result.".to_string()),
+            message_id,
+            &session_id,
+            vec![timing_activity, tool_activity],
+            Instant::now(),
+            false,
+        );
+
+        assert_eq!(
+            provider_timing
+                .iter()
+                .map(|emission| emission.event)
+                .collect::<Vec<_>>(),
+            ["trace_delta"]
+        );
+        assert_eq!(
+            preamble
+                .iter()
+                .map(|emission| emission.event)
+                .collect::<Vec<_>>(),
+            ["activity_step", "trace_status", "answer_delta"]
+        );
+        assert_eq!(
+            tool_trace
+                .iter()
+                .map(|emission| emission.event)
+                .collect::<Vec<_>>(),
+            ["trace_delta"]
+        );
+        assert_eq!(
+            continuation
+                .iter()
+                .map(|emission| emission.event)
+                .collect::<Vec<_>>(),
+            ["activity_step", "answer_delta"]
+        );
+        assert_eq!(
+            continuation[0]
+                .payload
+                .activity_step
+                .as_ref()
+                .map(|step| step.id.as_str()),
+            Some("tool-find-resources")
+        );
+        assert_eq!(
+            continuation[1].payload.delta.as_deref(),
+            Some("Here is the result.")
+        );
+        let all_activity_ids = provider_timing
+            .iter()
+            .chain(&preamble)
+            .chain(&tool_trace)
+            .chain(&continuation)
+            .filter_map(|emission| emission.payload.activity_step.as_ref())
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all_activity_ids
+                .iter()
+                .filter(|id| id.starts_with("activity-"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            all_activity_ids
+                .iter()
+                .filter(|id| **id == "tool-find-resources")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn public_transport_orders_selection_retry_result_provider_wait_answer_and_terminal_events() {
         let message_id = "msg_transport-order";
         let session_id = Some("44444444-4444-4444-4444-444444444444".to_string());
@@ -8561,7 +8779,7 @@ mod tests {
         let message_id = "msg_timing";
         let session_id = Some("33333333-3333-3333-3333-333333333333".to_string());
         let mut state = ChatStreamAnswerEmissionState {
-            activity_steps_sent: true,
+            emitted_activity_ids: HashSet::new(),
             writing_status_sent: true,
         };
         let emissions = chat_stream_emissions_for_signal(
@@ -8609,12 +8827,13 @@ mod tests {
             Json(body): Json<Value>,
         ) -> Response {
             state.requests.fetch_add(1, Ordering::SeqCst);
-            assert!(body.get("tools").is_none());
+            assert_eq!(body["tools"][0]["function"]["name"], "knowledge_search");
             let release_completion = state.release_completion.clone();
             let body = axum::body::Body::from_stream(async_stream::stream! {
-                yield Ok::<_, Infallible>(axum::body::Bytes::from_static(
-                    b"data: {\"choices\":[{\"delta\":{\"content\":\"Let me explain this directly. \"},\"finish_reason\":null}]}\n\n"
-                ));
+                yield Ok::<_, Infallible>(axum::body::Bytes::from_static(concat!(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hidden credential sk_test_never_stream and private value 8675309\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Let me explain this directly. \"},\"finish_reason\":null}]}\n\n"
+                ).as_bytes()));
                 release_completion.notified().await;
                 yield Ok::<_, Infallible>(axum::body::Bytes::from_static(concat!(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"It is now complete.\"},\"finish_reason\":\"stop\"}]}\n\n",
@@ -8650,7 +8869,11 @@ mod tests {
             "test-key".to_string(),
             0.1,
         );
-        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingReadTool {
+            executions: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
         let trace_events = Arc::new(Mutex::new(Vec::new()));
         let trace_sink = trace_events.clone();
         agent.set_trace_hook(Arc::new(move |event| {
@@ -8691,6 +8914,9 @@ mod tests {
         }
         assert_eq!(deltas.concat(), turn.answer);
         let trace_events = trace_events.lock().expect("native trace events");
+        let serialized_trace = format!("{trace_events:?}");
+        assert!(!serialized_trace.contains("sk_test_never_stream"));
+        assert!(!serialized_trace.contains("8675309"));
         assert!(trace_events.iter().any(|event| matches!(
             event,
             AgentTraceEvent::ToolSelectionObservation {
@@ -8699,7 +8925,9 @@ mod tests {
                 selected_tools,
                 outcome,
                 ..
-            } if enabled_tools.is_empty() && selected_tools.is_empty() && outcome == "none"
+            } if enabled_tools == &["knowledge_search"]
+                && selected_tools.is_empty()
+                && outcome == "none"
         )));
         for phase in [
             ConversationTimingPhase::ProviderFirstEventWait,
@@ -8772,6 +9000,72 @@ mod tests {
         assert_eq!(content["success"], true);
         assert_eq!(content["output"], "Top-ranked resource page");
         assert_eq!(content["metadata"], result.metadata);
+    }
+
+    #[test]
+    fn native_tool_selection_reports_rejected_and_partial_batches_truthfully() {
+        let enabled = vec!["knowledge_search".to_string()];
+        let known = native_test_call("call-known", "knowledge_search", ToolArgs::new());
+        let unknown = native_test_call("call-unknown", "invented_tool", ToolArgs::new());
+
+        let (selected, outcome) =
+            native_tool_selection_observation(&enabled, std::slice::from_ref(&unknown));
+        assert_eq!(selected, ["unrecognized_tool"]);
+        assert_eq!(outcome, "rejected");
+
+        let (selected, outcome) = native_tool_selection_observation(&enabled, &[known, unknown]);
+        assert_eq!(selected, ["knowledge_search", "unrecognized_tool"]);
+        assert_eq!(outcome, "partially_rejected");
+        let delta = agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
+            step: 0,
+            attempt: 1,
+            enabled_tools: enabled,
+            selected_tools: selected,
+            outcome,
+        });
+        assert_eq!(delta.status.as_deref(), Some("failed"));
+        assert_eq!(
+            delta.content.as_deref(),
+            Some("Some of the model's Tool selections were rejected.")
+        );
+    }
+
+    #[test]
+    fn native_tool_results_preserve_existing_per_result_and_batch_budgets() {
+        let results = (0..4)
+            .map(|index| ExecutedTool {
+                tool_call: crate::sage_agent::ToolCall {
+                    name: "knowledge_search".to_string(),
+                    args: ToolArgs::new(),
+                },
+                result: ToolResult::success_with_metadata(
+                    format!("result-{index}-{}", "x".repeat(10_000)),
+                    json!({"source": "large-test-document"}),
+                ),
+            })
+            .collect::<Vec<_>>();
+
+        let contents = bounded_native_tool_result_contents(&results);
+
+        assert_eq!(contents.len(), 4);
+        assert!(contents.iter().all(|content| {
+            content.chars().count() <= SageAgent::MAX_CURRENT_TOOL_RESULT_CHARS
+        }));
+        assert!(
+            contents
+                .iter()
+                .map(|content| content.chars().count())
+                .sum::<usize>()
+                <= SageAgent::MAX_CURRENT_TOOL_CONTEXT_CHARS
+        );
+        for content in contents {
+            let parsed: Value = serde_json::from_str(&content)
+                .expect("bounded native Tool result must remain valid JSON");
+            assert_eq!(parsed["success"], true);
+            assert_eq!(parsed["metadata"]["source"], "large-test-document");
+            assert_eq!(parsed["truncated"], true);
+            assert!(parsed["original_chars"].as_u64().unwrap() > 10_000);
+        }
     }
 
     #[test]
@@ -8901,14 +9195,14 @@ mod tests {
         .await
         .expect("one native Tool batch should complete");
 
-        assert_eq!(turn.answer, "Grounded answer.");
+        assert_eq!(turn.answer, "I found something. Grounded answer.");
         let mut answer_deltas = Vec::new();
         while let Ok(signal) = delta_rx.try_recv() {
             if let ConversationStreamSignal::Answer(delta) = signal {
                 answer_deltas.push(delta);
             }
         }
-        assert_eq!(answer_deltas.concat(), "Grounded answer.");
+        assert_eq!(answer_deltas.concat(), turn.answer);
         assert_eq!(turn.executed_tools.len(), 2);
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         let requests = provider_state.0.lock().expect("captured provider requests");
@@ -9442,7 +9736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_resources_tool_without_help_type_returns_ranked_page() {
+    async fn find_resources_global_scope_returns_ten_ranked_results_without_jurisdiction() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
         let app = Router::new().route(
@@ -9480,7 +9774,7 @@ mod tests {
                                     "verified_at": "2026-07-03T20:00:00Z"
                                 }
                             ],
-                            "resolved_country_code": "MX",
+                            "resolved_country_code": null,
                             "help_type": null,
                             "query": null,
                             "total_count": 11,
@@ -9517,11 +9811,17 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::from([("offset".to_string(), json!(10))]))
+            .execute(&ToolArgs::from([
+                ("scope".to_string(), json!("global")),
+                ("offset".to_string(), json!(10)),
+            ]))
             .await
             .expect("resource inventory should succeed");
         let mismatched_offset_error = tool
-            .execute(&ToolArgs::from([("offset".to_string(), json!(0))]))
+            .execute(&ToolArgs::from([
+                ("scope".to_string(), json!("global")),
+                ("offset".to_string(), json!(0)),
+            ]))
             .await
             .expect_err("a mismatched backend page offset must fail closed");
         assert!(matches!(
@@ -9544,7 +9844,7 @@ mod tests {
             result.metadata,
             json!({
                 "query": Value::Null,
-                "resolved_country_code": "MX",
+                "resolved_country_code": Value::Null,
                 "help_type": Value::Null,
                 "total_count": 11,
                 "returned_count": 1,
@@ -9558,7 +9858,7 @@ mod tests {
         {
             let traces = tool.traces.lock().expect("trace sink should lock");
             assert_eq!(traces.len(), 1);
-            assert_eq!(traces[0].query.as_deref(), Some("curated resources for MX"));
+            assert_eq!(traces[0].query.as_deref(), Some("curated resources"));
             assert_eq!(
                 traces[0].output_summary.as_deref(),
                 Some("Curated Resource lookup returned 1 relevance-ranked results.")
@@ -9571,10 +9871,10 @@ mod tests {
                     "has_more": false,
                     "next_offset": Value::Null,
                     "continuation_query": Value::Null,
-                    "continuation_region": "MX",
+                    "continuation_region": Value::Null,
                     "continuation_help_type": Value::Null,
                     "continuation_language": Value::Null,
-                    "resolved_region": "MX",
+                    "resolved_region": Value::Null,
                     "resource_names": ["Demo Test Resource"],
                 })
             );
@@ -9585,8 +9885,8 @@ mod tests {
             .expect("test backend should record the resource request");
         assert_eq!(token.as_deref(), Some("test-token"));
         assert!(payload.get("help_type").is_none());
-        assert_eq!(payload["jurisdiction"], "Mexico");
-        assert_eq!(payload["limit"], 5);
+        assert_eq!(payload["jurisdiction"], Value::Null);
+        assert_eq!(payload["limit"], 10);
         assert_eq!(payload["offset"], 10);
     }
 
@@ -9694,6 +9994,23 @@ mod tests {
         inconsistent.has_more = false;
         inconsistent.next_offset = None;
         assert!(!resource_page_contract_is_consistent(&inconsistent, 5));
+
+        let non_progressing_empty_page = InternalResourceSearchResponse {
+            resources: Vec::new(),
+            query: Some("legal aid".to_string()),
+            resolved_country_code: Some("MX".to_string()),
+            help_type: Some("legal".to_string()),
+            total_count: 12,
+            returned_count: 0,
+            limit: 5,
+            offset: 5,
+            has_more: true,
+            next_offset: Some(5),
+        };
+        assert!(!resource_page_contract_is_consistent(
+            &non_progressing_empty_page,
+            5
+        ));
     }
 
     #[test]
@@ -9810,6 +10127,11 @@ mod tests {
         }
         assert!(!tool_description.contains("fresh find_resources call"));
         assert!(!contact_tool.args_schema().contains("lookup_mode"));
+        assert!(contact_tool.args_schema().contains("scope"));
+        assert_eq!(
+            contact_tool.native_parameters().unwrap()["properties"]["scope"]["enum"],
+            json!(["jurisdiction", "global"])
+        );
 
         let disabled = build_chat_agent_instruction(
             "PROFILE",
@@ -10493,11 +10815,12 @@ mod tests {
                 let seen_empty = seen_empty.clone();
                 async move {
                     seen_empty.fetch_add(1, Ordering::SeqCst);
-                    Json(json!({"resources":[],"query":"none","resolved_country_code":"MX","help_type":"legal","total_count":0,"returned_count":0,"limit":5,"offset":0,"has_more":false,"next_offset":null})).into_response()
+                    Json(json!({"resources":[],"query":"none","resolved_country_code":"MX","help_type":"legal","total_count":12,"returned_count":0,"limit":5,"offset":12,"has_more":false,"next_offset":null})).into_response()
                 }
             }))).await.expect("empty endpoint should run");
         });
         let traces = Arc::new(Mutex::new(Vec::new()));
+        let empty_traces = traces.clone();
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(FindResourcesTool {
             internal: InternalAgentClient::new(
@@ -10513,12 +10836,31 @@ mod tests {
             .execute_native_tool_calls(&[native_test_call(
                 "call-empty-resources",
                 "find_resources",
-                ToolArgs::from([("help_type".to_string(), json!("legal"))]),
+                ToolArgs::from([
+                    ("help_type".to_string(), json!("legal")),
+                    ("offset".to_string(), json!(12)),
+                ]),
             )])
             .await;
         empty_server.abort();
         assert!(result.executed_tools[0].result.success);
+        assert_eq!(
+            result.executed_tools[0].result.output,
+            "No additional curated resources were returned for this page."
+        );
         assert_eq!(empty_requests.load(Ordering::SeqCst), 1);
+        {
+            let empty_traces = empty_traces.lock().expect("empty resource trace");
+            assert_eq!(
+                empty_traces[0].output_summary.as_deref(),
+                Some("No additional curated resources were returned for this page.")
+            );
+            assert_eq!(empty_traces[0].warnings, ["empty_curated_resources_page"]);
+            assert_eq!(empty_traces[0].metadata["returned_count"], 0);
+            assert_eq!(empty_traces[0].metadata["total_count"], 12);
+            assert_eq!(empty_traces[0].metadata["has_more"], false);
+            assert_eq!(empty_traces[0].metadata["next_offset"], Value::Null);
+        }
 
         let knowledge_requests = Arc::new(AtomicUsize::new(0));
         let seen_knowledge = knowledge_requests.clone();
@@ -10772,10 +11114,6 @@ mod tests {
             step: 0,
             attempt: 1,
         });
-        let reasoning = agent_trace_event_delta(AgentTraceEvent::ProviderReasoning {
-            step: 0,
-            content: "Provider exposed reasoning, not model-synthesized narration.".to_string(),
-        });
         let retry = agent_trace_event_delta(AgentTraceEvent::RetryScheduled {
             step: 0,
             attempt: 1,
@@ -10789,12 +11127,6 @@ mod tests {
 
         assert_eq!(started.kind, "model_step");
         assert_eq!(started.status.as_deref(), Some("running"));
-        assert_eq!(reasoning.kind, "reasoning");
-        assert_eq!(reasoning.metadata["source"], json!("provider"));
-        assert_eq!(
-            reasoning.content.as_deref(),
-            Some("Provider exposed reasoning, not model-synthesized narration.")
-        );
         assert_eq!(retry.kind, "retry");
         assert_eq!(
             retry.content.as_deref(),
@@ -10917,7 +11249,7 @@ mod tests {
     }
 
     #[test]
-    fn final_conversation_trace_accumulates_trace_deltas_without_faking_reasoning() {
+    fn final_conversation_trace_accumulates_content_free_trace_deltas() {
         let mut defaults = HashMap::new();
         defaults.insert(
             "admin_trace_visibility".to_string(),
@@ -10944,10 +11276,6 @@ mod tests {
                 step: 0,
                 attempt: 1,
             }),
-            agent_trace_event_delta(AgentTraceEvent::ProviderReasoning {
-                step: 0,
-                content: "Provider reasoning content.".to_string(),
-            }),
             turn_timing_trace_delta(42),
         ];
 
@@ -10965,7 +11293,7 @@ mod tests {
             trace.reasoning.summary,
             "Sage answered from the conversation context and configured instructions."
         );
-        assert!(trace
+        assert!(!trace
             .trace_deltas
             .iter()
             .any(|delta| delta.kind == "reasoning"));
