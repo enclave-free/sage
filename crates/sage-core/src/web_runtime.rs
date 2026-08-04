@@ -1494,10 +1494,9 @@ fn log_agent_trace_event(
 ) {
     match event {
         AgentTraceEvent::ToolSelectionObservation {
-            round,
+            step,
             attempt,
             enabled_tools,
-            raw_selected_tools,
             selected_tools,
             outcome,
         } => tracing::info!(
@@ -1507,11 +1506,10 @@ fn log_agent_trace_event(
             message_id = %message_id,
             actor_kind = %actor_kind,
             actor_id,
-            phase = "planning",
-            round = *round,
+            phase = "selection",
+            step = *step,
             attempt = *attempt,
             enabled_tools = ?enabled_tools,
-            raw_selected_tools = ?raw_selected_tools,
             selected_tools = ?selected_tools,
             selection_count = selected_tools.len(),
             outcome = outcome.as_str(),
@@ -1519,7 +1517,7 @@ fn log_agent_trace_event(
         AgentTraceEvent::ToolAttempted {
             call_id,
             tool_name,
-            planning_round,
+            tool_round,
             attempt,
         } => tracing::info!(
             target: "sage.tool_selection",
@@ -1531,13 +1529,13 @@ fn log_agent_trace_event(
             phase = "attempted",
             call_id = %call_id,
             tool_name = %tool_name,
-            round = *planning_round,
+            tool_round = *tool_round,
             attempt = *attempt,
         ),
         AgentTraceEvent::ToolTerminal {
             call_id,
             tool_name,
-            planning_round,
+            tool_round,
             attempt,
             status,
             elapsed_ms,
@@ -1551,7 +1549,7 @@ fn log_agent_trace_event(
             phase = "terminal",
             call_id = %call_id,
             tool_name = %tool_name,
-            round = *planning_round,
+            tool_round = *tool_round,
             attempt = *attempt,
             outcome = %status,
             duration_ms = *elapsed_ms as u64,
@@ -1559,7 +1557,7 @@ fn log_agent_trace_event(
         AgentTraceEvent::ToolRetryScheduled {
             call_id,
             tool_name,
-            planning_round,
+            tool_round,
             attempt,
             reason,
         } => tracing::info!(
@@ -1572,14 +1570,14 @@ fn log_agent_trace_event(
             phase = "retry",
             call_id = %call_id,
             tool_name = %tool_name,
-            round = *planning_round,
+            tool_round = *tool_round,
             attempt = *attempt,
             reason = %reason,
         ),
         AgentTraceEvent::ToolTimedOut {
             call_id,
             tool_name,
-            planning_round,
+            tool_round,
             attempt,
             elapsed_ms,
         } => tracing::info!(
@@ -1592,13 +1590,13 @@ fn log_agent_trace_event(
             phase = "timeout",
             call_id = %call_id,
             tool_name = %tool_name,
-            round = *planning_round,
+            tool_round = *tool_round,
             attempt = *attempt,
             duration_ms = *elapsed_ms,
         ),
         AgentTraceEvent::Timing {
             phase,
-            planning_round,
+            step,
             tool_name,
             call_id,
             attempt,
@@ -1612,31 +1610,13 @@ fn log_agent_trace_event(
             actor_kind = %actor_kind,
             actor_id,
             phase = phase.as_str(),
-            round = planning_round.unwrap_or_default(),
+            step = step.unwrap_or_default(),
             attempt = *attempt,
             call_id = call_id.as_deref().unwrap_or(""),
             tool_name = tool_name.as_deref().unwrap_or(""),
             outcome = outcome.as_str(),
             duration_ms = *elapsed_ms as u64,
             provider_wait_proxy = phase.is_provider_wait_proxy(),
-        ),
-        AgentTraceEvent::TimingUnavailable {
-            phase,
-            planning_round,
-            attempt,
-            reason,
-        } => tracing::info!(
-            target: "sage.conversation_timing",
-            event_name = "conversation_phase_timing_unavailable",
-            conversation_id = %conversation_id,
-            message_id = %message_id,
-            actor_kind = %actor_kind,
-            actor_id,
-            phase = phase.as_str(),
-            round = planning_round.unwrap_or_default(),
-            attempt = *attempt,
-            outcome = "unavailable",
-            reason = *reason,
         ),
         _ => {}
     }
@@ -1685,18 +1665,8 @@ fn tool_trace_title(tool_name: &str) -> String {
 
 fn timing_phase_title(phase: ConversationTimingPhase) -> String {
     match phase {
-        ConversationTimingPhase::ToolPlanningModelDuration => "Tool-planning model duration",
-        ConversationTimingPhase::ToolPlanningClusterScheduling => {
-            "Tool-planning cluster scheduling"
-        }
-        ConversationTimingPhase::ToolPlanningInference => "Tool-planning model inference",
-        ConversationTimingPhase::FinalAnswerModelDuration => "Final-answer model duration",
-        ConversationTimingPhase::FinalAnswerResponseHeaderWait => {
-            "Final-answer provider response-header wait"
-        }
-        ConversationTimingPhase::FinalAnswerFirstProviderEventWait => {
-            "Final-answer provider first-event wait"
-        }
+        ConversationTimingPhase::ModelRequest => "Model request",
+        ConversationTimingPhase::ProviderFirstEventWait => "Provider first-event wait",
         ConversationTimingPhase::ToolExecution => "Tool execution",
         ConversationTimingPhase::ResourceDirectoryLookup => "Resource Directory lookup",
         ConversationTimingPhase::Retrieval => "Retrieval",
@@ -1710,7 +1680,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
     match event {
         AgentTraceEvent::Timing {
             phase,
-            planning_round,
+            step,
             tool_name,
             call_id,
             attempt,
@@ -1720,14 +1690,14 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             let title = timing_phase_title(phase);
             let proxy = phase.is_provider_wait_proxy();
             let proxy_suffix = if proxy {
-                " (provider-wait proxy: network, queue, or startup)"
+                " (combined provider wait)"
             } else {
                 ""
             };
             let summary = format!("{}: {} ms{}.", title, elapsed_ms, proxy_suffix);
             let mut metadata = json!({
                 "phase": phase.as_str(),
-                "round": planning_round,
+                "step": step,
                 "attempt": attempt,
                 "call_id": call_id,
                 "outcome": outcome.as_str(),
@@ -1736,8 +1706,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             });
             if proxy {
                 metadata["wait_origin"] = json!("request_start");
-                metadata["proxy_scope"] =
-                    json!("network, provider queue, or model startup may contribute");
+                metadata["proxy_scope"] = json!("transport and provider processing may contribute");
             }
             ConversationTraceDeltaResponse {
                 id: trace_delta_id(
@@ -1745,7 +1714,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                     &format!(
                         "{}-{}-{}-{}",
                         phase.as_str(),
-                        planning_round.unwrap_or_default(),
+                        step.unwrap_or_default(),
                         attempt,
                         call_id.as_deref().unwrap_or("turn")
                     ),
@@ -1759,44 +1728,10 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 created_at: Some(chrono::Utc::now().to_rfc3339()),
             }
         }
-        AgentTraceEvent::TimingUnavailable {
-            phase,
-            planning_round,
-            attempt,
-            reason,
-        } => {
-            let title = timing_phase_title(phase);
-            ConversationTraceDeltaResponse {
-                id: trace_delta_id(
-                    "timing-unavailable",
-                    &format!(
-                        "{}-{}-{}",
-                        phase.as_str(),
-                        planning_round.unwrap_or_default(),
-                        attempt
-                    ),
-                ),
-                kind: "timing".to_string(),
-                title: Some(title.clone()),
-                content: Some(format!("{title}: unavailable from the current provider.")),
-                tool_name: None,
-                status: Some("unavailable".to_string()),
-                metadata: json!({
-                    "phase": phase.as_str(),
-                    "round": planning_round,
-                    "attempt": attempt,
-                    "outcome": "unavailable",
-                    "duration_ms": Value::Null,
-                    "reason": reason,
-                }),
-                created_at: Some(chrono::Utc::now().to_rfc3339()),
-            }
-        }
         AgentTraceEvent::ToolSelectionObservation {
-            round,
+            step,
             attempt,
             enabled_tools,
-            raw_selected_tools,
             selected_tools,
             outcome,
         } => {
@@ -1809,7 +1744,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 "The model selected enabled Tools."
             };
             ConversationTraceDeltaResponse {
-                id: trace_delta_id("tool-selection", &format!("{}-{}", round, attempt)),
+                id: trace_delta_id("tool-selection", &format!("{}-{}", step, attempt)),
                 kind: "tool_selection_observation".to_string(),
                 title: Some("Tool Selection".to_string()),
                 content: Some(summary.to_string()),
@@ -1820,10 +1755,9 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                     "succeeded".to_string()
                 }),
                 metadata: json!({
-                    "round": round,
+                    "step": step,
                     "attempt": attempt,
                     "enabled_tools": enabled_tools,
-                    "raw_selected_tools": raw_selected_tools,
                     "selected_tools": selected_tools,
                     "selection_count": selected_tools.len(),
                     "outcome": outcome,
@@ -1834,7 +1768,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
         AgentTraceEvent::ToolAttempted {
             call_id,
             tool_name,
-            planning_round,
+            tool_round,
             attempt,
         } => ConversationTraceDeltaResponse {
             id: format!("{}-attempted-{}", call_id, attempt),
@@ -1843,13 +1777,13 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             content: Some(format!("{} call attempted.", tool_trace_title(&tool_name))),
             tool_name: Some(tool_name),
             status: Some("running".to_string()),
-            metadata: json!({ "phase": "attempted", "call_id": call_id, "round": planning_round, "attempt": attempt }),
+            metadata: json!({ "phase": "attempted", "call_id": call_id, "tool_round": tool_round, "attempt": attempt }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
         AgentTraceEvent::ToolTerminal {
             call_id,
             tool_name,
-            planning_round,
+            tool_round,
             attempt,
             status,
             elapsed_ms,
@@ -1862,19 +1796,20 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                     "succeeded" => "Tool completed.",
                     "guarded" => "Tool was guarded.",
                     "timed_out" => "Tool timed out.",
+                    "rejected" => "Tool call was rejected.",
                     _ => "Tool failed.",
                 }
                 .to_string(),
             ),
             tool_name: Some(tool_name),
             status: Some(status),
-            metadata: json!({ "phase": "terminal", "call_id": call_id, "round": planning_round, "attempt": attempt, "duration_ms": elapsed_ms }),
+            metadata: json!({ "phase": "terminal", "call_id": call_id, "tool_round": tool_round, "attempt": attempt, "duration_ms": elapsed_ms }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
         AgentTraceEvent::ToolRetryScheduled {
             call_id,
             tool_name,
-            planning_round,
+            tool_round,
             attempt,
             reason,
         } => ConversationTraceDeltaResponse {
@@ -1891,7 +1826,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             metadata: json!({
                 "phase": "retry",
                 "call_id": call_id,
-                "round": planning_round,
+                "tool_round": tool_round,
                 "attempt": attempt,
                 "reason": reason,
             }),
@@ -1900,7 +1835,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
         AgentTraceEvent::ToolTimedOut {
             call_id,
             tool_name,
-            planning_round,
+            tool_round,
             attempt,
             elapsed_ms,
         } => ConversationTraceDeltaResponse {
@@ -1913,7 +1848,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             metadata: json!({
                 "phase": "timeout",
                 "call_id": call_id,
-                "round": planning_round,
+                "tool_round": tool_round,
                 "attempt": attempt,
                 "duration_ms": elapsed_ms,
             }),
@@ -6958,26 +6893,53 @@ async fn run_native_turn_with_provider(
             error: AppError::internal(format!("invalid native Tool contract: {error:#}")),
             progressed: false,
         })?;
+    let enabled_tools = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
     let mut messages = vec![
         NativeChatMessage::system(prompt.system),
         NativeChatMessage::user(prompt.user),
     ];
-    let (first_turn, mut first_answer_state) = request_native_turn_with_protocol_retry(
-        provider,
-        NativeTurnRequest {
-            model: model.to_string(),
-            messages: messages.clone(),
-            tools,
-            max_tokens: PLAIN_ANSWER_MAX_TOKENS,
+    let (first_turn, mut first_answer_state, selection_attempt) =
+        request_native_turn_with_protocol_retry(
+            agent,
+            provider,
+            NativeTurnRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                tools,
+                max_tokens: PLAIN_ANSWER_MAX_TOKENS,
+            },
+            0,
+            &delta_sender,
+        )
+        .await
+        .map_err(|(error, emitted_any)| AdapterTurnFailure {
+            error: model_provider_error(error),
+            progressed: emitted_any,
+        })?;
+    let selected_tools = first_turn
+        .tool_calls
+        .iter()
+        .map(|call| {
+            enabled_tools
+                .contains(&call.name)
+                .then(|| call.name.clone())
+                .unwrap_or_else(|| "unrecognized_tool".to_string())
+        })
+        .collect::<Vec<_>>();
+    agent.emit_trace_event(AgentTraceEvent::ToolSelectionObservation {
+        step: 0,
+        attempt: selection_attempt,
+        enabled_tools,
+        selected_tools: selected_tools.clone(),
+        outcome: if selected_tools.is_empty() {
+            "none".to_string()
+        } else {
+            "selected".to_string()
         },
-        0,
-        &delta_sender,
-    )
-    .await
-    .map_err(|(error, emitted_any)| AdapterTurnFailure {
-        error: model_provider_error(error),
-        progressed: emitted_any,
-    })?;
+    });
 
     let (answer, executed_tools) = match first_turn.finish_reason {
         NativeFinishReason::Stop => {
@@ -7018,7 +6980,8 @@ async fn run_native_turn_with_provider(
                     native_tool_result_content(&executed.result),
                 ));
             }
-            let (final_turn, _final_answer_state) = request_native_turn_with_protocol_retry(
+            let (final_turn, _final_answer_state, _) = request_native_turn_with_protocol_retry(
+                agent,
                 provider,
                 NativeTurnRequest {
                     model: model.to_string(),
@@ -7044,36 +7007,43 @@ async fn run_native_turn_with_provider(
 }
 
 async fn request_native_turn_with_protocol_retry(
+    agent: &SageAgent,
     provider: &OpenAiNativeClient,
     request: NativeTurnRequest,
     step: usize,
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-) -> std::result::Result<(NativeAssistantTurn, NativeAnswerStreamState), (NativeProviderError, bool)>
-{
+) -> std::result::Result<
+    (NativeAssistantTurn, NativeAnswerStreamState, u32),
+    (NativeProviderError, bool),
+> {
     let mut answer_state = NativeAnswerStreamState::default();
     match stream_native_turn_attempt(
+        agent,
         provider,
         request.clone(),
         step,
         &mut answer_state,
         delta_sender,
+        1,
     )
     .await
     {
-        Ok(turn) => Ok((turn, answer_state)),
+        Ok(turn) => Ok((turn, answer_state, 1)),
         Err(error) if error.is_protocol() && !answer_state.emitted_any => {
             warn!("Native provider returned an unusable response; retrying the same request once");
             let mut retry_state = NativeAnswerStreamState::default();
             match stream_native_turn_attempt(
+                agent,
                 provider,
                 request,
                 step,
                 &mut retry_state,
                 delta_sender,
+                2,
             )
             .await
             {
-                Ok(turn) => Ok((turn, retry_state)),
+                Ok(turn) => Ok((turn, retry_state, 2)),
                 Err(error) => Err((error, retry_state.emitted_any)),
             }
         }
@@ -7082,21 +7052,37 @@ async fn request_native_turn_with_protocol_retry(
 }
 
 async fn stream_native_turn_attempt(
+    agent: &SageAgent,
     provider: &OpenAiNativeClient,
     request: NativeTurnRequest,
     step: usize,
     answer_state: &mut NativeAnswerStreamState,
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    attempt: u32,
 ) -> std::result::Result<NativeAssistantTurn, NativeProviderError> {
     let tools_enabled = !request.tools.is_empty();
+    let request_started_at = Instant::now();
+    let mut first_provider_event_seen = false;
     let (native_sender, mut native_receiver) = mpsc::unbounded_channel();
     let provider_turn = provider.stream_turn(request, Some(native_sender));
     tokio::pin!(provider_turn);
 
-    let turn = loop {
+    let turn_result = loop {
         tokio::select! {
             result = &mut provider_turn => {
                 while let Ok(signal) = native_receiver.try_recv() {
+                    if !first_provider_event_seen {
+                        first_provider_event_seen = true;
+                        agent.emit_trace_event(AgentTraceEvent::Timing {
+                            phase: ConversationTimingPhase::ProviderFirstEventWait,
+                            step: Some(step),
+                            tool_name: None,
+                            call_id: None,
+                            attempt,
+                            outcome: ConversationTimingOutcome::Succeeded,
+                            elapsed_ms: request_started_at.elapsed().as_millis(),
+                        });
+                    }
                     stage_native_provider_signal(
                         signal,
                         step,
@@ -7105,9 +7091,21 @@ async fn stream_native_turn_attempt(
                         delta_sender,
                     )?;
                 }
-                break result?;
+                break result;
             }
             Some(signal) = native_receiver.recv() => {
+                if !first_provider_event_seen {
+                    first_provider_event_seen = true;
+                    agent.emit_trace_event(AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::ProviderFirstEventWait,
+                        step: Some(step),
+                        tool_name: None,
+                        call_id: None,
+                        attempt,
+                        outcome: ConversationTimingOutcome::Succeeded,
+                        elapsed_ms: request_started_at.elapsed().as_millis(),
+                    });
+                }
                 stage_native_provider_signal(
                     signal,
                     step,
@@ -7118,6 +7116,20 @@ async fn stream_native_turn_attempt(
             }
         }
     };
+    agent.emit_trace_event(AgentTraceEvent::Timing {
+        phase: ConversationTimingPhase::ModelRequest,
+        step: Some(step),
+        tool_name: None,
+        call_id: None,
+        attempt,
+        outcome: if turn_result.is_ok() {
+            ConversationTimingOutcome::Succeeded
+        } else {
+            ConversationTimingOutcome::Failed
+        },
+        elapsed_ms: request_started_at.elapsed().as_millis(),
+    });
+    let turn = turn_result?;
     if !tools_enabled && turn.finish_reason == NativeFinishReason::ToolCalls {
         return Err(NativeProviderError::Protocol(
             "provider returned Tool calls when no Tools were supplied".to_string(),
@@ -7288,7 +7300,7 @@ async fn run_conversation_tool_loop(
                 let elapsed_ms = turn_started_at.elapsed().as_millis();
                 agent.emit_trace_event(AgentTraceEvent::Timing {
                     phase: ConversationTimingPhase::TotalTurn,
-                    planning_round: None,
+                    step: None,
                     tool_name: None,
                     call_id: None,
                     attempt: 1,
@@ -7301,7 +7313,7 @@ async fn run_conversation_tool_loop(
     let elapsed_ms = turn_started_at.elapsed().as_millis();
     agent.emit_trace_event(AgentTraceEvent::Timing {
         phase: ConversationTimingPhase::TotalTurn,
-        planning_round: None,
+        step: None,
         tool_name: None,
         call_id: None,
         attempt: 1,
@@ -8033,7 +8045,7 @@ mod tests {
     fn structured_trace_events_correlate_turns_without_collapsing_same_conversation() {
         let event = AgentTraceEvent::Timing {
             phase: ConversationTimingPhase::TotalTurn,
-            planning_round: None,
+            step: None,
             tool_name: None,
             call_id: None,
             attempt: 1,
@@ -8053,8 +8065,8 @@ mod tests {
     #[test]
     fn latency_phase_timing_is_named_and_content_free() {
         let delta = agent_trace_event_delta(AgentTraceEvent::Timing {
-            phase: ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
-            planning_round: Some(2),
+            phase: ConversationTimingPhase::ProviderFirstEventWait,
+            step: Some(1),
             tool_name: None,
             call_id: None,
             attempt: 1,
@@ -8062,21 +8074,15 @@ mod tests {
             elapsed_ms: 37,
         });
         assert_eq!(delta.kind, "timing");
-        assert_eq!(
-            delta.title.as_deref(),
-            Some("Final-answer provider first-event wait")
-        );
-        assert_eq!(
-            delta.metadata["phase"],
-            json!("final_answer_first_provider_event_wait")
-        );
+        assert_eq!(delta.title.as_deref(), Some("Provider first-event wait"));
+        assert_eq!(delta.metadata["phase"], json!("provider_first_event_wait"));
         assert_eq!(delta.metadata["duration_ms"], json!(37));
         let delta_json = serde_json::to_string(&delta).unwrap();
         assert!(!delta_json.contains("contact@example"));
 
         let log = capture_structured_log(AgentTraceEvent::Timing {
             phase: ConversationTimingPhase::ResourceDirectoryLookup,
-            planning_round: Some(2),
+            step: None,
             tool_name: Some("find_resources".to_string()),
             call_id: Some("call-1".to_string()),
             attempt: 1,
@@ -8098,32 +8104,17 @@ mod tests {
             assert!(!serialized.contains(forbidden));
         }
 
-        let unavailable = agent_trace_event_delta(AgentTraceEvent::TimingUnavailable {
-            phase: ConversationTimingPhase::ToolPlanningClusterScheduling,
-            planning_round: Some(1),
-            attempt: 2,
-            reason: "provider_contract_does_not_expose_phase_timing",
-        });
-        assert_eq!(unavailable.status.as_deref(), Some("unavailable"));
-        assert_eq!(
-            unavailable.metadata["phase"],
-            json!("tool_planning_cluster_scheduling")
-        );
-        assert_eq!(unavailable.metadata["duration_ms"], Value::Null);
-        assert_eq!(
-            unavailable.metadata["reason"],
-            json!("provider_contract_does_not_expose_phase_timing")
-        );
-        assert!(!serde_json::to_string(&unavailable)
-            .unwrap()
-            .contains("contact@example"));
+        for unsupported in ["cluster_scheduling", "inference_only", "tool_planning"] {
+            assert!(!delta_json.contains(unsupported));
+            assert!(!serialized.contains(unsupported));
+        }
     }
 
     #[test]
     fn timing_activity_rows_have_human_labels_and_duration_only() {
         let delta = agent_trace_event_delta(AgentTraceEvent::Timing {
             phase: ConversationTimingPhase::RetryDelay,
-            planning_round: Some(2),
+            step: None,
             tool_name: Some("find_resources".to_string()),
             call_id: Some("call-1".to_string()),
             attempt: 1,
@@ -8141,7 +8132,7 @@ mod tests {
     fn guarded_timing_outcome_remains_guarded_in_transport_delta() {
         let delta = agent_trace_event_delta(AgentTraceEvent::Timing {
             phase: ConversationTimingPhase::ToolExecution,
-            planning_round: Some(1),
+            step: None,
             tool_name: Some("db_query".to_string()),
             call_id: Some("call-guarded".to_string()),
             attempt: 1,
@@ -8153,10 +8144,10 @@ mod tests {
     }
 
     #[test]
-    fn timing_deltas_keep_planning_rounds_distinct_and_logs_allowlist_metadata() {
+    fn timing_deltas_keep_model_steps_distinct_and_logs_allowlist_metadata() {
         let first = agent_trace_event_delta(AgentTraceEvent::Timing {
-            phase: ConversationTimingPhase::ToolPlanningModelDuration,
-            planning_round: Some(1),
+            phase: ConversationTimingPhase::ModelRequest,
+            step: Some(0),
             tool_name: None,
             call_id: None,
             attempt: 1,
@@ -8164,8 +8155,8 @@ mod tests {
             elapsed_ms: 4,
         });
         let second = agent_trace_event_delta(AgentTraceEvent::Timing {
-            phase: ConversationTimingPhase::ToolPlanningModelDuration,
-            planning_round: Some(2),
+            phase: ConversationTimingPhase::ModelRequest,
+            step: Some(1),
             tool_name: None,
             call_id: None,
             attempt: 1,
@@ -8173,12 +8164,12 @@ mod tests {
             elapsed_ms: 7,
         });
         assert_ne!(first.id, second.id);
-        assert!(first.id.contains("tool-planning-model-duration-1-1-turn"));
-        assert!(second.id.contains("tool-planning-model-duration-2-1-turn"));
+        assert!(first.id.contains("model-request-0-1-turn"));
+        assert!(second.id.contains("model-request-1-1-turn"));
 
         let log = capture_structured_log(AgentTraceEvent::Timing {
-            phase: ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
-            planning_round: Some(3),
+            phase: ConversationTimingPhase::ProviderFirstEventWait,
+            step: Some(1),
             tool_name: None,
             call_id: None,
             attempt: 2,
@@ -8203,7 +8194,7 @@ mod tests {
                 "actor_kind",
                 "actor_id",
                 "phase",
-                "round",
+                "step",
                 "attempt",
                 "call_id",
                 "tool_name",
@@ -8375,30 +8366,29 @@ mod tests {
         let message_id = "msg_transport-order";
         let session_id = Some("44444444-4444-4444-4444-444444444444".to_string());
         let selection = AgentTraceEvent::ToolSelectionObservation {
-            round: 1,
+            step: 0,
             attempt: 1,
             enabled_tools: vec!["find_resources".to_string()],
-            raw_selected_tools: vec!["find_resources".to_string()],
             selected_tools: vec!["find_resources".to_string()],
-            outcome: "planned".to_string(),
+            outcome: "selected".to_string(),
         };
         let attempted = AgentTraceEvent::ToolAttempted {
             call_id: "call-transport".to_string(),
             tool_name: "find_resources".to_string(),
-            planning_round: 1,
+            tool_round: 1,
             attempt: 1,
         };
         let retry = AgentTraceEvent::ToolRetryScheduled {
             call_id: "call-transport".to_string(),
             tool_name: "find_resources".to_string(),
-            planning_round: 1,
+            tool_round: 1,
             attempt: 1,
             reason: "connection_failure".to_string(),
         };
         let terminal = AgentTraceEvent::ToolTerminal {
             call_id: "call-transport".to_string(),
             tool_name: "find_resources".to_string(),
-            planning_round: 1,
+            tool_round: 1,
             attempt: 2,
             status: "succeeded".to_string(),
             elapsed_ms: 12,
@@ -8409,17 +8399,8 @@ mod tests {
             retry,
             terminal,
             AgentTraceEvent::Timing {
-                phase: ConversationTimingPhase::FinalAnswerResponseHeaderWait,
-                planning_round: Some(2),
-                tool_name: None,
-                call_id: None,
-                attempt: 1,
-                outcome: ConversationTimingOutcome::Succeeded,
-                elapsed_ms: 4,
-            },
-            AgentTraceEvent::Timing {
-                phase: ConversationTimingPhase::FinalAnswerFirstProviderEventWait,
-                planning_round: Some(2),
+                phase: ConversationTimingPhase::ProviderFirstEventWait,
+                step: Some(1),
                 tool_name: None,
                 call_id: None,
                 attempt: 1,
@@ -8453,8 +8434,8 @@ mod tests {
             &mut answer_state,
             ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
                 AgentTraceEvent::Timing {
-                    phase: ConversationTimingPhase::FinalAnswerModelDuration,
-                    planning_round: Some(2),
+                    phase: ConversationTimingPhase::ModelRequest,
+                    step: Some(1),
                     tool_name: None,
                     call_id: None,
                     attempt: 1,
@@ -8473,7 +8454,7 @@ mod tests {
             ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
                 AgentTraceEvent::Timing {
                     phase: ConversationTimingPhase::TotalTurn,
-                    planning_round: None,
+                    step: None,
                     tool_name: None,
                     call_id: None,
                     attempt: 1,
@@ -8541,9 +8522,11 @@ mod tests {
             .iter()
             .position(|emission| {
                 emission.event == "trace_delta"
-                    && emission.payload.trace_delta.as_ref().is_some_and(|delta| {
-                        delta.metadata["phase"] == json!("final_answer_model_duration")
-                    })
+                    && emission
+                        .payload
+                        .trace_delta
+                        .as_ref()
+                        .is_some_and(|delta| delta.metadata["phase"] == json!("model_request"))
             })
             .unwrap();
         let timing_position = |phase: &str| {
@@ -8559,8 +8542,7 @@ mod tests {
                 })
                 .expect("timing phase should be transported")
         };
-        assert!(timing_position("final_answer_response_header_wait") < answer_index);
-        assert!(timing_position("final_answer_first_provider_event_wait") < answer_index);
+        assert!(timing_position("provider_first_event_wait") < answer_index);
         assert!(answer_index < late_final_timing_index);
         assert!(answer_index < timing_position("total_turn"));
         assert_eq!(
@@ -8586,8 +8568,8 @@ mod tests {
             &mut state,
             ConversationStreamSignal::Trace(Box::new(agent_trace_event_delta(
                 AgentTraceEvent::Timing {
-                    phase: ConversationTimingPhase::FinalAnswerModelDuration,
-                    planning_round: Some(1),
+                    phase: ConversationTimingPhase::ModelRequest,
+                    step: Some(1),
                     tool_name: None,
                     call_id: None,
                     attempt: 1,
@@ -8610,7 +8592,7 @@ mod tests {
         );
         assert_eq!(
             emissions[1].payload.activity_step.as_ref().unwrap().title,
-            "Final-answer model duration"
+            "Model request"
         );
     }
 
@@ -8669,6 +8651,11 @@ mod tests {
             0.1,
         );
         let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let trace_events = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink.lock().expect("native trace sink").push(event);
+        }));
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
         let turn_task = tokio::spawn(async move {
@@ -8703,6 +8690,30 @@ mod tests {
             deltas.push(answer_signal(signal));
         }
         assert_eq!(deltas.concat(), turn.answer);
+        let trace_events = trace_events.lock().expect("native trace events");
+        assert!(trace_events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolSelectionObservation {
+                step: 0,
+                enabled_tools,
+                selected_tools,
+                outcome,
+                ..
+            } if enabled_tools.is_empty() && selected_tools.is_empty() && outcome == "none"
+        )));
+        for phase in [
+            ConversationTimingPhase::ProviderFirstEventWait,
+            ConversationTimingPhase::ModelRequest,
+        ] {
+            assert!(trace_events.iter().any(|event| matches!(
+                event,
+                AgentTraceEvent::Timing {
+                    phase: observed,
+                    step: Some(0),
+                    ..
+                } if observed == &phase
+            )));
+        }
     }
 
     #[test]
@@ -8867,6 +8878,11 @@ mod tests {
             executions: executions.clone(),
         }));
         let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let trace_events = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink.lock().expect("native trace sink").push(event);
+        }));
         let provider = OpenAiNativeClient::new(
             Client::new(),
             format!("http://{address}/v1"),
@@ -8905,6 +8921,54 @@ mod tests {
         assert_eq!(requests[1]["messages"][2]["tool_calls"][0]["id"], "call-a");
         assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-a");
         assert_eq!(requests[1]["messages"][4]["tool_call_id"], "call-b");
+        let trace_events = trace_events.lock().expect("native trace events");
+        assert!(trace_events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolSelectionObservation {
+                step: 0,
+                enabled_tools,
+                selected_tools,
+                ..
+            } if enabled_tools == &["knowledge_search"]
+                && selected_tools == &["knowledge_search", "knowledge_search"]
+        )));
+        for call_id in ["call-a", "call-b"] {
+            assert!(trace_events.iter().any(|event| matches!(
+                event,
+                AgentTraceEvent::ToolAttempted { call_id: observed, .. } if observed == call_id
+            )));
+            assert!(trace_events.iter().any(|event| matches!(
+                event,
+                AgentTraceEvent::ToolTerminal { call_id: observed, status, .. }
+                    if observed == call_id && status == "succeeded"
+            )));
+        }
+        assert_eq!(
+            trace_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::ModelRequest,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            trace_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::ProviderFirstEventWait,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -9931,20 +9995,20 @@ mod tests {
                 AgentTraceEvent::ToolAttempted {
                     call_id,
                     tool_name,
-                    planning_round,
+                    tool_round,
                     attempt,
                 } => Some((
                     "attempted",
                     call_id.clone(),
                     tool_name.clone(),
-                    *planning_round,
+                    *tool_round,
                     *attempt,
                     None,
                 )),
                 AgentTraceEvent::ToolTerminal {
                     call_id,
                     tool_name,
-                    planning_round,
+                    tool_round,
                     attempt,
                     status,
                     ..
@@ -9952,7 +10016,7 @@ mod tests {
                     "terminal",
                     call_id.clone(),
                     tool_name.clone(),
-                    *planning_round,
+                    *tool_round,
                     *attempt,
                     Some(status.clone()),
                 )),
@@ -10517,23 +10581,22 @@ mod tests {
     fn emitted_tool_logs_have_exact_native_structured_keys() {
         let events = [
             AgentTraceEvent::ToolSelectionObservation {
-                round: 2,
+                step: 0,
                 attempt: 2,
                 enabled_tools: vec!["find_resources".to_string()],
-                raw_selected_tools: vec!["find_resources".to_string()],
                 selected_tools: vec!["find_resources".to_string()],
-                outcome: "planned".to_string(),
+                outcome: "selected".to_string(),
             },
             AgentTraceEvent::ToolAttempted {
                 call_id: "call-1".to_string(),
                 tool_name: "find_resources".to_string(),
-                planning_round: 2,
+                tool_round: 1,
                 attempt: 1,
             },
             AgentTraceEvent::ToolTerminal {
                 call_id: "call-1".to_string(),
                 tool_name: "find_resources".to_string(),
-                planning_round: 2,
+                tool_round: 1,
                 attempt: 1,
                 status: "failed".to_string(),
                 elapsed_ms: 9,
@@ -10550,10 +10613,9 @@ mod tests {
                 "actor_kind",
                 "actor_id",
                 "phase",
-                "round",
+                "step",
                 "attempt",
                 "enabled_tools",
-                "raw_selected_tools",
                 "selected_tools",
                 "selection_count",
                 "outcome",
@@ -10570,7 +10632,7 @@ mod tests {
                 "phase",
                 "call_id",
                 "tool_name",
-                "round",
+                "tool_round",
                 "attempt",
             ],
             &[
@@ -10585,7 +10647,7 @@ mod tests {
                 "phase",
                 "call_id",
                 "tool_name",
-                "round",
+                "tool_round",
                 "attempt",
                 "outcome",
                 "duration_ms",
@@ -10627,7 +10689,7 @@ mod tests {
                 AgentTraceEvent::ToolRetryScheduled {
                     call_id: "call-1".to_string(),
                     tool_name: "find_resources".to_string(),
-                    planning_round: 2,
+                    tool_round: 1,
                     attempt: 1,
                     reason: "http_503".to_string(),
                 },
@@ -10643,7 +10705,7 @@ mod tests {
                     "phase",
                     "call_id",
                     "tool_name",
-                    "round",
+                    "tool_round",
                     "attempt",
                     "reason",
                 ],
@@ -10652,7 +10714,7 @@ mod tests {
                 AgentTraceEvent::ToolTimedOut {
                     call_id: "call-1".to_string(),
                     tool_name: "find_resources".to_string(),
-                    planning_round: 2,
+                    tool_round: 1,
                     attempt: 1,
                     elapsed_ms: 5000,
                 },
@@ -10668,7 +10730,7 @@ mod tests {
                     "phase",
                     "call_id",
                     "tool_name",
-                    "round",
+                    "tool_round",
                     "attempt",
                     "duration_ms",
                 ],
@@ -10744,74 +10806,57 @@ mod tests {
         assert_eq!(timing.metadata["duration_ms"], json!(1234));
 
         let selection = agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
-            round: 2,
+            step: 0,
             attempt: 1,
             enabled_tools: vec!["find_resources".to_string(), "knowledge_search".to_string()],
-            raw_selected_tools: vec!["find_resources".to_string()],
             selected_tools: Vec::new(),
-            outcome: "failed".to_string(),
+            outcome: "none".to_string(),
         });
         assert_eq!(selection.kind, "tool_selection_observation");
-        assert_eq!(selection.status.as_deref(), Some("failed"));
+        assert_eq!(selection.status.as_deref(), Some("succeeded"));
         assert_eq!(selection.metadata["selection_count"], json!(0));
         assert_eq!(
-            selection.metadata["raw_selected_tools"],
-            json!(["find_resources"])
-        );
-        let extra_lookup = agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
-            round: 3,
-            attempt: 1,
-            enabled_tools: vec!["find_resources".to_string()],
-            raw_selected_tools: vec!["find_resources".to_string()],
-            selected_tools: vec!["find_resources".to_string()],
-            outcome: "rejected".to_string(),
-        });
-        assert_eq!(
-            extra_lookup.content.as_deref(),
-            Some("The model's Tool selection was rejected.")
-        );
-        assert_eq!(
             selection.content.as_deref(),
-            Some("The model's Tool selection was rejected.")
+            Some("No Tools were selected.")
         );
+        assert!(selection.metadata.get("raw_selected_tools").is_none());
         assert!(!serde_json::to_string(&selection).unwrap().contains("email"));
 
         let retried_selection =
             agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
-                round: 2,
+                step: 0,
                 attempt: 2,
                 enabled_tools: vec!["find_resources".to_string()],
-                raw_selected_tools: vec!["find_resources".to_string()],
                 selected_tools: vec!["find_resources".to_string()],
-                outcome: "planned".to_string(),
+                outcome: "selected".to_string(),
             });
         assert_ne!(selection.id, retried_selection.id);
-        assert_eq!(retried_selection.metadata["round"], json!(2));
+        assert_eq!(retried_selection.metadata["step"], json!(0));
         assert_eq!(retried_selection.metadata["attempt"], json!(2));
 
         let attempted = agent_trace_event_delta(AgentTraceEvent::ToolAttempted {
             call_id: "call-1".to_string(),
             tool_name: "unknown_tool".to_string(),
-            planning_round: 1,
+            tool_round: 1,
             attempt: 1,
         });
         let terminal = agent_trace_event_delta(AgentTraceEvent::ToolTerminal {
             call_id: "call-1".to_string(),
             tool_name: "unknown_tool".to_string(),
-            planning_round: 1,
+            tool_round: 1,
             attempt: 1,
-            status: "failed".to_string(),
+            status: "rejected".to_string(),
             elapsed_ms: 3,
         });
         assert_eq!(attempted.kind, "tool_call");
         assert_eq!(attempted.metadata["phase"], json!("attempted"));
         assert_eq!(terminal.kind, "tool_result");
-        assert_eq!(terminal.status.as_deref(), Some("failed"));
+        assert_eq!(terminal.status.as_deref(), Some("rejected"));
 
         let retry = agent_trace_event_delta(AgentTraceEvent::ToolRetryScheduled {
             call_id: "call-1".to_string(),
             tool_name: "find_resources".to_string(),
-            planning_round: 1,
+            tool_round: 1,
             attempt: 1,
             reason: "http_503".to_string(),
         });
@@ -10821,7 +10866,7 @@ mod tests {
         let timeout = agent_trace_event_delta(AgentTraceEvent::ToolTimedOut {
             call_id: "call-1".to_string(),
             tool_name: "find_resources".to_string(),
-            planning_round: 1,
+            tool_round: 1,
             attempt: 2,
             elapsed_ms: 5000,
         });
@@ -10833,12 +10878,11 @@ mod tests {
     #[test]
     fn selection_observation_activity_is_accessible_and_content_free() {
         let delta = agent_trace_event_delta(AgentTraceEvent::ToolSelectionObservation {
-            round: 1,
+            step: 0,
             attempt: 1,
             enabled_tools: vec!["find_resources".to_string()],
-            raw_selected_tools: vec!["find_resources".to_string()],
             selected_tools: vec!["find_resources".to_string()],
-            outcome: "planned".to_string(),
+            outcome: "selected".to_string(),
         });
         let activity = conversation_activity_steps_from_trace_deltas(&[delta]);
         assert_eq!(activity.len(), 1);
@@ -10853,14 +10897,14 @@ mod tests {
             agent_trace_event_delta(AgentTraceEvent::ToolRetryScheduled {
                 call_id: "call-1".to_string(),
                 tool_name: "find_resources".to_string(),
-                planning_round: 1,
+                tool_round: 1,
                 attempt: 1,
                 reason: "http_503".to_string(),
             }),
             agent_trace_event_delta(AgentTraceEvent::ToolTimedOut {
                 call_id: "call-1".to_string(),
                 tool_name: "find_resources".to_string(),
-                planning_round: 1,
+                tool_round: 1,
                 attempt: 2,
                 elapsed_ms: 5000,
             }),
@@ -11535,7 +11579,7 @@ mod tests {
             AgentTraceEvent::Timing {
                 phase: ConversationTimingPhase::ToolExecution,
                 outcome: ConversationTimingOutcome::Guarded,
-                planning_round: Some(1),
+                step: None,
                 ..
             }
         )));
@@ -11555,7 +11599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_emits_correlated_failed_timing_in_batch_and_stream() {
+    async fn unknown_tool_emits_correlated_rejected_timing_in_batch_and_stream() {
         let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "test");
         let batch_events = Arc::new(Mutex::new(Vec::new()));
         let batch_sink = batch_events.clone();
@@ -11580,8 +11624,8 @@ mod tests {
             .find_map(|event| match event {
                 AgentTraceEvent::Timing {
                     phase: ConversationTimingPhase::ToolExecution,
-                    outcome: ConversationTimingOutcome::Failed,
-                    planning_round: Some(1),
+                    outcome: ConversationTimingOutcome::Rejected,
+                    step: None,
                     tool_name: Some(tool_name),
                     call_id: Some(call_id),
                     attempt: 1,
@@ -11589,7 +11633,7 @@ mod tests {
                 } => Some((tool_name.clone(), call_id.clone())),
                 _ => None,
             })
-            .expect("unknown Tool should emit failed execution timing");
+            .expect("unknown Tool should emit rejected execution timing");
         assert!(batch.iter().any(|event| matches!(
             event,
             AgentTraceEvent::ToolTerminal {
@@ -11598,7 +11642,7 @@ mod tests {
                 status,
                 attempt: 1,
                 ..
-            } if tool_name == &timing.0 && call_id == &timing.1 && status == "failed"
+            } if tool_name == &timing.0 && call_id == &timing.1 && status == "rejected"
         )));
         let mut streamed = Vec::new();
         while let Ok(signal) = stream_receiver.try_recv() {
@@ -11608,10 +11652,40 @@ mod tests {
         }
         assert!(streamed.iter().any(|delta| {
             delta.kind == "timing"
-                && delta.status.as_deref() == Some("failed")
+                && delta.status.as_deref() == Some("rejected")
                 && delta.metadata["phase"] == json!("tool_execution")
                 && delta.metadata["call_id"] == json!(timing.1)
         }));
+    }
+
+    #[tokio::test]
+    async fn malformed_native_arguments_emit_attempted_and_rejected_terminal_evidence() {
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "test");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            sink.lock().expect("event sink").push(event);
+        }));
+
+        let result = agent
+            .execute_native_tool_calls(&[crate::openai_native::NativeToolCall {
+                id: "call-malformed".to_string(),
+                name: "knowledge_search".to_string(),
+                arguments: json!("not-an-object"),
+            }])
+            .await;
+
+        assert!(!result.executed_tools[0].result.success);
+        let events = events.lock().expect("captured events");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolAttempted { call_id, .. } if call_id == "call-malformed"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ToolTerminal { call_id, status, .. }
+                if call_id == "call-malformed" && status == "rejected"
+        )));
     }
 
     #[tokio::test]

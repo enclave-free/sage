@@ -687,7 +687,7 @@ impl ToolRegistry {
     }
 
     /// Return enabled Tool names in stable registry order for content-free
-    /// planning observations. No Tool arguments or output are included.
+    /// selection observations. No Tool arguments or output are included.
     pub fn names(&self) -> Vec<String> {
         self.tools
             .keys()
@@ -915,23 +915,22 @@ pub struct StepResult {
 #[derive(Clone, Debug)]
 pub enum AgentTraceEvent {
     ToolSelectionObservation {
-        round: usize,
+        step: usize,
         attempt: u32,
         enabled_tools: Vec<String>,
-        raw_selected_tools: Vec<String>,
         selected_tools: Vec<String>,
         outcome: String,
     },
     ToolAttempted {
         call_id: String,
         tool_name: String,
-        planning_round: usize,
+        tool_round: usize,
         attempt: u32,
     },
     ToolTerminal {
         call_id: String,
         tool_name: String,
-        planning_round: usize,
+        tool_round: usize,
         attempt: u32,
         status: String,
         elapsed_ms: u128,
@@ -939,14 +938,14 @@ pub enum AgentTraceEvent {
     ToolRetryScheduled {
         call_id: String,
         tool_name: String,
-        planning_round: usize,
+        tool_round: usize,
         attempt: u32,
         reason: String,
     },
     ToolTimedOut {
         call_id: String,
         tool_name: String,
-        planning_round: usize,
+        tool_round: usize,
         attempt: u32,
         elapsed_ms: u128,
     },
@@ -993,30 +992,20 @@ pub enum AgentTraceEvent {
     /// product-visible phase; provider wait phases are explicitly proxies.
     Timing {
         phase: ConversationTimingPhase,
-        planning_round: Option<usize>,
+        step: Option<usize>,
         tool_name: Option<String>,
         call_id: Option<String>,
         attempt: u32,
         outcome: ConversationTimingOutcome,
         elapsed_ms: u128,
     },
-    TimingUnavailable {
-        phase: ConversationTimingPhase,
-        planning_round: Option<usize>,
-        attempt: u32,
-        reason: &'static str,
-    },
 }
 
 pub type AgentTraceHook = Arc<dyn Fn(AgentTraceEvent) + Send + Sync>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConversationTimingPhase {
-    ToolPlanningModelDuration,
-    ToolPlanningClusterScheduling,
-    ToolPlanningInference,
-    FinalAnswerModelDuration,
-    FinalAnswerResponseHeaderWait,
-    FinalAnswerFirstProviderEventWait,
+    ModelRequest,
+    ProviderFirstEventWait,
     ToolExecution,
     ResourceDirectoryLookup,
     Retrieval,
@@ -1028,6 +1017,7 @@ pub enum ConversationTimingPhase {
 pub enum ConversationTimingOutcome {
     Succeeded,
     Failed,
+    Rejected,
     TimedOut,
     Guarded,
 }
@@ -1037,6 +1027,7 @@ impl ConversationTimingOutcome {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Rejected => "rejected",
             Self::TimedOut => "timed_out",
             Self::Guarded => "guarded",
         }
@@ -1046,12 +1037,8 @@ impl ConversationTimingOutcome {
 impl ConversationTimingPhase {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ToolPlanningModelDuration => "tool_planning_model_duration",
-            Self::ToolPlanningClusterScheduling => "tool_planning_cluster_scheduling",
-            Self::ToolPlanningInference => "tool_planning_inference",
-            Self::FinalAnswerModelDuration => "final_answer_model_duration",
-            Self::FinalAnswerResponseHeaderWait => "final_answer_response_header_wait",
-            Self::FinalAnswerFirstProviderEventWait => "final_answer_first_provider_event_wait",
+            Self::ModelRequest => "model_request",
+            Self::ProviderFirstEventWait => "provider_first_event_wait",
             Self::ToolExecution => "tool_execution",
             Self::ResourceDirectoryLookup => "resource_directory_lookup",
             Self::Retrieval => "retrieval",
@@ -1061,10 +1048,7 @@ impl ConversationTimingPhase {
     }
 
     pub fn is_provider_wait_proxy(self) -> bool {
-        matches!(
-            self,
-            Self::FinalAnswerResponseHeaderWait | Self::FinalAnswerFirstProviderEventWait
-        )
+        matches!(self, Self::ProviderFirstEventWait)
     }
 }
 
@@ -1536,7 +1520,35 @@ impl SageAgent {
                         name: call.name.clone(),
                         args: ToolArgs::new(),
                     };
+                    let observable_tool_name = self
+                        .tools
+                        .get(&call.name)
+                        .map(|_| call.name.clone())
+                        .unwrap_or_else(|| "unrecognized_tool".to_string());
+                    self.emit_trace(AgentTraceEvent::ToolAttempted {
+                        call_id: call.id.clone(),
+                        tool_name: observable_tool_name.clone(),
+                        tool_round: 1,
+                        attempt: 1,
+                    });
                     let result = ToolResult::error(error.to_string());
+                    self.emit_trace(AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::ToolExecution,
+                        step: None,
+                        tool_name: Some(observable_tool_name.clone()),
+                        call_id: Some(call.id.clone()),
+                        attempt: 1,
+                        outcome: ConversationTimingOutcome::Rejected,
+                        elapsed_ms: 0,
+                    });
+                    self.emit_trace(AgentTraceEvent::ToolTerminal {
+                        call_id: call.id.clone(),
+                        tool_name: observable_tool_name,
+                        tool_round: 1,
+                        attempt: 1,
+                        status: "rejected".to_string(),
+                        elapsed_ms: 0,
+                    });
                     self.inject_tool_result(&tool_call, &result);
                     tool_calls.push(tool_call.clone());
                     executed_tools.push(ExecutedTool { tool_call, result });
@@ -1560,32 +1572,33 @@ impl SageAgent {
     async fn execute_tool_call(
         &self,
         call_id: &str,
-        planning_round: usize,
+        tool_round: usize,
         tool_call: &ToolCall,
     ) -> ToolResult {
         let Some(tool) = self.tools.get(&tool_call.name) else {
+            let observable_tool_name = "unrecognized_tool".to_string();
             self.emit_trace(AgentTraceEvent::ToolAttempted {
                 call_id: call_id.to_string(),
-                tool_name: tool_call.name.clone(),
-                planning_round,
+                tool_name: observable_tool_name.clone(),
+                tool_round,
                 attempt: 1,
             });
             let result = ToolResult::error(format!("Unknown tool: {}", tool_call.name));
             self.emit_trace(AgentTraceEvent::Timing {
                 phase: ConversationTimingPhase::ToolExecution,
-                planning_round: Some(planning_round),
-                tool_name: Some(tool_call.name.clone()),
+                step: None,
+                tool_name: Some(observable_tool_name.clone()),
                 call_id: Some(call_id.to_string()),
                 attempt: 1,
-                outcome: ConversationTimingOutcome::Failed,
+                outcome: ConversationTimingOutcome::Rejected,
                 elapsed_ms: 0,
             });
             self.emit_trace(AgentTraceEvent::ToolTerminal {
                 call_id: call_id.to_string(),
-                tool_name: tool_call.name.clone(),
-                planning_round,
+                tool_name: observable_tool_name,
+                tool_round,
                 attempt: 1,
-                status: "failed".to_string(),
+                status: "rejected".to_string(),
                 elapsed_ms: 0,
             });
             return result;
@@ -1598,7 +1611,7 @@ impl SageAgent {
             self.emit_trace(AgentTraceEvent::ToolAttempted {
                 call_id: call_id.to_string(),
                 tool_name: tool_call.name.clone(),
-                planning_round,
+                tool_round,
                 attempt,
             });
 
@@ -1625,7 +1638,7 @@ impl SageAgent {
                         self.emit_trace(AgentTraceEvent::ToolTimedOut {
                             call_id: call_id.to_string(),
                             tool_name: tool_call.name.clone(),
-                            planning_round,
+                            tool_round,
                             attempt,
                             elapsed_ms,
                         });
@@ -1649,7 +1662,7 @@ impl SageAgent {
                     if let Some(phase) = phase {
                         self.emit_trace(AgentTraceEvent::Timing {
                             phase,
-                            planning_round: Some(planning_round),
+                            step: None,
                             tool_name: Some(tool_call.name.clone()),
                             call_id: Some(call_id.to_string()),
                             attempt,
@@ -1659,7 +1672,7 @@ impl SageAgent {
                     }
                     self.emit_trace(AgentTraceEvent::Timing {
                         phase: ConversationTimingPhase::ToolExecution,
-                        planning_round: Some(planning_round),
+                        step: None,
                         tool_name: Some(tool_call.name.clone()),
                         call_id: Some(call_id.to_string()),
                         attempt,
@@ -1698,7 +1711,7 @@ impl SageAgent {
                     if let Some(phase) = phase {
                         self.emit_trace(AgentTraceEvent::Timing {
                             phase,
-                            planning_round: Some(planning_round),
+                            step: None,
                             tool_name: Some(tool_call.name.clone()),
                             call_id: Some(call_id.to_string()),
                             attempt,
@@ -1715,7 +1728,7 @@ impl SageAgent {
                         self.emit_trace(AgentTraceEvent::ToolTimedOut {
                             call_id: call_id.to_string(),
                             tool_name: tool_call.name.clone(),
-                            planning_round,
+                            tool_round,
                             attempt,
                             elapsed_ms: attempt_elapsed_ms,
                         });
@@ -1730,7 +1743,7 @@ impl SageAgent {
                         self.emit_trace(AgentTraceEvent::ToolRetryScheduled {
                             call_id: call_id.to_string(),
                             tool_name: tool_call.name.clone(),
-                            planning_round,
+                            tool_round,
                             attempt,
                             reason: reason.to_string(),
                         });
@@ -1738,7 +1751,7 @@ impl SageAgent {
                         tokio::time::sleep(policy.backoff()).await;
                         self.emit_trace(AgentTraceEvent::Timing {
                             phase: ConversationTimingPhase::RetryDelay,
-                            planning_round: Some(planning_round),
+                            step: None,
                             tool_name: Some(tool_call.name.clone()),
                             call_id: Some(call_id.to_string()),
                             attempt,
@@ -1756,7 +1769,7 @@ impl SageAgent {
                     let elapsed_ms = call_started_at.elapsed().as_millis();
                     self.emit_trace(AgentTraceEvent::Timing {
                         phase: ConversationTimingPhase::ToolExecution,
-                        planning_round: Some(planning_round),
+                        step: None,
                         tool_name: Some(tool_call.name.clone()),
                         call_id: Some(call_id.to_string()),
                         attempt,
@@ -1779,7 +1792,7 @@ impl SageAgent {
         self.emit_trace(AgentTraceEvent::ToolTerminal {
             call_id: call_id.to_string(),
             tool_name: tool_call.name.clone(),
-            planning_round,
+            tool_round,
             attempt,
             status: terminal_status,
             elapsed_ms,
