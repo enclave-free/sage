@@ -5,7 +5,7 @@
 //! - BAML-based response parsing
 //! - GEPA-compatible instruction optimization
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use baml_bridge::{
     baml_types::{type_meta, BamlValue, TypeIR},
     BamlAdapter, BamlConvertError,
@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::memory::MemoryManager;
+use crate::openai_native::NativeToolDefinition;
 
 #[cfg(unix)]
 struct StdoutSuppressor {
@@ -2347,6 +2348,43 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Convert the registry's existing argument examples into the JSON Schema
+    /// shape required by OpenAI-compatible native function calling.
+    pub fn native_definitions(&self) -> Result<Vec<NativeToolDefinition>> {
+        self.tools
+            .values()
+            .filter(|tool| tool.name() != "done")
+            .map(|tool| {
+                let example: serde_json::Value =
+                    serde_json::from_str(tool.args_schema()).map_err(|error| {
+                        anyhow!(
+                            "Tool '{}' has invalid argument schema JSON: {error}",
+                            tool.name()
+                        )
+                    })?;
+                let object = example.as_object().ok_or_else(|| {
+                    anyhow!(
+                        "Tool '{}' argument schema must be a JSON object",
+                        tool.name()
+                    )
+                })?;
+                let properties = object
+                    .iter()
+                    .map(|(name, example)| (name.clone(), native_property_schema(example)))
+                    .collect::<serde_json::Map<_, _>>();
+                Ok(NativeToolDefinition {
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": properties,
+                        "additionalProperties": false,
+                    }),
+                })
+            })
+            .collect()
+    }
+
     #[allow(dead_code)]
     pub fn has(&self, name: &str) -> bool {
         self.tools.contains_key(name)
@@ -2462,6 +2500,34 @@ impl ToolRegistry {
             description: description.to_string(),
             args_schema: args_schema.to_string(),
         }));
+    }
+}
+
+fn native_property_schema(example: &serde_json::Value) -> serde_json::Value {
+    match example {
+        serde_json::Value::String(description) => serde_json::json!({
+            "type": "string",
+            "description": description,
+        }),
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => {
+            serde_json::json!({"type": "integer", "default": number})
+        }
+        serde_json::Value::Number(number) => {
+            serde_json::json!({"type": "number", "default": number})
+        }
+        serde_json::Value::Bool(value) => {
+            serde_json::json!({"type": "boolean", "default": value})
+        }
+        serde_json::Value::Array(values) => serde_json::json!({
+            "type": "array",
+            "items": values.first().map(native_property_schema).unwrap_or_else(|| serde_json::json!({})),
+        }),
+        serde_json::Value::Object(values) => serde_json::json!({
+            "type": "object",
+            "properties": values.iter().map(|(name, value)| (name.clone(), native_property_schema(value))).collect::<serde_json::Map<_, _>>(),
+            "additionalProperties": false,
+        }),
+        serde_json::Value::Null => serde_json::json!({}),
     }
 }
 
@@ -4836,6 +4902,38 @@ impl ToolPlanner for SageAgent {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn native_tool_definitions_expose_valid_json_schema_and_omit_done() {
+        let mut registry = ToolRegistry::new();
+        registry.register_descriptor(
+            "knowledge_search",
+            "Search uploaded Documents.",
+            r#"{"query":"search terms","count":5,"exact":false}"#,
+        );
+        registry.register_descriptor("done", "Legacy loop terminator.", r#"{}"#);
+
+        let definitions = registry
+            .native_definitions()
+            .expect("descriptor examples should convert to JSON Schema");
+
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "knowledge_search");
+        assert_eq!(definitions[0].parameters["type"], "object");
+        assert_eq!(
+            definitions[0].parameters["properties"]["query"]["type"],
+            "string"
+        );
+        assert_eq!(
+            definitions[0].parameters["properties"]["count"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            definitions[0].parameters["properties"]["exact"]["type"],
+            "boolean"
+        );
+        assert_eq!(definitions[0].parameters["additionalProperties"], false);
+    }
 
     #[test]
     fn curated_resource_expectation_is_conservative_and_bilingual() {
