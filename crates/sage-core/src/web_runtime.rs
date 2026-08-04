@@ -45,8 +45,8 @@ use crate::openai_native::{
 };
 use crate::sage_agent::{
     tool_parse_arg, tool_string_arg, AgentTraceEvent, ConversationTimingOutcome,
-    ConversationTimingPhase, ExecutedTool, SageAgent, Tool, ToolArgs, ToolExecutionError,
-    ToolRegistry, ToolResult, ToolRetryPolicy,
+    ConversationTimingPhase, NativeExecutedTool, NativeToolResult, SageAgent, Tool, ToolArgs,
+    ToolExecutionError, ToolRegistry, ToolResult, ToolRetryPolicy,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -1368,6 +1368,56 @@ struct KnowledgeSearchTool {
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
 }
 
+impl KnowledgeSearchTool {
+    async fn search_data(&self, args: &ToolArgs) -> Result<Value> {
+        let query = tool_string_arg(args, "query")
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("knowledge_search requires query"))?;
+        let top_k = tool_parse_arg(args, "top_k").unwrap_or(self.top_k);
+
+        let response = self
+            .internal
+            .document_search(&InternalDocumentSearchRequest {
+                query: query.clone(),
+                user: self.user.clone(),
+                top_k,
+                job_ids: self.job_ids.clone(),
+                jurisdiction: self.jurisdiction.clone(),
+                situation_details: self.situation_details.clone(),
+            })
+            .await?;
+
+        if let Ok(mut sink) = self.sources.lock() {
+            sink.extend(response.sources.clone());
+        }
+        if let Ok(mut sink) = self.traces.lock() {
+            let mut warnings = Vec::new();
+            let output_summary =
+                if response.sources.is_empty() && response.context.trim().is_empty() {
+                    warnings.push("no_relevant_uploaded_document_context".to_string());
+                    "No relevant uploaded-document passages were found.".to_string()
+                } else {
+                    "Retrieved uploaded-document passages for the answer.".to_string()
+                };
+            sink.push(ToolCallInfoResponse {
+                tool_id: "knowledge-search".to_string(),
+                tool_name: "Knowledge Search".to_string(),
+                query: Some("uploaded-document search".to_string()),
+                output_summary: Some(output_summary),
+                warnings,
+                metadata: json!({}),
+                guarded: false,
+            });
+        }
+
+        Ok(json!({
+            "query": query,
+            "context": response.context,
+            "sources": response.sources,
+        }))
+    }
+}
+
 #[derive(Clone)]
 struct FindResourcesTool {
     internal: InternalAgentClient,
@@ -1380,6 +1430,68 @@ struct SearxWebSearchTool {
     http: Client,
     searxng_url: String,
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
+}
+
+impl SearxWebSearchTool {
+    async fn search_data(&self, args: &ToolArgs) -> Result<Value> {
+        let query = tool_string_arg(args, "query")
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("web_search requires query"))?;
+        let count: usize = tool_parse_arg(args, "count").unwrap_or(5);
+
+        let response = self
+            .http
+            .get(format!("{}/search", self.searxng_url.trim_end_matches('/')))
+            .query(&[
+                ("q", query.as_str()),
+                ("format", "json"),
+                ("categories", "general"),
+            ])
+            .send()
+            .await
+            .map_err(classify_tool_http_error)?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
+                response.status().as_u16(),
+            )));
+        }
+
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|_| anyhow::Error::new(ToolExecutionError::MalformedContract))?;
+        let results = payload
+            .get("results")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(count)
+            .map(|result| {
+                json!({
+                    "title": result.get("title").and_then(Value::as_str).unwrap_or("Untitled"),
+                    "url": result.get("url").and_then(Value::as_str).unwrap_or(""),
+                    "content": result.get("content").and_then(Value::as_str).unwrap_or(""),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if let Ok(mut sink) = self.traces.lock() {
+            sink.push(ToolCallInfoResponse {
+                tool_id: "web-search".to_string(),
+                tool_name: "Web Search".to_string(),
+                query: Some("web search".to_string()),
+                output_summary: Some(
+                    "Web search results were prepared for the answer.".to_string(),
+                ),
+                warnings: Vec::new(),
+                metadata: json!({}),
+                guarded: false,
+            });
+        }
+
+        Ok(json!({ "query": query, "results": results }))
+    }
 }
 
 #[derive(Clone)]
@@ -2252,8 +2364,15 @@ fn build_conversation_tool_registry_with_context(
         }
     }
 
-    registry.register(Arc::new(crate::tools::DoneTool));
     (registry, sinks)
+}
+
+fn empty_native_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+    })
 }
 
 #[async_trait::async_trait]
@@ -2286,64 +2405,33 @@ impl Tool for KnowledgeSearchTool {
         ToolRetryPolicy::knowledge_search()
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        let query = tool_string_arg(args, "query")
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("knowledge_search requires query"))?;
-        let top_k = tool_parse_arg(args, "top_k").unwrap_or(self.top_k);
-
-        let response = self
-            .internal
-            .document_search(&InternalDocumentSearchRequest {
-                query: query.clone(),
-                user: self.user.clone(),
-                top_k,
-                job_ids: self.job_ids.clone(),
-                jurisdiction: self.jurisdiction.clone(),
-                situation_details: self.situation_details.clone(),
-            })
-            .await?;
-
-        if let Ok(mut sink) = self.sources.lock() {
-            sink.extend(response.sources.clone());
-        }
-        if let Ok(mut sink) = self.traces.lock() {
-            let mut warnings = Vec::new();
-            let output_summary =
-                if response.sources.is_empty() && response.context.trim().is_empty() {
-                    warnings.push("no_relevant_uploaded_document_context".to_string());
-                    "No relevant uploaded-document passages were found.".to_string()
-                } else {
-                    "Retrieved uploaded-document passages for the answer.".to_string()
-                };
-            sink.push(ToolCallInfoResponse {
-                tool_id: "knowledge-search".to_string(),
-                tool_name: "Knowledge Search".to_string(),
-                query: Some(query.clone()),
-                output_summary: Some(output_summary),
-                warnings,
-                metadata: json!({}),
-                guarded: false,
-            });
-        }
-
-        let mut output = String::from("Knowledge search results:\n");
-        for (idx, source) in response.sources.iter().take(6).enumerate() {
-            output.push_str(&format!(
-                "{}. {} [{}]\n{}\n\n",
-                idx + 1,
-                fallback_text(&source.source_file, "document"),
-                source.source_type,
-                truncate_chars(&source.text, 800)
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
+        if tool_string_arg(args, "query").is_none_or(|query| query.trim().is_empty())
+            || args
+                .get("top_k")
+                .is_some_and(|top_k| top_k.as_i64().is_none_or(|top_k| top_k < 1))
+        {
+            return Ok(NativeToolResult::failure(
+                "invalid_arguments",
+                "Knowledge Search requires a non-empty query and a positive integer top_k.",
             ));
         }
+        self.search_data(args).await.map(NativeToolResult::success)
+    }
 
-        if !response.context.trim().is_empty() {
-            output.push_str("Compiled context:\n");
-            output.push_str(&response.context);
-        }
+    async fn execute_native_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+        self.execute_native(args)
+            .await
+            .map(|result| (result, ConversationTimingOutcome::Succeeded))
+    }
 
-        Ok(ToolResult::success(output))
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        self.search_data(args)
+            .await
+            .map(|data| ToolResult::success(data.to_string()))
     }
 }
 
@@ -2434,11 +2522,6 @@ impl Tool for FindResourcesTool {
         let trace_query = match response_region {
             Some(region) => format!("{} resources for {}", response_help_type, region),
             None => format!("{} resources", response_help_type),
-        };
-        let trace_query = if let Some(query) = response.query.as_deref().or(query.as_deref()) {
-            format!("{} matching {}", trace_query, query)
-        } else {
-            trace_query
         };
 
         let returned_count = response.returned_count;
@@ -2614,75 +2697,51 @@ impl Tool for SearxWebSearchTool {
         }))
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        let query = tool_string_arg(args, "query")
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("web_search requires query"))?;
-        let count = tool_parse_arg(args, "count").unwrap_or(5);
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        ToolRetryPolicy::read_only(Duration::from_secs(10), 2, Duration::from_secs(25))
+    }
 
-        let response = self
-            .http
-            .get(format!("{}/search", self.searxng_url.trim_end_matches('/')))
-            .query(&[
-                ("q", query.as_str()),
-                ("format", "json"),
-                ("categories", "general"),
-            ])
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Ok(ToolResult::error(format!(
-                "Search failed with status {}",
-                response.status()
-            )));
-        }
-
-        let payload = response.json::<Value>().await?;
-        let results = payload
-            .get("results")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        if let Ok(mut sink) = self.traces.lock() {
-            sink.push(ToolCallInfoResponse {
-                tool_id: "web-search".to_string(),
-                tool_name: "Web Search".to_string(),
-                query: Some(query.clone()),
-                output_summary: Some(
-                    "Web search results were prepared for the answer.".to_string(),
-                ),
-                warnings: Vec::new(),
-                metadata: json!({}),
-                guarded: false,
-            });
-        }
-
-        let mut output = String::from("Web search results:\n");
-        for (idx, result) in results.into_iter().take(count).enumerate() {
-            let title = result
-                .get("title")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Untitled");
-            let url = result
-                .get("url")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let content = result
-                .get("content")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            output.push_str(&format!(
-                "{}. {}\nURL: {}\n{}\n\n",
-                idx + 1,
-                title,
-                url,
-                truncate_chars(content, 500)
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
+        if tool_string_arg(args, "query").is_none_or(|query| query.trim().is_empty())
+            || args
+                .get("count")
+                .is_some_and(|count| count.as_u64().is_none_or(|count| count == 0))
+        {
+            return Ok(NativeToolResult::failure(
+                "invalid_arguments",
+                "Web Search requires a non-empty query and a positive integer count.",
             ));
         }
+        self.search_data(args).await.map(NativeToolResult::success)
+    }
 
-        Ok(ToolResult::success(output))
+    async fn execute_native_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+        self.execute_native(args)
+            .await
+            .map(|result| (result, ConversationTimingOutcome::Succeeded))
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        self.search_data(args)
+            .await
+            .map(|data| ToolResult::success(data.to_string()))
+    }
+}
+
+fn classify_tool_http_error(error: reqwest::Error) -> anyhow::Error {
+    if error.is_connect() {
+        anyhow::Error::new(ToolExecutionError::Connection)
+    } else if error.is_timeout() {
+        anyhow::Error::new(ToolExecutionError::Timeout)
+    } else if error.is_decode() {
+        anyhow::Error::new(ToolExecutionError::MalformedContract)
+    } else {
+        anyhow::Error::new(ToolExecutionError::Other(
+            "Tool HTTP request failed".to_string(),
+        ))
     }
 }
 
@@ -2698,6 +2757,10 @@ impl Tool for AdminConfigReadTool {
 
     fn args_schema(&self) -> &str {
         r#"{}"#
+    }
+
+    fn native_parameters(&self) -> Result<Value> {
+        Ok(empty_native_parameters())
     }
 
     async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
@@ -2756,6 +2819,10 @@ impl Tool for AdminConfigSetupSummaryTool {
 
     fn args_schema(&self) -> &str {
         r#"{}"#
+    }
+
+    fn native_parameters(&self) -> Result<Value> {
+        Ok(empty_native_parameters())
     }
 
     async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
@@ -2905,6 +2972,10 @@ impl Tool for AdminAgentSettingsReadTool {
 
     fn args_schema(&self) -> &str {
         r#"{}"#
+    }
+
+    fn native_parameters(&self) -> Result<Value> {
+        Ok(empty_native_parameters())
     }
 
     async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
@@ -3420,14 +3491,35 @@ impl Tool for AdminDbQueryTool {
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        Ok(self.execute_db_query_with_outcome(args).await?.0)
+        Ok(native_result_as_legacy(
+            &self.execute_db_query_with_outcome(args).await?.0,
+        ))
     }
 
     async fn execute_with_timing_outcome(
         &self,
         args: &ToolArgs,
     ) -> Result<(ToolResult, ConversationTimingOutcome)> {
+        let (result, outcome) = self.execute_db_query_with_outcome(args).await?;
+        Ok((native_result_as_legacy(&result), outcome))
+    }
+
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
+        Ok(self.execute_db_query_with_outcome(args).await?.0)
+    }
+
+    async fn execute_native_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
         self.execute_db_query_with_outcome(args).await
+    }
+}
+
+fn native_result_as_legacy(result: &NativeToolResult) -> ToolResult {
+    match result {
+        NativeToolResult::Success(data) => ToolResult::success(data.to_string()),
+        NativeToolResult::Failure { message, .. } => ToolResult::error(message.clone()),
     }
 }
 
@@ -3435,7 +3527,16 @@ impl AdminDbQueryTool {
     async fn execute_db_query_with_outcome(
         &self,
         args: &ToolArgs,
-    ) -> Result<(ToolResult, ConversationTimingOutcome)> {
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+        if tool_string_arg(args, "sql").is_none_or(|sql| sql.trim().is_empty()) {
+            return Ok((
+                NativeToolResult::failure(
+                    "invalid_arguments",
+                    "Database Query requires one non-empty read-only SELECT statement.",
+                ),
+                ConversationTimingOutcome::Rejected,
+            ));
+        }
         let sql = tool_string_arg(args, "sql")
             .map(str::to_string)
             .ok_or_else(|| anyhow!("db_query requires sql"))?;
@@ -3450,21 +3551,24 @@ impl AdminDbQueryTool {
                 sink.push(ToolCallInfoResponse {
                     tool_id: "db-query".to_string(),
                     tool_name: "Database Query".to_string(),
-                    query: Some(sql),
+                    query: Some("read-only database query".to_string()),
                     output_summary: Some(error.clone()),
                     warnings: vec!["db_query_rejected".to_string()],
                     metadata: json!({}),
                     guarded: true,
                 });
             }
-            return Ok((ToolResult::error(error), ConversationTimingOutcome::Guarded));
+            return Ok((
+                NativeToolResult::failure("query_rejected", error),
+                ConversationTimingOutcome::Guarded,
+            ));
         }
 
         if let Ok(mut sink) = self.traces.lock() {
             sink.push(ToolCallInfoResponse {
                 tool_id: "db-query".to_string(),
                 tool_name: "Database Query".to_string(),
-                query: Some(sql.clone()),
+                query: Some("read-only database query".to_string()),
                 output_summary: Some("Database results were redacted from the trace.".to_string()),
                 warnings: vec!["raw_results_redacted".to_string()],
                 metadata: json!({}),
@@ -3473,7 +3577,7 @@ impl AdminDbQueryTool {
         }
 
         Ok((
-            ToolResult::success(serde_json::to_string_pretty(&value)?),
+            NativeToolResult::success(value),
             ConversationTimingOutcome::Succeeded,
         ))
     }
@@ -4052,14 +4156,17 @@ The Python safe SQL executor enforces SELECT-only validation, blocked mutation k
     )
 }
 
-fn admin_config_tool_memory_content(executed: &ExecutedTool) -> Option<String> {
-    if !executed.result.success || !is_admin_config_tool_name(&executed.tool_call.name) {
+fn admin_config_tool_memory_content(executed: &NativeExecutedTool) -> Option<String> {
+    if !is_admin_config_tool_name(&executed.tool_call.name) {
         return None;
     }
 
-    let changed_names = serde_json::from_str::<Value>(&executed.result.output)
-        .ok()
-        .and_then(|value| value.get("data").cloned())
+    let NativeToolResult::Success(value) = &executed.result else {
+        return None;
+    };
+    let changed_names = value
+        .get("data")
+        .cloned()
         .and_then(|data| data.get("changed_names").cloned())
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default()
@@ -6936,7 +7043,7 @@ fn build_query_conversation_turn_input(
 
 struct AdapterTurnOutput {
     answer: String,
-    executed_tools: Vec<ExecutedTool>,
+    executed_tools: Vec<NativeExecutedTool>,
 }
 
 async fn run_native_turn_with_provider(
@@ -7256,17 +7363,11 @@ fn stage_native_provider_signal(
     Ok(())
 }
 
-fn native_tool_result_content(result: &ToolResult) -> String {
-    json!({
-        "success": result.success,
-        "output": result.output,
-        "error": result.error,
-        "metadata": result.metadata,
-    })
-    .to_string()
+fn native_tool_result_content(result: &NativeToolResult) -> String {
+    result.model_value().to_string()
 }
 
-fn bounded_native_tool_result_contents(results: &[ExecutedTool]) -> Vec<String> {
+fn bounded_native_tool_result_contents(results: &[NativeExecutedTool]) -> Vec<String> {
     if results.is_empty() {
         return Vec::new();
     }
@@ -7278,57 +7379,83 @@ fn bounded_native_tool_result_contents(results: &[ExecutedTool]) -> Vec<String> 
         .collect()
 }
 
-fn bounded_native_tool_result_content(result: &ToolResult, max_chars: usize) -> String {
+fn bounded_native_tool_result_content(result: &NativeToolResult, max_chars: usize) -> String {
     let full = native_tool_result_content(result);
     let full_chars = full.chars().count();
     if full_chars <= max_chars {
         return full;
     }
 
-    let source = if result.success {
-        result.output.as_str()
-    } else {
-        result.error.as_deref().unwrap_or("Tool execution failed")
-    };
-    let render = |content: &str| {
-        json!({
-            "success": result.success,
-            "output": if result.success { content } else { "" },
-            "error": if result.success { None } else { Some(content) },
-            "metadata": result.metadata,
-            "truncated": true,
-            "original_chars": full_chars,
-        })
-        .to_string()
-    };
-    let source_chars = source.chars().count();
-    let mut low = 0;
-    let mut high = source_chars;
-    let mut bounded = render("");
-    if bounded.chars().count() > max_chars {
-        return json!({
-            "success": result.success,
-            "output": "",
-            "error": if result.success { None } else { Some("Tool result exceeded the context budget") },
-            "metadata": {"truncated": true},
-            "truncated": true,
-            "original_chars": full_chars,
-        })
-        .to_string();
-    }
-    while low <= high {
-        let midpoint = low + (high - low) / 2;
-        let candidate = render(&source.chars().take(midpoint).collect::<String>());
-        if candidate.chars().count() <= max_chars {
-            bounded = candidate;
-            low = midpoint.saturating_add(1);
-        } else if midpoint == 0 {
-            break;
-        } else {
-            high = midpoint - 1;
+    if let NativeToolResult::Success(data) = result {
+        let render = |string_budget: usize| {
+            let mut bounded = truncate_json_strings(data, string_budget);
+            let metadata = json!({ "truncated": true, "original_chars": full_chars });
+            bounded = match bounded {
+                Value::Object(mut object) if !object.contains_key("__enclave_result_meta") => {
+                    object.insert("__enclave_result_meta".to_string(), metadata);
+                    Value::Object(object)
+                }
+                Value::Object(_) => {
+                    return json!({
+                        "error": {
+                            "code": "result_too_large",
+                            "message": "The Tool returned more structured data than this turn can accept. Narrow the query and try again."
+                        },
+                        "original_chars": full_chars,
+                    })
+                    .to_string();
+                }
+                data => json!({ "data": data, "__enclave_result_meta": metadata }),
+            };
+            bounded.to_string()
+        };
+        let mut low = 0;
+        let mut high = max_chars;
+        let mut bounded = render(0);
+        if bounded.chars().count() <= max_chars {
+            while low <= high {
+                let midpoint = low + (high - low) / 2;
+                let candidate = render(midpoint);
+                if candidate.chars().count() <= max_chars {
+                    bounded = candidate;
+                    low = midpoint.saturating_add(1);
+                } else if midpoint == 0 {
+                    break;
+                } else {
+                    high = midpoint - 1;
+                }
+            }
+            return bounded;
         }
     }
-    bounded
+
+    json!({
+        "error": {
+            "code": "result_too_large",
+            "message": "The Tool returned more structured data than this turn can accept. Narrow the query and try again."
+        },
+        "original_chars": full_chars,
+    })
+    .to_string()
+}
+
+fn truncate_json_strings(value: &Value, max_chars: usize) -> Value {
+    match value {
+        Value::String(value) => Value::String(truncate_chars(value, max_chars)),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| truncate_json_strings(value, max_chars))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), truncate_json_strings(value, max_chars)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
 }
 
 async fn run_agent_steps(
@@ -7367,7 +7494,7 @@ async fn run_agent_turn(
 async fn persist_successful_admin_config_tools(
     agent: &SageAgent,
     memory_user_id: Option<&str>,
-    executed_tools: &[ExecutedTool],
+    executed_tools: &[NativeExecutedTool],
 ) {
     let Some(memory_user_id) = memory_user_id else {
         return;
@@ -8974,21 +9101,22 @@ mod tests {
 
     #[test]
     fn native_tool_result_content_preserves_structured_availability_metadata() {
-        let result = ToolResult::success_with_metadata(
-            "Top-ranked resource page",
-            json!({
+        let result = NativeToolResult::success(json!({
+            "resources": ["Top-ranked resource page"],
+            "availability": {
                 "returned_count": 5,
                 "total_count": 12,
                 "has_more": true,
                 "next_offset": 5,
-            }),
-        );
+            }
+        }));
 
         let content: Value = serde_json::from_str(&native_tool_result_content(&result))
             .expect("native Tool result should be structured JSON");
-        assert_eq!(content["success"], true);
-        assert_eq!(content["output"], "Top-ranked resource page");
-        assert_eq!(content["metadata"], result.metadata);
+        assert_eq!(content["resources"][0], "Top-ranked resource page");
+        assert_eq!(content["availability"]["total_count"], 12);
+        assert!(content.get("success").is_none());
+        assert!(content.get("output").is_none());
     }
 
     #[test]
@@ -9022,15 +9150,15 @@ mod tests {
     #[test]
     fn native_tool_results_preserve_existing_per_result_and_batch_budgets() {
         let results = (0..4)
-            .map(|index| ExecutedTool {
+            .map(|index| NativeExecutedTool {
                 tool_call: crate::sage_agent::ToolCall {
                     name: "knowledge_search".to_string(),
                     args: ToolArgs::new(),
                 },
-                result: ToolResult::success_with_metadata(
-                    format!("result-{index}-{}", "x".repeat(10_000)),
-                    json!({"source": "large-test-document"}),
-                ),
+                result: NativeToolResult::success(json!({
+                    "content": format!("result-{index}-{}", "x".repeat(10_000)),
+                    "source": "large-test-document",
+                })),
             })
             .collect::<Vec<_>>();
 
@@ -9050,11 +9178,33 @@ mod tests {
         for content in contents {
             let parsed: Value = serde_json::from_str(&content)
                 .expect("bounded native Tool result must remain valid JSON");
-            assert_eq!(parsed["success"], true);
-            assert_eq!(parsed["metadata"]["source"], "large-test-document");
-            assert_eq!(parsed["truncated"], true);
-            assert!(parsed["original_chars"].as_u64().unwrap() > 10_000);
+            assert_eq!(parsed["source"], "large-test-document");
+            assert_eq!(parsed["__enclave_result_meta"]["truncated"], true);
+            assert!(
+                parsed["__enclave_result_meta"]["original_chars"]
+                    .as_u64()
+                    .unwrap()
+                    > 10_000
+            );
+            assert!(!parsed["content"].as_str().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn native_tool_result_truncation_marks_non_object_roots() {
+        let result = NativeToolResult::success(json!(["x".repeat(10_000)]));
+
+        let content = bounded_native_tool_result_content(&result, 500);
+        let parsed: Value = serde_json::from_str(&content).expect("result should remain JSON");
+
+        assert_eq!(parsed["__enclave_result_meta"]["truncated"], true);
+        assert!(
+            parsed["__enclave_result_meta"]["original_chars"]
+                .as_u64()
+                .unwrap()
+                > 10_000
+        );
+        assert!(parsed["data"][0].as_str().unwrap().len() < 500);
     }
 
     #[test]
@@ -10892,7 +11042,7 @@ mod tests {
     async fn run_endpoint_lookup(
         mode: &'static str,
         policy: ToolRetryPolicy,
-    ) -> (ToolResult, Vec<AgentTraceEvent>, usize) {
+    ) -> (NativeToolResult, Vec<AgentTraceEvent>, usize) {
         let count = Arc::new(AtomicUsize::new(0));
         let requests = count.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -10985,7 +11135,7 @@ mod tests {
             ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
-        assert!(result.success);
+        assert!(result.is_success());
         assert_eq!(requests, 2);
         assert_eq!(
             events
@@ -11007,7 +11157,7 @@ mod tests {
             ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         assert_eq!(requests, 2);
         assert_eq!(
             events
@@ -11029,7 +11179,7 @@ mod tests {
             ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         assert_eq!(requests, 2);
         assert_eq!(
             events
@@ -11049,7 +11199,7 @@ mod tests {
                 ),
             )
             .await;
-            assert!(!result.success);
+            assert!(!result.is_success());
             assert_eq!(requests, expected_requests);
             assert_eq!(
                 events
@@ -11072,8 +11222,8 @@ mod tests {
             ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
-        assert!(result.success);
-        assert!(result.output.is_empty());
+        assert!(result.is_success());
+        assert_eq!(result.model_value()["content"], "");
         assert_eq!(requests, 1);
         assert_eq!(
             events
@@ -11088,7 +11238,7 @@ mod tests {
             ToolRetryPolicy::read_only(Duration::from_millis(250), 2, Duration::from_millis(500)),
         )
         .await;
-        assert!(result.success);
+        assert!(result.is_success());
         assert_eq!(requests, 1);
         assert_eq!(
             events
@@ -11103,7 +11253,7 @@ mod tests {
             ToolRetryPolicy::read_only(Duration::from_millis(25), 2, Duration::from_millis(300)),
         )
         .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         assert_eq!(requests, 2);
         assert_eq!(
             events
@@ -11164,7 +11314,7 @@ mod tests {
             )])
             .await;
         server.abort();
-        assert!(!result.executed_tools[0].result.success);
+        assert!(!result.executed_tools[0].result.is_success());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert_eq!(
             events
@@ -11227,7 +11377,7 @@ mod tests {
             )])
             .await;
         server.abort();
-        assert!(result.executed_tools[0].result.success);
+        assert!(result.executed_tools[0].result.is_success());
         assert_eq!(resource_requests.load(Ordering::SeqCst), 2);
         assert_eq!(
             events
@@ -11289,11 +11439,7 @@ mod tests {
             )])
             .await;
         empty_server.abort();
-        assert!(result.executed_tools[0].result.success);
-        assert_eq!(
-            result.executed_tools[0].result.output,
-            "No additional curated resources were returned for this page."
-        );
+        assert!(result.executed_tools[0].result.is_success());
         assert_eq!(empty_requests.load(Ordering::SeqCst), 1);
         {
             let empty_traces = empty_traces.lock().expect("empty resource trace");
@@ -11361,7 +11507,7 @@ mod tests {
             )])
             .await;
         knowledge_server.abort();
-        assert!(result.executed_tools[0].result.success);
+        assert!(result.executed_tools[0].result.is_success());
         assert_eq!(knowledge_requests.load(Ordering::SeqCst), 2);
     }
 
@@ -12347,7 +12493,7 @@ mod tests {
             .await;
         server.abort();
 
-        assert!(!result.executed_tools[0].result.success);
+        assert!(!result.executed_tools[0].result.is_success());
         assert!(batch_events.lock().unwrap().iter().any(|event| matches!(
             event,
             AgentTraceEvent::Timing {
@@ -12391,7 +12537,12 @@ mod tests {
                 ToolArgs::default(),
             )])
             .await;
-        assert!(!result.executed_tools[0].result.success);
+        let failure = result.executed_tools[0].result.model_value();
+        assert_eq!(failure["error"]["code"], "unknown_tool");
+        assert_eq!(
+            failure["error"]["message"],
+            "The requested Tool is not enabled for this conversation."
+        );
         let batch = batch_events.lock().unwrap();
         let timing = batch
             .iter()
@@ -12449,7 +12600,12 @@ mod tests {
             }])
             .await;
 
-        assert!(!result.executed_tools[0].result.success);
+        let failure = result.executed_tools[0].result.model_value();
+        assert_eq!(failure["error"]["code"], "invalid_arguments");
+        assert_eq!(
+            failure["error"]["message"],
+            "Tool arguments did not match the declared schema."
+        );
         let events = events.lock().expect("captured events");
         assert!(events.iter().any(|event| matches!(
             event,
@@ -13313,16 +13469,25 @@ mod tests {
         ]);
 
         let result = tool
-            .execute(&args)
+            .execute_native(&args)
             .await
             .expect("Knowledge Search should execute");
         server.abort();
 
-        assert!(result.success);
-        assert!(result.output.contains("Support Handbook.pdf"));
-        assert!(result
-            .output
+        let data = result.model_value();
+        assert_eq!(data["query"], "What does the handbook say?");
+        assert_eq!(data["sources"][0]["source_file"], "Support Handbook.pdf");
+        assert_eq!(
+            data["sources"][0]["text"],
+            "The handbook says setup is complete."
+        );
+        assert!(data["context"]
+            .as_str()
+            .expect("Knowledge context should be text")
             .contains("The handbook says setup is complete."));
+        assert!(data.get("success").is_none());
+        assert!(data.get("output").is_none());
+        assert!(data.get("trace").is_none());
         let (token, payload) = seen_rx
             .await
             .expect("test backend should record Knowledge Search request");
@@ -13393,14 +13558,17 @@ mod tests {
         ]);
 
         let result = tool
-            .execute(&args)
+            .execute_native(&args)
             .await
             .expect("Web Search should execute");
         server.abort();
 
-        assert!(result.success);
-        assert!(result.output.contains("Deployment checklist"));
-        assert!(result.output.contains("https://example.test/checklist"));
+        let data = result.model_value();
+        assert_eq!(data["query"], "deployment checklist");
+        assert_eq!(data["results"][0]["title"], "Deployment checklist");
+        assert_eq!(data["results"][0]["url"], "https://example.test/checklist");
+        assert!(data.get("success").is_none());
+        assert!(data.get("output").is_none());
         let query = seen_rx
             .await
             .expect("test search server should record search request");
@@ -13498,7 +13666,7 @@ mod tests {
             .contains("settings_json"));
         assert!(!registry.has("propose_config_change_set"));
         assert!(!registry.has("propose_admin_config_bootstrap"));
-        assert!(registry.has("done"));
+        assert!(!registry.has("done"));
         let resources_tool = registry
             .get("find_resources")
             .expect("curated resources tool should be registered");
@@ -13571,7 +13739,7 @@ mod tests {
         assert!(!disabled_registry.has("configure_instance"));
         assert!(!disabled_registry.has("update_instance_settings"));
         assert!(!disabled_registry.has("read_deployment_secret"));
-        assert!(disabled_registry.has("done"));
+        assert!(!disabled_registry.has("done"));
     }
 
     #[test]

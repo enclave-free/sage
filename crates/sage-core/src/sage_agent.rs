@@ -496,6 +496,71 @@ pub struct ToolResult {
     pub metadata: serde_json::Value,
 }
 
+/// Model-facing result for provider-native Tool calls. Successful Tools return
+/// their domain data directly; failures use one stable, typed error shape.
+/// Execution traces remain outside this value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeToolResult {
+    Success(serde_json::Value),
+    Failure { code: String, message: String },
+}
+
+impl NativeToolResult {
+    pub fn success(data: serde_json::Value) -> Self {
+        Self::Success(data)
+    }
+
+    pub fn failure(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Failure {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success(_))
+    }
+
+    pub fn model_value(&self) -> serde_json::Value {
+        match self {
+            Self::Success(data) => data.clone(),
+            Self::Failure { code, message } => serde_json::json!({
+                "error": {
+                    "code": code,
+                    "message": message,
+                }
+            }),
+        }
+    }
+
+    fn from_legacy(result: ToolResult) -> Self {
+        if result.success {
+            let data = serde_json::from_str(&result.output)
+                .unwrap_or_else(|_| serde_json::json!({ "content": result.output }));
+            if result.metadata.is_null() {
+                Self::Success(data)
+            } else {
+                Self::Success(serde_json::json!({
+                    "data": data,
+                    "metadata": result.metadata,
+                }))
+            }
+        } else {
+            Self::failure(
+                "tool_execution_failed",
+                "The Tool could not complete the request.",
+            )
+        }
+    }
+
+    fn to_legacy(&self) -> ToolResult {
+        match self {
+            Self::Success(data) => ToolResult::success(data.to_string()),
+            Self::Failure { message, .. } => ToolResult::error(message.clone()),
+        }
+    }
+}
+
 /// Failure categories that the shared Tool executor can safely classify.
 /// Read-only adapters preserve this type through `anyhow` so retry policy does
 /// not depend on parsing provider or backend error strings.
@@ -667,6 +732,16 @@ pub trait Tool: Send + Sync {
             ConversationTimingOutcome::Failed
         };
         Ok((result, outcome))
+    }
+    async fn execute_native_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+        let (result, outcome) = self.execute_with_timing_outcome(args).await?;
+        Ok((NativeToolResult::from_legacy(result), outcome))
+    }
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
+        self.execute(args).await.map(NativeToolResult::from_legacy)
     }
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult>;
 }
@@ -928,6 +1003,40 @@ pub struct Message {
 pub struct ExecutedTool {
     pub tool_call: ToolCall,
     pub result: ToolResult,
+}
+
+/// Provider-native Tool execution retained for correlated result messages and
+/// product-runtime persistence.
+#[derive(Debug, Clone)]
+pub struct NativeExecutedTool {
+    pub tool_call: ToolCall,
+    pub result: NativeToolResult,
+}
+
+#[derive(Debug)]
+pub struct NativeToolBatchResult {
+    pub executed_tools: Vec<NativeExecutedTool>,
+}
+
+enum ToolCallExecutionResult {
+    Legacy(ToolResult),
+    Native(NativeToolResult),
+}
+
+impl ToolCallExecutionResult {
+    fn into_legacy(self) -> ToolResult {
+        match self {
+            Self::Legacy(result) => result,
+            Self::Native(result) => result.to_legacy(),
+        }
+    }
+
+    fn into_native(self) -> NativeToolResult {
+        match self {
+            Self::Legacy(result) => NativeToolResult::from_legacy(result),
+            Self::Native(result) => result,
+        }
+    }
 }
 
 /// Result of a single agent step
@@ -1537,8 +1646,10 @@ impl SageAgent {
     /// preserving the provider's call identifiers for correlated result
     /// messages. Unknown Tools are rejected by the same registry boundary as
     /// legacy calls and every selected call receives a terminal result.
-    pub async fn execute_native_tool_calls(&mut self, calls: &[NativeToolCall]) -> StepResult {
-        let mut tool_calls = Vec::with_capacity(calls.len());
+    pub async fn execute_native_tool_calls(
+        &mut self,
+        calls: &[NativeToolCall],
+    ) -> NativeToolBatchResult {
         let mut executed_tools = Vec::with_capacity(calls.len());
         for call in calls {
             let tool_call = match ToolArgs::from_json_object(&call.arguments) {
@@ -1546,7 +1657,7 @@ impl SageAgent {
                     name: call.name.clone(),
                     args,
                 },
-                Err(error) => {
+                Err(_error) => {
                     let tool_call = ToolCall {
                         name: call.name.clone(),
                         args: ToolArgs::new(),
@@ -1562,7 +1673,10 @@ impl SageAgent {
                         tool_round: 1,
                         attempt: 1,
                     });
-                    let result = ToolResult::error(error.to_string());
+                    let result = NativeToolResult::failure(
+                        "invalid_arguments",
+                        "Tool arguments did not match the declared schema.",
+                    );
                     self.emit_trace(AgentTraceEvent::Timing {
                         phase: ConversationTimingPhase::ToolExecution,
                         step: None,
@@ -1580,32 +1694,27 @@ impl SageAgent {
                         status: "rejected".to_string(),
                         elapsed_ms: 0,
                     });
-                    self.inject_tool_result(&tool_call, &result);
-                    tool_calls.push(tool_call.clone());
-                    executed_tools.push(ExecutedTool { tool_call, result });
+                    executed_tools.push(NativeExecutedTool { tool_call, result });
                     continue;
                 }
             };
-            let result = self.execute_tool_call(&call.id, 1, &tool_call).await;
-            self.inject_tool_result(&tool_call, &result);
-            tool_calls.push(tool_call.clone());
-            executed_tools.push(ExecutedTool { tool_call, result });
+            let result = self
+                .execute_tool_call_with_mode(&call.id, 1, &tool_call, true)
+                .await
+                .into_native();
+            executed_tools.push(NativeExecutedTool { tool_call, result });
         }
 
-        StepResult {
-            messages: Vec::new(),
-            tool_calls,
-            executed_tools,
-            done: calls.is_empty(),
-        }
+        NativeToolBatchResult { executed_tools }
     }
 
-    async fn execute_tool_call(
+    async fn execute_tool_call_with_mode(
         &self,
         call_id: &str,
         tool_round: usize,
         tool_call: &ToolCall,
-    ) -> ToolResult {
+        native: bool,
+    ) -> ToolCallExecutionResult {
         let Some(tool) = self.tools.get(&tool_call.name) else {
             let observable_tool_name = "unrecognized_tool".to_string();
             self.emit_trace(AgentTraceEvent::ToolAttempted {
@@ -1614,7 +1723,17 @@ impl SageAgent {
                 tool_round,
                 attempt: 1,
             });
-            let result = ToolResult::error(format!("Unknown tool: {}", tool_call.name));
+            let result = if native {
+                ToolCallExecutionResult::Native(NativeToolResult::failure(
+                    "unknown_tool",
+                    "The requested Tool is not enabled for this conversation.",
+                ))
+            } else {
+                ToolCallExecutionResult::Legacy(ToolResult::error(format!(
+                    "Unknown tool: {}",
+                    tool_call.name
+                )))
+            };
             self.emit_trace(AgentTraceEvent::Timing {
                 phase: ConversationTimingPhase::ToolExecution,
                 step: None,
@@ -1653,13 +1772,19 @@ impl SageAgent {
                 .unwrap_or(Duration::MAX);
             let attempt_started_at = Instant::now();
             let mut timeout_event_emitted = false;
+            let execute = async {
+                if native {
+                    tool.execute_native_with_timing_outcome(&tool_call.args)
+                        .await
+                        .map(|(result, outcome)| (ToolCallExecutionResult::Native(result), outcome))
+                } else {
+                    tool.execute_with_timing_outcome(&tool_call.args)
+                        .await
+                        .map(|(result, outcome)| (ToolCallExecutionResult::Legacy(result), outcome))
+                }
+            };
             let execution = if let Some(timeout) = policy.attempt_timeout(remaining) {
-                match tokio::time::timeout(
-                    timeout,
-                    tool.execute_with_timing_outcome(&tool_call.args),
-                )
-                .await
-                {
+                match tokio::time::timeout(timeout, execute).await {
                     Ok(result) => result,
                     Err(_) => {
                         let elapsed_ms = attempt_started_at.elapsed().as_millis();
@@ -1675,7 +1800,7 @@ impl SageAgent {
                     }
                 }
             } else {
-                tool.execute_with_timing_outcome(&tool_call.args).await
+                execute.await
             };
 
             let attempt_elapsed_ms = attempt_started_at.elapsed().as_millis();
@@ -1807,11 +1932,23 @@ impl SageAgent {
                         },
                         elapsed_ms,
                     });
-                    break (
-                        ToolResult::error(error.to_string()),
-                        terminal_status.to_string(),
-                        elapsed_ms,
-                    );
+                    let message = match failure {
+                        ToolExecutionError::Connection => "The Tool backend could not be reached.",
+                        ToolExecutionError::Timeout => "The Tool timed out before returning data.",
+                        ToolExecutionError::HttpStatus(_) => {
+                            "The Tool backend could not complete the request."
+                        }
+                        ToolExecutionError::MalformedContract => {
+                            "The Tool backend returned an invalid response."
+                        }
+                        ToolExecutionError::Other(_) => "The Tool could not complete the request.",
+                    };
+                    let result = if native {
+                        ToolCallExecutionResult::Native(NativeToolResult::failure(reason, message))
+                    } else {
+                        ToolCallExecutionResult::Legacy(ToolResult::error(error.to_string()))
+                    };
+                    break (result, terminal_status.to_string(), elapsed_ms);
                 }
             }
         };
@@ -2161,7 +2298,10 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             );
 
             let call_id = format!("tool-call-{}", Uuid::new_v4().simple());
-            let result = self.execute_tool_call(&call_id, 0, tool_call).await;
+            let result = self
+                .execute_tool_call_with_mode(&call_id, 0, tool_call, false)
+                .await
+                .into_legacy();
             tracing::debug!("Tool {} result: {:?}", tool_call.name, result);
 
             // Inject into current request cycle (for multi-step reasoning)
@@ -2377,6 +2517,75 @@ mod tests {
         outcomes: Arc<Mutex<std::collections::VecDeque<Result<ToolResult>>>>,
     }
 
+    struct DivergentLegacyAndNativeTool;
+
+    #[async_trait::async_trait]
+    impl Tool for DivergentLegacyAndNativeTool {
+        fn name(&self) -> &str {
+            "divergent_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test-only divergent Tool"
+        }
+
+        fn args_schema(&self) -> &str {
+            "{}"
+        }
+
+        async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
+            Ok(NativeToolResult::success(serde_json::json!({
+                "path": "native"
+            })))
+        }
+
+        async fn execute_native_with_timing_outcome(
+            &self,
+            args: &ToolArgs,
+        ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+            self.execute_native(args)
+                .await
+                .map(|result| (result, ConversationTimingOutcome::Succeeded))
+        }
+
+        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+            Ok(ToolResult::success("legacy"))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_executor_does_not_route_through_native_overrides() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DivergentLegacyAndNativeTool));
+        let agent = SageAgent::new_without_memory(registry, "test");
+        let call = ToolCall {
+            name: "divergent_tool".to_string(),
+            args: ToolArgs::new(),
+        };
+
+        let result = agent
+            .execute_tool_call_with_mode("legacy-call", 0, &call, false)
+            .await
+            .into_legacy();
+
+        assert!(result.success);
+        assert_eq!(result.output, "legacy");
+    }
+
+    #[test]
+    fn legacy_failure_bridge_never_forwards_backend_details_to_the_model() {
+        let result = NativeToolResult::from_legacy(ToolResult::error(
+            "backend failed with secret SENTINEL_PRIVATE_VALUE",
+        ));
+        let model_value = result.model_value().to_string();
+
+        assert!(!model_value.contains("SENTINEL_PRIVATE_VALUE"));
+        assert_eq!(
+            result.model_value()["error"]["message"],
+            "The Tool could not complete the request."
+        );
+    }
+
     #[async_trait::async_trait]
     impl Tool for ScriptedRetryTool {
         fn name(&self) -> &str {
@@ -2404,7 +2613,7 @@ mod tests {
         }
     }
 
-    async fn execute_native_test_call(agent: &mut SageAgent, name: &str) -> StepResult {
+    async fn execute_native_test_call(agent: &mut SageAgent, name: &str) -> NativeToolBatchResult {
         agent
             .execute_native_tool_calls(&[NativeToolCall {
                 id: "native-test-call".to_string(),
@@ -2478,7 +2687,7 @@ mod tests {
 
         let result = execute_native_test_call(&mut agent, "scripted_lookup").await;
 
-        assert!(result.executed_tools[0].result.success);
+        assert!(result.executed_tools[0].result.is_success());
         let events = events.lock().expect("event sink should lock");
         let attempted = events
             .iter()
@@ -2526,7 +2735,7 @@ mod tests {
                 .push(event);
         }));
         let result = execute_native_test_call(&mut agent, "scripted_lookup").await;
-        assert!(!result.executed_tools[0].result.success);
+        assert!(!result.executed_tools[0].result.is_success());
         assert_eq!(outcomes.lock().expect("outcomes should lock").len(), 0);
         let events = events.lock().expect("event sink should lock");
         assert_eq!(
@@ -2590,7 +2799,7 @@ mod tests {
 
         let result = execute_native_test_call(&mut agent, "hanging_write").await;
 
-        assert!(!result.executed_tools[0].result.success);
+        assert!(!result.executed_tools[0].result.is_success());
         let events = events.lock().expect("event sink");
         assert_eq!(
             events
@@ -2643,7 +2852,7 @@ mod tests {
         }));
         let mut agent = SageAgent::new_without_memory(registry, "test");
         let result = execute_native_test_call(&mut agent, "scripted_lookup").await;
-        assert!(!result.executed_tools[0].result.success);
+        assert!(!result.executed_tools[0].result.is_success());
         assert_eq!(outcomes.lock().expect("outcomes should lock").len(), 1);
     }
 
@@ -2667,7 +2876,7 @@ mod tests {
         let sink = events.clone();
         agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
         let result = execute_native_test_call(&mut agent, "scripted_lookup").await;
-        assert!(result.executed_tools[0].result.success);
+        assert!(result.executed_tools[0].result.is_success());
         let events = events.lock().unwrap();
         assert_eq!(
             events
@@ -2710,7 +2919,7 @@ mod tests {
         let sink = events.clone();
         agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
         let result = execute_native_test_call(&mut agent, "scripted_lookup").await;
-        assert!(result.executed_tools[0].result.success);
+        assert!(result.executed_tools[0].result.is_success());
         let events = events.lock().unwrap();
         assert_eq!(
             events
@@ -2746,7 +2955,7 @@ mod tests {
         let sink = events.clone();
         agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
         let result = execute_native_test_call(&mut agent, "delayed_timeout_lookup").await;
-        assert!(!result.executed_tools[0].result.success);
+        assert!(!result.executed_tools[0].result.is_success());
         let events = events.lock().unwrap();
         let timeout_ms = events.iter().find_map(|event| match event {
             AgentTraceEvent::ToolTimedOut {
