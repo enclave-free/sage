@@ -1595,6 +1595,25 @@ fn log_agent_trace_event(
             attempt = *attempt,
             duration_ms = *elapsed_ms,
         ),
+        AgentTraceEvent::NativeModelRetry {
+            model,
+            step,
+            attempt,
+            reason,
+            outcome,
+        } => tracing::info!(
+            target: "sage.model_retry",
+            event_name = "native_model_retry",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            model = %model,
+            step = *step,
+            attempt = *attempt,
+            reason = %reason,
+            outcome = %outcome,
+        ),
         AgentTraceEvent::Timing {
             phase,
             step,
@@ -1915,6 +1934,39 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             tool_name: None,
             status: Some("running".to_string()),
             metadata: json!({ "step": step, "attempt": attempt }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::NativeModelRetry {
+            model,
+            step,
+            attempt,
+            reason,
+            outcome,
+        } => ConversationTraceDeltaResponse {
+            id: trace_delta_id(
+                "native-model-retry",
+                &format!("{}-{}-{}", step, attempt, outcome),
+            ),
+            kind: "retry".to_string(),
+            title: Some("Model retry".to_string()),
+            content: Some(match outcome.as_str() {
+                "scheduled" => "Retrying the authoritative model once.".to_string(),
+                "recovered" => "The authoritative model retry recovered.".to_string(),
+                _ => "The authoritative model retry was exhausted.".to_string(),
+            }),
+            tool_name: None,
+            status: Some(match outcome.as_str() {
+                "scheduled" => "running".to_string(),
+                "recovered" => "succeeded".to_string(),
+                _ => "failed".to_string(),
+            }),
+            metadata: json!({
+                "model": model,
+                "step": step,
+                "attempt": attempt,
+                "reason": reason,
+                "outcome": outcome,
+            }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
         AgentTraceEvent::CorrectionStarted {
@@ -3790,7 +3842,7 @@ async fn chat(
     let request = apply_conversation_default_policy(&state, &ai_config, &auth, request).await?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
-    lm_settings.configure_primary().await?;
+    lm_settings.configure_authoritative().await?;
 
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.message)?;
@@ -4070,7 +4122,7 @@ async fn chat_stream(
     let request = apply_conversation_default_policy(&state, &ai_config, &auth, request).await?;
     let temperature = value_as_f64(ai_config.parameters.get("temperature"), 0.1);
     let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
-    lm_settings.configure_primary().await?;
+    lm_settings.configure_authoritative().await?;
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.message)?;
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
@@ -4302,7 +4354,7 @@ async fn query(
         .unwrap_or_else(|| value_as_i32(ai_config.parameters.get("top_k"), 8));
 
     let lm_settings = RequestLmSettings::from_config(&state.config, temperature)?;
-    lm_settings.configure_primary().await?;
+    lm_settings.configure_authoritative().await?;
 
     let session = get_or_create_web_session(&state, request.session_id.as_deref(), &auth)?;
     update_session_last_question(&state, session.id, &request.question)?;
@@ -6882,17 +6934,6 @@ fn build_query_conversation_turn_input(
     input
 }
 
-/// Failure from a single agent turn attempt.
-///
-/// `progressed` is true once at least one agent step has completed, which means
-/// the turn already has side effects (tool calls, partial messages) and must NOT
-/// be retried on a different model. We only fail over on a clean first-step
-/// failure — exactly the shape of a "configured model is unavailable" error.
-struct AgentTurnFailure {
-    error: AppError,
-    progressed: bool,
-}
-
 struct AdapterTurnOutput {
     answer: String,
     executed_tools: Vec<ExecutedTool>,
@@ -6904,14 +6945,11 @@ async fn run_native_turn_with_provider(
     input: &str,
     model: &str,
     delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-) -> std::result::Result<AdapterTurnOutput, AdapterTurnFailure> {
+) -> AppResult<AdapterTurnOutput> {
     let prompt = agent.native_turn_prompt(input);
     let tools = agent
         .native_tool_definitions()
-        .map_err(|error| AdapterTurnFailure {
-            error: AppError::internal(format!("invalid native Tool contract: {error:#}")),
-            progressed: false,
-        })?;
+        .map_err(|error| AppError::internal(format!("invalid native Tool contract: {error:#}")))?;
     let enabled_tools = tools
         .iter()
         .map(|tool| tool.name.clone())
@@ -6920,24 +6958,20 @@ async fn run_native_turn_with_provider(
         NativeChatMessage::system(prompt.system),
         NativeChatMessage::user(prompt.user),
     ];
-    let (first_turn, mut first_answer_state, selection_attempt) =
-        request_native_turn_with_protocol_retry(
-            agent,
-            provider,
-            NativeTurnRequest {
-                model: model.to_string(),
-                messages: messages.clone(),
-                tools,
-                max_tokens: PLAIN_ANSWER_MAX_TOKENS,
-            },
-            0,
-            &delta_sender,
-        )
-        .await
-        .map_err(|(error, emitted_any)| AdapterTurnFailure {
-            error: model_provider_error(error),
-            progressed: emitted_any,
-        })?;
+    let (first_turn, mut first_answer_state, selection_attempt) = request_native_turn_with_retry(
+        agent,
+        provider,
+        NativeTurnRequest {
+            model: model.to_string(),
+            messages: messages.clone(),
+            tools,
+            max_tokens: PLAIN_ANSWER_MAX_TOKENS,
+        },
+        0,
+        &delta_sender,
+    )
+    .await
+    .map_err(|(error, _)| model_provider_error(error))?;
     let (selected_tools, selection_outcome) =
         native_tool_selection_observation(&enabled_tools, &first_turn.tool_calls);
     agent.emit_trace_event(AgentTraceEvent::ToolSelectionObservation {
@@ -6956,10 +6990,7 @@ async fn run_native_turn_with_provider(
                     &mut first_answer_state,
                     &delta_sender,
                 )
-                .map_err(|error| AdapterTurnFailure {
-                    progressed: first_answer_state.emitted_any,
-                    error: model_provider_error(error),
-                })?;
+                .map_err(model_provider_error)?;
             }
             (first_turn.content, Vec::new())
         }
@@ -6976,7 +7007,7 @@ async fn run_native_turn_with_provider(
             for (call, content) in first_turn.tool_calls.iter().zip(result_contents) {
                 messages.push(NativeChatMessage::tool_result(&call.id, content));
             }
-            let (final_turn, _final_answer_state, _) = request_native_turn_with_protocol_retry(
+            let (final_turn, _final_answer_state, _) = request_native_turn_with_retry(
                 agent,
                 provider,
                 NativeTurnRequest {
@@ -6989,10 +7020,7 @@ async fn run_native_turn_with_provider(
                 &delta_sender,
             )
             .await
-            .map_err(|(error, _)| AdapterTurnFailure {
-                error: model_provider_error(error),
-                progressed: true,
-            })?;
+            .map_err(|(error, _)| model_provider_error(error))?;
             (
                 format!("{preamble}{}", final_turn.content),
                 batch.executed_tools,
@@ -7032,7 +7060,7 @@ fn native_tool_selection_observation(
     (selected_tools, outcome.to_string())
 }
 
-async fn request_native_turn_with_protocol_retry(
+async fn request_native_turn_with_retry(
     agent: &SageAgent,
     provider: &OpenAiNativeClient,
     request: NativeTurnRequest,
@@ -7042,6 +7070,7 @@ async fn request_native_turn_with_protocol_retry(
     (NativeAssistantTurn, NativeAnswerStreamState, u32),
     (NativeProviderError, bool),
 > {
+    let model = request.model.clone();
     let mut answer_state = NativeAnswerStreamState::default();
     match stream_native_turn_attempt(
         agent,
@@ -7055,8 +7084,16 @@ async fn request_native_turn_with_protocol_retry(
     .await
     {
         Ok(turn) => Ok((turn, answer_state, 1)),
-        Err(error) if error.is_protocol() && !answer_state.emitted_any => {
-            warn!("Native provider returned an unusable response; retrying the same request once");
+        Err(error) if same_model_retry_eligible(&error) && !answer_state.released_any => {
+            let reason = same_model_retry_category(&error).unwrap_or("transient_provider_failure");
+            warn!("Authoritative model request failed transiently; retrying the same request once");
+            agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
+                model: model.clone(),
+                step,
+                attempt: 2,
+                reason: reason.to_string(),
+                outcome: "scheduled".to_string(),
+            });
             let mut retry_state = NativeAnswerStreamState::default();
             match stream_native_turn_attempt(
                 agent,
@@ -7069,11 +7106,53 @@ async fn request_native_turn_with_protocol_retry(
             )
             .await
             {
-                Ok(turn) => Ok((turn, retry_state, 2)),
-                Err(error) => Err((error, retry_state.emitted_any)),
+                Ok(turn) => {
+                    agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
+                        model,
+                        step,
+                        attempt: 2,
+                        reason: reason.to_string(),
+                        outcome: "recovered".to_string(),
+                    });
+                    Ok((turn, retry_state, 2))
+                }
+                Err(error) => {
+                    agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
+                        model,
+                        step,
+                        attempt: 2,
+                        reason: same_model_retry_category(&error)
+                            .unwrap_or("retry_failed")
+                            .to_string(),
+                        outcome: "exhausted".to_string(),
+                    });
+                    Err((error, retry_state.released_any))
+                }
             }
         }
-        Err(error) => Err((error, answer_state.emitted_any)),
+        Err(error) => Err((error, answer_state.released_any)),
+    }
+}
+
+fn same_model_retry_eligible(error: &NativeProviderError) -> bool {
+    same_model_retry_category(error).is_some()
+}
+
+fn same_model_retry_category(error: &NativeProviderError) -> Option<&'static str> {
+    match error {
+        NativeProviderError::Protocol(_) => Some("protocol"),
+        NativeProviderError::Transport(error) if error.is_timeout() => Some("timeout"),
+        NativeProviderError::Transport(error) if error.is_connect() => Some("connection"),
+        NativeProviderError::Transport(error) if error.is_body() || error.is_decode() => {
+            Some("response_stream")
+        }
+        NativeProviderError::Http { status, .. } => match *status {
+            reqwest::StatusCode::BAD_GATEWAY => Some("http_502"),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE => Some("http_503"),
+            reqwest::StatusCode::GATEWAY_TIMEOUT => Some("http_504"),
+            _ => None,
+        },
+        NativeProviderError::Transport(_) => None,
     }
 }
 
@@ -7172,8 +7251,8 @@ fn stage_native_provider_signal(
         NativeProviderSignal::Content(delta) => delta,
         NativeProviderSignal::Event => return Ok(()),
     };
-    answer_state.push(&delta);
-    release_answer_deltas(vec![delta], delta_sender);
+    let released = release_answer_delta(delta.clone(), delta_sender);
+    answer_state.push(&delta, released);
     Ok(())
 }
 
@@ -7252,12 +7331,6 @@ fn bounded_native_tool_result_content(result: &ToolResult, max_chars: usize) -> 
     bounded
 }
 
-#[derive(Debug)]
-struct AdapterTurnFailure {
-    error: AppError,
-    progressed: bool,
-}
-
 async fn run_agent_steps(
     agent: &mut SageAgent,
     input: &str,
@@ -7265,26 +7338,22 @@ async fn run_agent_steps(
     lm: &RequestLmSettings,
     model: &str,
     delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-) -> Result<String, AgentTurnFailure> {
+) -> AppResult<String> {
     let provider = OpenAiNativeClient::new(
-        Client::new(),
+        conversation_model_http_client()
+            .map_err(|_| AppError::internal("failed to initialize Conversation model client"))?,
         lm.api_url.clone(),
         lm.api_key.clone(),
         lm.temperature,
     );
-    let turn = run_native_turn_with_provider(agent, &provider, input, model, delta_sender)
-        .await
-        .map_err(|failure| AgentTurnFailure {
-            error: failure.error,
-            progressed: failure.progressed,
-        })?;
+    let turn = run_native_turn_with_provider(agent, &provider, input, model, delta_sender).await?;
     persist_successful_admin_config_tools(agent, memory_user_id, &turn.executed_tools).await;
     Ok(turn.answer)
 }
 
-/// Run an agent turn, falling back through the configured chat model chain when
-/// the primary model is unavailable upstream (e.g. Tinfoil 502). Each model is
-/// tried once, in order; fallback only happens before any step has succeeded.
+/// Run an agent turn with the one configured authoritative model. Eligible
+/// provider failures are retried inside the native request boundary against the
+/// exact same model and request.
 async fn run_agent_turn(
     agent: &mut SageAgent,
     input: &str,
@@ -7292,43 +7361,7 @@ async fn run_agent_turn(
     lm: &RequestLmSettings,
     delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> AppResult<String> {
-    let chain = &lm.model_chain;
-    let mut last_error: Option<AppError> = None;
-
-    for (idx, model) in chain.iter().enumerate() {
-        match run_agent_steps(
-            agent,
-            input,
-            memory_user_id,
-            lm,
-            model,
-            delta_sender.clone(),
-        )
-        .await
-        {
-            Ok(answer) => return Ok(answer),
-            Err(AgentTurnFailure { error, progressed }) => {
-                let more_models = idx + 1 < chain.len();
-                if should_fallback_agent_turn(&error, progressed, more_models) {
-                    warn!(
-                        "chat model '{}' unavailable ({}); falling back to '{}'",
-                        model,
-                        error.message,
-                        chain[idx + 1]
-                    );
-                    last_error = Some(error);
-                    continue;
-                }
-                return Err(error);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| AppError::internal("no chat model configured")))
-}
-
-fn should_fallback_agent_turn(error: &AppError, progressed: bool, more_models: bool) -> bool {
-    !progressed && more_models && is_model_fallback_eligible(error)
+    run_agent_steps(agent, input, memory_user_id, lm, &lm.model, delta_sender).await
 }
 
 async fn persist_successful_admin_config_tools(
@@ -7786,100 +7819,77 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
 }
 
 const PLAIN_ANSWER_MAX_TOKENS: u32 = 8192;
+const CONVERSATION_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Default)]
 struct NativeAnswerStreamState {
     answer: String,
-    emitted_any: bool,
+    released_any: bool,
 }
 
 impl NativeAnswerStreamState {
-    fn push(&mut self, delta: &str) {
+    fn push(&mut self, delta: &str, released: bool) {
         if delta.is_empty() {
             return;
         }
         self.answer.push_str(delta);
-        self.emitted_any = true;
-    }
-}
-fn release_answer_deltas(
-    answer_deltas: Vec<String>,
-    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-) {
-    let Some(sender) = delta_sender else {
-        return;
-    };
-    for delta in answer_deltas {
-        let _ = sender.send(ConversationStreamSignal::Answer(delta));
+        self.released_any |= released;
     }
 }
 
-/// Per-request LM configuration: the ordered chat model chain (primary first,
-/// then fallbacks) plus the endpoint and temperature used to (re)configure the
-/// global LM as the request fails over between models.
+fn release_answer_delta(
+    delta: String,
+    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) -> bool {
+    let Some(sender) = delta_sender else {
+        return false;
+    };
+    sender.send(ConversationStreamSignal::Answer(delta)).is_ok()
+}
+
+fn conversation_model_http_client() -> std::result::Result<Client, reqwest::Error> {
+    conversation_model_http_client_with_timeout(CONVERSATION_MODEL_REQUEST_TIMEOUT)
+}
+
+fn conversation_model_http_client_with_timeout(
+    timeout: Duration,
+) -> std::result::Result<Client, reqwest::Error> {
+    Client::builder().timeout(timeout).build()
+}
+
+/// Per-request configuration for the one authoritative Conversation model.
 struct RequestLmSettings {
     api_url: String,
     api_key: String,
-    model_chain: Vec<String>,
+    model: String,
     temperature: f64,
 }
 
 impl RequestLmSettings {
-    /// Build the model chain and endpoint settings for a request, deduping any
-    /// fallback that repeats the primary model.
     fn from_config(config: &Config, temperature: f64) -> AppResult<Self> {
         let api_key = config
             .tinfoil_api_key
             .as_deref()
             .ok_or_else(|| AppError::internal("TINFOIL_API_KEY not configured"))?;
 
-        let mut model_chain = Vec::with_capacity(1 + config.tinfoil_model_fallbacks.len());
-        model_chain.push(config.tinfoil_model.clone());
-        for fallback in &config.tinfoil_model_fallbacks {
-            if !model_chain.iter().any(|existing| existing == fallback) {
-                model_chain.push(fallback.clone());
-            }
-        }
-
         Ok(Self {
             api_url: config.tinfoil_api_url.clone(),
             api_key: api_key.to_string(),
-            model_chain,
+            model: config.tinfoil_model.clone(),
             temperature,
         })
     }
 
-    /// Point the global LM at `model`.
-    async fn configure(&self, model: &str) -> AppResult<()> {
+    async fn configure_authoritative(&self) -> AppResult<()> {
         SageAgent::configure_lm_with_temperature(
             &self.api_url,
             &self.api_key,
-            model,
+            &self.model,
             self.temperature,
         )
         .await
         .map_err(internal_error)
     }
-
-    /// Configure the primary model — used by handlers before any intermediate
-    /// memory work so it runs against the same model the turn starts on.
-    async fn configure_primary(&self) -> AppResult<()> {
-        let primary = self
-            .model_chain
-            .first()
-            .ok_or_else(|| AppError::internal("no chat model configured"))?;
-        self.configure(primary).await
-    }
-}
-
-/// Whether a failed turn should fall over to the next model. Upstream model
-/// outages and missing-model errors surface as 502 via [`model_provider_error`];
-/// everything else (bad request, auth, app bugs) is returned unchanged.
-fn is_model_fallback_eligible(error: &AppError) -> bool {
-    matches!(
-        error.status,
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-    )
 }
 
 fn enforce_csrf(config: &EnclaveWebConfig, method: &Method, headers: &HeaderMap) -> AppResult<()> {
@@ -8000,41 +8010,34 @@ fn internal_error(error: impl std::fmt::Display) -> AppError {
     AppError::internal(error.to_string())
 }
 
-fn model_provider_error(error: impl std::fmt::Display) -> AppError {
-    let message = error.to_string();
-    if is_upstream_model_failure(&message) {
+fn model_provider_error(error: NativeProviderError) -> AppError {
+    if same_model_retry_eligible(&error) {
+        warn!(
+            target: "sage.model_provider",
+            event_name = "authoritative_model_unavailable",
+            category = same_model_retry_category(&error).unwrap_or("transient_provider_failure"),
+        );
         AppError::new(
             StatusCode::BAD_GATEWAY,
-            "Configured Tinfoil model is unavailable. Check TINFOIL_MODEL and restart Sage.",
+            "The configured Conversation model is temporarily unavailable. Please try again.",
         )
     } else {
-        AppError::internal(message)
+        let (category, status) = match &error {
+            NativeProviderError::Http { status, .. } => ("provider_rejected", status.as_u16()),
+            NativeProviderError::Transport(_) => ("provider_transport", 0),
+            NativeProviderError::Protocol(_) => ("provider_protocol", 0),
+        };
+        warn!(
+            target: "sage.model_provider",
+            event_name = "authoritative_model_request_failed",
+            category,
+            status,
+        );
+        AppError::new(
+            StatusCode::BAD_GATEWAY,
+            "The configured Conversation model request failed. Check Deployment Settings and try again.",
+        )
     }
-}
-
-/// Detect errors that mean the chat model itself is unreachable/unavailable
-/// upstream (vs. a request or application error). These are the failures worth
-/// failing over to a different model for.
-fn is_upstream_model_failure(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    const MARKERS: &[&str] = &[
-        "the model does not exist",
-        "model not found",
-        "model_not_found",
-        "502",
-        "bad gateway",
-        "503",
-        "service unavailable",
-        "504",
-        "gateway timeout",
-        "connection refused",
-        "connection reset",
-        "connection closed",
-        "error sending request",
-        "timed out",
-        "dns error",
-    ];
-    MARKERS.iter().any(|marker| message.contains(marker))
 }
 
 fn auth_error(error: anyhow::Error) -> AppError {
@@ -8287,20 +8290,6 @@ mod tests {
         );
         assert_eq!(log["provider_wait_proxy"], json!(true));
         assert_eq!(log["outcome"], json!("failed"));
-    }
-
-    #[test]
-    fn model_fallback_is_allowed_only_before_side_effects_or_answer_chunks() {
-        let upstream = AppError::new(StatusCode::BAD_GATEWAY, "provider unavailable");
-
-        assert!(should_fallback_agent_turn(&upstream, false, true));
-        assert!(!should_fallback_agent_turn(&upstream, true, true));
-        assert!(!should_fallback_agent_turn(&upstream, false, false));
-        assert!(!should_fallback_agent_turn(
-            &AppError::new(StatusCode::BAD_REQUEST, "bad request"),
-            false,
-            true
-        ));
     }
 
     #[test]
@@ -9330,14 +9319,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_free_turn_falls_back_before_the_first_answer_chunk() {
+    async fn transient_failure_retries_the_same_authoritative_model_once() {
         async fn completion(
             State(requested_models): State<Arc<Mutex<Vec<String>>>>,
             Json(body): Json<Value>,
         ) -> Response {
             let model = body["model"].as_str().unwrap_or_default().to_string();
             requested_models.lock().unwrap().push(model.clone());
-            if model == "primary" {
+            if requested_models.lock().unwrap().len() == 1 {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({ "error": "503 Service Unavailable" })),
@@ -9347,7 +9336,7 @@ mod tests {
             (
                 [("content-type", "text/event-stream")],
                 concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"fallback answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"recovered answer\"},\"finish_reason\":\"stop\"}]}\n\n",
                     "data: [DONE]\n\n"
                 ),
             )
@@ -9375,19 +9364,476 @@ mod tests {
         let settings = RequestLmSettings {
             api_url: format!("http://{address}/v1"),
             api_key: "test-key".to_string(),
-            model_chain: vec!["primary".to_string(), "fallback".to_string()],
+            model: "glm-5-2".to_string(),
             temperature: 0.1,
         };
 
         let answer = run_agent_turn(&mut agent, "hello", None, &settings, None)
             .await
-            .expect("clean pre-chunk failure should use fallback");
+            .expect("eligible failure should recover on the same model");
 
-        assert_eq!(answer, "fallback answer");
+        assert_eq!(answer, "recovered answer");
         assert_eq!(
             requested_models.lock().unwrap().as_slice(),
-            ["primary", "fallback"]
+            ["glm-5-2", "glm-5-2"]
         );
+    }
+
+    #[tokio::test]
+    async fn final_model_retry_reuses_tool_results_without_replaying_tools() {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            let request_number = {
+                let mut requests = state.0.lock().expect("provider request capture");
+                requests.push(body);
+                requests.len()
+            };
+            match request_number {
+                1 => (
+                    [(("content-type"), "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-once\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+                    .into_response(),
+                2 => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "temporary"})),
+                )
+                    .into_response(),
+                _ => (
+                    [(("content-type"), "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Final answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+                    .into_response(),
+            }
+        }
+
+        let state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_state),
+            )
+            .await
+            .unwrap();
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingReadTool {
+            executions: executions.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let turn = run_native_turn_with_provider(
+            &mut agent,
+            &provider,
+            "use the documents",
+            "glm-5-2",
+            None,
+        )
+        .await
+        .expect("the final request should recover without replaying its Tool batch");
+
+        assert_eq!(turn.answer, "Final answer.");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let requests = state.0.lock().expect("captured provider requests");
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request["model"] == "glm-5-2"));
+        assert!(requests[1].get("tools").is_none());
+        assert_eq!(requests[1]["messages"], requests[2]["messages"]);
+        assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-once");
+    }
+
+    #[tokio::test]
+    async fn exhausted_transient_retry_returns_a_clear_temporary_failure() {
+        async fn completion(
+            State(requested_models): State<Arc<Mutex<Vec<String>>>>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            requested_models
+                .lock()
+                .unwrap()
+                .push(body["model"].as_str().unwrap_or_default().to_string());
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": "temporary"})))
+        }
+
+        let requested_models = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_models = requested_models.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_models),
+            )
+            .await
+            .unwrap();
+        });
+        let settings = RequestLmSettings {
+            api_url: format!("http://{address}/v1"),
+            api_key: "test-key".to_string(),
+            model: "glm-5-2".to_string(),
+            temperature: 0.1,
+        };
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+
+        let error = run_agent_turn(&mut agent, "hello", None, &settings, None)
+            .await
+            .expect_err("two transient failures should end the turn");
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.message,
+            "The configured Conversation model is temporarily unavailable. Please try again."
+        );
+        assert_eq!(
+            requested_models.lock().unwrap().as_slice(),
+            ["glm-5-2", "glm-5-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_and_timeout_failures_each_receive_one_same_model_retry() {
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_address = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+        let connection_provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{closed_address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut connection_agent =
+            SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let connection_traces = Arc::new(Mutex::new(Vec::new()));
+        let connection_sink = connection_traces.clone();
+        connection_agent.set_trace_hook(Arc::new(move |event| {
+            connection_sink.lock().unwrap().push(event);
+        }));
+
+        let connection_result = run_native_turn_with_provider(
+            &mut connection_agent,
+            &connection_provider,
+            "hello",
+            "glm-5-2",
+            None,
+        )
+        .await;
+        assert!(
+            connection_result.is_err(),
+            "closed endpoint should exhaust the retry"
+        );
+        assert_eq!(
+            connection_traces
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::ModelRequest,
+                        outcome: ConversationTimingOutcome::Failed,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+
+        #[derive(Clone)]
+        struct TimeoutState(Arc<AtomicUsize>);
+        async fn never_respond(State(state): State<TimeoutState>) -> Response {
+            state.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Response>().await
+        }
+        let timeout_requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let timeout_state = TimeoutState(timeout_requests.clone());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(never_respond))
+                    .with_state(timeout_state),
+            )
+            .await
+            .unwrap();
+        });
+        let timeout_client =
+            conversation_model_http_client_with_timeout(Duration::from_millis(25)).unwrap();
+        let timeout_provider = OpenAiNativeClient::new(
+            timeout_client,
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut timeout_agent =
+            SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+
+        let timeout_result = run_native_turn_with_provider(
+            &mut timeout_agent,
+            &timeout_provider,
+            "hello",
+            "glm-5-2",
+            None,
+        )
+        .await;
+        assert!(
+            timeout_result.is_err(),
+            "provider timeout should exhaust the retry"
+        );
+        assert_eq!(timeout_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn response_stream_connection_termination_retries_before_content_is_emitted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_accepted = accepted.clone();
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                server_accepted.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                if attempt == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 100\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let body = concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered stream.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let trace_events = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink.lock().unwrap().push(event);
+        }));
+
+        let turn = run_native_turn_with_provider(&mut agent, &provider, "hello", "glm-5-2", None)
+            .await
+            .expect("a pre-content stream disconnect should retry once");
+
+        assert_eq!(turn.answer, "Recovered stream.");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        let retry_events = trace_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                AgentTraceEvent::NativeModelRetry {
+                    model,
+                    reason,
+                    outcome,
+                    ..
+                } => Some((model.clone(), reason.clone(), outcome.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retry_events,
+            [
+                (
+                    "glm-5-2".to_string(),
+                    "response_stream".to_string(),
+                    "scheduled".to_string(),
+                ),
+                (
+                    "glm-5-2".to_string(),
+                    "response_stream".to_string(),
+                    "recovered".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn private_partial_content_can_retry_but_released_stream_content_cannot() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn spawn_provider() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let server_accepted = accepted.clone();
+            tokio::spawn(async move {
+                for attempt in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    server_accepted.fetch_add(1, Ordering::SeqCst);
+                    let mut request = [0_u8; 4096];
+                    let _ = socket.read(&mut request).await;
+                    let body = if attempt == 0 {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Private partial. \"},\"finish_reason\":null}]}\n\n"
+                    } else {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered cleanly.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                    };
+                    let declared_length = if attempt == 0 {
+                        body.len() + 100
+                    } else {
+                        body.len()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {declared_length}\r\n\r\n{body}"
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+            });
+            (address, accepted)
+        }
+
+        let (nonstream_address, nonstream_accepted) = spawn_provider().await;
+        let nonstream_provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{nonstream_address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut nonstream_agent =
+            SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let turn = run_native_turn_with_provider(
+            &mut nonstream_agent,
+            &nonstream_provider,
+            "hello",
+            "glm-5-2",
+            None,
+        )
+        .await
+        .expect("private buffered content should not prevent a safe retry");
+        assert_eq!(turn.answer, "Recovered cleanly.");
+        assert_eq!(nonstream_accepted.load(Ordering::SeqCst), 2);
+
+        let (stream_address, stream_accepted) = spawn_provider().await;
+        let stream_provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{stream_address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut stream_agent =
+            SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let streamed = run_native_turn_with_provider(
+            &mut stream_agent,
+            &stream_provider,
+            "hello",
+            "glm-5-2",
+            Some(delta_tx),
+        )
+        .await;
+
+        assert!(
+            streamed.is_err(),
+            "released content must not be duplicated by retrying the request"
+        );
+        assert_eq!(stream_accepted.load(Ordering::SeqCst), 1);
+        match delta_rx.try_recv().unwrap() {
+            ConversationStreamSignal::Answer(delta) => {
+                assert_eq!(delta, "Private partial. ")
+            }
+            ConversationStreamSignal::Trace(_) => panic!("expected the released answer delta"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_and_validation_failures_are_not_retried() {
+        #[derive(Clone)]
+        struct FailureState {
+            requests: Arc<AtomicUsize>,
+            status: StatusCode,
+        }
+        async fn fail(State(state): State<FailureState>) -> Response {
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            (state.status, Json(json!({"error": "rejected"}))).into_response()
+        }
+
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::BAD_REQUEST] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = FailureState {
+                requests: requests.clone(),
+                status,
+            };
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/v1/chat/completions", post(fail))
+                        .with_state(state),
+                )
+                .await
+                .unwrap();
+            });
+            let provider = OpenAiNativeClient::new(
+                Client::new(),
+                format!("http://{address}/v1"),
+                "test-key".to_string(),
+                0.1,
+            );
+            let mut agent =
+                SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+
+            let result =
+                run_native_turn_with_provider(&mut agent, &provider, "hello", "glm-5-2", None)
+                    .await;
+            assert!(
+                result.is_err(),
+                "non-transient provider rejection should fail immediately"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "status {status}");
+        }
     }
 
     #[test]
@@ -13407,25 +13853,12 @@ mod tests {
     }
 
     #[test]
-    fn lm_settings_chain_puts_primary_first_and_dedupes() {
+    fn lm_settings_use_only_the_authoritative_model() {
         let mut config = test_config_with_tinfoil_key("secret");
-        config.tinfoil_model = "kimi-k2-6".to_string();
-        // Fallback that repeats the primary should be dropped.
-        config.tinfoil_model_fallbacks = vec![
-            "kimi-k2-6".to_string(),
-            "glm-5-2".to_string(),
-            "gpt-oss-120b".to_string(),
-        ];
+        config.tinfoil_model = "glm-5-2".to_string();
 
         let settings = RequestLmSettings::from_config(&config, 0.1).expect("settings");
-        assert_eq!(
-            settings.model_chain,
-            vec![
-                "kimi-k2-6".to_string(),
-                "glm-5-2".to_string(),
-                "gpt-oss-120b".to_string(),
-            ],
-        );
+        assert_eq!(settings.model, "glm-5-2");
     }
 
     #[test]
@@ -13436,36 +13869,80 @@ mod tests {
     }
 
     #[test]
-    fn upstream_model_failures_are_fallback_eligible() {
-        for message in [
-            "The model does not exist",
-            "upstream returned 502 Bad Gateway",
-            "503 Service Unavailable",
-            "error sending request for url",
-            "connection refused",
-            // Realistic anyhow chain ({:#}) surfaced by run_agent_steps: the
-            // status lives in a nested source, not the top-level message.
-            "LLM call failed after 3 attempts: HttpError: Invalid status code \
-             503 Service Unavailable with message: Workload proxy is not ready.",
+    fn same_model_retry_accepts_only_protocol_and_transient_http_failures() {
+        assert!(same_model_retry_eligible(&NativeProviderError::Protocol(
+            "malformed response".to_string()
+        )));
+        for status in [
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
         ] {
-            let error = model_provider_error(message);
-            assert!(
-                is_model_fallback_eligible(&error),
-                "expected fallback for: {message}"
-            );
+            assert!(same_model_retry_eligible(&NativeProviderError::Http {
+                status,
+                body: "temporary".to_string(),
+            }));
         }
+        assert!(!same_model_retry_eligible(&NativeProviderError::Http {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: "invalid key".to_string(),
+        }));
+        assert!(!same_model_retry_eligible(&NativeProviderError::Http {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "invalid request".to_string(),
+        }));
     }
 
     #[test]
-    fn request_and_app_errors_are_not_fallback_eligible() {
-        // A 400-class provider error (e.g. malformed request) must not fail over.
-        assert!(!is_model_fallback_eligible(&model_provider_error(
-            "400 Bad Request: invalid 'messages'"
-        )));
-        assert!(!is_model_fallback_eligible(&AppError::new(
-            StatusCode::UNAUTHORIZED,
-            "nope"
-        )));
+    fn non_retryable_provider_errors_never_expose_upstream_response_bodies() {
+        let secret = "sk-private-upstream-echo";
+        let error = model_provider_error(NativeProviderError::Http {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: format!("Authorization failed for {secret}"),
+        });
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.message,
+            "The configured Conversation model request failed. Check Deployment Settings and try again."
+        );
+        assert!(!error.message.contains(secret));
+        assert!(!error.message.contains("Authorization"));
+    }
+
+    #[test]
+    fn native_model_retry_observability_is_content_free_and_records_outcome() {
+        let event = AgentTraceEvent::NativeModelRetry {
+            model: "glm-5-2".to_string(),
+            step: 1,
+            attempt: 2,
+            reason: "http_503".to_string(),
+            outcome: "recovered".to_string(),
+        };
+        let log = capture_structured_log(event.clone());
+        assert_eq!(log["event_name"], "native_model_retry");
+        assert_eq!(log["model"], "glm-5-2");
+        assert_eq!(log["attempt"], 2);
+        assert_eq!(log["reason"], "http_503");
+        assert_eq!(log["outcome"], "recovered");
+
+        let delta = agent_trace_event_delta(event);
+        assert_eq!(delta.kind, "retry");
+        assert_eq!(delta.status.as_deref(), Some("succeeded"));
+        assert_eq!(delta.metadata["model"], "glm-5-2");
+        assert_eq!(delta.metadata["reason"], "http_503");
+        assert_eq!(delta.metadata["outcome"], "recovered");
+        let rendered = format!("{log}{delta:?}");
+        for forbidden in [
+            "prompt",
+            "answer",
+            "arguments",
+            "result",
+            "reasoning",
+            "secret",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
     }
 
     #[test]
@@ -13655,7 +14132,7 @@ mod tests {
             payload["runtime_config"]["TINFOIL_API_URL"],
             "http://tinfoil-proxy:8089/v1"
         );
-        assert_eq!(payload["runtime_config"]["TINFOIL_MODEL"], "kimi-k2-6");
+        assert_eq!(payload["runtime_config"]["TINFOIL_MODEL"], "glm-5-2");
         assert_eq!(
             payload["runtime_config"]["TINFOIL_EMBEDDING_MODEL"],
             "nomic-embed-text"
@@ -13685,8 +14162,7 @@ mod tests {
         Config {
             tinfoil_api_url: "http://tinfoil-proxy:8089/v1".to_string(),
             tinfoil_api_key: Some(secret.to_string()),
-            tinfoil_model: "kimi-k2-6".to_string(),
-            tinfoil_model_fallbacks: vec!["glm-5-2".to_string(), "gpt-oss-120b".to_string()],
+            tinfoil_model: "glm-5-2".to_string(),
             tinfoil_embedding_model: "nomic-embed-text".to_string(),
             tinfoil_vision_model: "qwen3-vl-30b".to_string(),
             database_url: "postgres://sage:sage@localhost:5434/sage".to_string(),

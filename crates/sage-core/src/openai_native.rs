@@ -131,12 +131,6 @@ pub enum NativeProviderError {
     Protocol(String),
 }
 
-impl NativeProviderError {
-    pub fn is_protocol(&self) -> bool {
-        matches!(self, Self::Protocol(_))
-    }
-}
-
 pub struct OpenAiNativeClient {
     client: Client,
     api_url: String,

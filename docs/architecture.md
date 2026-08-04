@@ -66,38 +66,28 @@ This file contains the branch-specific integration layer:
 | `POST /admin/tools/execute` | Sage | public admin route; execution delegated to Python |
 | `/admin/ai-config/*` | Sage | public route family and storage both live in Sage |
 
-### Conversation final-answer safety
+### Native Conversation trust boundary
 
-`POST /llm/chat` plans and runs selected Tools before requesting a separate
-plain final answer. Current-turn Tool results are de-duplicated, limited to
-4,000 characters each and 12,000 characters total, with the newest results
-preferred when the budget is full. The planner's `replan_after_results` field
-is an optional hint; omitting it means no requested replan.
+`POST /llm/chat` sends enabled, authorized native Tool definitions to the one
+configured Conversation model. The model either answers directly or selects
+one bounded Tool batch. After a Tool batch, correlated structured Tool results
+are returned to the same model without Tool definitions, so a second Tool round
+cannot begin. Current-turn Tool results are limited to 4,000 characters each
+and 12,000 characters total.
 
-The final-answer stream briefly holds ambiguous planning/search openings and
-structured Tool-like output. Repeated process narration, Tool intent, provider
-token-limit termination, and unsupported finish reasons fail the answer rather
-than being persisted as success. A quarantined Tool, repetition, or token-limit
-failure may retry once only when no answer text has reached the client.
+Native assistant content streams in provider order without semantic scanning,
+quarantine, rewriting, or deterministic answer fallback. Provider reasoning is
+discarded. Structural protocol failures and eligible connection, timeout, or
+502/503/504 failures may retry the identical request once against the identical
+model. A final-request retry reuses existing Tool-result messages and cannot
+execute Tools again. No other Conversation model is substituted after failure.
 
-One narrow deterministic terminal fallback applies after that retry is
-exhausted: when the turn executed exactly one successful Curated Resources
-inventory lookup and exposed no answer text, Sage may return the Tool adapter's
-separately marked user-safe inventory rendering. Internal Tool output is never
-used for this fallback. Contact lookups, multiple-Tool turns, partial answer
-streams, and ordinary provider or transport failures retain the fail-closed
-behavior above.
-
-Conversation traces time total Tool planning, retrieval, Resource Directory
-lookup, Tool execution, retry delay, final-answer generation, and total turn
-duration separately. Final-answer response-header and first-event waits are
-explicit provider-wait proxies: network transit, provider queueing, and model
-startup may all contribute. The current typed Tool-planning provider contract
-does not expose cluster-scheduling or inference-only timings, so Sage emits
-those two phases as `unavailable` instead of fabricating durations or treating
-the combined planning duration as either metric. This preserves an honest
-correlation between slow planning attempts and omitted/rejected Tool selections
-while making the provider instrumentation gap visible.
+Conversation traces record native model requests, provider first-event wait,
+Retrieval or Resource lookup, Tool execution, retry, and total-turn timing where
+those stages are measurable. Provider first-event wait is a combined proxy:
+network transit, provider queueing, and model startup may all contribute. Sage
+does not emit fabricated `cluster_scheduling` or `inference_only` phases when
+the provider does not supply those measurements.
 
 ## InternalAgentClient Contract
 

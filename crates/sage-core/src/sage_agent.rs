@@ -996,6 +996,13 @@ pub enum AgentTraceEvent {
         step: usize,
         attempt: u32,
     },
+    NativeModelRetry {
+        model: String,
+        step: usize,
+        attempt: u32,
+        reason: String,
+        outcome: String,
+    },
     CorrectionStarted {
         step: usize,
         attempt: u32,
@@ -2103,10 +2110,8 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
                     MAX_LLM_RETRIES,
                     err
                 );
-                // Use Debug ({:?}) so the underlying provider status (e.g. the
-                // upstream "503 Service Unavailable") is preserved in the error
-                // message. The provider error's Display is only "LLM call failed",
-                // which hides the status that model-fallback classification needs.
+                // Preserve the underlying provider status in this generic
+                // runtime's internal diagnostic error chain.
                 return Err(anyhow::anyhow!(
                     "LLM error after {} retries: {:?}",
                     MAX_LLM_RETRIES,
