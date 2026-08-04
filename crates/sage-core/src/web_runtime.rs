@@ -105,14 +105,6 @@ Output style:
 - Either answer directly in plain user-visible prose or use the provided native Tools when they are useful.
 - Do not describe a Tool call in prose. Call the native Tool instead, then answer from its result.
 "#;
-const CURATED_RESOURCES_GROUNDING_POLICY: &str = r#"
-
-=== CURATED RESOURCES GROUNDING ===
-- For a current email, phone number, website, address, secure channel, or equivalent contact-detail request, use a fresh find_resources call with lookup_mode=contact. Use recent Conversation context for the organization, jurisdiction, language, and help type when it is clear.
-- For a list or inventory request, use lookup_mode=inventory and preserve any explicit organization or name filter in query.
-- For the next page, call find_resources with the prior filters and the positive next offset returned by the Tool.
-- Current contact details must come from the fresh find_resources result for this turn. If it has no matching contact, say so honestly and do not invent or reconstruct one.
-"#;
 const ADMIN_ONBOARDING_SURFACE: &str = "admin-onboarding";
 const ADMIN_ONBOARDING_INSTRUCTION: &str = r#"
 
@@ -802,47 +794,24 @@ struct InternalResourceSearchResponse {
     next_offset: Option<usize>,
 }
 
-fn conservative_resource_pagination(
-    offset: usize,
-    page_item_count: usize,
-    total_count: usize,
-    reported_has_more: bool,
-    reported_next_offset: Option<usize>,
-) -> (bool, Option<usize>) {
-    let consumed_count = offset.saturating_add(page_item_count);
-    let has_more = reported_has_more || consumed_count < total_count;
-    let next_offset = has_more
-        .then(|| {
-            reported_next_offset
-                .filter(|next_offset| page_item_count > 0 && *next_offset == consumed_count)
-                .or_else(|| (page_item_count > 0).then_some(consumed_count))
-        })
-        .flatten();
-    (has_more, next_offset)
-}
-
-fn conservative_resource_total_count(
-    offset: usize,
-    page_item_count: usize,
-    reported_total_count: usize,
-) -> usize {
-    reported_total_count.max(offset.saturating_add(page_item_count))
-}
-
-fn resource_response_offset_matches(requested_offset: i32, response_offset: usize) -> bool {
-    usize::try_from(requested_offset).ok() == Some(response_offset)
-}
-
-fn is_inventory_resource_lookup(help_type: Option<&str>, lookup_mode: Option<&str>) -> bool {
-    help_type.is_none() && lookup_mode == Some("inventory")
-}
-
-fn resource_page_is_definitively_empty(
-    page_item_count: usize,
-    total_count: usize,
-    has_more: bool,
+fn resource_page_contract_is_consistent(
+    response: &InternalResourceSearchResponse,
+    requested_offset: i32,
 ) -> bool {
-    page_item_count == 0 && total_count == 0 && !has_more
+    let Ok(requested_offset) = usize::try_from(requested_offset) else {
+        return false;
+    };
+    let returned_count = response.resources.len();
+    let consumed_count = response.offset.saturating_add(returned_count);
+    let expected_has_more = consumed_count < response.total_count;
+    let expected_next_offset = expected_has_more.then_some(consumed_count);
+
+    response.offset == requested_offset
+        && response.returned_count == returned_count
+        && returned_count <= response.limit
+        && consumed_count <= response.total_count
+        && response.has_more == expected_has_more
+        && response.next_offset == expected_next_offset
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2311,7 +2280,7 @@ impl Tool for KnowledgeSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search uploaded enclave.free documents and knowledge chunks."
+        "Search uploaded Documents. Documents may use different languages or titles than the user's question; multiple calls in one Tool batch may be useful for alternate queries."
     }
 
     fn args_schema(&self) -> &str {
@@ -2402,40 +2371,22 @@ impl Tool for FindResourcesTool {
     }
 
     fn description(&self) -> &str {
-        "Look up trusted, vetted real-world resources to connect a person with help: \
-         lawyers, NGOs, UN bodies, clinics, shelters, food, financial aid. Use this when a \
-         conversation escalates from information to action - when someone needs to be put in \
-         touch with a real organization or person who can help. Also use this for inventory \
-         questions like 'what resources do you have?' or 'list available resources'; use \
-         lookup_mode=inventory and omit help_type in that case. For any current contact request \
-         or follow-up asking for an \
-         email, phone, website/URL, address, secure channel, or equivalent contact detail, \
-         make a fresh find_resources call with lookup_mode=contact when enabled and use only its \
-         returned contact data. \
-         Use recent Conversation context for the organization, jurisdiction, language, and help \
-         type instead of relying on earlier assistant contact prose. Referral results are filtered \
-         by region and the type of help needed and ranked from most-local to global. If the fresh \
-         result has no matching contact, say so honestly and do not invent or reconstruct one."
+        "Search curated services and contact information. Results are relevance-ranked and include availability metadata."
     }
 
     fn args_schema(&self) -> &str {
-        r#"{"lookup_mode":"contact for contact-detail follow-ups; inventory for list/inventory requests; omit for ordinary referrals","query":"optional organization name or exact contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; contact/referral lookups default to the user's jurisdiction, inventory lookups remain global when omitted","language":"optional preferred language code, e.g. es","offset":"optional continuation offset from a previous result page"}"#
+        r#"{"query":"optional organization name or contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other","region":"optional country or region","language":"optional preferred language code, e.g. es","offset":"optional continuation offset"}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
         Ok(json!({
             "type": "object",
             "properties": {
-                "lookup_mode": {
-                    "type": "string",
-                    "enum": ["contact", "inventory"],
-                    "description": "Use contact for contact-detail follow-ups or inventory for list requests; omit for ordinary referrals."
-                },
-                "query": {"type": "string", "description": "Optional organization name or exact contact value."},
+                "query": {"type": "string", "description": "Optional organization name or contact value."},
                 "help_type": {
                     "type": "string",
                     "enum": ["legal", "humanitarian", "medical", "food", "shelter", "financial", "psychosocial", "other"],
-                    "description": "Optional help category; omit for inventory requests."
+                    "description": "Optional help category."
                 },
                 "region": {"type": "string", "description": "Optional country or region."},
                 "language": {"type": "string", "description": "Optional preferred language code."},
@@ -2453,15 +2404,9 @@ impl Tool for FindResourcesTool {
         let help_type = tool_string_arg(args, "help_type")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let lookup_mode = tool_string_arg(args, "lookup_mode").map(str::trim);
-        let is_inventory_lookup = is_inventory_resource_lookup(help_type.as_deref(), lookup_mode);
         let region = tool_string_arg(args, "region")
             .map(str::to_string)
-            .or_else(|| {
-                (!is_inventory_lookup)
-                    .then(|| self.jurisdiction.clone())
-                    .flatten()
-            });
+            .or_else(|| self.jurisdiction.clone());
         let language = tool_string_arg(args, "language").map(str::to_string);
         let query = tool_string_arg(args, "query")
             .map(|value| value.trim().to_string())
@@ -2475,11 +2420,11 @@ impl Tool for FindResourcesTool {
                 help_type: help_type.clone(),
                 jurisdiction: region.clone(),
                 language: language.clone(),
-                limit: if is_inventory_lookup { 10 } else { 5 },
+                limit: 5,
                 offset,
             })
             .await?;
-        if !resource_response_offset_matches(offset, response.offset) {
+        if !resource_page_contract_is_consistent(&response, offset) {
             return Err(anyhow::Error::new(ToolExecutionError::MalformedContract));
         }
         let response_help_type = response
@@ -2492,23 +2437,9 @@ impl Tool for FindResourcesTool {
             .resolved_country_code
             .as_deref()
             .or(region.as_deref());
-        let continuation_lookup_mode = if is_inventory_lookup {
-            Some("inventory")
-        } else if lookup_mode == Some("contact") {
-            Some("contact")
-        } else {
-            None
-        };
-        let trace_query = if is_inventory_lookup {
-            match response_region {
-                Some(region) => format!("curated resources inventory for {}", region),
-                None => "curated resources inventory".to_string(),
-            }
-        } else {
-            match response_region {
-                Some(region) => format!("{} resources for {}", response_help_type, region),
-                None => format!("{} resources", response_help_type),
-            }
+        let trace_query = match response_region {
+            Some(region) => format!("{} resources for {}", response_help_type, region),
+            None => format!("{} resources", response_help_type),
         };
         let trace_query = if let Some(query) = response.query.as_deref().or(query.as_deref()) {
             format!("{} matching {}", trace_query, query)
@@ -2516,21 +2447,10 @@ impl Tool for FindResourcesTool {
             trace_query
         };
 
-        let returned_count = response.resources.len();
-        let returned_count_mismatch = response.returned_count != returned_count;
-        let total_count = conservative_resource_total_count(
-            response.offset,
-            returned_count,
-            response.total_count,
-        );
-        let (has_more, next_offset) = conservative_resource_pagination(
-            response.offset,
-            returned_count,
-            total_count,
-            response.has_more,
-            response.next_offset,
-        );
-        let continuation_available = !has_more || next_offset.is_some();
+        let returned_count = response.returned_count;
+        let total_count = response.total_count;
+        let has_more = response.has_more;
+        let next_offset = response.next_offset;
         let resource_names = response
             .resources
             .iter()
@@ -2542,19 +2462,25 @@ impl Tool for FindResourcesTool {
             })
             .collect::<Vec<_>>();
 
-        if resource_page_is_definitively_empty(returned_count, total_count, has_more) {
-            let where_label = response_region.unwrap_or("the requested region");
-            let empty_summary = if is_inventory_lookup {
-                "No ready curated resources were found."
-            } else {
-                "No matching curated resources were found."
-            };
+        let result_metadata = json!({
+            "query": response.query,
+            "resolved_country_code": response.resolved_country_code,
+            "help_type": response.help_type,
+            "total_count": response.total_count,
+            "returned_count": response.returned_count,
+            "limit": response.limit,
+            "offset": response.offset,
+            "has_more": response.has_more,
+            "next_offset": response.next_offset,
+        });
+
+        if response.resources.is_empty() {
             if let Ok(mut sink) = self.traces.lock() {
                 sink.push(ToolCallInfoResponse {
                     tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                     tool_name: "Curated Resources".to_string(),
                     query: Some(trace_query),
-                    output_summary: Some(empty_summary.to_string()),
+                    output_summary: Some("No matching curated resources were found.".to_string()),
                     warnings: vec!["no_curated_resources".to_string()],
                     metadata: json!({
                         "returned_count": 0,
@@ -2565,61 +2491,28 @@ impl Tool for FindResourcesTool {
                         "continuation_region": response_region,
                         "continuation_help_type": help_type,
                         "continuation_language": language,
-                        "continuation_lookup_mode": continuation_lookup_mode,
                         "resolved_region": response_region,
                         "resource_names": [],
                     }),
                     guarded: false,
                 });
             }
-            if is_inventory_lookup {
-                return Ok(ToolResult::success_with_metadata(
-                    "No ready curated resources are currently listed. Do not invent referrals; \
-                     say that the curated resource directory is empty or still being configured.",
-                    json!({"has_more": false}),
-                ));
-            }
             return Ok(ToolResult::success_with_metadata(
-                format!(
-                    "No vetted {} resources are currently listed for {}. Do not invent referrals; \
-                     offer general guidance instead and suggest the person seek a trusted local contact.",
-                    response_help_type, where_label
-                ),
-                json!({"has_more": false}),
+                "No curated resources matched the supplied filters.",
+                result_metadata,
             ));
         }
 
-        let output_summary = if has_more {
-            match next_offset {
-                Some(next_offset) => format!(
-                    "Returned {} of {} matching ready Curated Resources; more results are available at offset {}.",
-                    returned_count, total_count, next_offset
-                ),
-                None => format!(
-                    "Returned {} of {} matching ready Curated Resources; more results are available.",
-                    returned_count, total_count
-                ),
-            }
-        } else {
-            format!(
-                "Returned {} of {} matching ready Curated Resources on this page; no remaining results.",
-                returned_count, total_count
-            )
-        };
+        let output_summary = format!(
+            "Curated Resource lookup returned {} relevance-ranked results.",
+            returned_count
+        );
         if let Ok(mut sink) = self.traces.lock() {
-            let mut warnings = if has_more && continuation_available {
+            let warnings = if has_more {
                 vec!["curated_resources_truncated".to_string()]
-            } else if has_more {
-                vec![
-                    "curated_resources_truncated".to_string(),
-                    "curated_resources_continuation_unavailable".to_string(),
-                ]
             } else {
                 Vec::new()
             };
-            if returned_count_mismatch {
-                warnings.push("curated_resources_count_mismatch".to_string());
-            }
             sink.push(ToolCallInfoResponse {
                 tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                 tool_name: "Curated Resources".to_string(),
@@ -2635,7 +2528,6 @@ impl Tool for FindResourcesTool {
                     "continuation_region": response_region,
                     "continuation_help_type": help_type,
                     "continuation_language": language,
-                    "continuation_lookup_mode": continuation_lookup_mode,
                     "resolved_region": response_region,
                     "resource_names": resource_names,
                 }),
@@ -2643,47 +2535,11 @@ impl Tool for FindResourcesTool {
             });
         }
 
-        let effective_offset = response.offset;
-        let effective_limit = response.limit;
-        let mut output = format!(
-            "Showing {} of {} matching ready Curated Resources (offset {}, limit {}).\n",
-            returned_count, total_count, effective_offset, effective_limit,
-        );
-        if has_more {
-            if let Some(next_offset) = next_offset {
-                output.push_str(&format!(
-                    "more results are available; continue with next offset {}.\n",
-                    next_offset
-                ));
-            } else {
-                output.push_str(
-                    "more results are reported, but no safe continuation cursor is available.\n",
-                );
-            }
-        } else if effective_offset == 0 && returned_count == total_count {
-            output.push_str(
-                "This is the complete set of matching ready Curated Resources for the supplied filters.\n",
-            );
-        } else {
-            output.push_str(
-                "This is the final page of matching ready Curated Resources for the supplied filters; \
-                 no matching results remain after this page.\n",
-            );
-        }
-        output.push('\n');
-        output.push_str(&if is_inventory_lookup {
-            "Available curated resources".to_string()
-        } else {
-            format!("Trusted {} resources", response_help_type)
-        });
+        let mut output = format!("Relevance-ranked {} resources", response_help_type);
         if let Some(region) = response_region {
             output.push_str(&format!(" for {}", region));
         }
-        if is_inventory_lookup {
-            output.push_str(" (ready resources only):\n\n");
-        } else {
-            output.push_str(" (most local first):\n\n");
-        }
+        output.push_str(":\n\n");
         for (idx, r) in response.resources.iter().enumerate() {
             let name = r.name.clone().unwrap_or_else(|| r.resource_id.clone());
             let rtype = r.resource_type.clone().unwrap_or_default();
@@ -2719,15 +2575,7 @@ impl Tool for FindResourcesTool {
             }
             output.push('\n');
         }
-        output.push_str(
-            "Relay these to the person plainly. Only share what is listed here — never invent \
-             contact details. Encourage them to verify before acting where possible.",
-        );
-
-        Ok(ToolResult::success_with_metadata(
-            output,
-            json!({"has_more": has_more}),
-        ))
+        Ok(ToolResult::success_with_metadata(output, result_metadata))
     }
 }
 
@@ -4585,17 +4433,7 @@ async fn query(
     let mut agent = SageAgent::new_with_optional_memory(
         registry,
         Some(memory),
-        build_agent_instruction(
-            &ai_config.compiled_prompt,
-            chat_request
-                .tools
-                .iter()
-                .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
-            chat_request
-                .tools
-                .iter()
-                .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
-        ),
+        build_agent_instruction(&ai_config.compiled_prompt),
     );
     install_conversation_trace_hook(
         &mut agent,
@@ -6985,42 +6823,20 @@ fn build_human_block(auth: &InternalAuthContext, profile: &HashMap<String, Strin
 
 struct EnclaveWebRuntimeProfile<'a> {
     compiled_prompt: &'a str,
-    include_knowledge_tool: bool,
-    include_curated_resources_tool: bool,
 }
 
 impl<'a> EnclaveWebRuntimeProfile<'a> {
     fn build_instruction(&self) -> String {
         let mut instruction = String::from(ENCLAVE_WEB_BASE_INSTRUCTION);
         instruction.push_str("\nRuntime profile: enclave_web\n");
-        if self.include_knowledge_tool {
-            instruction.push_str(
-                "\nTool preference:\n- Use knowledge_search first for uploaded-document questions.\n",
-            );
-        }
-        if self.include_curated_resources_tool {
-            instruction.push_str(
-                "\nCurated Resources:\n- Use find_resources for trusted real-world referrals, legal aid, humanitarian support, medical, shelter, financial, or psychosocial help.\n- For contact-detail follow-ups, use lookup_mode=contact so the user's jurisdiction remains the default even when help_type is unavailable.\n- For inventory questions such as \"what resources do you have?\" or \"list available resources\", call find_resources with lookup_mode=inventory and no help_type so you can list the ready curated resources instead of describing the tool catalog.\n- Curated Resources are admin-vetted priority referrals stored separately from uploaded documents. Prefer them over guessing or generic web results when the user needs a real organization or contact.\n- Do not claim all, every, or a complete list when the Tool reports more results or completeness is unknown. When it reports no more results, scope completeness claims to matching ready Curated Resources and the supplied filters.\n- Only share contact details returned by find_resources.\n",
-            );
-            instruction.push_str(CURATED_RESOURCES_GROUNDING_POLICY);
-        }
         instruction.push_str("\nAgent Settings profile:\n");
         instruction.push_str(self.compiled_prompt);
         instruction
     }
 }
 
-fn build_agent_instruction(
-    compiled_prompt: &str,
-    include_knowledge_tool: bool,
-    include_curated_resources_tool: bool,
-) -> String {
-    EnclaveWebRuntimeProfile {
-        compiled_prompt,
-        include_knowledge_tool,
-        include_curated_resources_tool,
-    }
-    .build_instruction()
+fn build_agent_instruction(compiled_prompt: &str) -> String {
+    EnclaveWebRuntimeProfile { compiled_prompt }.build_instruction()
 }
 
 fn build_chat_agent_instruction(
@@ -7028,17 +6844,7 @@ fn build_chat_agent_instruction(
     request: &ChatRequest,
     auth: &InternalAuthContext,
 ) -> String {
-    let mut instruction = build_agent_instruction(
-        compiled_prompt,
-        request
-            .tools
-            .iter()
-            .any(|tool| tool == KNOWLEDGE_SEARCH_TOOL_SET_ID),
-        request
-            .tools
-            .iter()
-            .any(|tool| tool == CURATED_RESOURCES_TOOL_SET_ID),
-    );
+    let mut instruction = build_agent_instruction(compiled_prompt);
     if auth.kind == "admin"
         && request.conversation_surface.as_deref() == Some(ADMIN_ONBOARDING_SURFACE)
         && request
@@ -7345,14 +7151,13 @@ fn stage_native_provider_signal(
 }
 
 fn native_tool_result_content(result: &ToolResult) -> String {
-    if result.success {
-        result.output.clone()
-    } else {
-        format!(
-            "Tool execution failed: {}",
-            result.error.as_deref().unwrap_or("Unknown error")
-        )
-    }
+    json!({
+        "success": result.success,
+        "output": result.output,
+        "error": result.error,
+        "metadata": result.metadata,
+    })
+    .to_string()
 }
 
 #[derive(Debug)]
@@ -8902,7 +8707,7 @@ mod tests {
 
     #[test]
     fn native_conversation_instruction_has_no_legacy_planner_protocol() {
-        let instruction = build_agent_instruction("Be accurate.", true, true);
+        let instruction = build_agent_instruction("Be accurate.");
         for obsolete in [
             "typed Tool decision",
             "Tool-planning mode",
@@ -8937,6 +8742,25 @@ mod tests {
             serialized.get("clarifying_questions").is_none(),
             "clarifying questions must remain ordinary answer Markdown"
         );
+    }
+
+    #[test]
+    fn native_tool_result_content_preserves_structured_availability_metadata() {
+        let result = ToolResult::success_with_metadata(
+            "Top-ranked resource page",
+            json!({
+                "returned_count": 5,
+                "total_count": 12,
+                "has_more": true,
+                "next_offset": 5,
+            }),
+        );
+
+        let content: Value = serde_json::from_str(&native_tool_result_content(&result))
+            .expect("native Tool result should be structured JSON");
+        assert_eq!(content["success"], true);
+        assert_eq!(content["output"], "Top-ranked resource page");
+        assert_eq!(content["metadata"], result.metadata);
     }
 
     #[test]
@@ -9442,7 +9266,7 @@ mod tests {
                             "resolved_country_code": "MX",
                             "help_type": "legal",
                             "query": "mexico legal aid network",
-                            "total_count": 6,
+                            "total_count": 7,
                             "returned_count": 1,
                             "limit": 5,
                             "offset": 5,
@@ -9475,7 +9299,6 @@ mod tests {
             traces: Arc::new(Mutex::new(Vec::new())),
         };
         let args = ToolArgs::from([
-            ("lookup_mode".to_string(), json!("inventory")),
             ("help_type".to_string(), json!("legal")),
             ("query".to_string(), json!("Mexico Legal Aid Network")),
             ("offset".to_string(), json!(5)),
@@ -9489,7 +9312,9 @@ mod tests {
         server.abort();
 
         assert!(result.success);
-        assert!(result.output.contains("Trusted legal resources for MX"));
+        assert!(result
+            .output
+            .contains("Relevance-ranked legal resources for MX"));
         assert!(result.output.contains("Mexico Legal Aid Network (ngo)"));
         assert!(result.output.contains("covers Mexico [verified]"));
         assert!(result.output.contains("Languages: es, en"));
@@ -9497,12 +9322,22 @@ mod tests {
         assert!(result
             .output
             .contains("secure_channel: Signal: +52-555-0100"));
-        assert!(result.output.contains("never invent contact details"));
-        assert!(result
-            .output
-            .contains("Showing 1 of 6 matching ready Curated Resources"));
-        assert!(result.output.contains("more results are available"));
-        assert!(result.output.contains("next offset 6"));
+        assert!(!result.output.contains("offset"));
+        assert!(!result.output.contains("complete set"));
+        assert_eq!(
+            result.metadata,
+            json!({
+                "query": "mexico legal aid network",
+                "resolved_country_code": "MX",
+                "help_type": "legal",
+                "total_count": 7,
+                "returned_count": 1,
+                "limit": 5,
+                "offset": 5,
+                "has_more": true,
+                "next_offset": 6,
+            })
+        );
 
         {
             let traces = tool.traces.lock().expect("trace sink should lock");
@@ -9510,23 +9345,20 @@ mod tests {
             assert_eq!(traces[0].tool_id, "curated-resources");
             assert_eq!(traces[0].tool_name, "Curated Resources");
             assert_eq!(
-            traces[0].output_summary.as_deref(),
-            Some(
-                "Returned 1 of 6 matching ready Curated Resources; more results are available at offset 6."
-            )
-        );
+                traces[0].output_summary.as_deref(),
+                Some("Curated Resource lookup returned 1 relevance-ranked results.")
+            );
             assert_eq!(
                 traces[0].metadata,
                 json!({
                     "returned_count": 1,
-                    "total_count": 6,
+                    "total_count": 7,
                     "has_more": true,
                     "next_offset": 6,
                     "continuation_query": "mexico legal aid network",
                     "continuation_region": "MX",
                     "continuation_help_type": "legal",
                     "continuation_language": "es",
-                    "continuation_lookup_mode": Value::Null,
                     "resolved_region": "MX",
                     "resource_names": ["Mexico Legal Aid Network"],
                 })
@@ -9546,7 +9378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_resources_tool_without_help_type_lists_ready_inventory() {
+    async fn find_resources_tool_without_help_type_returns_ranked_page() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
         let app = Router::new().route(
@@ -9584,7 +9416,7 @@ mod tests {
                                     "verified_at": "2026-07-03T20:00:00Z"
                                 }
                             ],
-                            "resolved_country_code": null,
+                            "resolved_country_code": "MX",
                             "help_type": null,
                             "query": null,
                             "total_count": 11,
@@ -9621,17 +9453,11 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::from([
-                ("lookup_mode".to_string(), json!("inventory")),
-                ("offset".to_string(), json!(10)),
-            ]))
+            .execute(&ToolArgs::from([("offset".to_string(), json!(10))]))
             .await
             .expect("resource inventory should succeed");
         let mismatched_offset_error = tool
-            .execute(&ToolArgs::from([
-                ("lookup_mode".to_string(), json!("inventory")),
-                ("offset".to_string(), json!(0)),
-            ]))
+            .execute(&ToolArgs::from([("offset".to_string(), json!(0))]))
             .await
             .expect_err("a mismatched backend page offset must fail closed");
         assert!(matches!(
@@ -9641,33 +9467,38 @@ mod tests {
         server.abort();
 
         assert!(result.success);
-        assert!(result.output.contains("Available curated resources"));
-        assert!(result.output.contains("(offset 10, limit 7)"));
+        assert!(result.output.contains("Relevance-ranked curated resources"));
         assert!(result.output.contains("Demo Test Resource (ngo)"));
         assert!(result
             .output
             .contains("Synthetic resource used to verify inventory questions."));
         assert!(result.output.contains("Helps with: legal, humanitarian"));
         assert!(result.output.contains("email: demo-test@example.test"));
-        assert!(result.output.contains("never invent contact details"));
-        assert!(result.output.contains(
-            "This is the final page of matching ready Curated Resources for the supplied filters; no matching results remain after this page."
-        ));
-        assert!(!result.output.contains("This is the complete set"));
+        assert!(!result.output.contains("offset"));
+        assert!(!result.output.contains("final page"));
+        assert_eq!(
+            result.metadata,
+            json!({
+                "query": Value::Null,
+                "resolved_country_code": "MX",
+                "help_type": Value::Null,
+                "total_count": 11,
+                "returned_count": 1,
+                "limit": 7,
+                "offset": 10,
+                "has_more": false,
+                "next_offset": Value::Null,
+            })
+        );
 
         {
             let traces = tool.traces.lock().expect("trace sink should lock");
             assert_eq!(traces.len(), 1);
+            assert_eq!(traces[0].query.as_deref(), Some("curated resources for MX"));
             assert_eq!(
-                traces[0].query.as_deref(),
-                Some("curated resources inventory")
+                traces[0].output_summary.as_deref(),
+                Some("Curated Resource lookup returned 1 relevance-ranked results.")
             );
-            assert_eq!(
-            traces[0].output_summary.as_deref(),
-            Some(
-                "Returned 1 of 11 matching ready Curated Resources on this page; no remaining results."
-            )
-        );
             assert_eq!(
                 traces[0].metadata,
                 json!({
@@ -9676,11 +9507,10 @@ mod tests {
                     "has_more": false,
                     "next_offset": Value::Null,
                     "continuation_query": Value::Null,
-                    "continuation_region": Value::Null,
+                    "continuation_region": "MX",
                     "continuation_help_type": Value::Null,
                     "continuation_language": Value::Null,
-                    "continuation_lookup_mode": "inventory",
-                    "resolved_region": Value::Null,
+                    "resolved_region": "MX",
                     "resource_names": ["Demo Test Resource"],
                 })
             );
@@ -9691,12 +9521,8 @@ mod tests {
             .expect("test backend should record the resource request");
         assert_eq!(token.as_deref(), Some("test-token"));
         assert!(payload.get("help_type").is_none());
-        assert_eq!(
-            payload["jurisdiction"],
-            Value::Null,
-            "inventory lookup must not inherit the user's default jurisdiction"
-        );
-        assert_eq!(payload["limit"], 10);
+        assert_eq!(payload["jurisdiction"], "Mexico");
+        assert_eq!(payload["limit"], 5);
         assert_eq!(payload["offset"], 10);
     }
 
@@ -9754,10 +9580,10 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::from([
-                ("lookup_mode".to_string(), json!("contact")),
-                ("query".to_string(), json!("Acme Legal Aid")),
-            ]))
+            .execute(&ToolArgs::from([(
+                "query".to_string(),
+                json!("Acme Legal Aid"),
+            )]))
             .await
             .expect("contact lookup should succeed");
         server.abort();
@@ -9770,50 +9596,40 @@ mod tests {
     }
 
     #[test]
-    fn resource_pagination_fails_closed_on_inconsistent_backend_counts() {
-        assert_eq!(
-            conservative_resource_pagination(0, 5, 12, false, None),
-            (true, Some(5)),
-            "counts prove another page even when the backend flag is false"
-        );
-        assert_eq!(
-            conservative_resource_pagination(0, 5, 20, false, None),
-            (true, Some(5)),
-            "cursor synthesis must advance by actual records, not an inflated reported count"
-        );
-        assert_eq!(
-            conservative_resource_pagination(10, 0, 12, true, None),
-            (true, None),
-            "an empty page cannot invent a safe cursor"
-        );
-        assert_eq!(
-            conservative_resource_pagination(10, 2, 12, false, Some(99)),
-            (false, None),
-            "a stale cursor must not survive a proven final page"
-        );
-        assert_eq!(
-            conservative_resource_pagination(10, 5, 20, true, Some(12)),
-            (true, Some(15)),
-            "an overlapping backend cursor must be replaced with the first unseen offset"
-        );
-        assert_eq!(
-            conservative_resource_pagination(0, 5, 20, true, Some(20)),
-            (true, Some(5)),
-            "a forward-jumping backend cursor must not skip unseen records"
-        );
-        assert_eq!(conservative_resource_total_count(10, 2, 11), 12);
-        assert!(is_inventory_resource_lookup(None, Some("inventory")));
-        assert!(!is_inventory_resource_lookup(None, None));
-        assert!(!is_inventory_resource_lookup(None, Some("contact")));
-        assert!(!is_inventory_resource_lookup(
-            Some("legal"),
-            Some("inventory")
-        ));
-        assert!(resource_response_offset_matches(10, 10));
-        assert!(!resource_response_offset_matches(10, 0));
-        assert!(!resource_response_offset_matches(10, 20));
-        assert!(!resource_page_is_definitively_empty(0, 0, true));
-        assert!(resource_page_is_definitively_empty(0, 0, false));
+    fn resource_page_contract_preserves_consistent_backend_metadata_unchanged() {
+        let resources = (0..2)
+            .map(|index| ResourceRecord {
+                resource_id: format!("resource-{index}"),
+                ..ResourceRecord::default()
+            })
+            .collect();
+        let valid = InternalResourceSearchResponse {
+            resources,
+            query: Some("legal aid".to_string()),
+            resolved_country_code: Some("MX".to_string()),
+            help_type: Some("legal".to_string()),
+            total_count: 12,
+            returned_count: 2,
+            limit: 5,
+            offset: 5,
+            has_more: true,
+            next_offset: Some(7),
+        };
+
+        assert!(resource_page_contract_is_consistent(&valid, 5));
+
+        let mut inconsistent = valid.clone();
+        inconsistent.returned_count = 3;
+        assert!(!resource_page_contract_is_consistent(&inconsistent, 5));
+
+        let mut inconsistent = valid.clone();
+        inconsistent.next_offset = Some(10);
+        assert!(!resource_page_contract_is_consistent(&inconsistent, 5));
+
+        let mut inconsistent = valid;
+        inconsistent.has_more = false;
+        inconsistent.next_offset = None;
+        assert!(!resource_page_contract_is_consistent(&inconsistent, 5));
     }
 
     #[test]
@@ -9866,7 +9682,7 @@ mod tests {
 
     #[test]
     fn enclave_web_instruction_uses_runtime_profile_boundary() {
-        let instruction = build_agent_instruction("PROFILE: custom instance", false, false);
+        let instruction = build_agent_instruction("PROFILE: custom instance");
 
         assert!(instruction.contains("Runtime profile: enclave_web"));
         assert!(instruction.contains("Agent Settings profile:"));
@@ -9880,7 +9696,7 @@ mod tests {
     }
 
     #[test]
-    fn curated_resources_contact_followups_require_fresh_grounding_in_both_modes() {
+    fn curated_resources_instruction_leaves_tool_choice_to_the_model() {
         let request = ChatRequest {
             message: "me puedes dar el email de la organización?".to_string(),
             session_id: Some("session-123".to_string()),
@@ -9904,23 +9720,9 @@ mod tests {
 
         let instruction = build_chat_agent_instruction("PROFILE", &request, &user);
 
-        assert!(instruction.contains("fresh find_resources call"));
-        assert!(instruction.contains("recent Conversation context"));
-        assert!(instruction.contains("organization, jurisdiction, language, and help type"));
-        for contact_kind in [
-            "email",
-            "phone number",
-            "website",
-            "address",
-            "secure channel",
-        ] {
-            assert!(
-                instruction.contains(contact_kind),
-                "contact policy should cover {contact_kind}"
-            );
-        }
-        assert!(instruction.contains("must come from the fresh find_resources result"));
-        assert!(instruction.contains("no matching contact"));
+        assert!(!instruction.contains("fresh find_resources call"));
+        assert!(!instruction.contains("lookup_mode"));
+        assert!(!instruction.contains("Do not claim all"));
 
         let contact_tool = FindResourcesTool {
             internal: InternalAgentClient::new(
@@ -9932,20 +9734,18 @@ mod tests {
             traces: Arc::new(Mutex::new(Vec::new())),
         };
         let tool_description = contact_tool.description();
-        for shared_rule in [
-            "fresh find_resources call",
-            "Use recent Conversation context",
-            "organization, jurisdiction, language, and help type",
-            "only its returned contact data",
-            "instead of relying on earlier assistant contact prose",
-            "If the fresh result has no matching contact",
-            "do not invent or reconstruct one",
+        for capability in [
+            "curated services and contact information",
+            "relevance-ranked",
+            "availability metadata",
         ] {
             assert!(
-                tool_description.contains(shared_rule),
-                "Tool contract must retain the shared contact-grounding rule: {shared_rule}"
+                tool_description.contains(capability),
+                "Tool contract must disclose {capability}"
             );
         }
+        assert!(!tool_description.contains("fresh find_resources call"));
+        assert!(!contact_tool.args_schema().contains("lookup_mode"));
 
         let disabled = build_chat_agent_instruction(
             "PROFILE",
@@ -9955,7 +9755,7 @@ mod tests {
             },
             &user,
         );
-        assert!(!disabled.contains("CURATED RESOURCES GROUNDING"));
+        assert!(!disabled.contains("Curated Resources:"));
         assert!(!disabled.contains("fresh find_resources call"));
     }
 
@@ -12854,10 +12654,20 @@ mod tests {
         let resources_tool = registry
             .get("find_resources")
             .expect("curated resources tool should be registered");
+        assert!(resources_tool.description().contains("relevance-ranked"));
         assert!(resources_tool
             .description()
-            .contains("what resources do you have?"));
-        assert!(resources_tool.args_schema().contains("omit for inventory"));
+            .contains("availability metadata"));
+        assert!(!resources_tool.args_schema().contains("lookup_mode"));
+        let knowledge_tool = registry
+            .get("knowledge_search")
+            .expect("Knowledge Search should be registered");
+        assert!(knowledge_tool
+            .description()
+            .contains("different languages or titles"));
+        assert!(knowledge_tool
+            .description()
+            .contains("multiple calls in one Tool batch"));
 
         let user = InternalAuthContext {
             id: 2,
