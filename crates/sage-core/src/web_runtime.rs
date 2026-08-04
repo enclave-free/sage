@@ -41,7 +41,7 @@ use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::openai_native::{
     NativeAssistantMessage, NativeAssistantTurn, NativeChatMessage, NativeFinishReason,
-    NativeProviderError, NativeTurnRequest, OpenAiNativeClient,
+    NativeProviderError, NativeProviderSignal, NativeTurnRequest, OpenAiNativeClient,
 };
 use crate::sage_agent::{
     has_syntactic_tool_intent, lookup_process_narration_opening, multiline_tool_call_header_match,
@@ -105,19 +105,16 @@ Core behavior:
 
 Output style:
 - Keep answers concise unless the user asked for depth.
-- Follow the stage-specific output contract at the end of this instruction exactly.
-- Tool planning returns only the typed Tool decision requested by that stage.
-- Final-answer generation returns only plain user-visible prose, with no messages wrapper, Tool call, or done sentinel.
+- Either answer directly in plain user-visible prose or use the provided native Tools when they are useful.
+- Do not describe a Tool call in prose. Call the native Tool instead, then answer from its result.
 "#;
 const CURATED_RESOURCES_GROUNDING_POLICY: &str = r#"
 
 === CURATED RESOURCES GROUNDING ===
-- In Tool-planning mode, a current request or follow-up asking for an email, phone number, website or URL, address, secure channel, or equivalent contact detail requires a fresh find_resources decision with lookup_mode=contact whenever Curated Resources is enabled. This includes English and Spanish phrasing such as "me puedes dar el email...", "correo electrónico", "teléfono", "sitio web", "dirección", or "canal seguro".
-- Use recent Conversation context to carry the organization, jurisdiction, language, and help type already established into the fresh find_resources arguments. Do not make the user repeat that context unless it is genuinely missing or ambiguous.
-- A request to list or inventory Curated Resources requires find_resources. Preserve an explicit organization or name filter in query; do not replace a filtered inventory with an unfiltered lookup.
-- A request for the next page requires a fresh find_resources call carrying the previous query and the positive next offset shown by the prior result.
-- These are model-planning requirements inside the existing Model-Driven Tool Loop. Runtime validation may reject and retry an incomplete model plan, but it must never synthesize, authorize, or execute find_resources itself.
-- In final-answer mode, current contact details must come from the fresh find_resources result for this turn. Never copy a contact detail solely from earlier assistant prose, memory, or a previous Tool result. If the fresh result has no matching contact, say so honestly and do not invent or reconstruct one.
+- For a current email, phone number, website, address, secure channel, or equivalent contact-detail request, use a fresh find_resources call with lookup_mode=contact. Use recent Conversation context for the organization, jurisdiction, language, and help type when it is clear.
+- For a list or inventory request, use lookup_mode=inventory and preserve any explicit organization or name filter in query.
+- For the next page, call find_resources with the prior filters and the positive next offset returned by the Tool.
+- Current contact details must come from the fresh find_resources result for this turn. If it has no matching contact, say so honestly and do not invent or reconstruct one.
 "#;
 const ADMIN_ONBOARDING_SURFACE: &str = "admin-onboarding";
 const ADMIN_ONBOARDING_INSTRUCTION: &str = r#"
@@ -2091,6 +2088,7 @@ fn turn_timing_trace_delta(elapsed_ms: u128) -> ConversationTraceDeltaResponse {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_conversation_tool_registry(
     internal: &InternalAgentClient,
     http: &Client,
@@ -2116,6 +2114,7 @@ fn build_conversation_tool_registry(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_conversation_tool_registry_with_context(
     internal: &InternalAgentClient,
     http: &Client,
@@ -2323,6 +2322,18 @@ impl Tool for KnowledgeSearchTool {
         r#"{"query":"search query","top_k":"optional result count"}"#
     }
 
+    fn native_parameters(&self) -> Result<Value> {
+        Ok(json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query."},
+                "top_k": {"type": "integer", "description": "Optional result count.", "minimum": 1}
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }))
+    }
+
     fn retry_policy(&self) -> ToolRetryPolicy {
         ToolRetryPolicy::knowledge_search()
     }
@@ -2413,6 +2424,29 @@ impl Tool for FindResourcesTool {
 
     fn args_schema(&self) -> &str {
         r#"{"lookup_mode":"contact for contact-detail follow-ups; inventory for list/inventory requests; omit for ordinary referrals","query":"optional organization name or exact contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other; omit for inventory/list-all questions","region":"optional country or region; contact/referral lookups default to the user's jurisdiction, inventory lookups remain global when omitted","language":"optional preferred language code, e.g. es","offset":"optional continuation offset from a previous result page"}"#
+    }
+
+    fn native_parameters(&self) -> Result<Value> {
+        Ok(json!({
+            "type": "object",
+            "properties": {
+                "lookup_mode": {
+                    "type": "string",
+                    "enum": ["contact", "inventory"],
+                    "description": "Use contact for contact-detail follow-ups or inventory for list requests; omit for ordinary referrals."
+                },
+                "query": {"type": "string", "description": "Optional organization name or exact contact value."},
+                "help_type": {
+                    "type": "string",
+                    "enum": ["legal", "humanitarian", "medical", "food", "shelter", "financial", "psychosocial", "other"],
+                    "description": "Optional help category; omit for inventory requests."
+                },
+                "region": {"type": "string", "description": "Optional country or region."},
+                "language": {"type": "string", "description": "Optional preferred language code."},
+                "offset": {"type": "integer", "description": "Optional continuation offset.", "minimum": 0}
+            },
+            "additionalProperties": false
+        }))
     }
 
     fn retry_policy(&self) -> ToolRetryPolicy {
@@ -2730,6 +2764,18 @@ impl Tool for SearxWebSearchTool {
 
     fn args_schema(&self) -> &str {
         r#"{"query":"search query","count":"optional number of results"}"#
+    }
+
+    fn native_parameters(&self) -> Result<Value> {
+        Ok(json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query."},
+                "count": {"type": "integer", "description": "Optional number of results.", "minimum": 1}
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }))
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -3256,6 +3302,153 @@ fn build_admin_config_direct_payload(tool_name: &str, args: &ToolArgs) -> Result
     }
 }
 
+fn admin_config_direct_native_parameters(tool_name: &str) -> Result<Value> {
+    let schema = match tool_name {
+        "configure_instance" => json!({
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": "object",
+                    "properties": {
+                        "instance_name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "assistant_name": {"type": "string"},
+                        "primary_color": {"type": "string"},
+                        "default_theme": {"type": "string"},
+                        "default_language": {"type": "string"},
+                        "header_tagline": {"type": "string"},
+                        "auto_approve_users": {"type": "boolean"}
+                    },
+                    "additionalProperties": false
+                },
+                "user_types": {"type": "array", "items": {"type": "object"}},
+                "onboarding_questions": {"type": "array", "items": {"type": "object"}},
+                "behavior_rules": {"type": "array", "items": {"type": "string"}},
+                "forbidden_topics": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["settings", "user_types", "onboarding_questions", "behavior_rules", "forbidden_topics"],
+            "additionalProperties": false
+        }),
+        "update_instance_settings" => json!({
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": "object",
+                    "properties": {
+                        "instance_name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "assistant_name": {"type": "string"},
+                        "primary_color": {"type": "string"},
+                        "default_theme": {"type": "string"},
+                        "default_language": {"type": "string"},
+                        "header_tagline": {"type": "string"},
+                        "auto_approve_users": {"type": "boolean"}
+                    },
+                    "minProperties": 1,
+                    "additionalProperties": false
+                }
+            },
+            "required": ["settings"],
+            "additionalProperties": false
+        }),
+        "update_deployment_settings" => json!({
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": "object",
+                    "description": "Deployment setting names and desired values.",
+                    "minProperties": 1,
+                    "additionalProperties": {}
+                }
+            },
+            "required": ["settings"],
+            "additionalProperties": false
+        }),
+        "update_agent_settings" => json!({
+            "type": "object",
+            "properties": {
+                "updates": {
+                    "type": "object",
+                    "description": "Agent setting names and desired values.",
+                    "additionalProperties": {}
+                },
+                "user_type_id": {"type": "integer", "description": "Optional User Type id for overrides."},
+                "revert_keys": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "User-Type override keys to remove."
+                }
+            },
+            "anyOf": [{"required": ["updates"]}, {"required": ["revert_keys"]}],
+            "additionalProperties": false
+        }),
+        "manage_user_types" => json!({
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["create", "update", "delete"]},
+                "user_type_id": {"type": "integer"},
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+                "icon": {"type": "string"},
+                "display_order": {"type": "integer"}
+            },
+            "required": ["operation"],
+            "additionalProperties": false
+        }),
+        "manage_onboarding_questions" => json!({
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["create", "update", "delete"]},
+                "question_id": {"type": "integer"},
+                "field_name": {"type": "string"},
+                "field_type": {"type": "string"},
+                "required": {"type": "boolean"},
+                "display_order": {"type": "integer"},
+                "user_type_id": {"type": "integer"},
+                "placeholder": {"type": "string"},
+                "options": {"type": "array", "items": {"type": "string"}},
+                "encryption_enabled": {"type": "boolean"},
+                "include_in_chat": {"type": "boolean"}
+            },
+            "required": ["operation"],
+            "additionalProperties": false
+        }),
+        "update_document_access" => json!({
+            "type": "object",
+            "properties": {
+                "user_type_id": {"type": "integer"},
+                "updates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "job_id": {"type": "string"},
+                            "available": {"type": "boolean"},
+                            "is_default": {"type": "boolean"},
+                            "display_order": {"type": "integer"}
+                        },
+                        "required": ["job_id"],
+                        "additionalProperties": false
+                    }
+                },
+                "revert_job_ids": {"type": "array", "items": {"type": "string"}}
+            },
+            "anyOf": [{"required": ["updates"]}, {"required": ["revert_job_ids"]}],
+            "additionalProperties": false
+        }),
+        "read_deployment_secret" => json!({
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Secret Deployment Setting name explicitly requested by the Admin."}
+            },
+            "required": ["key"],
+            "additionalProperties": false
+        }),
+        _ => return Err(anyhow!("Unsupported Admin Config Tool: {tool_name}")),
+    };
+    Ok(schema)
+}
+
 #[async_trait::async_trait]
 impl Tool for AdminConfigDirectTool {
     fn name(&self) -> &str {
@@ -3268,6 +3461,10 @@ impl Tool for AdminConfigDirectTool {
 
     fn args_schema(&self) -> &str {
         &self.args_schema
+    }
+
+    fn native_parameters(&self) -> Result<Value> {
+        admin_config_direct_native_parameters(&self.name)
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -3373,6 +3570,17 @@ impl Tool for AdminDbQueryTool {
 
     fn args_schema(&self) -> &str {
         r#"{"sql":"read-only SQLite SELECT query"}"#
+    }
+
+    fn native_parameters(&self) -> Result<Value> {
+        Ok(json!({
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "Read-only SQLite SELECT query."}
+            },
+            "required": ["sql"],
+            "additionalProperties": false
+        }))
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -6970,7 +7178,7 @@ async fn run_native_turn_with_provider(
         NativeChatMessage::system(prompt.system),
         NativeChatMessage::user(prompt.user),
     ];
-    let first_turn = request_native_turn_with_protocol_retry(
+    let (first_turn, mut first_answer_state) = request_native_turn_with_protocol_retry(
         provider,
         NativeTurnRequest {
             model: model.to_string(),
@@ -6978,16 +7186,48 @@ async fn run_native_turn_with_provider(
             tools,
             max_tokens: PLAIN_ANSWER_MAX_TOKENS,
         },
+        0,
+        false,
+        &delta_sender,
     )
     .await
-    .map_err(|error| AdapterTurnFailure {
+    .map_err(|(error, emitted_any)| AdapterTurnFailure {
         error: model_provider_error(error),
-        progressed: false,
+        progressed: emitted_any,
     })?;
 
-    let (answer, executed_tools, incomplete_resource_page) = match first_turn.finish_reason {
-        NativeFinishReason::Stop => (first_turn.content, Vec::new(), false),
+    let (answer, executed_tools) = match first_turn.finish_reason {
+        NativeFinishReason::Stop => {
+            if first_answer_state.answer.is_empty() {
+                stage_native_provider_signal(
+                    NativeProviderSignal::Content(first_turn.content.clone()),
+                    0,
+                    true,
+                    &mut first_answer_state,
+                    &delta_sender,
+                )
+                .map_err(|error| AdapterTurnFailure {
+                    progressed: first_answer_state.emitted_any,
+                    error: model_provider_error(error),
+                })?;
+            }
+            finish_native_answer_stream(&mut first_answer_state, &delta_sender).map_err(
+                |error| AdapterTurnFailure {
+                    progressed: error.emitted_any,
+                    error: model_provider_error(error),
+                },
+            )?;
+            (first_turn.content, Vec::new())
+        }
         NativeFinishReason::ToolCalls => {
+            if first_answer_state.emitted_any {
+                return Err(AdapterTurnFailure {
+                    error: model_provider_error(
+                        "native response mixed public answer content with Tool calls",
+                    ),
+                    progressed: true,
+                });
+            }
             messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
                 content: first_turn.content,
                 tool_calls: first_turn.tool_calls.clone(),
@@ -7011,7 +7251,7 @@ async fn run_native_turn_with_provider(
                         .and_then(Value::as_bool)
                         .unwrap_or(true)
             });
-            let final_turn = request_native_turn_with_protocol_retry(
+            let (final_turn, mut final_answer_state) = request_native_turn_with_protocol_retry(
                 provider,
                 NativeTurnRequest {
                     model: model.to_string(),
@@ -7019,37 +7259,24 @@ async fn run_native_turn_with_provider(
                     tools: Vec::new(),
                     max_tokens: PLAIN_ANSWER_MAX_TOKENS,
                 },
+                1,
+                incomplete_resource_page,
+                &delta_sender,
             )
             .await
-            .map_err(|error| AdapterTurnFailure {
+            .map_err(|(error, _)| AdapterTurnFailure {
                 error: model_provider_error(error),
                 progressed: true,
             })?;
-            if final_turn.finish_reason != NativeFinishReason::Stop {
-                return Err(AdapterTurnFailure {
-                    error: model_provider_error(
-                        "final native response attempted another Tool round",
-                    ),
+            finish_native_answer_stream(&mut final_answer_state, &delta_sender).map_err(
+                |error| AdapterTurnFailure {
+                    error: model_provider_error(error),
                     progressed: true,
-                });
-            }
-            (
-                final_turn.content,
-                batch.executed_tools,
-                incomplete_resource_page,
-            )
+                },
+            )?;
+            (final_turn.content, batch.executed_tools)
         }
     };
-    let mut answer_state = PlainAnswerStreamState::new(incomplete_resource_page);
-    let mut answer_deltas = Vec::new();
-    answer_state
-        .push_staged(&answer, &mut answer_deltas)
-        .and_then(|_| answer_state.finish_staged(&mut answer_deltas))
-        .map_err(|error| AdapterTurnFailure {
-            progressed: error.emitted_any,
-            error: model_provider_error(error),
-        })?;
-    release_answer_deltas(answer_deltas, &delta_sender);
     Ok(AdapterTurnOutput {
         answer,
         executed_tools,
@@ -7059,15 +7286,126 @@ async fn run_native_turn_with_provider(
 async fn request_native_turn_with_protocol_retry(
     provider: &OpenAiNativeClient,
     request: NativeTurnRequest,
-) -> std::result::Result<NativeAssistantTurn, NativeProviderError> {
-    match provider.stream_turn(request.clone(), None).await {
-        Ok(turn) => Ok(turn),
-        Err(error) if error.is_protocol() => {
+    step: usize,
+    forbid_unscoped_completeness: bool,
+    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) -> std::result::Result<(NativeAssistantTurn, PlainAnswerStreamState), (NativeProviderError, bool)>
+{
+    let mut answer_state = PlainAnswerStreamState::new(forbid_unscoped_completeness);
+    match stream_native_turn_attempt(
+        provider,
+        request.clone(),
+        step,
+        &mut answer_state,
+        delta_sender,
+    )
+    .await
+    {
+        Ok(turn) => Ok((turn, answer_state)),
+        Err(error) if error.is_protocol() && !answer_state.emitted_any => {
             warn!("Native provider returned an unusable response; retrying the same request once");
-            provider.stream_turn(request, None).await
+            let mut retry_state = PlainAnswerStreamState::new(forbid_unscoped_completeness);
+            match stream_native_turn_attempt(
+                provider,
+                request,
+                step,
+                &mut retry_state,
+                delta_sender,
+            )
+            .await
+            {
+                Ok(turn) => Ok((turn, retry_state)),
+                Err(error) => Err((error, retry_state.emitted_any)),
+            }
         }
-        Err(error) => Err(error),
+        Err(error) => Err((error, answer_state.emitted_any)),
     }
+}
+
+async fn stream_native_turn_attempt(
+    provider: &OpenAiNativeClient,
+    request: NativeTurnRequest,
+    step: usize,
+    answer_state: &mut PlainAnswerStreamState,
+    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) -> std::result::Result<NativeAssistantTurn, NativeProviderError> {
+    let tools_enabled = !request.tools.is_empty();
+    let (native_sender, mut native_receiver) = mpsc::unbounded_channel();
+    let provider_turn = provider.stream_turn(request, Some(native_sender));
+    tokio::pin!(provider_turn);
+
+    let turn = loop {
+        tokio::select! {
+            result = &mut provider_turn => {
+                while let Ok(signal) = native_receiver.try_recv() {
+                    stage_native_provider_signal(
+                        signal,
+                        step,
+                        !tools_enabled,
+                        answer_state,
+                        delta_sender,
+                    )?;
+                }
+                break result?;
+            }
+            Some(signal) = native_receiver.recv() => {
+                stage_native_provider_signal(
+                    signal,
+                    step,
+                    !tools_enabled,
+                    answer_state,
+                    delta_sender,
+                )?;
+            }
+        }
+    };
+    if !tools_enabled && turn.finish_reason == NativeFinishReason::ToolCalls {
+        return Err(NativeProviderError::Protocol(
+            "provider returned Tool calls when no Tools were supplied".to_string(),
+        ));
+    }
+    Ok(turn)
+}
+
+fn stage_native_provider_signal(
+    signal: NativeProviderSignal,
+    step: usize,
+    stream_answer: bool,
+    answer_state: &mut PlainAnswerStreamState,
+    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) -> std::result::Result<(), NativeProviderError> {
+    let delta = match signal {
+        NativeProviderSignal::Content(delta) if stream_answer => delta,
+        NativeProviderSignal::Content(_) => return Ok(()),
+        NativeProviderSignal::Reasoning(content) => {
+            if let Some(sender) = delta_sender {
+                let _ = sender.send(ConversationStreamSignal::Trace(Box::new(
+                    agent_trace_event_delta(AgentTraceEvent::ProviderReasoning { step, content }),
+                )));
+            }
+            return Ok(());
+        }
+    };
+    let mut answer_deltas = Vec::new();
+    answer_state
+        .push_staged(&delta, &mut answer_deltas)
+        .map_err(|error| NativeProviderError::Protocol(error.to_string()))?;
+    answer_state.emitted_any |= !answer_deltas.is_empty();
+    release_answer_deltas(answer_deltas, delta_sender);
+    Ok(())
+}
+
+fn finish_native_answer_stream(
+    answer_state: &mut PlainAnswerStreamState,
+    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) -> std::result::Result<(), PlainAnswerGenerationError> {
+    let mut answer_deltas = Vec::new();
+    let result = answer_state.finish_staged(&mut answer_deltas);
+    if result.is_ok() {
+        answer_state.emitted_any |= !answer_deltas.is_empty();
+        release_answer_deltas(answer_deltas, delta_sender);
+    }
+    result
 }
 
 fn native_tool_result_content(result: &ToolResult) -> String {
@@ -8090,8 +8428,7 @@ impl PlainAnswerStreamState {
         let normalized_opening = value
             .trim_start()
             .to_ascii_lowercase()
-            .replace('’', "'")
-            .replace('‘', "'");
+            .replace(['’', '‘'], "'");
         let opening = normalized_opening
             .trim_start_matches(['*', '_', '-', '+', '#', '>', '•'])
             .trim_start();
@@ -8695,7 +9032,6 @@ mod tests {
     use serde_json::json;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::OnceLock;
 
     fn answer_signal(signal: ConversationStreamSignal) -> String {
         match signal {
@@ -8765,11 +9101,6 @@ mod tests {
             }
             assert_eq!(deltas.concat(), candidate, "split {split}");
         }
-    }
-
-    fn contact_replay_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     #[derive(Clone)]
@@ -10337,30 +10668,47 @@ mod tests {
 
     #[tokio::test]
     async fn native_tool_free_turn_uses_one_model_request_and_streams_the_answer() {
+        #[derive(Clone)]
+        struct StreamingProviderState {
+            requests: Arc<AtomicUsize>,
+            release_completion: Arc<tokio::sync::Notify>,
+        }
+
         async fn completion(
-            State(requests): State<Arc<AtomicUsize>>,
+            State(state): State<StreamingProviderState>,
             Json(body): Json<Value>,
-        ) -> impl IntoResponse {
-            requests.fetch_add(1, Ordering::SeqCst);
+        ) -> Response {
+            state.requests.fetch_add(1, Ordering::SeqCst);
             assert!(body.get("tools").is_none());
-            (
-                [("content-type", "text/event-stream")],
-                concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"A trusted \"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+            let release_completion = state.release_completion.clone();
+            let body = axum::body::Body::from_stream(async_stream::stream! {
+                yield Ok::<_, Infallible>(axum::body::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"A trusted answer begins here. \"},\"finish_reason\":null}]}\n\n"
+                ));
+                release_completion.notified().await;
+                yield Ok::<_, Infallible>(axum::body::Bytes::from_static(concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"It is now complete.\"},\"finish_reason\":\"stop\"}]}\n\n",
                     "data: [DONE]\n\n"
-                ),
-            )
+                ).as_bytes()));
+            });
+            Response::builder()
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(body)
+                .expect("streaming response should build")
         }
 
         let requests = Arc::new(AtomicUsize::new(0));
+        let release_completion = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test provider should bind");
         let address = listener.local_addr().expect("test provider address");
         let app = Router::new()
             .route("/v1/chat/completions", post(completion))
-            .with_state(requests.clone());
+            .with_state(StreamingProviderState {
+                requests: requests.clone(),
+                release_completion: release_completion.clone(),
+            });
         tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -10375,23 +10723,81 @@ mod tests {
         let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
-        let turn = run_native_turn_with_provider(
-            &mut agent,
-            &provider,
-            "hello",
-            "test-model",
-            Some(delta_tx),
-        )
-        .await
-        .expect("native direct answer should complete");
+        let turn_task = tokio::spawn(async move {
+            run_native_turn_with_provider(
+                &mut agent,
+                &provider,
+                "hello",
+                "test-model",
+                Some(delta_tx),
+            )
+            .await
+        });
+
+        let first_delta = tokio::time::timeout(Duration::from_secs(1), delta_rx.recv())
+            .await
+            .expect("first answer delta should arrive before provider completion")
+            .expect("answer stream should remain open");
+        assert!(!turn_task.is_finished());
+        release_completion.notify_one();
+        let turn = turn_task
+            .await
+            .expect("native turn task should join")
+            .expect("native direct answer should complete");
 
         assert_eq!(requests.load(Ordering::SeqCst), 1);
-        assert_eq!(turn.answer, "A trusted answer");
-        let mut deltas = Vec::new();
+        assert_eq!(
+            turn.answer,
+            "A trusted answer begins here. It is now complete."
+        );
+        let mut deltas = vec![answer_signal(first_delta)];
         while let Ok(signal) = delta_rx.try_recv() {
             deltas.push(answer_signal(signal));
         }
         assert_eq!(deltas.concat(), turn.answer);
+    }
+
+    #[test]
+    fn native_conversation_instruction_has_no_legacy_planner_protocol() {
+        let instruction = build_agent_instruction("Be accurate.", true, true);
+        for obsolete in [
+            "typed Tool decision",
+            "Tool-planning mode",
+            "final-answer mode",
+            "stage-specific output contract",
+            "Runtime validation may reject and retry an incomplete model plan",
+        ] {
+            assert!(
+                !instruction.contains(obsolete),
+                "native instruction retained obsolete planner text: {obsolete}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_admin_native_schemas_keep_dynamic_setting_maps_open() {
+        let deployment = admin_config_direct_native_parameters("update_deployment_settings")
+            .expect("deployment Tool schema should exist");
+        assert_eq!(deployment["required"], json!(["settings"]));
+        assert_eq!(
+            deployment["properties"]["settings"]["additionalProperties"],
+            json!({})
+        );
+        assert!(
+            deployment["properties"]["settings"]["properties"].is_null(),
+            "dynamic deployment settings must not expose a literal placeholder key"
+        );
+
+        let agent = admin_config_direct_native_parameters("update_agent_settings")
+            .expect("agent settings Tool schema should exist");
+        assert_eq!(
+            agent["properties"]["updates"]["additionalProperties"],
+            json!({})
+        );
+        assert_eq!(
+            agent["anyOf"],
+            json!([{"required": ["updates"]}, {"required": ["revert_keys"]}])
+        );
     }
 
     struct CountingReadTool {
@@ -10437,7 +10843,7 @@ mod tests {
             };
             let stream = if request_number == 1 {
                 concat!(
-                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}},{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"I found something. \",\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}},{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                     "data: [DONE]\n\n"
                 )
             } else {
@@ -10478,18 +10884,26 @@ mod tests {
             "test-key".to_string(),
             0.1,
         );
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
 
         let turn = run_native_turn_with_provider(
             &mut agent,
             &provider,
             "use the documents",
             "test-model",
-            None,
+            Some(delta_tx),
         )
         .await
         .expect("one native Tool batch should complete");
 
         assert_eq!(turn.answer, "Grounded answer.");
+        let mut answer_deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            if let ConversationStreamSignal::Answer(delta) = signal {
+                answer_deltas.push(delta);
+            }
+        }
+        assert_eq!(answer_deltas.concat(), "Grounded answer.");
         assert_eq!(turn.executed_tools.len(), 2);
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         let requests = provider_state.0.lock().expect("captured provider requests");
@@ -10570,9 +10984,6 @@ mod tests {
 
     #[tokio::test]
     async fn tool_free_turn_falls_back_before_the_first_answer_chunk() {
-        let _guard = contact_replay_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         async fn completion(
             State(requested_models): State<Arc<Mutex<Vec<String>>>>,
             Json(body): Json<Value>,
@@ -10929,32 +11340,34 @@ mod tests {
         assert!(result.output.contains("next offset 6"));
         assert!(result.user_safe_fallback.is_none());
 
-        let traces = tool.traces.lock().expect("trace sink should lock");
-        assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0].tool_id, "curated-resources");
-        assert_eq!(traces[0].tool_name, "Curated Resources");
-        assert_eq!(
+        {
+            let traces = tool.traces.lock().expect("trace sink should lock");
+            assert_eq!(traces.len(), 1);
+            assert_eq!(traces[0].tool_id, "curated-resources");
+            assert_eq!(traces[0].tool_name, "Curated Resources");
+            assert_eq!(
             traces[0].output_summary.as_deref(),
             Some(
                 "Returned 1 of 6 matching ready Curated Resources; more results are available at offset 6."
             )
         );
-        assert_eq!(
-            traces[0].metadata,
-            json!({
-                "returned_count": 1,
-                "total_count": 6,
-                "has_more": true,
-                "next_offset": 6,
-                "continuation_query": "mexico legal aid network",
-                "continuation_region": "MX",
-                "continuation_help_type": "legal",
-                "continuation_language": "es",
-                "continuation_lookup_mode": Value::Null,
-                "resolved_region": "MX",
-                "resource_names": ["Mexico Legal Aid Network"],
-            })
-        );
+            assert_eq!(
+                traces[0].metadata,
+                json!({
+                    "returned_count": 1,
+                    "total_count": 6,
+                    "has_more": true,
+                    "next_offset": 6,
+                    "continuation_query": "mexico legal aid network",
+                    "continuation_region": "MX",
+                    "continuation_help_type": "legal",
+                    "continuation_language": "es",
+                    "continuation_lookup_mode": Value::Null,
+                    "resolved_region": "MX",
+                    "resource_names": ["Mexico Legal Aid Network"],
+                })
+            );
+        }
 
         let (token, payload) = seen_rx
             .await
@@ -11090,34 +11503,36 @@ mod tests {
         assert!(!fallback.output.contains("Relay these to the person"));
         assert!(!fallback.output.contains("never invent contact details"));
 
-        let traces = tool.traces.lock().expect("trace sink should lock");
-        assert_eq!(traces.len(), 1);
-        assert_eq!(
-            traces[0].query.as_deref(),
-            Some("curated resources inventory")
-        );
-        assert_eq!(
+        {
+            let traces = tool.traces.lock().expect("trace sink should lock");
+            assert_eq!(traces.len(), 1);
+            assert_eq!(
+                traces[0].query.as_deref(),
+                Some("curated resources inventory")
+            );
+            assert_eq!(
             traces[0].output_summary.as_deref(),
             Some(
                 "Returned 1 of 11 matching ready Curated Resources on this page; no remaining results."
             )
         );
-        assert_eq!(
-            traces[0].metadata,
-            json!({
-                "returned_count": 1,
-                "total_count": 11,
-                "has_more": false,
-                "next_offset": Value::Null,
-                "continuation_query": Value::Null,
-                "continuation_region": Value::Null,
-                "continuation_help_type": Value::Null,
-                "continuation_language": Value::Null,
-                "continuation_lookup_mode": "inventory",
-                "resolved_region": Value::Null,
-                "resource_names": ["Demo Test Resource"],
-            })
-        );
+            assert_eq!(
+                traces[0].metadata,
+                json!({
+                    "returned_count": 1,
+                    "total_count": 11,
+                    "has_more": false,
+                    "next_offset": Value::Null,
+                    "continuation_query": Value::Null,
+                    "continuation_region": Value::Null,
+                    "continuation_help_type": Value::Null,
+                    "continuation_language": Value::Null,
+                    "continuation_lookup_mode": "inventory",
+                    "resolved_region": Value::Null,
+                    "resource_names": ["Demo Test Resource"],
+                })
+            );
+        }
 
         let (token, payload) = seen_rx
             .await
@@ -11308,9 +11723,8 @@ mod tests {
         assert!(!instruction.contains("building genuine friendships"));
         assert!(!instruction.contains("final user-facing answer in messages"));
         assert!(!instruction.contains("Use done only"));
-        assert!(
-            instruction.contains("Final-answer generation returns only plain user-visible prose")
-        );
+        assert!(instruction.contains("Either answer directly in plain user-visible prose"));
+        assert!(instruction.contains("Call the native Tool instead"));
     }
 
     #[test]
@@ -11338,28 +11752,22 @@ mod tests {
 
         let instruction = build_chat_agent_instruction("PROFILE", &request, &user);
 
-        assert!(instruction.contains("fresh find_resources decision"));
+        assert!(instruction.contains("fresh find_resources call"));
         assert!(instruction.contains("recent Conversation context"));
         assert!(instruction.contains("organization, jurisdiction, language, and help type"));
-        assert!(instruction.contains("me puedes dar el email"));
         for contact_kind in [
             "email",
             "phone number",
-            "website or URL",
+            "website",
             "address",
             "secure channel",
-            "correo electrónico",
-            "teléfono",
-            "sitio web",
-            "dirección",
-            "canal seguro",
         ] {
             assert!(
                 instruction.contains(contact_kind),
                 "contact policy should cover {contact_kind}"
             );
         }
-        assert!(instruction.contains("earlier assistant prose"));
+        assert!(instruction.contains("must come from the fresh find_resources result"));
         assert!(instruction.contains("no matching contact"));
 
         let contact_tool = FindResourcesTool {
@@ -11396,8 +11804,7 @@ mod tests {
             &user,
         );
         assert!(!disabled.contains("CURATED RESOURCES GROUNDING"));
-        assert!(!disabled.contains("fresh find_resources decision"));
-        assert!(!disabled.contains("me puedes dar el email"));
+        assert!(!disabled.contains("fresh find_resources call"));
     }
 
     #[test]
@@ -11527,7 +11934,7 @@ mod tests {
             args: &ToolArgs,
         ) -> Result<(ToolResult, ConversationTimingOutcome)> {
             let result = self.execute(args).await?;
-            let outcome = self.outcome.clone().unwrap_or(if result.success {
+            let outcome = self.outcome.unwrap_or(if result.success {
                 ConversationTimingOutcome::Succeeded
             } else {
                 ConversationTimingOutcome::Failed
@@ -12999,7 +13406,6 @@ mod tests {
         };
         let persisted = PersistedConversationContext {
             summary: Some("Persisted summary from Sage Session Memory.".to_string()),
-            ..Default::default()
         };
         let profile = HashMap::new();
 

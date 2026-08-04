@@ -12,6 +12,9 @@ mod config;
 mod marmot;
 mod memory;
 mod messenger;
+#[allow(dead_code)]
+mod openai_native;
+#[allow(dead_code)]
 mod sage_agent;
 mod scheduler;
 mod scheduler_tools;

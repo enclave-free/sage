@@ -682,6 +682,9 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn args_schema(&self) -> &str;
+    fn native_parameters(&self) -> Result<serde_json::Value> {
+        native_parameters_from_contract(self.name(), self.args_schema())
+    }
     fn retry_policy(&self) -> ToolRetryPolicy {
         ToolRetryPolicy::None
     }
@@ -753,38 +756,17 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Convert the registry's existing argument examples into the JSON Schema
-    /// shape required by OpenAI-compatible native function calling.
+    /// Return each Tool's authoritative provider-native JSON Schema. Legacy
+    /// example-shaped contracts are converted at this compatibility boundary.
     pub fn native_definitions(&self) -> Result<Vec<NativeToolDefinition>> {
         self.tools
             .values()
             .filter(|tool| tool.name() != "done")
             .map(|tool| {
-                let example: serde_json::Value =
-                    serde_json::from_str(tool.args_schema()).map_err(|error| {
-                        anyhow!(
-                            "Tool '{}' has invalid argument schema JSON: {error}",
-                            tool.name()
-                        )
-                    })?;
-                let object = example.as_object().ok_or_else(|| {
-                    anyhow!(
-                        "Tool '{}' argument schema must be a JSON object",
-                        tool.name()
-                    )
-                })?;
-                let properties = object
-                    .iter()
-                    .map(|(name, example)| (name.clone(), native_property_schema(example)))
-                    .collect::<serde_json::Map<_, _>>();
                 Ok(NativeToolDefinition {
                     name: tool.name().to_string(),
                     description: tool.description().to_string(),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": properties,
-                        "additionalProperties": false,
-                    }),
+                    parameters: tool.native_parameters()?,
                 })
             })
             .collect()
@@ -906,6 +888,30 @@ impl ToolRegistry {
             args_schema: args_schema.to_string(),
         }));
     }
+}
+
+fn native_parameters_from_contract(tool_name: &str, contract: &str) -> Result<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(contract)
+        .map_err(|error| anyhow!("Tool '{tool_name}' has invalid argument schema JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("Tool '{tool_name}' argument schema must be a JSON object"))?;
+    if object.get("type").and_then(serde_json::Value::as_str) == Some("object")
+        && object
+            .get("properties")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return Ok(value);
+    }
+    let properties = object
+        .iter()
+        .map(|(name, example)| (name.clone(), native_property_schema(example)))
+        .collect::<serde_json::Map<_, _>>();
+    Ok(serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false,
+    }))
 }
 
 fn native_property_schema(example: &serde_json::Value) -> serde_json::Value {
@@ -2617,12 +2623,39 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn native_tool_definitions_expose_valid_json_schema_and_omit_done() {
+    fn native_tool_definitions_preserve_authoritative_json_schema_and_omit_done() {
         let mut registry = ToolRegistry::new();
+        let knowledge_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search terms"},
+                "count": {"type": "integer", "default": 5},
+                "exact": {"type": "boolean", "default": false}
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        });
         registry.register_descriptor(
             "knowledge_search",
             "Search uploaded Documents.",
-            r#"{"query":"search terms","count":5,"exact":false}"#,
+            &knowledge_schema.to_string(),
+        );
+        let deployment_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": "object",
+                    "description": "Deployment setting names and desired values.",
+                    "additionalProperties": {}
+                }
+            },
+            "required": ["settings"],
+            "additionalProperties": false
+        });
+        registry.register_descriptor(
+            "update_deployment_settings",
+            "Update Deployment Settings.",
+            &deployment_schema.to_string(),
         );
         registry.register_descriptor("done", "Legacy loop terminator.", r#"{}"#);
 
@@ -2630,22 +2663,11 @@ mod tests {
             .native_definitions()
             .expect("descriptor examples should convert to JSON Schema");
 
-        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions.len(), 2);
         assert_eq!(definitions[0].name, "knowledge_search");
-        assert_eq!(definitions[0].parameters["type"], "object");
-        assert_eq!(
-            definitions[0].parameters["properties"]["query"]["type"],
-            "string"
-        );
-        assert_eq!(
-            definitions[0].parameters["properties"]["count"]["type"],
-            "integer"
-        );
-        assert_eq!(
-            definitions[0].parameters["properties"]["exact"]["type"],
-            "boolean"
-        );
-        assert_eq!(definitions[0].parameters["additionalProperties"], false);
+        assert_eq!(definitions[0].parameters, knowledge_schema);
+        assert_eq!(definitions[1].name, "update_deployment_settings");
+        assert_eq!(definitions[1].parameters, deployment_schema);
     }
 
     #[test]
