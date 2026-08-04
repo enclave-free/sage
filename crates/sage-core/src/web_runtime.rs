@@ -43,6 +43,10 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::memory::MemoryManager;
+use crate::openai_native::{
+    NativeAssistantMessage, NativeAssistantTurn, NativeChatMessage, NativeFinishReason,
+    NativeProviderError, NativeTurnRequest, OpenAiNativeClient,
+};
 use crate::sage_agent::{
     curated_resource_lookup_expectation, has_syntactic_tool_intent,
     lookup_process_narration_opening, multiline_tool_call_header_match, normalized_lookup_text,
@@ -7087,6 +7091,135 @@ struct AdapterTurnOutput {
     executed_tools: Vec<ExecutedTool>,
 }
 
+async fn run_native_turn_with_provider(
+    agent: &mut SageAgent,
+    provider: &OpenAiNativeClient,
+    input: &str,
+    model: &str,
+    delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) -> std::result::Result<AdapterTurnOutput, AdapterTurnFailure> {
+    let prompt = agent.native_turn_prompt(input);
+    let tools = agent
+        .native_tool_definitions()
+        .map_err(|error| AdapterTurnFailure {
+            error: AppError::internal(format!("invalid native Tool contract: {error:#}")),
+            progressed: false,
+        })?;
+    let mut messages = vec![
+        NativeChatMessage::system(prompt.system),
+        NativeChatMessage::user(prompt.user),
+    ];
+    let first_turn = request_native_turn_with_protocol_retry(
+        provider,
+        NativeTurnRequest {
+            model: model.to_string(),
+            messages: messages.clone(),
+            tools,
+            max_tokens: PLAIN_ANSWER_MAX_TOKENS,
+        },
+    )
+    .await
+    .map_err(|error| AdapterTurnFailure {
+        error: model_provider_error(error),
+        progressed: false,
+    })?;
+
+    let (answer, executed_tools, incomplete_resource_page) = match first_turn.finish_reason {
+        NativeFinishReason::Stop => (first_turn.content, Vec::new(), false),
+        NativeFinishReason::ToolCalls => {
+            messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
+                content: first_turn.content,
+                tool_calls: first_turn.tool_calls.clone(),
+            }));
+            let batch = agent
+                .execute_native_tool_calls(&first_turn.tool_calls)
+                .await;
+            for (call, executed) in first_turn.tool_calls.iter().zip(&batch.executed_tools) {
+                messages.push(NativeChatMessage::tool_result(
+                    &call.id,
+                    native_tool_result_content(&executed.result),
+                ));
+            }
+            let incomplete_resource_page = batch.executed_tools.iter().any(|executed| {
+                executed.tool_call.name == "find_resources"
+                    && executed.result.success
+                    && executed
+                        .result
+                        .metadata
+                        .get("has_more")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true)
+            });
+            let final_turn = request_native_turn_with_protocol_retry(
+                provider,
+                NativeTurnRequest {
+                    model: model.to_string(),
+                    messages,
+                    tools: Vec::new(),
+                    max_tokens: PLAIN_ANSWER_MAX_TOKENS,
+                },
+            )
+            .await
+            .map_err(|error| AdapterTurnFailure {
+                error: model_provider_error(error),
+                progressed: true,
+            })?;
+            if final_turn.finish_reason != NativeFinishReason::Stop {
+                return Err(AdapterTurnFailure {
+                    error: model_provider_error(
+                        "final native response attempted another Tool round",
+                    ),
+                    progressed: true,
+                });
+            }
+            (
+                final_turn.content,
+                batch.executed_tools,
+                incomplete_resource_page,
+            )
+        }
+    };
+    let mut answer_state = PlainAnswerStreamState::new(incomplete_resource_page);
+    let mut answer_deltas = Vec::new();
+    answer_state
+        .push_staged(&answer, &mut answer_deltas)
+        .and_then(|_| answer_state.finish_staged(&mut answer_deltas))
+        .map_err(|error| AdapterTurnFailure {
+            progressed: error.emitted_any,
+            error: model_provider_error(error),
+        })?;
+    release_answer_deltas(answer_deltas, &delta_sender);
+    Ok(AdapterTurnOutput {
+        answer,
+        executed_tools,
+    })
+}
+
+async fn request_native_turn_with_protocol_retry(
+    provider: &OpenAiNativeClient,
+    request: NativeTurnRequest,
+) -> std::result::Result<NativeAssistantTurn, NativeProviderError> {
+    match provider.stream_turn(request.clone(), None).await {
+        Ok(turn) => Ok(turn),
+        Err(error) if error.is_protocol() => {
+            warn!("Native provider returned an unusable response; retrying the same request once");
+            provider.stream_turn(request, None).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn native_tool_result_content(result: &ToolResult) -> String {
+    if result.success {
+        result.output.clone()
+    } else {
+        format!(
+            "Tool execution failed: {}",
+            result.error.as_deref().unwrap_or("Unknown error")
+        )
+    }
+}
+
 #[derive(Debug)]
 struct AdapterTurnFailure {
     error: AppError,
@@ -7256,13 +7389,13 @@ async fn run_agent_steps(
     model: &str,
     delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> Result<String, AgentTurnFailure> {
-    let generator = OpenAiPlainAnswerGenerator::new(
+    let provider = OpenAiNativeClient::new(
         Client::new(),
         lm.api_url.clone(),
         lm.api_key.clone(),
         lm.temperature,
     );
-    let turn = run_turn_with_adapters(agent, &generator, input, model, delta_sender)
+    let turn = run_native_turn_with_provider(agent, &provider, input, model, delta_sender)
         .await
         .map_err(|failure| AgentTurnFailure {
             error: failure.error,
@@ -7286,13 +7419,6 @@ async fn run_agent_turn(
     let mut last_error: Option<AppError> = None;
 
     for (idx, model) in chain.iter().enumerate() {
-        // Point the global LM at this model before the attempt. The primary
-        // (idx 0) was already configured by the handler for any intermediate
-        // memory work, so only reconfigure when switching to a fallback.
-        if idx > 0 {
-            lm.configure(model).await?;
-        }
-
         match run_agent_steps(
             agent,
             input,
@@ -12249,6 +12375,239 @@ mod tests {
             deltas.push(answer_signal(signal));
         }
         assert_eq!(deltas.concat(), answer);
+    }
+
+    #[tokio::test]
+    async fn native_tool_free_turn_uses_one_model_request_and_streams_the_answer() {
+        async fn completion(
+            State(requests): State<Arc<AtomicUsize>>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            requests.fetch_add(1, Ordering::SeqCst);
+            assert!(body.get("tools").is_none());
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"A trusted \"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(requests.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider should serve");
+        });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let turn = run_native_turn_with_provider(
+            &mut agent,
+            &provider,
+            "hello",
+            "test-model",
+            Some(delta_tx),
+        )
+        .await
+        .expect("native direct answer should complete");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(turn.answer, "A trusted answer");
+        let mut deltas = Vec::new();
+        while let Ok(signal) = delta_rx.try_recv() {
+            deltas.push(answer_signal(signal));
+        }
+        assert_eq!(deltas.concat(), turn.answer);
+    }
+
+    struct CountingReadTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CountingReadTool {
+        fn name(&self) -> &str {
+            "knowledge_search"
+        }
+
+        fn description(&self) -> &str {
+            "Search uploaded Documents."
+        }
+
+        fn args_schema(&self) -> &str {
+            r#"{"query":"search terms"}"#
+        }
+
+        async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::success(format!(
+                "trusted result for {}",
+                tool_string_arg(args, "query").unwrap_or("missing")
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn native_tool_turn_executes_one_batch_and_returns_correlated_results_without_tools() {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            let request_number = {
+                let mut requests = state.0.lock().expect("provider request capture");
+                requests.push(body);
+                requests.len()
+            };
+            let stream = if request_number == 1 {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}},{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            } else {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                stream,
+            )
+        }
+
+        let provider_state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(provider_state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider should serve");
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingReadTool {
+            executions: executions.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let turn = run_native_turn_with_provider(
+            &mut agent,
+            &provider,
+            "use the documents",
+            "test-model",
+            None,
+        )
+        .await
+        .expect("one native Tool batch should complete");
+
+        assert_eq!(turn.answer, "Grounded answer.");
+        assert_eq!(turn.executed_tools.len(), 2);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        let requests = provider_state.0.lock().expect("captured provider requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]["tools"][0]["function"]["name"],
+            "knowledge_search"
+        );
+        assert!(requests[1].get("tools").is_none());
+        assert_eq!(requests[1]["messages"][2]["tool_calls"][0]["id"], "call-a");
+        assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-a");
+        assert_eq!(requests[1]["messages"][4]["tool_call_id"], "call-b");
+    }
+
+    #[tokio::test]
+    async fn unusable_native_response_gets_one_content_neutral_protocol_retry() {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            let request_number = {
+                let mut requests = state.0.lock().expect("provider request capture");
+                requests.push(body);
+                requests.len()
+            };
+            let stream = if request_number == 1 {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            } else {
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                stream,
+            )
+        }
+
+        let provider_state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(provider_state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider should serve");
+        });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+
+        let turn =
+            run_native_turn_with_provider(&mut agent, &provider, "hello", "test-model", None)
+                .await
+                .expect("one protocol retry should recover");
+
+        assert_eq!(turn.answer, "Recovered answer.");
+        let requests = provider_state.0.lock().expect("captured provider requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
     }
 
     struct OneToolPlanner {

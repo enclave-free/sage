@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::memory::MemoryManager;
-use crate::openai_native::NativeToolDefinition;
+use crate::openai_native::{NativeToolCall, NativeToolDefinition};
 
 #[cfg(unix)]
 struct StdoutSuppressor {
@@ -96,6 +96,13 @@ pub struct ToolArgs(HashMap<String, serde_json::Value>);
 impl ToolArgs {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_json_object(value: &serde_json::Value) -> Result<Self> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("native Tool arguments must be a JSON object"))?;
+        Ok(Self(object.clone().into_iter().collect()))
     }
 }
 
@@ -3616,8 +3623,17 @@ impl SageAgent {
 
     /// Build the plain final-answer prompt after the bounded Tool phase.
     pub fn plain_answer_prompt(&self, user_message: &str) -> PlainAnswerPrompt {
+        let mut prompt = self.native_turn_prompt(user_message);
+        prompt.system.push_str(PLAIN_ANSWER_INSTRUCTION);
+        prompt
+    }
+
+    /// Build the provider-native Conversation request without forcing either
+    /// a Tool decision or a plain answer. The model receives enabled Tools
+    /// separately through the provider contract.
+    pub fn native_turn_prompt(&self, user_message: &str) -> PlainAnswerPrompt {
         let context = self.build_context();
-        let system = format!("{}{}", self.instruction, PLAIN_ANSWER_INSTRUCTION);
+        let system = self.instruction.clone();
         let user = format!(
             "CURRENT TIME\n{}\n\nPERSONA\n{}\n\nHUMAN\n{}\n\nMEMORY METADATA\n{}\n\nPREVIOUS CONTEXT SUMMARY\n{}\n\nRECENT CONVERSATION AND TOOL RESULTS\n{}\n\nCURRENT REQUEST\n{}",
             context.current_time,
@@ -3633,6 +3649,10 @@ impl SageAgent {
             user,
             incomplete_curated_resource_page: self.curated_resource_page_incomplete,
         }
+    }
+
+    pub fn native_tool_definitions(&self) -> Result<Vec<NativeToolDefinition>> {
+        self.tools.native_definitions()
     }
 
     /// Execute one provider-neutral Tool decision and retain its results for
@@ -3665,6 +3685,53 @@ impl SageAgent {
             tool_calls: decision.tool_calls.clone(),
             executed_tools,
             done: decision.tool_calls.is_empty(),
+        }
+    }
+
+    /// Execute the single native Tool batch selected by the provider while
+    /// preserving the provider's call identifiers for correlated result
+    /// messages. Unknown Tools are rejected by the same registry boundary as
+    /// legacy calls and every selected call receives a terminal result.
+    pub async fn execute_native_tool_calls(&mut self, calls: &[NativeToolCall]) -> StepResult {
+        let mut tool_calls = Vec::with_capacity(calls.len());
+        let mut executed_tools = Vec::with_capacity(calls.len());
+        for call in calls {
+            let tool_call = match ToolArgs::from_json_object(&call.arguments) {
+                Ok(args) => ToolCall {
+                    name: call.name.clone(),
+                    args,
+                },
+                Err(error) => {
+                    let tool_call = ToolCall {
+                        name: call.name.clone(),
+                        args: ToolArgs::new(),
+                    };
+                    let result = ToolResult::error(error.to_string());
+                    self.inject_tool_result(&tool_call, &result);
+                    tool_calls.push(tool_call.clone());
+                    executed_tools.push(ExecutedTool { tool_call, result });
+                    continue;
+                }
+            };
+            let result = self.execute_tool_call(&call.id, 1, &tool_call).await;
+            self.inject_tool_result(&tool_call, &result);
+            if tool_call.name == "find_resources" && result.success {
+                self.curated_resource_lookup_succeeded = true;
+                self.curated_resource_page_incomplete = result
+                    .metadata
+                    .get("has_more")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+            }
+            tool_calls.push(tool_call.clone());
+            executed_tools.push(ExecutedTool { tool_call, result });
+        }
+
+        StepResult {
+            messages: Vec::new(),
+            tool_calls,
+            executed_tools,
+            done: calls.is_empty(),
         }
     }
 
