@@ -54,7 +54,7 @@ impl Config {
             tinfoil_api_key: std::env::var("TINFOIL_API_KEY").ok(),
             tinfoil_model: std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "glm-5-2".to_string()),
             tinfoil_reasoning_effort: std::env::var("TINFOIL_REASONING_EFFORT")
-                .unwrap_or_else(|_| "max".to_string())
+                .unwrap_or_else(|_| NativeReasoningEffort::default().to_string())
                 .parse()
                 .map_err(anyhow::Error::msg)
                 .context("TINFOIL_REASONING_EFFORT must be a supported reasoning effort")?,
@@ -202,6 +202,13 @@ mod tests {
         std::env::remove_var("TINFOIL_VISION_MODEL");
         let defaulted_vision = Config::from_env().unwrap();
         assert_eq!(defaulted_vision.tinfoil_vision_model, "qwen3-vl-30b");
+
+        std::env::remove_var("TINFOIL_REASONING_EFFORT");
+        let defaulted_reasoning = Config::from_env().unwrap();
+        assert_eq!(
+            defaulted_reasoning.tinfoil_reasoning_effort,
+            NativeReasoningEffort::None
+        );
 
         restore_env("DATABASE_URL", previous_database);
         restore_env("TINFOIL_API_URL", previous_tinfoil_api_url);

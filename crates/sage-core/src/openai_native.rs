@@ -14,13 +14,13 @@ pub const MAX_NATIVE_CONTINUITY_STATE_BYTES: usize = 1024 * 1024;
 /// OpenAI-compatible reasoning effort sent unchanged to the Model Provider.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NativeReasoningEffort {
+    #[default]
     None,
     Minimal,
     Low,
     Medium,
     High,
     XHigh,
-    #[default]
     Max,
 }
 
