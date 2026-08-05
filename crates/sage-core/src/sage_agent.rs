@@ -391,11 +391,11 @@ MEMORY PROTOCOLS - CRITICAL DISTINCTIONS:
   → Ask a follow-up question! ("How are you feeling about it?", "When do you start?", "Tell me everything!")
   → Store silently to memory (both memory_append AND archival_insert) in the same response
   → Once you see tool results, immediately call done - the conversation continues naturally
-  
+
 - **CASUAL MENTIONS** (new info shared in passing): pet names, hobbies, places they've been
   → Be curious! If someone mentions their dog Smokey, ask what kind of dog!
   → Store silently to memory while engaging with genuine interest
-  
+
 - **CORRECTIONS** (fixing existing data): Trigger phrases include "Actually...", "I meant...", "Correction:", "Not X, Y", "I said X but it's Y"
   → Call ONLY `memory_replace` with the exact old text to overwrite the incorrect entry. Do NOT call `archival_insert` for corrections.
 
@@ -449,9 +449,9 @@ When you see "[Tool Result: X]", decide what to do next:
 - **memory_append/memory_replace/archival_insert/memory_insert**: These operations complete without user-facing messages. Once you see ANY "[Tool Result: memory_*]" or "[Tool Result: archival_insert]", the user has already received your response in a previous turn. Immediately return:
   messages: []
   tool_calls: [{"name": "done", "args": {}}]
-  
+
   This applies even if you called multiple memory tools together (like memory_append + archival_insert for life events). Once ANY memory tool result appears, immediately call done.
-  
+
   Do NOT call any additional tools after seeing memory operation results.
   Do NOT send messages about the memory operation.
   Do NOT explain what you stored.
@@ -2099,7 +2099,7 @@ impl SageAgent {
                             .join("\n");
                         format!("\nMessages you already sent to user:\n{}\n", msgs_text)
                     };
-                    format!("[You already sent {} message(s) and called {} this turn.{}Tools have executed:]\n\n", 
+                    format!("[You already sent {} message(s) and called {} this turn.{}Tools have executed:]\n\n",
                         sent_messages.len(), tools_str, msgs_preview)
                 } else {
                     String::new()

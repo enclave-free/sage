@@ -7236,7 +7236,6 @@ fn same_model_retry_eligible(error: &NativeProviderError) -> bool {
 
 fn same_model_retry_category(error: &NativeProviderError) -> Option<&'static str> {
     match error {
-        NativeProviderError::Timeout { .. } => Some("timeout"),
         NativeProviderError::Protocol(_) => Some("protocol"),
         NativeProviderError::Transport(error) if error.is_timeout() => Some("timeout"),
         NativeProviderError::Transport(error) if error.is_connect() => Some("connection"),
@@ -8135,7 +8134,6 @@ fn model_provider_error(error: NativeProviderError) -> AppError {
             NativeProviderError::Http { status, .. } => ("provider_rejected", status.as_u16()),
             NativeProviderError::Transport(_) => ("provider_transport", 0),
             NativeProviderError::Protocol(_) => ("provider_protocol", 0),
-            NativeProviderError::Timeout { .. } => ("provider_timeout", 0),
         };
         warn!(
             target: "sage.model_provider",
@@ -9789,9 +9787,15 @@ mod tests {
 
         #[derive(Clone)]
         struct TimeoutState(Arc<AtomicUsize>);
-        async fn never_respond(State(state): State<TimeoutState>) -> Response {
+        async fn stall_response_body(State(state): State<TimeoutState>) -> Response {
             state.0.fetch_add(1, Ordering::SeqCst);
-            std::future::pending::<Response>().await
+            let body = axum::body::Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, Infallible>,
+            >());
+            Response::builder()
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(body)
+                .expect("stalled provider response should build")
         }
         let timeout_requests = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9801,7 +9805,7 @@ mod tests {
             axum::serve(
                 listener,
                 Router::new()
-                    .route("/v1/chat/completions", post(never_respond))
+                    .route("/v1/chat/completions", post(stall_response_body))
                     .with_state(timeout_state),
             )
             .await
@@ -9828,7 +9832,7 @@ mod tests {
         .await;
         assert!(
             timeout_result.is_err(),
-            "provider timeout should exhaust the retry"
+            "the configured HTTP timeout should bound a stalled response body and exhaust the retry"
         );
         assert_eq!(timeout_requests.load(Ordering::SeqCst), 2);
     }

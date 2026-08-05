@@ -54,7 +54,7 @@ impl Config {
             tinfoil_embedding_model: std::env::var("TINFOIL_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string()),
             tinfoil_vision_model: std::env::var("TINFOIL_VISION_MODEL")
-                .unwrap_or_else(|_| "qwen3-vl-30b".to_string()),
+                .unwrap_or_else(|_| "kimi-k2-5".to_string()),
 
             database_url: std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?,
 
@@ -191,7 +191,7 @@ mod tests {
 
         std::env::remove_var("TINFOIL_VISION_MODEL");
         let defaulted_vision = Config::from_env().unwrap();
-        assert_eq!(defaulted_vision.tinfoil_vision_model, "qwen3-vl-30b");
+        assert_eq!(defaulted_vision.tinfoil_vision_model, "kimi-k2-5");
 
         restore_env("DATABASE_URL", previous_database);
         restore_env("TINFOIL_API_URL", previous_tinfoil_api_url);
