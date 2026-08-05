@@ -7252,6 +7252,18 @@ fn same_model_retry_category(error: &NativeProviderError) -> Option<&'static str
     }
 }
 
+fn safe_protocol_error_detail(error: &NativeProviderError) -> &str {
+    match error {
+        NativeProviderError::Protocol(detail)
+            if detail.starts_with("provider streamed an error:") =>
+        {
+            "provider_streamed_error"
+        }
+        NativeProviderError::Protocol(detail) => detail,
+        NativeProviderError::Transport(_) | NativeProviderError::Http { .. } => "",
+    }
+}
+
 async fn stream_native_turn_attempt(
     agent: &SageAgent,
     provider: &OpenAiNativeClient,
@@ -8124,6 +8136,7 @@ fn model_provider_error(error: NativeProviderError) -> AppError {
             target: "sage.model_provider",
             event_name = "authoritative_model_unavailable",
             category = same_model_retry_category(&error).unwrap_or("transient_provider_failure"),
+            protocol_detail = safe_protocol_error_detail(&error),
         );
         AppError::new(
             StatusCode::BAD_GATEWAY,
@@ -14407,6 +14420,29 @@ mod tests {
             status: reqwest::StatusCode::BAD_REQUEST,
             body: "invalid request".to_string(),
         }));
+    }
+
+    #[test]
+    fn protocol_error_observability_redacts_provider_error_payloads() {
+        assert_eq!(
+            safe_protocol_error_detail(&NativeProviderError::Protocol(
+                "provider stopped without an answer".to_string()
+            )),
+            "provider stopped without an answer"
+        );
+        assert_eq!(
+            safe_protocol_error_detail(&NativeProviderError::Protocol(
+                "provider streamed an error: private upstream payload".to_string()
+            )),
+            "provider_streamed_error"
+        );
+        assert_eq!(
+            safe_protocol_error_detail(&NativeProviderError::Http {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                body: "private upstream body".to_string(),
+            }),
+            ""
+        );
     }
 
     #[test]
