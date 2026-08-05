@@ -2183,25 +2183,34 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             total_tokens,
             cached_tokens,
             reasoning_tokens,
-        } => ConversationTraceDeltaResponse {
-            id: trace_delta_id("model-usage", &format!("{}-{}", step, attempt)),
-            kind: "timing".to_string(),
-            title: Some("Model usage".to_string()),
-            content: Some("Provider-reported model usage observed.".to_string()),
-            tool_name: None,
-            status: Some("succeeded".to_string()),
-            metadata: json!({
+        } => {
+            let mut metadata = json!({
                 "phase": ConversationTimingPhase::ModelRequest.as_str(),
                 "step": step,
                 "attempt": attempt,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens,
-                "cached_tokens": cached_tokens,
-                "reasoning_tokens": reasoning_tokens,
-            }),
-            created_at: Some(chrono::Utc::now().to_rfc3339()),
-        },
+            });
+            for (field, value) in [
+                ("prompt_tokens", prompt_tokens),
+                ("completion_tokens", completion_tokens),
+                ("total_tokens", total_tokens),
+                ("cached_tokens", cached_tokens),
+                ("reasoning_tokens", reasoning_tokens),
+            ] {
+                if let Some(value) = value {
+                    metadata[field] = json!(value);
+                }
+            }
+            ConversationTraceDeltaResponse {
+                id: trace_delta_id("model-usage", &format!("{}-{}", step, attempt)),
+                kind: "timing".to_string(),
+                title: Some("Model usage".to_string()),
+                content: Some("Provider-reported model usage observed.".to_string()),
+                tool_name: None,
+                status: Some("succeeded".to_string()),
+                metadata,
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+            }
+        }
         AgentTraceEvent::CorrectionStarted {
             step,
             attempt,
@@ -15150,8 +15159,8 @@ mod tests {
         assert_eq!(delta.metadata["prompt_tokens"], 101);
         assert_eq!(delta.metadata["completion_tokens"], 29);
         assert_eq!(delta.metadata["total_tokens"], 130);
-        assert!(delta.metadata["cached_tokens"].is_null());
-        assert!(delta.metadata["reasoning_tokens"].is_null());
+        assert!(delta.metadata.get("cached_tokens").is_none());
+        assert!(delta.metadata.get("reasoning_tokens").is_none());
         let rendered = format!("{delta:?}");
         for forbidden in [
             "prompt text",
