@@ -114,6 +114,7 @@ start:
         -e TINFOIL_API_URL="${TINFOIL_API_URL:-http://localhost:${TINFOIL_PROXY_PORT}/v1}" \
         -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
         -e TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-2}" \
+        -e TINFOIL_REASONING_EFFORT="${TINFOIL_REASONING_EFFORT:-none}" \
         -e TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}" \
         -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-qwen3-vl-30b}" \
         $MESSENGER_ENV \
@@ -210,6 +211,7 @@ restart:
         -e TINFOIL_API_URL="${TINFOIL_API_URL:-http://localhost:${TINFOIL_PROXY_PORT}/v1}" \
         -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
         -e TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-2}" \
+        -e TINFOIL_REASONING_EFFORT="${TINFOIL_REASONING_EFFORT:-none}" \
         -e TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}" \
         -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-qwen3-vl-30b}" \
         $MESSENGER_ENV \
