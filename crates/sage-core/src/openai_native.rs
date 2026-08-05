@@ -207,6 +207,8 @@ impl OpenAiNativeClient {
                 ),
             );
             body.insert("tool_choice".to_string(), json!("auto"));
+        } else {
+            body.insert("tool_choice".to_string(), json!("none"));
         }
 
         let response = self
@@ -642,6 +644,7 @@ mod tests {
             requests[0].pointer("/tools/0/function/parameters/properties/query/type"),
             Some(&json!("string"))
         );
+        assert_eq!(requests[0].get("tool_choice"), Some(&json!("auto")));
         assert_eq!(
             requests[1].pointer("/messages/2/tool_calls/0/id"),
             Some(&json!("call-1"))
@@ -651,6 +654,7 @@ mod tests {
             Some(&json!("call-1"))
         );
         assert!(requests[1].get("tools").is_none());
+        assert_eq!(requests[1].get("tool_choice"), Some(&json!("none")));
     }
 
     #[test]
