@@ -15,7 +15,7 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::sage_agent::{
-    tool_parse_arg, tool_string_arg, Tool, ToolArgs, ToolResult, ToolRetryPolicy,
+    tool_parse_arg, tool_string_arg, LegacyTool, ToolArgs, ToolResult, ToolRetryPolicy,
 };
 
 /// Dangerous command patterns that should be blocked
@@ -128,7 +128,7 @@ impl ShellTool {
 }
 
 #[async_trait]
-impl Tool for ShellTool {
+impl LegacyTool for ShellTool {
     fn name(&self) -> &str {
         "shell"
     }

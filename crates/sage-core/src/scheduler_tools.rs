@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::sage_agent::{tool_string_arg, Tool, ToolArgs, ToolResult};
+use crate::sage_agent::{tool_string_arg, LegacyTool, ToolArgs, ToolResult};
 use crate::scheduler::{
     is_cron_expression, next_cron_time, parse_cron, parse_datetime, MessagePayload, SchedulerDb,
     TaskPayload, TaskType, ToolCallPayload,
@@ -38,7 +38,7 @@ impl ScheduleTaskTool {
 }
 
 #[async_trait]
-impl Tool for ScheduleTaskTool {
+impl LegacyTool for ScheduleTaskTool {
     fn name(&self) -> &str {
         "schedule_task"
     }
@@ -200,7 +200,7 @@ impl ListSchedulesTool {
 }
 
 #[async_trait]
-impl Tool for ListSchedulesTool {
+impl LegacyTool for ListSchedulesTool {
     fn name(&self) -> &str {
         "list_schedules"
     }
@@ -275,7 +275,7 @@ impl CancelScheduleTool {
 }
 
 #[async_trait]
-impl Tool for CancelScheduleTool {
+impl LegacyTool for CancelScheduleTool {
     fn name(&self) -> &str {
         "cancel_schedule"
     }

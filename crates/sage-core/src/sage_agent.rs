@@ -533,7 +533,14 @@ impl NativeToolResult {
         }
     }
 
-    fn from_legacy(result: ToolResult) -> Self {
+    fn to_tool_result(&self) -> ToolResult {
+        match self {
+            Self::Success(data) => ToolResult::success(data.to_string()),
+            Self::Failure { message, .. } => ToolResult::error(message.clone()),
+        }
+    }
+
+    fn from_upstream_legacy(result: ToolResult) -> Self {
         if result.success {
             let data = serde_json::from_str(&result.output)
                 .unwrap_or_else(|_| serde_json::json!({ "content": result.output }));
@@ -550,13 +557,6 @@ impl NativeToolResult {
                 "tool_execution_failed",
                 "The Tool could not complete the request.",
             )
-        }
-    }
-
-    fn to_legacy(&self) -> ToolResult {
-        match self {
-            Self::Success(data) => ToolResult::success(data.to_string()),
-            Self::Failure { message, .. } => ToolResult::error(message.clone()),
         }
     }
 }
@@ -716,43 +716,72 @@ impl ToolResult {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
-    fn args_schema(&self) -> &str;
-    fn native_parameters(&self) -> Result<serde_json::Value> {
-        native_parameters_from_contract(self.name(), self.args_schema())
-    }
+    fn native_parameters(&self) -> Result<serde_json::Value>;
     fn retry_policy(&self) -> ToolRetryPolicy {
         ToolRetryPolicy::none()
-    }
-    async fn execute_with_timing_outcome(
-        &self,
-        args: &ToolArgs,
-    ) -> Result<(ToolResult, ConversationTimingOutcome)> {
-        let result = self.execute(args).await?;
-        let outcome = if result.success {
-            ConversationTimingOutcome::Succeeded
-        } else {
-            ConversationTimingOutcome::Failed
-        };
-        Ok((result, outcome))
     }
     async fn execute_native_with_timing_outcome(
         &self,
         args: &ToolArgs,
     ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        let (result, outcome) = self.execute_with_timing_outcome(args).await?;
-        Ok((NativeToolResult::from_legacy(result), outcome))
+        let result = self.execute_native(args).await?;
+        let outcome = if result.is_success() {
+            ConversationTimingOutcome::Succeeded
+        } else {
+            ConversationTimingOutcome::Rejected
+        };
+        Ok((result, outcome))
     }
-    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
-        self.execute(args).await.map(NativeToolResult::from_legacy)
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult>;
+}
+
+/// Upstream Sage's prompt-planned Tool contract. Enclave Tools do not
+/// implement this trait; it remains only for the standalone memory/scheduler
+/// runtime while that upstream surface still exists.
+#[async_trait::async_trait]
+pub trait LegacyTool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn args_schema(&self) -> &str;
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        ToolRetryPolicy::none()
     }
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult>;
+}
+
+#[async_trait::async_trait]
+impl<T> Tool for T
+where
+    T: LegacyTool,
+{
+    fn name(&self) -> &str {
+        LegacyTool::name(self)
+    }
+
+    fn description(&self) -> &str {
+        LegacyTool::description(self)
+    }
+
+    fn native_parameters(&self) -> Result<serde_json::Value> {
+        legacy_parameters_from_example_contract(LegacyTool::name(self), self.args_schema())
+    }
+
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        LegacyTool::retry_policy(self)
+    }
+
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
+        self.execute(args)
+            .await
+            .map(NativeToolResult::from_upstream_legacy)
+    }
 }
 
 /// Description-only Tool stub for generating prompt text without live backends.
 struct ToolDescriptor {
     name: String,
     description: String,
-    args_schema: String,
+    native_parameters: serde_json::Value,
 }
 
 #[async_trait::async_trait]
@@ -763,10 +792,10 @@ impl Tool for ToolDescriptor {
     fn description(&self) -> &str {
         &self.description
     }
-    fn args_schema(&self) -> &str {
-        &self.args_schema
+    fn native_parameters(&self) -> Result<serde_json::Value> {
+        Ok(self.native_parameters.clone())
     }
-    async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+    async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
         unreachable!("ToolDescriptor is description-only and should never be executed")
     }
 }
@@ -801,8 +830,7 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Return each Tool's authoritative provider-native JSON Schema. Legacy
-    /// example-shaped contracts are converted at this compatibility boundary.
+    /// Return each Tool's authoritative provider-native JSON Schema.
     pub fn native_definitions(&self) -> Result<Vec<NativeToolDefinition>> {
         self.tools
             .values()
@@ -834,7 +862,9 @@ impl ToolRegistry {
                 "{}:\n  Description: {}\n  Args: {}\n\n",
                 tool.name(),
                 tool.description(),
-                tool.args_schema()
+                tool.native_parameters()
+                    .map(|parameters| parameters.to_string())
+                    .unwrap_or_else(|error| format!("invalid schema: {error}"))
             ));
         }
         desc
@@ -926,21 +956,33 @@ impl ToolRegistry {
     }
 
     #[allow(dead_code)]
-    fn register_descriptor(&mut self, name: &str, description: &str, args_schema: &str) {
+    fn register_descriptor(&mut self, name: &str, description: &str, legacy_contract: &str) {
+        let native_parameters = legacy_parameters_from_example_contract(name, legacy_contract)
+            .unwrap_or_else(|error| panic!("invalid upstream descriptor for {name}: {error}"));
         self.register(Arc::new(ToolDescriptor {
             name: name.to_string(),
             description: description.to_string(),
-            args_schema: args_schema.to_string(),
+            native_parameters,
         }));
     }
 }
 
-fn native_parameters_from_contract(tool_name: &str, contract: &str) -> Result<serde_json::Value> {
-    let value: serde_json::Value = serde_json::from_str(contract)
-        .map_err(|error| anyhow!("Tool '{tool_name}' has invalid argument schema JSON: {error}"))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("Tool '{tool_name}' argument schema must be a JSON object"))?;
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn legacy_parameters_from_example_contract(
+    tool_name: &str,
+    contract: &str,
+) -> Result<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(contract).map_err(|error| {
+        anyhow!("Upstream Tool '{tool_name}' has invalid argument contract JSON: {error}")
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        anyhow!("Upstream Tool '{tool_name}' argument contract must be a JSON object")
+    })?;
     if object.get("type").and_then(serde_json::Value::as_str) == Some("object")
         && object
             .get("properties")
@@ -950,7 +992,7 @@ fn native_parameters_from_contract(tool_name: &str, contract: &str) -> Result<se
     }
     let properties = object
         .iter()
-        .map(|(name, example)| (name.clone(), native_property_schema(example)))
+        .map(|(name, example)| (name.clone(), legacy_property_schema(example)))
         .collect::<serde_json::Map<_, _>>();
     Ok(serde_json::json!({
         "type": "object",
@@ -959,7 +1001,7 @@ fn native_parameters_from_contract(tool_name: &str, contract: &str) -> Result<se
     }))
 }
 
-fn native_property_schema(example: &serde_json::Value) -> serde_json::Value {
+fn legacy_property_schema(example: &serde_json::Value) -> serde_json::Value {
     match example {
         serde_json::Value::String(description) => serde_json::json!({
             "type": "string",
@@ -976,20 +1018,14 @@ fn native_property_schema(example: &serde_json::Value) -> serde_json::Value {
         }
         serde_json::Value::Array(values) => serde_json::json!({
             "type": "array",
-            "items": values.first().map(native_property_schema).unwrap_or_else(|| serde_json::json!({})),
+            "items": values.first().map(legacy_property_schema).unwrap_or_else(|| serde_json::json!({})),
         }),
         serde_json::Value::Object(values) => serde_json::json!({
             "type": "object",
-            "properties": values.iter().map(|(name, value)| (name.clone(), native_property_schema(value))).collect::<serde_json::Map<_, _>>(),
+            "properties": values.iter().map(|(name, value)| (name.clone(), legacy_property_schema(value))).collect::<serde_json::Map<_, _>>(),
             "additionalProperties": false,
         }),
         serde_json::Value::Null => serde_json::json!({}),
-    }
-}
-
-impl Default for ToolRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1018,27 +1054,6 @@ pub struct NativeExecutedTool {
 #[derive(Debug)]
 pub struct NativeToolBatchResult {
     pub executed_tools: Vec<NativeExecutedTool>,
-}
-
-enum ToolCallExecutionResult {
-    Legacy(ToolResult),
-    Native(NativeToolResult),
-}
-
-impl ToolCallExecutionResult {
-    fn into_legacy(self) -> ToolResult {
-        match self {
-            Self::Legacy(result) => result,
-            Self::Native(result) => result.to_legacy(),
-        }
-    }
-
-    fn into_native(self) -> NativeToolResult {
-        match self {
-            Self::Legacy(result) => NativeToolResult::from_legacy(result),
-            Self::Native(result) => result,
-        }
-    }
 }
 
 /// Result of a single agent step
@@ -1700,23 +1715,19 @@ impl SageAgent {
                     continue;
                 }
             };
-            let result = self
-                .execute_tool_call_with_mode(&call.id, 1, &tool_call, true)
-                .await
-                .into_native();
+            let result = self.execute_tool_call(&call.id, 1, &tool_call).await;
             executed_tools.push(NativeExecutedTool { tool_call, result });
         }
 
         NativeToolBatchResult { executed_tools }
     }
 
-    async fn execute_tool_call_with_mode(
+    async fn execute_tool_call(
         &self,
         call_id: &str,
         tool_round: usize,
         tool_call: &ToolCall,
-        native: bool,
-    ) -> ToolCallExecutionResult {
+    ) -> NativeToolResult {
         let Some(tool) = self.tools.get(&tool_call.name) else {
             let observable_tool_name = "unrecognized_tool".to_string();
             self.emit_trace(AgentTraceEvent::ToolAttempted {
@@ -1725,17 +1736,10 @@ impl SageAgent {
                 tool_round,
                 attempt: 1,
             });
-            let result = if native {
-                ToolCallExecutionResult::Native(NativeToolResult::failure(
-                    "unknown_tool",
-                    "The requested Tool is not enabled for this conversation.",
-                ))
-            } else {
-                ToolCallExecutionResult::Legacy(ToolResult::error(format!(
-                    "Unknown tool: {}",
-                    tool_call.name
-                )))
-            };
+            let result = NativeToolResult::failure(
+                "unknown_tool",
+                "The requested Tool is not enabled for this conversation.",
+            );
             self.emit_trace(AgentTraceEvent::Timing {
                 phase: ConversationTimingPhase::ToolExecution,
                 step: None,
@@ -1774,17 +1778,7 @@ impl SageAgent {
                 .unwrap_or(Duration::MAX);
             let attempt_started_at = Instant::now();
             let mut timeout_event_emitted = false;
-            let execute = async {
-                if native {
-                    tool.execute_native_with_timing_outcome(&tool_call.args)
-                        .await
-                        .map(|(result, outcome)| (ToolCallExecutionResult::Native(result), outcome))
-                } else {
-                    tool.execute_with_timing_outcome(&tool_call.args)
-                        .await
-                        .map(|(result, outcome)| (ToolCallExecutionResult::Legacy(result), outcome))
-                }
-            };
+            let execute = tool.execute_native_with_timing_outcome(&tool_call.args);
             let execution = if let Some(timeout) = policy.attempt_timeout(remaining) {
                 match tokio::time::timeout(timeout, execute).await {
                     Ok(result) => result,
@@ -1949,11 +1943,7 @@ impl SageAgent {
                         }
                         ToolExecutionError::Other(_) => "The Tool could not complete the request.",
                     };
-                    let result = if native {
-                        ToolCallExecutionResult::Native(NativeToolResult::failure(reason, message))
-                    } else {
-                        ToolCallExecutionResult::Legacy(ToolResult::error(error.to_string()))
-                    };
+                    let result = NativeToolResult::failure(reason, message);
                     break (result, terminal_status.to_string(), elapsed_ms);
                 }
             }
@@ -2305,9 +2295,9 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
 
             let call_id = format!("tool-call-{}", Uuid::new_v4().simple());
             let result = self
-                .execute_tool_call_with_mode(&call_id, 0, tool_call, false)
+                .execute_tool_call(&call_id, 0, tool_call)
                 .await
-                .into_legacy();
+                .to_tool_result();
             tracing::debug!("Tool {} result: {:?}", tool_call.name, result);
 
             // Inject into current request cycle (for multi-step reasoning)
@@ -2520,23 +2510,27 @@ mod tests {
 
     struct ScriptedRetryTool {
         policy: ToolRetryPolicy,
-        outcomes: Arc<Mutex<std::collections::VecDeque<Result<ToolResult>>>>,
+        outcomes: Arc<Mutex<std::collections::VecDeque<Result<NativeToolResult>>>>,
     }
 
-    struct DivergentLegacyAndNativeTool;
+    struct NativeOnlyTool;
 
     #[async_trait::async_trait]
-    impl Tool for DivergentLegacyAndNativeTool {
+    impl Tool for NativeOnlyTool {
         fn name(&self) -> &str {
-            "divergent_tool"
+            "native_only_tool"
         }
 
         fn description(&self) -> &str {
-            "test-only divergent Tool"
+            "test-only native Tool"
         }
 
-        fn args_schema(&self) -> &str {
-            "{}"
+        fn native_parameters(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }))
         }
 
         async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
@@ -2553,34 +2547,26 @@ mod tests {
                 .await
                 .map(|result| (result, ConversationTimingOutcome::Succeeded))
         }
-
-        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
-            Ok(ToolResult::success("legacy"))
-        }
     }
 
     #[tokio::test]
-    async fn legacy_executor_does_not_route_through_native_overrides() {
+    async fn shared_executor_has_one_native_tool_path() {
         let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(DivergentLegacyAndNativeTool));
+        registry.register(Arc::new(NativeOnlyTool));
         let agent = SageAgent::new_without_memory(registry, "test");
         let call = ToolCall {
-            name: "divergent_tool".to_string(),
+            name: "native_only_tool".to_string(),
             args: ToolArgs::new(),
         };
 
-        let result = agent
-            .execute_tool_call_with_mode("legacy-call", 0, &call, false)
-            .await
-            .into_legacy();
+        let result = agent.execute_tool_call("native-call", 1, &call).await;
 
-        assert!(result.success);
-        assert_eq!(result.output, "legacy");
+        assert_eq!(result.model_value()["path"], "native");
     }
 
     #[test]
-    fn legacy_failure_bridge_never_forwards_backend_details_to_the_model() {
-        let result = NativeToolResult::from_legacy(ToolResult::error(
+    fn upstream_legacy_failure_bridge_never_forwards_backend_details_to_the_model() {
+        let result = NativeToolResult::from_upstream_legacy(ToolResult::error(
             "backend failed with secret SENTINEL_PRIVATE_VALUE",
         ));
         let model_value = result.model_value().to_string();
@@ -2602,15 +2588,19 @@ mod tests {
             "test-only scripted lookup"
         }
 
-        fn args_schema(&self) -> &str {
-            "{}"
+        fn native_parameters(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }))
         }
 
         fn retry_policy(&self) -> ToolRetryPolicy {
             self.policy.clone()
         }
 
-        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+        async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
             self.outcomes
                 .lock()
                 .expect("scripted outcomes should lock")
@@ -2643,15 +2633,19 @@ mod tests {
             "test-only delayed timeout lookup"
         }
 
-        fn args_schema(&self) -> &str {
-            "{}"
+        fn native_parameters(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }))
         }
 
         fn retry_policy(&self) -> ToolRetryPolicy {
             ToolRetryPolicy::read_only(Duration::from_millis(100), 2, Duration::from_millis(500))
         }
 
-        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+        async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
             match self
                 .attempt
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -2661,7 +2655,9 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     Err(anyhow::Error::new(ToolExecutionError::Timeout))
                 }
-                _ => Ok(ToolResult::success("recovered")),
+                _ => Ok(NativeToolResult::success(serde_json::json!({
+                    "status": "recovered"
+                }))),
             }
         }
     }
@@ -2670,7 +2666,9 @@ mod tests {
     async fn read_only_retry_reuses_call_correlation_and_emits_one_terminal() {
         let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
             Err(anyhow::Error::new(ToolExecutionError::HttpStatus(503))),
-            Ok(ToolResult::success("recovered")),
+            Ok(NativeToolResult::success(serde_json::json!({
+                "status": "recovered"
+            }))),
         ])));
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(ScriptedRetryTool {
@@ -2779,15 +2777,19 @@ mod tests {
             "test-only hanging write"
         }
 
-        fn args_schema(&self) -> &str {
-            "{}"
+        fn native_parameters(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }))
         }
 
         fn retry_policy(&self) -> ToolRetryPolicy {
             ToolRetryPolicy::no_retry(Duration::from_millis(10))
         }
 
-        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+        async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
             std::future::pending().await
         }
     }
@@ -2845,7 +2847,9 @@ mod tests {
     async fn retry_is_skipped_when_only_backoff_budget_remains() {
         let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
             Err(anyhow::Error::new(ToolExecutionError::HttpStatus(503))),
-            Ok(ToolResult::success("should not run")),
+            Ok(NativeToolResult::success(serde_json::json!({
+                "status": "should not run"
+            }))),
         ])));
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(ScriptedRetryTool {
@@ -2866,7 +2870,9 @@ mod tests {
     async fn connection_failure_retries_once_with_privacy_safe_reason() {
         let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
             Err(anyhow::Error::new(ToolExecutionError::Connection)),
-            Ok(ToolResult::success("recovered")),
+            Ok(NativeToolResult::success(serde_json::json!({
+                "status": "recovered"
+            }))),
         ])));
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(ScriptedRetryTool {
@@ -2909,7 +2915,9 @@ mod tests {
     async fn typed_timeout_emits_one_timeout_event_before_retry() {
         let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
             Err(anyhow::Error::new(ToolExecutionError::Timeout)),
-            Ok(ToolResult::success("recovered")),
+            Ok(NativeToolResult::success(serde_json::json!({
+                "status": "recovered"
+            }))),
         ])));
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(ScriptedRetryTool {

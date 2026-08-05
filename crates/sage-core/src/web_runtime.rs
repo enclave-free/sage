@@ -46,7 +46,7 @@ use crate::openai_native::{
 use crate::sage_agent::{
     tool_parse_arg, tool_string_arg, AgentTraceEvent, ConversationTimingOutcome,
     ConversationTimingPhase, NativeExecutedTool, NativeToolResult, SageAgent, Tool, ToolArgs,
-    ToolExecutionError, ToolRegistry, ToolResult, ToolRetryPolicy,
+    ToolExecutionError, ToolRegistry, ToolRetryPolicy,
 };
 use crate::schema::{
     agents, ai_config, ai_config_user_type_overrides, blocks, messages, passages, scheduled_tasks,
@@ -1603,7 +1603,6 @@ struct AdminConfigDirectTool {
     name: String,
     endpoint: String,
     description: String,
-    args_schema: String,
     traces: Arc<Mutex<Vec<ToolCallInfoResponse>>>,
     affected_areas: Arc<Mutex<Vec<String>>>,
 }
@@ -2368,54 +2367,46 @@ fn build_conversation_tool_registry_with_context(
                 traces: sinks.traces.clone(),
             }));
         }
-        for (name, endpoint, description, args_schema) in [
+        for (name, endpoint, description) in [
             (
                 "configure_instance",
                 "configure-instance",
                 "Apply the complete guided first-setup configuration atomically after the Admin confirms it conversationally.",
-                r##"{"settings":{"instance_name":"name","description":"purpose","assistant_name":"name","primary_color":"#3B82F6","default_theme":"dark","default_language":"en","header_tagline":"short line","auto_approve_users":false},"user_types":[{"reference":"stable-reference","name":"display name","description":"optional","display_order":1}],"onboarding_questions":[{"field_name":"field","field_type":"text","user_type_reference":"stable-reference"}],"behavior_rules":["rule"],"forbidden_topics":["topic"]}"##,
             ),
             (
                 "update_instance_settings",
                 "update-instance-settings",
                 "Update one or more existing Instance Settings atomically after conversational confirmation.",
-                r##"{"settings":{"instance_name":"name","description":"long purpose and audience description","assistant_name":"name","primary_color":"#3B82F6","default_theme":"dark","default_language":"en","header_tagline":"short header line","auto_approve_users":true}}"##,
             ),
             (
                 "update_deployment_settings",
                 "update-deployment-settings",
                 "Update one or more Deployment Settings atomically. Reports restart requirements but never restarts services.",
-                r#"{"settings":{"SUPPORTED_DEPLOYMENT_SETTING":"desired value"}}"#,
             ),
             (
                 "update_agent_settings",
                 "update-agent-settings",
                 "Update global or User-Type-specific Agent Settings, or revert User-Type overrides, atomically.",
-                r#"{"updates":{"agent_setting":"desired value"},"user_type_id":"optional numeric User Type id for overrides","revert_keys":["User-Type override key to remove"]}"#,
             ),
             (
                 "manage_user_types",
                 "manage-user-types",
                 "Create, update, or delete a User Type through the authoritative Admin Config control plane.",
-                r#"{"operation":"create, update, or delete","user_type_id":"required numeric id for update/delete","name":"required for create; optional for update","description":"optional","icon":"optional","display_order":"optional integer"}"#,
             ),
             (
                 "manage_onboarding_questions",
                 "manage-onboarding-questions",
                 "Create, update, reorder, or delete an Onboarding Question through the authoritative control plane.",
-                r#"{"operation":"create, update, or delete","question_id":"required numeric id for update/delete","field_name":"required for create; optional for update","field_type":"required for create; optional for update","required":"optional true or false","display_order":"optional integer","user_type_id":"optional numeric User Type id","placeholder":"optional","options":["option"],"encryption_enabled":"optional true or false","include_in_chat":"optional true or false"}"#,
             ),
             (
                 "update_document_access",
                 "update-document-access",
                 "Set or revert global or User-Type-specific Document Access defaults without changing Document content or lifecycle.",
-                r#"{"user_type_id":"optional numeric User Type id; omit for global defaults","updates":[{"job_id":"document id","available":true,"is_default":true,"display_order":1}],"revert_job_ids":["User-Type override document id to remove"]}"#,
             ),
             (
                 "read_deployment_secret",
                 "read-deployment-secret",
                 "Read one configured secret Deployment Setting only when the Admin explicitly asks to see that secret.",
-                r#"{"key":"secret Deployment Setting name explicitly requested by the Admin"}"#,
             ),
         ] {
             registry.register(
@@ -2426,7 +2417,6 @@ fn build_conversation_tool_registry_with_context(
                     name: name.to_string(),
                     endpoint: endpoint.to_string(),
                     description: description.to_string(),
-                    args_schema: args_schema.to_string(),
                     traces: sinks.traces.clone(),
                     affected_areas: sinks.admin_config_affected_areas.clone(),
                 }),
@@ -2453,10 +2443,6 @@ impl Tool for KnowledgeSearchTool {
 
     fn description(&self) -> &str {
         "Search uploaded Documents. Documents may use different languages or titles than the user's question; multiple calls in one Tool batch may be useful for alternate queries."
-    }
-
-    fn args_schema(&self) -> &str {
-        r#"{"query":"search query","top_k":"optional result count"}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -2488,26 +2474,6 @@ impl Tool for KnowledgeSearchTool {
         }
         self.search_data(args).await.map(NativeToolResult::success)
     }
-
-    async fn execute_native_with_timing_outcome(
-        &self,
-        args: &ToolArgs,
-    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        self.execute_native(args).await.map(|result| {
-            let outcome = if result.is_success() {
-                ConversationTimingOutcome::Succeeded
-            } else {
-                ConversationTimingOutcome::Rejected
-            };
-            (result, outcome)
-        })
-    }
-
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        self.search_data(args)
-            .await
-            .map(|data| ToolResult::success(data.to_string()))
-    }
 }
 
 #[async_trait::async_trait]
@@ -2518,10 +2484,6 @@ impl Tool for FindResourcesTool {
 
     fn description(&self) -> &str {
         "Search Admin-curated people, organizations, products, services, methods, references, and exact contact pointers. Results are relevance-ranked and include pagination metadata."
-    }
-
-    fn args_schema(&self) -> &str {
-        r#"{"query":"optional precise name, pointer, or descriptive query","kind":"optional person, organization, product, service, method, reference, or other","tags":"optional resource tags","region":"optional country or region","language":"optional preferred language code","offset":"optional continuation offset"}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -2721,26 +2683,6 @@ impl Tool for FindResourcesTool {
             "next_offset": response.next_offset,
         })))
     }
-
-    async fn execute_native_with_timing_outcome(
-        &self,
-        args: &ToolArgs,
-    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        self.execute_native(args).await.map(|result| {
-            let outcome = if result.is_success() {
-                ConversationTimingOutcome::Succeeded
-            } else {
-                ConversationTimingOutcome::Rejected
-            };
-            (result, outcome)
-        })
-    }
-
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        self.execute_native(args)
-            .await
-            .map(|result| native_result_as_legacy(&result))
-    }
 }
 
 #[async_trait::async_trait]
@@ -2751,10 +2693,6 @@ impl Tool for SearxWebSearchTool {
 
     fn description(&self) -> &str {
         "Search the web for current information using SearXNG."
-    }
-
-    fn args_schema(&self) -> &str {
-        r#"{"query":"search query","count":"optional number of results"}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -2786,26 +2724,6 @@ impl Tool for SearxWebSearchTool {
         }
         self.search_data(args).await.map(NativeToolResult::success)
     }
-
-    async fn execute_native_with_timing_outcome(
-        &self,
-        args: &ToolArgs,
-    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        self.execute_native(args).await.map(|result| {
-            let outcome = if result.is_success() {
-                ConversationTimingOutcome::Succeeded
-            } else {
-                ConversationTimingOutcome::Rejected
-            };
-            (result, outcome)
-        })
-    }
-
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        self.search_data(args)
-            .await
-            .map(|data| ToolResult::success(data.to_string()))
-    }
 }
 
 fn classify_tool_http_error(error: reqwest::Error) -> anyhow::Error {
@@ -2830,10 +2748,6 @@ impl Tool for AdminConfigReadTool {
 
     fn description(&self) -> &str {
         &self.description
-    }
-
-    fn args_schema(&self) -> &str {
-        r#"{}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -2871,26 +2785,6 @@ impl Tool for AdminConfigReadTool {
             "data": response.data,
         })))
     }
-
-    async fn execute_native_with_timing_outcome(
-        &self,
-        args: &ToolArgs,
-    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        self.execute_native(args).await.map(|result| {
-            let outcome = if result.is_success() {
-                ConversationTimingOutcome::Succeeded
-            } else {
-                ConversationTimingOutcome::Rejected
-            };
-            (result, outcome)
-        })
-    }
-
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        self.execute_native(args)
-            .await
-            .map(|result| native_result_as_legacy(&result))
-    }
 }
 
 #[async_trait::async_trait]
@@ -2901,10 +2795,6 @@ impl Tool for AdminConfigSetupSummaryTool {
 
     fn description(&self) -> &str {
         "Read a compact Admin Config setup summary, including deployment readiness, missing setup, and next actions. Use first for broad setup, status, readiness, or missing-configuration questions; use low-level read Tools only for narrow follow-up inspection."
-    }
-
-    fn args_schema(&self) -> &str {
-        r#"{}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -2991,26 +2881,6 @@ impl Tool for AdminConfigSetupSummaryTool {
             "data": data,
         })))
     }
-
-    async fn execute_native_with_timing_outcome(
-        &self,
-        args: &ToolArgs,
-    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        self.execute_native(args).await.map(|result| {
-            let outcome = if result.is_success() {
-                ConversationTimingOutcome::Succeeded
-            } else {
-                ConversationTimingOutcome::Rejected
-            };
-            (result, outcome)
-        })
-    }
-
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        self.execute_native(args)
-            .await
-            .map(|result| native_result_as_legacy(&result))
-    }
 }
 
 impl AdminConfigSetupSummaryTool {
@@ -3068,10 +2938,6 @@ impl Tool for AdminAgentSettingsReadTool {
 
     fn description(&self) -> &str {
         "Read global and per-user-type Sage Agent Settings."
-    }
-
-    fn args_schema(&self) -> &str {
-        r#"{}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -3141,26 +3007,6 @@ impl Tool for AdminAgentSettingsReadTool {
             "warnings": warnings,
             "data": data,
         })))
-    }
-
-    async fn execute_native_with_timing_outcome(
-        &self,
-        args: &ToolArgs,
-    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        self.execute_native(args).await.map(|result| {
-            let outcome = if result.is_success() {
-                ConversationTimingOutcome::Succeeded
-            } else {
-                ConversationTimingOutcome::Rejected
-            };
-            (result, outcome)
-        })
-    }
-
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        self.execute_native(args)
-            .await
-            .map(|result| native_result_as_legacy(&result))
     }
 }
 
@@ -3546,10 +3392,6 @@ impl Tool for AdminConfigDirectTool {
         &self.description
     }
 
-    fn args_schema(&self) -> &str {
-        &self.args_schema
-    }
-
     fn native_parameters(&self) -> Result<Value> {
         admin_config_direct_native_parameters(&self.name)
     }
@@ -3633,26 +3475,6 @@ impl Tool for AdminConfigDirectTool {
             "data": response.data,
         })))
     }
-
-    async fn execute_native_with_timing_outcome(
-        &self,
-        args: &ToolArgs,
-    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
-        self.execute_native(args).await.map(|result| {
-            let outcome = if result.is_success() {
-                ConversationTimingOutcome::Succeeded
-            } else {
-                ConversationTimingOutcome::Rejected
-            };
-            (result, outcome)
-        })
-    }
-
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        self.execute_native(args)
-            .await
-            .map(|result| native_result_as_legacy(&result))
-    }
 }
 
 #[async_trait::async_trait]
@@ -3663,10 +3485,6 @@ impl Tool for AdminDbQueryTool {
 
     fn description(&self) -> &str {
         "Inspect enclave.free's SQLite admin data. Use this for Admin database questions when live database facts would improve the answer. Generate one read-only SQLite SELECT query; the safe executor enforces read-only validation, table allowlists, truncation, and trace redaction."
-    }
-
-    fn args_schema(&self) -> &str {
-        r#"{"sql":"read-only SQLite SELECT query"}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -3680,20 +3498,6 @@ impl Tool for AdminDbQueryTool {
         }))
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        Ok(native_result_as_legacy(
-            &self.execute_db_query_with_outcome(args).await?.0,
-        ))
-    }
-
-    async fn execute_with_timing_outcome(
-        &self,
-        args: &ToolArgs,
-    ) -> Result<(ToolResult, ConversationTimingOutcome)> {
-        let (result, outcome) = self.execute_db_query_with_outcome(args).await?;
-        Ok((native_result_as_legacy(&result), outcome))
-    }
-
     async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
         Ok(self.execute_db_query_with_outcome(args).await?.0)
     }
@@ -3703,13 +3507,6 @@ impl Tool for AdminDbQueryTool {
         args: &ToolArgs,
     ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
         self.execute_db_query_with_outcome(args).await
-    }
-}
-
-fn native_result_as_legacy(result: &NativeToolResult) -> ToolResult {
-    match result {
-        NativeToolResult::Success(data) => ToolResult::success(data.to_string()),
-        NativeToolResult::Failure { message, .. } => ToolResult::error(message.clone()),
     }
 }
 
@@ -9515,16 +9312,23 @@ mod tests {
             "Search uploaded Documents."
         }
 
-        fn args_schema(&self) -> &str {
-            r#"{"query":"search terms"}"#
+        fn native_parameters(&self) -> Result<Value> {
+            Ok(json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": false
+            }))
         }
 
-        async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
             self.executions.fetch_add(1, Ordering::SeqCst);
-            Ok(ToolResult::success(format!(
-                "trusted result for {}",
-                tool_string_arg(args, "query").unwrap_or("missing")
-            )))
+            Ok(NativeToolResult::success(json!({
+                "content": format!(
+                    "trusted result for {}",
+                    tool_string_arg(args, "query").unwrap_or("missing")
+                )
+            })))
         }
     }
 
@@ -10575,7 +10379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_resources_legacy_adapter_uses_only_generic_native_contract() {
+    async fn find_resources_native_contract_preserves_generic_filters_and_metadata() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
         let app = Router::new().route(
@@ -10657,14 +10461,14 @@ mod tests {
         ]);
 
         let result = tool
-            .execute(&args)
+            .execute_native(&args)
             .await
             .expect("resource lookup should succeed");
         server.abort();
 
-        assert!(result.success);
-        let output: Value =
-            serde_json::from_str(&result.output).expect("structured adapter output");
+        let NativeToolResult::Success(output) = result else {
+            panic!("expected structured native success");
+        };
         assert_eq!(output["resources"][0]["kind"], "organization");
         assert_eq!(
             output["resources"][0]["pointers"][0]["value"],
@@ -10789,11 +10593,11 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::from([("offset".to_string(), json!(10))]))
+            .execute_native(&ToolArgs::from([("offset".to_string(), json!(10))]))
             .await
             .expect("resource inventory should succeed");
         let mismatched_offset_error = tool
-            .execute(&ToolArgs::from([("offset".to_string(), json!(0))]))
+            .execute_native(&ToolArgs::from([("offset".to_string(), json!(0))]))
             .await
             .expect_err("a mismatched backend page offset must fail closed");
         assert!(matches!(
@@ -10802,9 +10606,9 @@ mod tests {
         ));
         server.abort();
 
-        assert!(result.success);
-        let output: Value =
-            serde_json::from_str(&result.output).expect("structured adapter output");
+        let NativeToolResult::Success(output) = result else {
+            panic!("expected structured native success");
+        };
         assert_eq!(output["resources"][0]["kind"], "organization");
         assert_eq!(
             output["resources"][0]["pointers"][0]["value"],
@@ -10902,7 +10706,7 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::from([(
+            .execute_native(&ToolArgs::from([(
                 "query".to_string(),
                 json!("Acme Legal Aid"),
             )]))
@@ -10910,7 +10714,7 @@ mod tests {
             .expect("contact lookup should succeed");
         server.abort();
 
-        assert!(result.success);
+        assert!(result.is_success());
         let payload = seen_rx.await.expect("backend should record the request");
         assert!(payload.get("help_type").is_none());
         assert!(payload.get("jurisdiction").is_none());
@@ -11084,10 +10888,10 @@ mod tests {
             );
         }
         assert!(!tool_description.contains("fresh find_resources call"));
-        assert!(!contact_tool.args_schema().contains("lookup_mode"));
-        assert!(!contact_tool.args_schema().contains("help_type"));
-        assert!(!contact_tool.args_schema().contains("scope"));
         let parameters = contact_tool.native_parameters().unwrap();
+        assert!(parameters["properties"].get("lookup_mode").is_none());
+        assert!(parameters["properties"].get("help_type").is_none());
+        assert!(parameters["properties"].get("scope").is_none());
         assert_eq!(
             parameters["properties"]["kind"]["enum"],
             json!([
@@ -11215,7 +11019,7 @@ mod tests {
 
     struct TestTraceTool {
         name: &'static str,
-        result: ToolResult,
+        result: NativeToolResult,
         outcome: Option<ConversationTimingOutcome>,
     }
 
@@ -11229,20 +11033,24 @@ mod tests {
             "Test trace tool"
         }
 
-        fn args_schema(&self) -> &str {
-            r#"{"query":"test"}"#
+        fn native_parameters(&self) -> Result<Value> {
+            Ok(json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": false
+            }))
         }
 
-        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+        async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
             Ok(self.result.clone())
         }
 
-        async fn execute_with_timing_outcome(
+        async fn execute_native_with_timing_outcome(
             &self,
             args: &ToolArgs,
-        ) -> Result<(ToolResult, ConversationTimingOutcome)> {
-            let result = self.execute(args).await?;
-            let outcome = self.outcome.unwrap_or(if result.success {
+        ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+            let result = self.execute_native(args).await?;
+            let outcome = self.outcome.unwrap_or(if result.is_success() {
                 ConversationTimingOutcome::Succeeded
             } else {
                 ConversationTimingOutcome::Failed
@@ -11256,12 +11064,12 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(TestTraceTool {
             name: "web_search",
-            result: ToolResult::error("network failure"),
+            result: NativeToolResult::failure("execution_failed", "network failure"),
             outcome: None,
         }));
         registry.register(Arc::new(TestTraceTool {
             name: "db_query",
-            result: ToolResult::error("read-only guard rejected the query"),
+            result: NativeToolResult::failure("guarded", "read-only guard rejected the query"),
             outcome: Some(ConversationTimingOutcome::Guarded),
         }));
         let mut agent = SageAgent::new_without_memory(registry, "test");
@@ -11345,15 +11153,15 @@ mod tests {
             "test endpoint lookup"
         }
 
-        fn args_schema(&self) -> &str {
-            "{}"
+        fn native_parameters(&self) -> Result<Value> {
+            Ok(empty_native_parameters())
         }
 
         fn retry_policy(&self) -> ToolRetryPolicy {
             self.policy.clone()
         }
 
-        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+        async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
             let response = reqwest::Client::new()
                 .get(&self.url)
                 .send()
@@ -11378,9 +11186,9 @@ mod tests {
             let body = response.bytes().await?;
             let payload = serde_json::from_slice::<Value>(&body)
                 .map_err(|_| anyhow::Error::new(ToolExecutionError::MalformedContract))?;
-            Ok(ToolResult::success(
-                payload.get("output").and_then(Value::as_str).unwrap_or(""),
-            ))
+            Ok(NativeToolResult::success(json!({
+                "output": payload.get("output").and_then(Value::as_str).unwrap_or("")
+            })))
         }
     }
 
@@ -11398,18 +11206,18 @@ mod tests {
             "test state-changing write"
         }
 
-        fn args_schema(&self) -> &str {
-            "{}"
+        fn native_parameters(&self) -> Result<Value> {
+            Ok(empty_native_parameters())
         }
 
-        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+        async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
             let response = reqwest::Client::new().get(&self.url).send().await?;
             if !response.status().is_success() {
                 return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
                     response.status().as_u16(),
                 )));
             }
-            Ok(ToolResult::success("written"))
+            Ok(NativeToolResult::success(json!({"status": "written"})))
         }
     }
 
@@ -11597,7 +11405,7 @@ mod tests {
         )
         .await;
         assert!(result.is_success());
-        assert_eq!(result.model_value()["content"], "");
+        assert_eq!(result.model_value()["output"], "");
         assert_eq!(requests, 1);
         assert_eq!(
             events
@@ -12783,15 +12591,14 @@ mod tests {
         let args = ToolArgs::from([("sql".to_string(), json!("DROP TABLE users"))]);
 
         let result = tool
-            .execute(&args)
+            .execute_native(&args)
             .await
             .expect("backend rejection should become a tool result");
         server.abort();
 
-        assert!(!result.success);
         assert_eq!(
-            result.error.as_deref(),
-            Some("Only SELECT queries are allowed.")
+            result,
+            NativeToolResult::failure("query_rejected", "Only SELECT queries are allowed.")
         );
         let (token, payload) = seen_rx
             .await
@@ -13112,7 +12919,6 @@ mod tests {
             name: "update_deployment_settings".to_string(),
             endpoint: "update-deployment-settings".to_string(),
             description: "Update Deployment Settings.".to_string(),
-            args_schema: r#"{"settings":"settings"}"#.to_string(),
             traces: traces.clone(),
             affected_areas: affected_areas.clone(),
         };
@@ -13207,7 +13013,6 @@ mod tests {
             name: "update_instance_settings".to_string(),
             endpoint: "update-instance-settings".to_string(),
             description: "Update Instance Settings.".to_string(),
-            args_schema: r#"{"settings":"settings"}"#.to_string(),
             traces: Arc::new(Mutex::new(Vec::new())),
             affected_areas: Arc::new(Mutex::new(Vec::new())),
         };
@@ -13294,7 +13099,6 @@ mod tests {
             name: "update_instance_settings".to_string(),
             endpoint: "update-instance-settings".to_string(),
             description: "Update instance settings.".to_string(),
-            args_schema: r#"{"settings":"settings"}"#.to_string(),
             traces: Arc::new(Mutex::new(Vec::new())),
             affected_areas: Arc::new(Mutex::new(Vec::new())),
         };
@@ -13372,7 +13176,6 @@ mod tests {
             name: "read_deployment_secret".to_string(),
             endpoint: "read-deployment-secret".to_string(),
             description: "Read a requested secret.".to_string(),
-            args_schema: r#"{"key":"secret key"}"#.to_string(),
             traces: traces.clone(),
             affected_areas: Arc::new(Mutex::new(Vec::new())),
         };
@@ -14192,12 +13995,15 @@ mod tests {
         let instance_settings_tool = registry
             .get("update_instance_settings")
             .expect("instance settings write tool should be registered");
-        assert!(instance_settings_tool
-            .args_schema()
-            .contains(r#""settings":{"#));
-        assert!(!instance_settings_tool
-            .args_schema()
-            .contains("settings_json"));
+        let instance_settings_parameters = instance_settings_tool
+            .native_parameters()
+            .expect("instance settings schema should be valid");
+        assert!(instance_settings_parameters["properties"]
+            .get("settings")
+            .is_some());
+        assert!(instance_settings_parameters["properties"]
+            .get("settings_json")
+            .is_none());
         assert!(!registry.has("propose_config_change_set"));
         assert!(!registry.has("propose_admin_config_bootstrap"));
         assert!(!registry.has("done"));
@@ -14206,7 +14012,11 @@ mod tests {
             .expect("curated resources tool should be registered");
         assert!(resources_tool.description().contains("relevance-ranked"));
         assert!(resources_tool.description().contains("pagination metadata"));
-        assert!(!resources_tool.args_schema().contains("lookup_mode"));
+        assert!(resources_tool
+            .native_parameters()
+            .expect("resource schema should be valid")["properties"]
+            .get("lookup_mode")
+            .is_none());
         let knowledge_tool = registry
             .get("knowledge_search")
             .expect("Knowledge Search should be registered");
