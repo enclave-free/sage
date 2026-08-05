@@ -2,12 +2,66 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 
 const MAX_NATIVE_SSE_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_NATIVE_CONTINUITY_STATE_BYTES: usize = 1024 * 1024;
+
+/// OpenAI-compatible reasoning effort sent unchanged to the Model Provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NativeReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    #[default]
+    Max,
+}
+
+impl NativeReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl fmt::Display for NativeReasoningEffort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for NativeReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
+            _ => Err(format!(
+                "unsupported reasoning effort {value:?}; expected none, minimal, low, medium, high, xhigh, or max"
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeToolDefinition {
@@ -160,6 +214,7 @@ pub struct OpenAiNativeClient {
     api_url: String,
     api_key: String,
     temperature: f64,
+    reasoning_effort: NativeReasoningEffort,
     stream_usage_supported: Arc<AtomicBool>,
 }
 
@@ -188,8 +243,14 @@ impl OpenAiNativeClient {
             api_url,
             api_key,
             temperature,
+            reasoning_effort: NativeReasoningEffort::default(),
             stream_usage_supported,
         }
+    }
+
+    pub fn with_reasoning_effort(mut self, reasoning_effort: NativeReasoningEffort) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
     }
 
     pub async fn stream_turn(
@@ -210,6 +271,10 @@ impl OpenAiNativeClient {
                 ),
             ),
             ("temperature".to_string(), json!(self.temperature)),
+            (
+                "reasoning_effort".to_string(),
+                json!(self.reasoning_effort.as_str()),
+            ),
             ("max_tokens".to_string(), json!(request.max_tokens)),
             ("stream".to_string(), json!(true)),
         ]);
@@ -643,9 +708,9 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         consume_sse_line, finish_stream, validate_sse_buffer_len, NativeAssistantMessage,
-        NativeChatMessage, NativeFinishReason, NativeProviderSignal, NativeStreamState,
-        NativeToolCall, NativeToolDefinition, NativeTurnRequest, OpenAiNativeClient,
-        MAX_NATIVE_CONTINUITY_STATE_BYTES, MAX_NATIVE_SSE_LINE_BYTES,
+        NativeChatMessage, NativeFinishReason, NativeProviderSignal, NativeReasoningEffort,
+        NativeStreamState, NativeToolCall, NativeToolDefinition, NativeTurnRequest,
+        OpenAiNativeClient, MAX_NATIVE_CONTINUITY_STATE_BYTES, MAX_NATIVE_SSE_LINE_BYTES,
     };
     use axum::{
         extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
@@ -711,7 +776,8 @@ mod tests {
             format!("http://{address}/v1"),
             "test-key".to_string(),
             0.1,
-        );
+        )
+        .with_reasoning_effort(NativeReasoningEffort::High);
         let tool = NativeToolDefinition {
             name: "knowledge_search".to_string(),
             description: "Search uploaded Documents.".to_string(),
@@ -803,6 +869,7 @@ mod tests {
             Some(&json!("string"))
         );
         assert_eq!(requests[0].get("tool_choice"), Some(&json!("auto")));
+        assert_eq!(requests[0].get("reasoning_effort"), Some(&json!("high")));
         assert_eq!(
             requests[0].pointer("/stream_options/include_usage"),
             Some(&json!(true))
@@ -824,6 +891,7 @@ mod tests {
             Some(&json!("knowledge_search"))
         );
         assert_eq!(requests[1].get("tool_choice"), Some(&json!("auto")));
+        assert_eq!(requests[1].get("reasoning_effort"), Some(&json!("high")));
     }
 
     #[tokio::test]

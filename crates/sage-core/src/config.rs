@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::marmot::MarmotConfig;
+use crate::openai_native::NativeReasoningEffort;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MessengerType {
@@ -14,6 +15,7 @@ pub struct Config {
     pub tinfoil_api_url: String,
     pub tinfoil_api_key: Option<String>,
     pub tinfoil_model: String,
+    pub tinfoil_reasoning_effort: NativeReasoningEffort,
     pub tinfoil_embedding_model: String,
     pub tinfoil_vision_model: String,
 
@@ -51,6 +53,11 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:8089/v1".to_string()),
             tinfoil_api_key: std::env::var("TINFOIL_API_KEY").ok(),
             tinfoil_model: std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "glm-5-2".to_string()),
+            tinfoil_reasoning_effort: std::env::var("TINFOIL_REASONING_EFFORT")
+                .unwrap_or_else(|_| "max".to_string())
+                .parse()
+                .map_err(anyhow::Error::msg)
+                .context("TINFOIL_REASONING_EFFORT must be a supported reasoning effort")?,
             tinfoil_embedding_model: std::env::var("TINFOIL_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string()),
             tinfoil_vision_model: std::env::var("TINFOIL_VISION_MODEL")
@@ -160,6 +167,7 @@ mod tests {
         let previous_tinfoil_api_url = std::env::var("TINFOIL_API_URL").ok();
         let previous_tinfoil_api_key = std::env::var("TINFOIL_API_KEY").ok();
         let previous_tinfoil_model = std::env::var("TINFOIL_MODEL").ok();
+        let previous_tinfoil_reasoning_effort = std::env::var("TINFOIL_REASONING_EFFORT").ok();
         let previous_tinfoil_embedding_model = std::env::var("TINFOIL_EMBEDDING_MODEL").ok();
         let previous_tinfoil_vision_model = std::env::var("TINFOIL_VISION_MODEL").ok();
         let previous_maple_api_url = std::env::var("MAPLE_API_URL").ok();
@@ -172,6 +180,7 @@ mod tests {
         std::env::set_var("TINFOIL_API_URL", "http://localhost:8089/v1");
         std::env::set_var("TINFOIL_API_KEY", "test-key");
         std::env::set_var("TINFOIL_MODEL", "kimi-k2-6");
+        std::env::set_var("TINFOIL_REASONING_EFFORT", "high");
         std::env::set_var("TINFOIL_EMBEDDING_MODEL", "nomic-embed-text");
         std::env::set_var("TINFOIL_VISION_MODEL", "qwen3-vl-30b");
 
@@ -186,6 +195,7 @@ mod tests {
         assert_eq!(config.tinfoil_api_url, "http://localhost:8089/v1");
         assert_eq!(config.tinfoil_api_key.as_deref(), Some("test-key"));
         assert_eq!(config.tinfoil_model, "kimi-k2-6");
+        assert_eq!(config.tinfoil_reasoning_effort, NativeReasoningEffort::High);
         assert_eq!(config.tinfoil_embedding_model, "nomic-embed-text");
         assert_eq!(config.tinfoil_vision_model, "qwen3-vl-30b");
 
@@ -197,6 +207,10 @@ mod tests {
         restore_env("TINFOIL_API_URL", previous_tinfoil_api_url);
         restore_env("TINFOIL_API_KEY", previous_tinfoil_api_key);
         restore_env("TINFOIL_MODEL", previous_tinfoil_model);
+        restore_env(
+            "TINFOIL_REASONING_EFFORT",
+            previous_tinfoil_reasoning_effort,
+        );
         restore_env("TINFOIL_EMBEDDING_MODEL", previous_tinfoil_embedding_model);
         restore_env("TINFOIL_VISION_MODEL", previous_tinfoil_vision_model);
         restore_env("MAPLE_API_URL", previous_maple_api_url);

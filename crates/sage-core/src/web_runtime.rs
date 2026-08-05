@@ -41,8 +41,8 @@ use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::openai_native::{
     NativeAssistantMessage, NativeAssistantTurn, NativeChatMessage, NativeFinishReason,
-    NativeModelUsage, NativeProviderError, NativeProviderSignal, NativeTurnRequest,
-    OpenAiNativeClient, MAX_NATIVE_CONTINUITY_STATE_BYTES,
+    NativeModelUsage, NativeProviderError, NativeProviderSignal, NativeReasoningEffort,
+    NativeTurnRequest, OpenAiNativeClient, MAX_NATIVE_CONTINUITY_STATE_BYTES,
 };
 use crate::sage_agent::{
     tool_parse_arg, tool_string_arg, AgentTraceEvent, ConversationTimingOutcome,
@@ -3712,6 +3712,7 @@ fn runtime_config_fingerprint_response(
                 "fingerprint": api_key_fingerprint,
             },
             "TINFOIL_MODEL": config.tinfoil_model,
+            "TINFOIL_REASONING_EFFORT": config.tinfoil_reasoning_effort.as_str(),
             "TINFOIL_EMBEDDING_MODEL": config.tinfoil_embedding_model,
             "FRONTEND_URL": web_config.frontend_url,
             "CORS_ORIGINS": web_config.allowed_origins,
@@ -7731,7 +7732,8 @@ async fn run_agent_steps(
         lm.api_url.clone(),
         lm.api_key.clone(),
         lm.temperature,
-    );
+    )
+    .with_reasoning_effort(lm.reasoning_effort);
     let turn = run_native_turn_with_provider(agent, &provider, input, model, delta_sender).await?;
     persist_successful_admin_config_tools(agent, memory_user_id, &turn.executed_tools).await;
     Ok(turn.answer)
@@ -8253,6 +8255,7 @@ struct RequestLmSettings {
     api_key: String,
     model: String,
     temperature: f64,
+    reasoning_effort: NativeReasoningEffort,
 }
 
 impl RequestLmSettings {
@@ -8267,6 +8270,7 @@ impl RequestLmSettings {
             api_key: api_key.to_string(),
             model: config.tinfoil_model.clone(),
             temperature,
+            reasoning_effort: config.tinfoil_reasoning_effort,
         })
     }
 
@@ -10719,6 +10723,7 @@ mod tests {
             api_key: "test-key".to_string(),
             model: "glm-5-2".to_string(),
             temperature: 0.1,
+            reasoning_effort: NativeReasoningEffort::Max,
         };
 
         let answer = run_agent_turn(&mut agent, "hello", None, &settings, None)
@@ -10934,6 +10939,7 @@ mod tests {
             api_key: "test-key".to_string(),
             model: "glm-5-2".to_string(),
             temperature: 0.1,
+            reasoning_effort: NativeReasoningEffort::Max,
         };
         let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
 
@@ -16089,6 +16095,7 @@ mod tests {
             "http://tinfoil-proxy:8089/v1"
         );
         assert_eq!(payload["runtime_config"]["TINFOIL_MODEL"], "glm-5-2");
+        assert_eq!(payload["runtime_config"]["TINFOIL_REASONING_EFFORT"], "max");
         assert_eq!(
             payload["runtime_config"]["TINFOIL_EMBEDDING_MODEL"],
             "nomic-embed-text"
@@ -16119,6 +16126,7 @@ mod tests {
             tinfoil_api_url: "http://tinfoil-proxy:8089/v1".to_string(),
             tinfoil_api_key: Some(secret.to_string()),
             tinfoil_model: "glm-5-2".to_string(),
+            tinfoil_reasoning_effort: NativeReasoningEffort::Max,
             tinfoil_embedding_model: "nomic-embed-text".to_string(),
             tinfoil_vision_model: "qwen3-vl-30b".to_string(),
             database_url: "postgres://sage:sage@localhost:5434/sage".to_string(),
