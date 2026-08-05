@@ -41,7 +41,8 @@ use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::openai_native::{
     NativeAssistantMessage, NativeAssistantTurn, NativeChatMessage, NativeFinishReason,
-    NativeProviderError, NativeProviderSignal, NativeTurnRequest, OpenAiNativeClient,
+    NativeProviderError, NativeProviderSignal, NativeToolChoice, NativeTurnRequest,
+    OpenAiNativeClient,
 };
 use crate::sage_agent::{
     tool_parse_arg, tool_string_arg, AgentTraceEvent, ConversationTimingOutcome,
@@ -7054,13 +7055,19 @@ async fn run_native_turn_with_provider(
         NativeChatMessage::system(prompt.system),
         NativeChatMessage::user(prompt.user),
     ];
+    let initial_tool_choice = if tools.is_empty() {
+        NativeToolChoice::None
+    } else {
+        NativeToolChoice::Auto
+    };
     let (first_turn, mut first_answer_state, selection_attempt) = request_native_turn_with_retry(
         agent,
         provider,
         NativeTurnRequest {
             model: model.to_string(),
             messages: messages.clone(),
-            tools,
+            tools: tools.clone(),
+            tool_choice: initial_tool_choice,
             max_tokens: PLAIN_ANSWER_MAX_TOKENS,
         },
         0,
@@ -7109,7 +7116,8 @@ async fn run_native_turn_with_provider(
                 NativeTurnRequest {
                     model: model.to_string(),
                     messages,
-                    tools: Vec::new(),
+                    tools,
+                    tool_choice: NativeToolChoice::None,
                     max_tokens: PLAIN_ANSWER_MAX_TOKENS,
                 },
                 1,
@@ -7273,7 +7281,7 @@ async fn stream_native_turn_attempt(
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
     attempt: u32,
 ) -> std::result::Result<NativeAssistantTurn, NativeProviderError> {
-    let tools_enabled = !request.tools.is_empty();
+    let tools_enabled = request.tool_choice == NativeToolChoice::Auto;
     let request_started_at = Instant::now();
     let mut first_provider_event_seen = false;
     let (native_sender, mut native_receiver) = mpsc::unbounded_channel();
@@ -9346,7 +9354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_tool_turn_executes_one_batch_and_returns_correlated_results_without_tools() {
+    async fn native_tool_turn_executes_one_batch_and_disables_final_tool_selection() {
         #[derive(Clone, Default)]
         struct ProviderState(Arc<Mutex<Vec<Value>>>);
 
@@ -9435,7 +9443,9 @@ mod tests {
             requests[0]["tools"][0]["function"]["name"],
             "knowledge_search"
         );
-        assert!(requests[1].get("tools").is_none());
+        assert_eq!(requests[1]["tools"], requests[0]["tools"]);
+        assert_eq!(requests[0]["tool_choice"], "auto");
+        assert_eq!(requests[1]["tool_choice"], "none");
         assert_eq!(requests[1]["messages"][2]["tool_calls"][0]["id"], "call-a");
         assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-a");
         assert_eq!(requests[1]["messages"][4]["tool_call_id"], "call-b");
@@ -9695,8 +9705,11 @@ mod tests {
         let requests = state.0.lock().expect("captured provider requests");
         assert_eq!(requests.len(), 3);
         assert!(requests.iter().all(|request| request["model"] == "glm-5-2"));
-        assert!(requests[1].get("tools").is_none());
+        assert_eq!(requests[1]["tools"], requests[0]["tools"]);
+        assert_eq!(requests[1]["tool_choice"], "none");
+        assert_eq!(requests[2]["tool_choice"], "none");
         assert_eq!(requests[1]["messages"], requests[2]["messages"]);
+        assert_eq!(requests[1]["tools"], requests[2]["tools"]);
         assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-once");
     }
 
