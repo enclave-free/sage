@@ -7950,7 +7950,7 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
 }
 
 const PLAIN_ANSWER_MAX_TOKENS: u32 = 8192;
-const MAX_NATIVE_TOOL_ROUNDS: usize = 2;
+const MAX_NATIVE_TOOL_ROUNDS: usize = 4;
 const CONVERSATION_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Default)]
@@ -9499,7 +9499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_tool_turn_allows_one_model_selected_follow_up_batch() {
+    async fn native_tool_turn_allows_multiple_model_selected_follow_up_batches() {
         #[derive(Clone, Default)]
         struct ProviderState(Arc<Mutex<Vec<Value>>>);
 
@@ -9521,6 +9521,10 @@ mod tests {
                 ),
                 1 => concat!(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"Refining. \",\"tool_calls\":[{\"index\":0,\"id\":\"call-b\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                2 => concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Checking one more source. \",\"tool_calls\":[{\"index\":0,\"id\":\"call-c\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"gamma\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                     "data: [DONE]\n\n"
                 ),
                 _ => concat!(
@@ -9574,18 +9578,22 @@ mod tests {
             None,
         )
         .await
-        .expect("the model-selected follow-up Tool batch should complete");
+        .expect("the model-selected follow-up Tool batches should complete");
 
-        assert_eq!(turn.answer, "First lookup. Refining. Grounded answer.");
-        assert_eq!(executions.load(Ordering::SeqCst), 2);
-        assert_eq!(turn.executed_tools.len(), 2);
+        assert_eq!(
+            turn.answer,
+            "First lookup. Refining. Checking one more source. Grounded answer."
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+        assert_eq!(turn.executed_tools.len(), 3);
         let requests = provider_state.0.lock().expect("captured requests");
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert!(requests
             .iter()
             .all(|request| request["tool_choice"] == "auto"));
         assert_eq!(requests[2]["messages"][3]["tool_call_id"], "call-a");
         assert_eq!(requests[2]["messages"][5]["tool_call_id"], "call-b");
+        assert_eq!(requests[3]["messages"][7]["tool_call_id"], "call-c");
         let attempted_rounds = trace_events
             .lock()
             .expect("native trace events")
@@ -9595,11 +9603,11 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(attempted_rounds, [1, 2]);
+        assert_eq!(attempted_rounds, [1, 2, 3]);
     }
 
     #[tokio::test]
-    async fn native_tool_round_limit_never_executes_a_third_batch() {
+    async fn native_tool_round_limit_never_executes_a_batch_past_the_limit() {
         async fn completion(Json(body): Json<Value>) -> impl IntoResponse {
             let tool_result_count = body["messages"]
                 .as_array()
