@@ -7236,6 +7236,7 @@ fn same_model_retry_eligible(error: &NativeProviderError) -> bool {
 
 fn same_model_retry_category(error: &NativeProviderError) -> Option<&'static str> {
     match error {
+        NativeProviderError::Timeout { .. } => Some("timeout"),
         NativeProviderError::Protocol(_) => Some("protocol"),
         NativeProviderError::Transport(error) if error.is_timeout() => Some("timeout"),
         NativeProviderError::Transport(error) if error.is_connect() => Some("connection"),
@@ -8134,6 +8135,7 @@ fn model_provider_error(error: NativeProviderError) -> AppError {
             NativeProviderError::Http { status, .. } => ("provider_rejected", status.as_u16()),
             NativeProviderError::Transport(_) => ("provider_transport", 0),
             NativeProviderError::Protocol(_) => ("provider_protocol", 0),
+            NativeProviderError::Timeout { .. } => ("provider_timeout", 0),
         };
         warn!(
             target: "sage.model_provider",

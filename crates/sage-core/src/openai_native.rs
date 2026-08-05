@@ -2,7 +2,11 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+const NATIVE_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const NATIVE_PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeToolDefinition {
@@ -129,6 +133,8 @@ pub enum NativeProviderError {
     },
     #[error("native provider protocol error: {0}")]
     Protocol(String),
+    #[error("native provider timed out during {phase}")]
+    Timeout { phase: &'static str },
 }
 
 pub struct OpenAiNativeClient {
@@ -136,6 +142,8 @@ pub struct OpenAiNativeClient {
     api_url: String,
     api_key: String,
     temperature: f64,
+    request_timeout: Duration,
+    stream_idle_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -160,10 +168,46 @@ impl OpenAiNativeClient {
             api_url,
             api_key,
             temperature,
+            request_timeout: NATIVE_PROVIDER_REQUEST_TIMEOUT,
+            stream_idle_timeout: NATIVE_PROVIDER_STREAM_IDLE_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_timeouts(
+        client: Client,
+        api_url: String,
+        api_key: String,
+        temperature: f64,
+        request_timeout: Duration,
+        stream_idle_timeout: Duration,
+    ) -> Self {
+        Self {
+            client,
+            api_url,
+            api_key,
+            temperature,
+            request_timeout,
+            stream_idle_timeout,
         }
     }
 
     pub async fn stream_turn(
+        &self,
+        request: NativeTurnRequest,
+        signal_sender: Option<mpsc::UnboundedSender<NativeProviderSignal>>,
+    ) -> Result<NativeAssistantTurn, NativeProviderError> {
+        tokio::time::timeout(
+            self.request_timeout,
+            self.stream_turn_inner(request, signal_sender),
+        )
+        .await
+        .map_err(|_| NativeProviderError::Timeout {
+            phase: "request_total",
+        })?
+    }
+
+    async fn stream_turn_inner(
         &self,
         request: NativeTurnRequest,
         signal_sender: Option<mpsc::UnboundedSender<NativeProviderSignal>>,
@@ -229,7 +273,15 @@ impl OpenAiNativeClient {
         let mut state = NativeStreamState::default();
         let mut buffer = Vec::new();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = tokio::time::timeout(self.stream_idle_timeout, stream.next())
+                .await
+                .map_err(|_| NativeProviderError::Timeout {
+                    phase: "stream_idle",
+                })?;
+            let Some(chunk) = next else {
+                break;
+            };
             buffer.extend_from_slice(&chunk?);
             while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line = String::from_utf8_lossy(&buffer[..newline])
@@ -284,10 +336,16 @@ fn consume_sse_line(
         ));
     }
     let choice = &choices[0];
-    let delta = choice
-        .get("delta")
-        .and_then(Value::as_object)
-        .ok_or_else(|| NativeProviderError::Protocol("choice omitted delta".to_string()))?;
+    let empty_delta = Map::new();
+    let delta = match choice.get("delta") {
+        None | Some(Value::Null) => &empty_delta,
+        Some(Value::Object(delta)) => delta,
+        Some(_) => {
+            return Err(NativeProviderError::Protocol(
+                "choice delta was not an object".to_string(),
+            ));
+        }
+    };
     let mut emitted_content = false;
     if let Some(content) = optional_string(delta.get("content"), "delta.content")? {
         state.content.push_str(content);
@@ -476,10 +534,17 @@ mod tests {
         NativeToolDefinition, NativeTurnRequest, OpenAiNativeClient,
     };
     use axum::{
-        extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
+        body::{Body, Bytes},
+        extract::State,
+        http::{header::CONTENT_TYPE, StatusCode},
+        response::{IntoResponse, Response},
+        routing::post,
+        Json, Router,
     };
     use serde_json::{json, Value};
+    use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     #[derive(Clone, Default)]
@@ -644,6 +709,79 @@ mod tests {
             signal_receiver.try_recv().expect("provider event signal"),
             NativeProviderSignal::Event
         );
+    }
+
+    #[test]
+    fn terminal_null_delta_preserves_finish_reason() {
+        let mut state = NativeStreamState::default();
+        state.content.push_str("Complete answer.");
+
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":null,"finish_reason":"stop"}]}"#,
+            &mut state,
+            &None,
+        )
+        .expect("a terminal null delta should still carry its finish reason");
+        consume_sse_line("data: [DONE]", &mut state, &None).expect("DONE marker should parse");
+
+        let turn = finish_stream(state).expect("terminal stream should finish");
+        assert_eq!(turn.finish_reason, NativeFinishReason::Stop);
+        assert_eq!(turn.content, "Complete answer.");
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_body_hits_the_native_idle_timeout() {
+        async fn completion() -> Response {
+            let body = Body::from_stream(async_stream::stream! {
+                yield Ok::<_, Infallible>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"Started\"},\"finish_reason\":null}]}\n\n",
+                ));
+                std::future::pending::<()>().await;
+            });
+            Response::builder()
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(body)
+                .expect("stream response should build")
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        let app = Router::new().route("/v1/chat/completions", post(completion));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider should serve");
+        });
+
+        let client = OpenAiNativeClient::new_with_timeouts(
+            reqwest::Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+            Duration::from_millis(500),
+            Duration::from_millis(25),
+        );
+        let error = client
+            .stream_turn(
+                NativeTurnRequest {
+                    model: "glm-5-2".to_string(),
+                    messages: vec![NativeChatMessage::user("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 8192,
+                },
+                None,
+            )
+            .await
+            .expect_err("a stalled body must not wait indefinitely");
+
+        assert!(matches!(
+            error,
+            super::NativeProviderError::Timeout {
+                phase: "stream_idle"
+            }
+        ));
     }
 
     #[test]

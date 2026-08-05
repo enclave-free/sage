@@ -486,7 +486,7 @@ pub struct AgentContext {
 }
 
 /// Result of executing a tool
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolResult {
     pub success: bool,
     pub output: String,
@@ -502,7 +502,14 @@ pub struct ToolResult {
 #[derive(Clone, Debug, PartialEq)]
 pub enum NativeToolResult {
     Success(serde_json::Value),
-    Failure { code: String, message: String },
+    Failure {
+        code: String,
+        message: String,
+    },
+    UpstreamLegacy {
+        original: Box<ToolResult>,
+        model_value: serde_json::Value,
+    },
 }
 
 impl NativeToolResult {
@@ -518,7 +525,11 @@ impl NativeToolResult {
     }
 
     pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success(_))
+        match self {
+            Self::Success(_) => true,
+            Self::Failure { .. } => false,
+            Self::UpstreamLegacy { original, .. } => original.success,
+        }
     }
 
     pub fn model_value(&self) -> serde_json::Value {
@@ -530,6 +541,7 @@ impl NativeToolResult {
                     "message": message,
                 }
             }),
+            Self::UpstreamLegacy { model_value, .. } => model_value.clone(),
         }
     }
 
@@ -537,26 +549,43 @@ impl NativeToolResult {
         match self {
             Self::Success(data) => ToolResult::success(data.to_string()),
             Self::Failure { message, .. } => ToolResult::error(message.clone()),
+            Self::UpstreamLegacy { original, .. } if original.success => original.as_ref().clone(),
+            Self::UpstreamLegacy { .. } => {
+                ToolResult::error("The Tool could not complete the request.")
+            }
+        }
+    }
+
+    fn into_upstream_tool_result(self) -> ToolResult {
+        match self {
+            Self::UpstreamLegacy { original, .. } => *original,
+            other => other.to_tool_result(),
         }
     }
 
     fn from_upstream_legacy(result: ToolResult) -> Self {
-        if result.success {
+        let model_value = if result.success {
             let data = serde_json::from_str(&result.output)
                 .unwrap_or_else(|_| serde_json::json!({ "content": result.output }));
             if result.metadata.is_null() {
-                Self::Success(data)
+                data
             } else {
-                Self::Success(serde_json::json!({
+                serde_json::json!({
                     "data": data,
                     "metadata": result.metadata,
-                }))
+                })
             }
         } else {
-            Self::failure(
-                "tool_execution_failed",
-                "The Tool could not complete the request.",
-            )
+            serde_json::json!({
+                "error": {
+                    "code": "tool_execution_failed",
+                    "message": "The Tool could not complete the request.",
+                }
+            })
+        };
+        Self::UpstreamLegacy {
+            original: Box::new(result),
+            model_value,
         }
     }
 }
@@ -2294,14 +2323,13 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             );
 
             let call_id = format!("tool-call-{}", Uuid::new_v4().simple());
-            let result = self
-                .execute_tool_call(&call_id, 0, tool_call)
-                .await
-                .to_tool_result();
+            let native_result = self.execute_tool_call(&call_id, 0, tool_call).await;
+            let model_result = native_result.to_tool_result();
+            let result = native_result.into_upstream_tool_result();
             tracing::debug!("Tool {} result: {:?}", tool_call.name, result);
 
             // Inject into current request cycle (for multi-step reasoning)
-            self.inject_tool_result(tool_call, &result);
+            self.inject_tool_result(tool_call, &model_result);
 
             // Collect for storage (skip "done" tool - it's just a no-op signal)
             if tool_call.name != "done" {
@@ -2576,6 +2604,21 @@ mod tests {
             result.model_value()["error"]["message"],
             "The Tool could not complete the request."
         );
+        assert_eq!(
+            result.into_upstream_tool_result(),
+            ToolResult::error("backend failed with secret SENTINEL_PRIVATE_VALUE")
+        );
+    }
+
+    #[test]
+    fn upstream_legacy_success_bridge_preserves_exact_output_and_metadata() {
+        let original = ToolResult::success_with_metadata(
+            "plain upstream output",
+            serde_json::json!({"source": "upstream"}),
+        );
+        let result = NativeToolResult::from_upstream_legacy(original.clone());
+
+        assert_eq!(result.into_upstream_tool_result(), original);
     }
 
     #[async_trait::async_trait]
