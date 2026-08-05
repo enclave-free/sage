@@ -752,32 +752,62 @@ struct InternalResourceSearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     query: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    help_type: Option<String>,
-    jurisdiction: Option<String>,
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     language: Option<String>,
     limit: i32,
     offset: i32,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ResourceRecord {
     resource_id: String,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    resource_type: Option<String>,
+    kind: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    pointers: Vec<ResourcePointer>,
+    #[serde(default)]
+    regions: Vec<ResourceRegion>,
+    #[serde(default)]
+    provenance: ResourceProvenance,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
-    contact: std::collections::HashMap<String, String>,
-    #[serde(default)]
     languages: Vec<String>,
-    #[serde(default)]
-    coverage: Option<String>,
-    #[serde(default)]
-    help_types: Vec<String>,
-    #[serde(default)]
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ResourcePointer {
+    #[serde(rename = "type")]
+    kind: String,
+    value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ResourceRegion {
+    level: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ResourceProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     verified_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vetted_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -785,7 +815,6 @@ struct InternalResourceSearchResponse {
     resources: Vec<ResourceRecord>,
     query: Option<String>,
     resolved_country_code: Option<String>,
-    help_type: Option<String>,
     total_count: usize,
     returned_count: usize,
     limit: usize,
@@ -2440,11 +2469,11 @@ impl Tool for FindResourcesTool {
     }
 
     fn description(&self) -> &str {
-        "Search curated services and contact information. Results are relevance-ranked and include availability metadata."
+        "Search Admin-curated people, organizations, products, services, methods, references, and exact contact pointers. Results are relevance-ranked and include pagination metadata."
     }
 
     fn args_schema(&self) -> &str {
-        r#"{"query":"optional organization name or contact value","help_type":"optional; one of legal, humanitarian, medical, food, shelter, financial, psychosocial, other","region":"optional country or region","scope":"optional; jurisdiction (default) or global","language":"optional preferred language code, e.g. es","offset":"optional continuation offset"}"#
+        r#"{"query":"optional precise name, pointer, or descriptive query","kind":"optional person, organization, product, service, method, reference, or other","tags":"optional resource tags","region":"optional country or region","language":"optional preferred language code","offset":"optional continuation offset"}"#
     }
 
     fn native_parameters(&self) -> Result<Value> {
@@ -2452,17 +2481,17 @@ impl Tool for FindResourcesTool {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Optional organization name or contact value."},
-                "help_type": {
+                "kind": {
                     "type": "string",
-                    "enum": ["legal", "humanitarian", "medical", "food", "shelter", "financial", "psychosocial", "other"],
-                    "description": "Optional help category."
+                    "enum": ["person", "organization", "product", "service", "method", "reference", "other"],
+                    "description": "Optional generic resource kind."
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional tags that every result must contain."
                 },
                 "region": {"type": "string", "description": "Optional country or region."},
-                "scope": {
-                    "type": "string",
-                    "enum": ["jurisdiction", "global"],
-                    "description": "Search the user's jurisdiction by default, or search globally."
-                },
                 "language": {"type": "string", "description": "Optional preferred language code."},
                 "offset": {"type": "integer", "description": "Optional continuation offset.", "minimum": 0}
             },
@@ -2474,58 +2503,103 @@ impl Tool for FindResourcesTool {
         ToolRetryPolicy::curated_resources()
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
-        let help_type = tool_string_arg(args, "help_type")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let global_scope = tool_string_arg(args, "scope") == Some("global");
-        let default_region = if global_scope {
-            None
-        } else {
-            self.jurisdiction.clone()
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
+        const KINDS: [&str; 7] = [
+            "person",
+            "organization",
+            "product",
+            "service",
+            "method",
+            "reference",
+            "other",
+        ];
+        for key in ["query", "kind", "region", "language"] {
+            if args.get(key).is_some_and(|value| !value.is_string()) {
+                return Ok(NativeToolResult::failure(
+                    "invalid_arguments",
+                    "Curated Resources string filters must be strings.",
+                ));
+            }
+        }
+        let query = tool_string_arg(args, "query")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let kind = tool_string_arg(args, "kind")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase);
+        if kind.as_deref().is_some_and(|value| !KINDS.contains(&value)) {
+            return Ok(NativeToolResult::failure(
+                "invalid_arguments",
+                "Curated Resources kind is not supported.",
+            ));
+        }
+        let tags = match args.get("tags") {
+            None => None,
+            Some(Value::Array(values)) => {
+                let mut tags = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(tag) = value.as_str().map(str::trim) else {
+                        return Ok(NativeToolResult::failure(
+                            "invalid_arguments",
+                            "Curated Resources tags must be strings.",
+                        ));
+                    };
+                    let normalized = tag.to_lowercase();
+                    if !normalized.is_empty()
+                        && !tags.iter().any(|existing| existing == &normalized)
+                    {
+                        tags.push(normalized);
+                    }
+                }
+                (!tags.is_empty()).then_some(tags)
+            }
+            Some(_) => {
+                return Ok(NativeToolResult::failure(
+                    "invalid_arguments",
+                    "Curated Resources tags must be an array of strings.",
+                ));
+            }
+        };
+        let offset = match args.get("offset") {
+            None => 0,
+            Some(value) => match value.as_i64().and_then(|value| i32::try_from(value).ok()) {
+                Some(value) if value >= 0 => value,
+                _ => {
+                    return Ok(NativeToolResult::failure(
+                        "invalid_arguments",
+                        "Curated Resources offset must be a non-negative integer.",
+                    ));
+                }
+            },
         };
         let region = tool_string_arg(args, "region")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .map(str::to_string)
-            .or(default_region);
-        let language = tool_string_arg(args, "language").map(str::to_string);
-        let query = tool_string_arg(args, "query")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let offset: i32 = tool_parse_arg(args, "offset").unwrap_or(0).max(0);
+            .or_else(|| self.jurisdiction.clone());
+        let language = tool_string_arg(args, "language")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
 
         let response = self
             .internal
             .resources_search(&InternalResourceSearchRequest {
                 query: query.clone(),
-                help_type: help_type.clone(),
-                jurisdiction: region.clone(),
+                kind: kind.clone(),
+                tags: tags.clone(),
+                region: region.clone(),
                 language: language.clone(),
-                limit: if global_scope { 10 } else { 5 },
+                limit: 10,
                 offset,
             })
             .await?;
         if !resource_page_contract_is_consistent(&response, offset) {
             return Err(anyhow::Error::new(ToolExecutionError::MalformedContract));
         }
-        let response_help_type = response
-            .help_type
-            .as_deref()
-            .map(|value| fallback_text(value, "curated"))
-            .or(help_type.as_deref())
-            .unwrap_or("curated");
-        let response_region = response
-            .resolved_country_code
-            .as_deref()
-            .or(region.as_deref());
-        let trace_query = match response_region {
-            Some(region) => format!("{} resources for {}", response_help_type, region),
-            None => format!("{} resources", response_help_type),
-        };
 
-        let returned_count = response.returned_count;
-        let total_count = response.total_count;
-        let has_more = response.has_more;
-        let next_offset = response.next_offset;
         let resource_names = response
             .resources
             .iter()
@@ -2536,136 +2610,88 @@ impl Tool for FindResourcesTool {
                     .unwrap_or_else(|| resource.resource_id.clone())
             })
             .collect::<Vec<_>>();
-
-        let result_metadata = json!({
-            "query": response.query,
-            "resolved_country_code": response.resolved_country_code,
-            "help_type": response.help_type,
-            "total_count": response.total_count,
-            "returned_count": response.returned_count,
-            "limit": response.limit,
-            "offset": response.offset,
-            "has_more": response.has_more,
-            "next_offset": response.next_offset,
-        });
-
-        if response.resources.is_empty() {
-            let exhausted_continuation = total_count > 0;
-            let empty_summary = if exhausted_continuation {
-                "No additional curated resources were returned for this page."
+        let (output_summary, warnings) = if response.resources.is_empty() {
+            if response.total_count > 0 {
+                (
+                    "No additional curated resources were returned for this page.".to_string(),
+                    vec!["empty_curated_resources_page".to_string()],
+                )
             } else {
-                "No matching curated resources were found."
-            };
-            let warning = if exhausted_continuation {
-                "empty_curated_resources_page"
-            } else {
-                "no_curated_resources"
-            };
-            if let Ok(mut sink) = self.traces.lock() {
-                sink.push(ToolCallInfoResponse {
-                    tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
-                    tool_name: "Curated Resources".to_string(),
-                    query: Some(trace_query),
-                    output_summary: Some(empty_summary.to_string()),
-                    warnings: vec![warning.to_string()],
-                    metadata: json!({
-                        "returned_count": returned_count,
-                        "total_count": total_count,
-                        "has_more": has_more,
-                        "next_offset": next_offset,
-                        "continuation_query": response.query.as_deref().or(query.as_deref()),
-                        "continuation_region": response_region,
-                        "continuation_help_type": help_type,
-                        "continuation_language": language,
-                        "resolved_region": response_region,
-                        "resource_names": [],
-                    }),
-                    guarded: false,
-                });
+                (
+                    "No matching curated resources were found.".to_string(),
+                    vec!["no_curated_resources".to_string()],
+                )
             }
-            return Ok(ToolResult::success_with_metadata(
-                if exhausted_continuation {
-                    "No additional curated resources were returned for this page."
-                } else {
-                    "No curated resources matched the supplied filters."
-                },
-                result_metadata,
-            ));
-        }
-
-        let output_summary = format!(
-            "Curated Resource lookup returned {} relevance-ranked results.",
-            returned_count
-        );
+        } else {
+            (
+                format!(
+                    "Curated Resource lookup returned {} relevance-ranked results.",
+                    response.returned_count
+                ),
+                response
+                    .has_more
+                    .then_some("curated_resources_truncated".to_string())
+                    .into_iter()
+                    .collect(),
+            )
+        };
         if let Ok(mut sink) = self.traces.lock() {
-            let warnings = if has_more {
-                vec!["curated_resources_truncated".to_string()]
-            } else {
-                Vec::new()
-            };
             sink.push(ToolCallInfoResponse {
                 tool_id: CURATED_RESOURCES_TOOL_SET_ID.to_string(),
                 tool_name: "Curated Resources".to_string(),
-                query: Some(trace_query),
+                query: Some(match response.resolved_country_code.as_deref() {
+                    Some(region) => format!("curated resources for {region}"),
+                    None => "curated resources".to_string(),
+                }),
                 output_summary: Some(output_summary),
                 warnings,
                 metadata: json!({
-                    "returned_count": returned_count,
-                    "total_count": total_count,
-                    "has_more": has_more,
-                    "next_offset": next_offset,
+                    "returned_count": response.returned_count,
+                    "total_count": response.total_count,
+                    "has_more": response.has_more,
+                    "next_offset": response.next_offset,
                     "continuation_query": response.query.as_deref().or(query.as_deref()),
-                    "continuation_region": response_region,
-                    "continuation_help_type": help_type,
+                    "continuation_kind": kind,
+                    "continuation_tags": tags,
+                    "continuation_region": response.resolved_country_code.as_deref().or(region.as_deref()),
                     "continuation_language": language,
-                    "resolved_region": response_region,
                     "resource_names": resource_names,
                 }),
                 guarded: false,
             });
         }
 
-        let mut output = format!("Relevance-ranked {} resources", response_help_type);
-        if let Some(region) = response_region {
-            output.push_str(&format!(" for {}", region));
-        }
-        output.push_str(":\n\n");
-        for (idx, r) in response.resources.iter().enumerate() {
-            let name = r.name.clone().unwrap_or_else(|| r.resource_id.clone());
-            let rtype = r.resource_type.clone().unwrap_or_default();
-            let coverage = r.coverage.clone().unwrap_or_default();
-            output.push_str(&format!("{}. {}", idx + 1, name));
-            if !rtype.is_empty() {
-                output.push_str(&format!(" ({})", rtype));
-            }
-            if !coverage.is_empty() {
-                output.push_str(&format!(" — covers {}", coverage));
-            }
-            if r.verified_at.is_some() {
-                output.push_str(" [verified]");
-            }
-            output.push('\n');
-            if let Some(desc) = &r.description {
-                if !desc.trim().is_empty() {
-                    output.push_str(&format!("   {}\n", desc.trim()));
-                }
-            }
-            if !r.help_types.is_empty() {
-                output.push_str(&format!("   Helps with: {}\n", r.help_types.join(", ")));
-            }
-            if !r.languages.is_empty() {
-                output.push_str(&format!("   Languages: {}\n", r.languages.join(", ")));
-            }
-            for key in ["phone", "email", "url", "secure_channel", "address"] {
-                if let Some(value) = r.contact.get(key) {
-                    if !value.trim().is_empty() {
-                        output.push_str(&format!("   {}: {}\n", key, value));
-                    }
-                }
-            }
-            output.push('\n');
-        }
-        Ok(ToolResult::success_with_metadata(output, result_metadata))
+        Ok(NativeToolResult::success(json!({
+            "resources": response.resources,
+            "query": response.query,
+            "resolved_region": response.resolved_country_code,
+            "total_count": response.total_count,
+            "returned_count": response.returned_count,
+            "limit": response.limit,
+            "offset": response.offset,
+            "has_more": response.has_more,
+            "next_offset": response.next_offset,
+        })))
+    }
+
+    async fn execute_native_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+        self.execute_native(args).await.map(|result| {
+            let outcome = if result.is_success() {
+                ConversationTimingOutcome::Succeeded
+            } else {
+                ConversationTimingOutcome::Rejected
+            };
+            (result, outcome)
+        })
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        self.execute_native(args)
+            .await
+            .map(|result| native_result_as_legacy(&result))
     }
 }
 
@@ -8130,14 +8156,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn fallback_text<'a>(value: &'a str, fallback: &'a str) -> &'a str {
-    if value.trim().is_empty() {
-        fallback
-    } else {
-        value
-    }
-}
-
 fn internal_error(error: impl std::fmt::Display) -> AppError {
     AppError::internal(error.to_string())
 }
@@ -10249,7 +10267,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_resources_tool_posts_internal_request_and_formats_results() {
+    async fn find_resources_native_returns_generic_structured_results() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Value>();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let app = Router::new().route(
+            "/internal/agent/resources/search",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |Json(payload): Json<Value>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        if let Some(sender) = seen_tx.lock().expect("request recorder").take() {
+                            let _ = sender.send(payload);
+                        }
+                        Json(json!({
+                            "resources": [{
+                                "resource_id": "bitcoin-reference",
+                                "name": "Bitcoin Reference",
+                                "kind": "reference",
+                                "description": "A curated Bitcoin reference.",
+                                "tags": ["bitcoin", "education"],
+                                "pointers": [{
+                                    "type": "email",
+                                    "label": "Questions",
+                                    "value": "bitcoin@example.test"
+                                }],
+                                "regions": [{"level": "country", "code": "US"}],
+                                "languages": ["en"],
+                                "provenance": {
+                                    "verified_at": "2026-08-01T00:00:00Z",
+                                    "vetted_by": "Admin",
+                                    "source_note": "Customer manual"
+                                }
+                            }],
+                            "resolved_country_code": "US",
+                            "query": "bitcoin@example.test",
+                            "total_count": 1,
+                            "returned_count": 1,
+                            "limit": 10,
+                            "offset": 0,
+                            "has_more": false,
+                            "next_offset": null
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener.local_addr().expect("test backend address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let tool = FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::builder().build().expect("http client should build"),
+                format!("http://{addr}"),
+                "test-token".to_string(),
+            ),
+            jurisdiction: Some("US".to_string()),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        };
+        let args = ToolArgs::from([
+            ("query".to_string(), json!("bitcoin@example.test")),
+            ("kind".to_string(), json!("reference")),
+            ("tags".to_string(), json!(["bitcoin"])),
+        ]);
+
+        let result = tool
+            .execute_native(&args)
+            .await
+            .expect("generic lookup should succeed");
+        server.abort();
+
+        let NativeToolResult::Success(data) = result else {
+            panic!("expected structured success");
+        };
+        assert_eq!(data["resources"][0]["kind"], "reference");
+        assert_eq!(
+            data["resources"][0]["pointers"][0]["value"],
+            "bitcoin@example.test"
+        );
+        assert_eq!(data["resources"][0]["regions"][0]["code"], "US");
+        assert_eq!(data["total_count"], 1);
+        assert_eq!(data["has_more"], false);
+        assert!(data["resources"][0].get("contact").is_none());
+        assert!(data["resources"][0].get("help_types").is_none());
+
+        let payload = seen_rx.await.expect("request should be recorded");
+        assert_eq!(payload["query"], "bitcoin@example.test");
+        assert_eq!(payload["kind"], "reference");
+        assert_eq!(payload["tags"], json!(["bitcoin"]));
+        assert_eq!(payload["region"], "US");
+        assert!(payload.get("help_type").is_none());
+        assert_eq!(payload["limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn find_resources_native_rejects_invalid_generic_arguments() {
+        let tool = FindResourcesTool {
+            internal: InternalAgentClient::new(
+                Client::builder().build().expect("http client should build"),
+                "http://127.0.0.1:1".to_string(),
+                "test-token".to_string(),
+            ),
+            jurisdiction: None,
+            traces: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let result = tool
+            .execute_native(&ToolArgs::from([(
+                "kind".to_string(),
+                json!("aid-organization"),
+            )]))
+            .await
+            .expect("invalid arguments should be represented");
+
+        assert_eq!(
+            result,
+            NativeToolResult::failure(
+                "invalid_arguments",
+                "Curated Resources kind is not supported."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn find_resources_legacy_adapter_uses_only_generic_native_contract() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
         let app = Router::new().route(
@@ -10275,25 +10422,24 @@ mod tests {
                                 {
                                     "resource_id": "mx-legal-aid",
                                     "name": "Mexico Legal Aid Network",
-                                    "resource_type": "ngo",
+                                    "kind": "organization",
                                     "description": "Connects people with pro bono immigration and asylum counsel.",
-                                    "contact": {
-                                        "phone": "+52-555-0100",
-                                        "url": "https://legal.example.test",
-                                        "secure_channel": "Signal: +52-555-0100"
-                                    },
+                                    "tags": ["legal", "humanitarian"],
+                                    "pointers": [
+                                        {"type": "phone", "value": "+52-555-0100"},
+                                        {"type": "url", "value": "https://legal.example.test"},
+                                        {"type": "secure_channel", "value": "Signal: +52-555-0100"}
+                                    ],
+                                    "regions": [{"level": "country", "code": "MX"}],
                                     "languages": ["es", "en"],
-                                    "coverage": "Mexico",
-                                    "help_types": ["legal", "humanitarian"],
-                                    "verified_at": "2026-05-30T20:00:00Z"
+                                    "provenance": {"verified_at": "2026-05-30T20:00:00Z"}
                                 }
                             ],
                             "resolved_country_code": "MX",
-                            "help_type": "legal",
                             "query": "mexico legal aid network",
                             "total_count": 7,
                             "returned_count": 1,
-                            "limit": 5,
+                            "limit": 10,
                             "offset": 5,
                             "has_more": true,
                             "next_offset": 6
@@ -10324,7 +10470,8 @@ mod tests {
             traces: Arc::new(Mutex::new(Vec::new())),
         };
         let args = ToolArgs::from([
-            ("help_type".to_string(), json!("legal")),
+            ("kind".to_string(), json!("organization")),
+            ("tags".to_string(), json!(["Legal", "legal"])),
             ("query".to_string(), json!("Mexico Legal Aid Network")),
             ("offset".to_string(), json!(5)),
             ("language".to_string(), json!("es")),
@@ -10337,32 +10484,15 @@ mod tests {
         server.abort();
 
         assert!(result.success);
-        assert!(result
-            .output
-            .contains("Relevance-ranked legal resources for MX"));
-        assert!(result.output.contains("Mexico Legal Aid Network (ngo)"));
-        assert!(result.output.contains("covers Mexico [verified]"));
-        assert!(result.output.contains("Languages: es, en"));
-        assert!(result.output.contains("phone: +52-555-0100"));
-        assert!(result
-            .output
-            .contains("secure_channel: Signal: +52-555-0100"));
-        assert!(!result.output.contains("offset"));
-        assert!(!result.output.contains("complete set"));
+        let output: Value =
+            serde_json::from_str(&result.output).expect("structured adapter output");
+        assert_eq!(output["resources"][0]["kind"], "organization");
         assert_eq!(
-            result.metadata,
-            json!({
-                "query": "mexico legal aid network",
-                "resolved_country_code": "MX",
-                "help_type": "legal",
-                "total_count": 7,
-                "returned_count": 1,
-                "limit": 5,
-                "offset": 5,
-                "has_more": true,
-                "next_offset": 6,
-            })
+            output["resources"][0]["pointers"][0]["value"],
+            "+52-555-0100"
         );
+        assert_eq!(output["total_count"], 7);
+        assert_eq!(output["has_more"], true);
 
         {
             let traces = tool.traces.lock().expect("trace sink should lock");
@@ -10382,9 +10512,9 @@ mod tests {
                     "next_offset": 6,
                     "continuation_query": "mexico legal aid network",
                     "continuation_region": "MX",
-                    "continuation_help_type": "legal",
+                    "continuation_kind": "organization",
+                    "continuation_tags": ["legal"],
                     "continuation_language": "es",
-                    "resolved_region": "MX",
                     "resource_names": ["Mexico Legal Aid Network"],
                 })
             );
@@ -10394,16 +10524,19 @@ mod tests {
             .await
             .expect("test backend should record the resource request");
         assert_eq!(token.as_deref(), Some("test-token"));
-        assert_eq!(payload["help_type"], "legal");
-        assert_eq!(payload["jurisdiction"], "Mexico");
+        assert!(payload.get("help_type").is_none());
+        assert!(payload.get("jurisdiction").is_none());
+        assert_eq!(payload["kind"], "organization");
+        assert_eq!(payload["tags"], json!(["legal"]));
+        assert_eq!(payload["region"], "Mexico");
         assert_eq!(payload["language"], "es");
         assert_eq!(payload["query"], "Mexico Legal Aid Network");
         assert_eq!(payload["offset"], 5);
-        assert_eq!(payload["limit"], 5);
+        assert_eq!(payload["limit"], 10);
     }
 
     #[tokio::test]
-    async fn find_resources_global_scope_returns_ten_ranked_results_without_jurisdiction() {
+    async fn find_resources_generic_inventory_returns_ten_ranked_results_without_region() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
         let app = Router::new().route(
@@ -10429,20 +10562,19 @@ mod tests {
                                 {
                                     "resource_id": "demo-test-resource",
                                     "name": "Demo Test Resource",
-                                    "resource_type": "ngo",
+                                    "kind": "organization",
                                     "description": "Synthetic resource used to verify inventory questions.",
-                                    "contact": {
-                                        "email": "demo-test@example.test",
-                                        "url": "https://demo-test.example.test"
-                                    },
+                                    "tags": ["legal", "humanitarian"],
+                                    "pointers": [
+                                        {"type": "email", "value": "demo-test@example.test"},
+                                        {"type": "url", "value": "https://demo-test.example.test"}
+                                    ],
+                                    "regions": [{"level": "global", "code": null}],
                                     "languages": ["en"],
-                                    "coverage": "Global",
-                                    "help_types": ["legal", "humanitarian"],
-                                    "verified_at": "2026-07-03T20:00:00Z"
+                                    "provenance": {"verified_at": "2026-07-03T20:00:00Z"}
                                 }
                             ],
                             "resolved_country_code": null,
-                            "help_type": null,
                             "query": null,
                             "total_count": 11,
                             "returned_count": 1,
@@ -10473,22 +10605,16 @@ mod tests {
                 format!("http://{}", addr),
                 "test-token".to_string(),
             ),
-            jurisdiction: Some("Mexico".to_string()),
+            jurisdiction: None,
             traces: Arc::new(Mutex::new(Vec::new())),
         };
 
         let result = tool
-            .execute(&ToolArgs::from([
-                ("scope".to_string(), json!("global")),
-                ("offset".to_string(), json!(10)),
-            ]))
+            .execute(&ToolArgs::from([("offset".to_string(), json!(10))]))
             .await
             .expect("resource inventory should succeed");
         let mismatched_offset_error = tool
-            .execute(&ToolArgs::from([
-                ("scope".to_string(), json!("global")),
-                ("offset".to_string(), json!(0)),
-            ]))
+            .execute(&ToolArgs::from([("offset".to_string(), json!(0))]))
             .await
             .expect_err("a mismatched backend page offset must fail closed");
         assert!(matches!(
@@ -10498,29 +10624,15 @@ mod tests {
         server.abort();
 
         assert!(result.success);
-        assert!(result.output.contains("Relevance-ranked curated resources"));
-        assert!(result.output.contains("Demo Test Resource (ngo)"));
-        assert!(result
-            .output
-            .contains("Synthetic resource used to verify inventory questions."));
-        assert!(result.output.contains("Helps with: legal, humanitarian"));
-        assert!(result.output.contains("email: demo-test@example.test"));
-        assert!(!result.output.contains("offset"));
-        assert!(!result.output.contains("final page"));
+        let output: Value =
+            serde_json::from_str(&result.output).expect("structured adapter output");
+        assert_eq!(output["resources"][0]["kind"], "organization");
         assert_eq!(
-            result.metadata,
-            json!({
-                "query": Value::Null,
-                "resolved_country_code": Value::Null,
-                "help_type": Value::Null,
-                "total_count": 11,
-                "returned_count": 1,
-                "limit": 7,
-                "offset": 10,
-                "has_more": false,
-                "next_offset": Value::Null,
-            })
+            output["resources"][0]["pointers"][0]["value"],
+            "demo-test@example.test"
         );
+        assert_eq!(output["offset"], 10);
+        assert_eq!(output["has_more"], false);
 
         {
             let traces = tool.traces.lock().expect("trace sink should lock");
@@ -10539,9 +10651,9 @@ mod tests {
                     "next_offset": Value::Null,
                     "continuation_query": Value::Null,
                     "continuation_region": Value::Null,
-                    "continuation_help_type": Value::Null,
+                    "continuation_kind": Value::Null,
+                    "continuation_tags": Value::Null,
                     "continuation_language": Value::Null,
-                    "resolved_region": Value::Null,
                     "resource_names": ["Demo Test Resource"],
                 })
             );
@@ -10552,13 +10664,14 @@ mod tests {
             .expect("test backend should record the resource request");
         assert_eq!(token.as_deref(), Some("test-token"));
         assert!(payload.get("help_type").is_none());
-        assert_eq!(payload["jurisdiction"], Value::Null);
+        assert!(payload.get("jurisdiction").is_none());
+        assert!(payload.get("region").is_none());
         assert_eq!(payload["limit"], 10);
         assert_eq!(payload["offset"], 10);
     }
 
     #[tokio::test]
-    async fn contact_lookup_without_help_type_preserves_default_jurisdiction() {
+    async fn contact_lookup_preserves_default_region() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Value>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
         let app = Router::new().route(
@@ -10577,7 +10690,6 @@ mod tests {
                             "resources": [],
                             "query": "Acme Legal Aid",
                             "resolved_country_code": "MX",
-                            "help_type": null,
                             "total_count": 0,
                             "returned_count": 0,
                             "limit": 5,
@@ -10622,8 +10734,9 @@ mod tests {
         assert!(result.success);
         let payload = seen_rx.await.expect("backend should record the request");
         assert!(payload.get("help_type").is_none());
-        assert_eq!(payload["jurisdiction"], "Mexico");
-        assert_eq!(payload["limit"], 5);
+        assert!(payload.get("jurisdiction").is_none());
+        assert_eq!(payload["region"], "Mexico");
+        assert_eq!(payload["limit"], 10);
     }
 
     #[test]
@@ -10638,7 +10751,6 @@ mod tests {
             resources,
             query: Some("legal aid".to_string()),
             resolved_country_code: Some("MX".to_string()),
-            help_type: Some("legal".to_string()),
             total_count: 12,
             returned_count: 2,
             limit: 5,
@@ -10666,7 +10778,6 @@ mod tests {
             resources: Vec::new(),
             query: Some("legal aid".to_string()),
             resolved_country_code: Some("MX".to_string()),
-            help_type: Some("legal".to_string()),
             total_count: 12,
             returned_count: 0,
             limit: 5,
@@ -10783,9 +10894,10 @@ mod tests {
         };
         let tool_description = contact_tool.description();
         for capability in [
-            "curated services and contact information",
+            "Admin-curated people",
+            "exact contact pointers",
             "relevance-ranked",
-            "availability metadata",
+            "pagination metadata",
         ] {
             assert!(
                 tool_description.contains(capability),
@@ -10794,11 +10906,23 @@ mod tests {
         }
         assert!(!tool_description.contains("fresh find_resources call"));
         assert!(!contact_tool.args_schema().contains("lookup_mode"));
-        assert!(contact_tool.args_schema().contains("scope"));
+        assert!(!contact_tool.args_schema().contains("help_type"));
+        assert!(!contact_tool.args_schema().contains("scope"));
+        let parameters = contact_tool.native_parameters().unwrap();
         assert_eq!(
-            contact_tool.native_parameters().unwrap()["properties"]["scope"]["enum"],
-            json!(["jurisdiction", "global"])
+            parameters["properties"]["kind"]["enum"],
+            json!([
+                "person",
+                "organization",
+                "product",
+                "service",
+                "method",
+                "reference",
+                "other"
+            ])
         );
+        assert!(parameters["properties"].get("tags").is_some());
+        assert!(parameters["properties"].get("region").is_some());
 
         let disabled = build_chat_agent_instruction(
             "PROFILE",
@@ -11417,8 +11541,8 @@ mod tests {
                         return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response();
                     }
                     Json(json!({
-                        "resources": [{"resource_id":"r1","name":"Trusted Aid","resource_type":"ngo","contact":{},"languages":[],"help_types":["legal"],"verified_at":null}],
-                        "query":"aid","resolved_country_code":"MX","help_type":"legal","total_count":1,"returned_count":1,"limit":5,"offset":0,"has_more":false,"next_offset":null
+                        "resources": [{"resource_id":"r1","name":"Trusted Aid","kind":"organization","description":"Curated support.","tags":["legal"],"pointers":[{"type":"url","value":"https://aid.example.test"}],"regions":[{"level":"country","code":"MX"}],"provenance":{},"languages":[]}],
+                        "query":"aid","resolved_country_code":"MX","total_count":1,"returned_count":1,"limit":10,"offset":0,"has_more":false,"next_offset":null
                     })).into_response()
                 }
             }))).await.expect("resource endpoint should run");
@@ -11441,10 +11565,7 @@ mod tests {
             .execute_native_tool_calls(&[native_test_call(
                 "call-resources",
                 "find_resources",
-                ToolArgs::from([
-                    ("query".to_string(), json!("aid")),
-                    ("help_type".to_string(), json!("legal")),
-                ]),
+                ToolArgs::from([("query".to_string(), json!("aid"))]),
             )])
             .await;
         server.abort();
@@ -11482,7 +11603,7 @@ mod tests {
                 let seen_empty = seen_empty.clone();
                 async move {
                     seen_empty.fetch_add(1, Ordering::SeqCst);
-                    Json(json!({"resources":[],"query":"none","resolved_country_code":"MX","help_type":"legal","total_count":12,"returned_count":0,"limit":5,"offset":12,"has_more":false,"next_offset":null})).into_response()
+                    Json(json!({"resources":[],"query":"none","resolved_country_code":"MX","total_count":12,"returned_count":0,"limit":10,"offset":12,"has_more":false,"next_offset":null})).into_response()
                 }
             }))).await.expect("empty endpoint should run");
         });
@@ -11503,10 +11624,7 @@ mod tests {
             .execute_native_tool_calls(&[native_test_call(
                 "call-empty-resources",
                 "find_resources",
-                ToolArgs::from([
-                    ("help_type".to_string(), json!("legal")),
-                    ("offset".to_string(), json!(12)),
-                ]),
+                ToolArgs::from([("offset".to_string(), json!(12))]),
             )])
             .await;
         empty_server.abort();
@@ -13794,9 +13912,7 @@ mod tests {
             .get("find_resources")
             .expect("curated resources tool should be registered");
         assert!(resources_tool.description().contains("relevance-ranked"));
-        assert!(resources_tool
-            .description()
-            .contains("availability metadata"));
+        assert!(resources_tool.description().contains("pagination metadata"));
         assert!(!resources_tool.args_schema().contains("lookup_mode"));
         let knowledge_tool = registry
             .get("knowledge_search")
