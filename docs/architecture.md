@@ -50,7 +50,7 @@ This file contains the branch-specific integration layer:
 - session ownership checks
 - AI config CRUD and prompt preview
 - current prepared-tool context logic plus Tool Set expansion and the bounded
-  native Tool batch for Conversation routes
+  native Tool loop for Conversation routes
 - prompt assembly helpers
 
 ## Public Routes
@@ -58,7 +58,7 @@ This file contains the branch-specific integration layer:
 | Route | Ownership | Notes |
 | --- | --- | --- |
 | `GET /health` | Sage service health | direct Sage runtime health, usually consumed internally |
-| `POST /llm/chat` | Sage | Conversation transport with at most one native Tool batch |
+| `POST /llm/chat` | Sage | Conversation transport with at most two native Tool batches |
 | `POST /query` | Sage | stateful Conversation API compatibility shape |
 | `GET /query/session/{session_id}` | Sage | session inspection |
 | `DELETE /query/session/{session_id}` | Sage | deletes session record |
@@ -70,10 +70,11 @@ This file contains the branch-specific integration layer:
 
 `POST /llm/chat` sends enabled, authorized native Tool definitions to the one
 configured Conversation model. The model either answers directly or selects
-one bounded Tool batch. After a Tool batch, correlated structured Tool results
-are returned to the same model without Tool definitions, so a second Tool round
-cannot begin. Current-turn Tool results are limited to 4,000 characters each
-and 12,000 characters total.
+a bounded Tool batch. After a Tool batch, correlated structured Tool results
+and the same enabled Tool definitions return to the same model. The model may
+select one follow-up batch; Sage rejects a third selected batch before execution.
+Each batch's Tool results are limited to 4,000 characters per result and 12,000
+characters total.
 
 Native assistant content streams in provider order without semantic scanning,
 quarantine, rewriting, or deterministic answer fallback. Provider reasoning is
@@ -82,7 +83,7 @@ discarded. Structural protocol failures and eligible connection, timeout, or
 model. A final-request retry reuses existing Tool-result messages and cannot
 execute Tools again. No other Conversation model is substituted after failure.
 
-Conversation traces record native model requests, provider first-event wait,
+Conversation traces record each native loop step, provider first-event wait,
 Retrieval or Resource lookup, Tool execution, retry, and total-turn timing where
 those stages are measurable. Provider first-event wait is a combined proxy:
 network transit, provider queueing, and model startup may all contribute. Sage
@@ -119,18 +120,19 @@ This is the real integration boundary. If request or response shapes change, bot
 
 ## Conversation Flow Target
 
-Sage owns the bounded native Tool round for Conversation routes.
+Sage owns the bounded native Tool loop for Conversation routes.
 
 1. enforce CSRF for cookie-authenticated unsafe requests
 2. verify auth natively in Sage
 3. hydrate user/admin identity from Python if needed
 4. load effective AI config and request temperature from Sage Postgres
 5. expand enabled Tool Sets into concrete Tool contracts
-6. ask the configured Conversation model to answer directly or select at most
-   one bounded batch of authorized Tool calls
+6. ask the configured Conversation model to answer directly or select a bounded
+   batch of authorized Tool calls
 7. if Tools were selected, execute that batch and return its correlated,
-   structured results to the same model without Tool definitions
-8. accept the model's Tool-free final response; no further Tool execution can begin
+   structured results plus the same enabled Tool definitions to the same model
+8. allow one model-selected follow-up batch, then require an answer; reject a
+   third selected batch before execution
 9. return the assistant message plus Activity/Trace metadata and Tool summaries
 
 Tool Sets:
@@ -156,7 +158,7 @@ The frontend should not pre-run Tools or inject admin configuration snapshots th
    - persona block from compiled Enclave prompt profile
    - human block from auth + profile context
 8. persist the user turn
-9. run the same bounded native Tool round with memory enabled
+9. run the same bounded native Tool loop with memory enabled
 10. persist the assistant turn
 11. return `session_id`, `sources`, `context_used`, and answer
 

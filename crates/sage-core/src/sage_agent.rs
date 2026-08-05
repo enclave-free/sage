@@ -1691,12 +1691,13 @@ impl SageAgent {
         self.tools.native_definitions()
     }
 
-    /// Execute the single native Tool batch selected by the provider while
+    /// Execute one native Tool batch selected by the provider while
     /// preserving the provider's call identifiers for correlated result
     /// messages. Unknown Tools are rejected by the same registry boundary as
     /// legacy calls and every selected call receives a terminal result.
     pub async fn execute_native_tool_calls(
         &mut self,
+        tool_round: usize,
         calls: &[NativeToolCall],
     ) -> NativeToolBatchResult {
         let mut executed_tools = Vec::with_capacity(calls.len());
@@ -1719,7 +1720,7 @@ impl SageAgent {
                     self.emit_trace(AgentTraceEvent::ToolAttempted {
                         call_id: call.id.clone(),
                         tool_name: observable_tool_name.clone(),
-                        tool_round: 1,
+                        tool_round,
                         attempt: 1,
                     });
                     let result = NativeToolResult::failure(
@@ -1738,7 +1739,7 @@ impl SageAgent {
                     self.emit_trace(AgentTraceEvent::ToolTerminal {
                         call_id: call.id.clone(),
                         tool_name: observable_tool_name,
-                        tool_round: 1,
+                        tool_round,
                         attempt: 1,
                         status: "rejected".to_string(),
                         elapsed_ms: 0,
@@ -1747,7 +1748,9 @@ impl SageAgent {
                     continue;
                 }
             };
-            let result = self.execute_tool_call(&call.id, 1, &tool_call).await;
+            let result = self
+                .execute_tool_call(&call.id, tool_round, &tool_call)
+                .await;
             executed_tools.push(NativeExecutedTool { tool_call, result });
         }
 
@@ -2680,11 +2683,14 @@ mod tests {
 
     async fn execute_native_test_call(agent: &mut SageAgent, name: &str) -> NativeToolBatchResult {
         agent
-            .execute_native_tool_calls(&[NativeToolCall {
-                id: "native-test-call".to_string(),
-                name: name.to_string(),
-                arguments: serde_json::json!({}),
-            }])
+            .execute_native_tool_calls(
+                1,
+                &[NativeToolCall {
+                    id: "native-test-call".to_string(),
+                    name: name.to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            )
             .await
     }
 
