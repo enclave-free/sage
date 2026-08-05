@@ -1712,38 +1712,11 @@ impl SageAgent {
                         name: call.name.clone(),
                         args: ToolArgs::new(),
                     };
-                    let observable_tool_name = self
-                        .tools
-                        .get(&call.name)
-                        .map(|_| call.name.clone())
-                        .unwrap_or_else(|| "unrecognized_tool".to_string());
-                    self.emit_trace(AgentTraceEvent::ToolAttempted {
-                        call_id: call.id.clone(),
-                        tool_name: observable_tool_name.clone(),
-                        tool_round,
-                        attempt: 1,
-                    });
                     let result = NativeToolResult::failure(
                         "invalid_arguments",
                         "Tool arguments did not match the declared schema.",
                     );
-                    self.emit_trace(AgentTraceEvent::Timing {
-                        phase: ConversationTimingPhase::ToolExecution,
-                        step: None,
-                        tool_name: Some(observable_tool_name.clone()),
-                        call_id: Some(call.id.clone()),
-                        attempt: 1,
-                        outcome: ConversationTimingOutcome::Rejected,
-                        elapsed_ms: 0,
-                    });
-                    self.emit_trace(AgentTraceEvent::ToolTerminal {
-                        call_id: call.id.clone(),
-                        tool_name: observable_tool_name,
-                        tool_round,
-                        attempt: 1,
-                        status: "rejected".to_string(),
-                        elapsed_ms: 0,
-                    });
+                    self.emit_rejected_native_tool_trace(&call.id, &call.name, tool_round);
                     executed_tools.push(NativeExecutedTool { tool_call, result });
                     continue;
                 }
@@ -1757,6 +1730,66 @@ impl SageAgent {
         NativeToolBatchResult { executed_tools }
     }
 
+    /// Reject a provider-selected native Tool batch without executing it while
+    /// preserving call correlation and terminal trace evidence for every call.
+    pub fn reject_native_tool_calls(
+        &self,
+        tool_round: usize,
+        calls: &[NativeToolCall],
+        code: &str,
+        message: &str,
+    ) -> NativeToolBatchResult {
+        let mut executed_tools = Vec::with_capacity(calls.len());
+        for call in calls {
+            self.emit_rejected_native_tool_trace(&call.id, &call.name, tool_round);
+            executed_tools.push(NativeExecutedTool {
+                tool_call: ToolCall {
+                    name: call.name.clone(),
+                    args: ToolArgs::from_json_object(&call.arguments)
+                        .unwrap_or_else(|_| ToolArgs::new()),
+                },
+                result: NativeToolResult::failure(code, message),
+            });
+        }
+        NativeToolBatchResult { executed_tools }
+    }
+
+    fn emit_rejected_native_tool_trace(
+        &self,
+        call_id: &str,
+        requested_tool_name: &str,
+        tool_round: usize,
+    ) {
+        let observable_tool_name = self
+            .tools
+            .get(requested_tool_name)
+            .map(|_| requested_tool_name.to_string())
+            .unwrap_or_else(|| "unrecognized_tool".to_string());
+        self.emit_trace(AgentTraceEvent::ToolAttempted {
+            call_id: call_id.to_string(),
+            tool_name: observable_tool_name.clone(),
+            tool_round,
+            attempt: 1,
+        });
+        self.emit_trace(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ToolExecution,
+            step: None,
+            tool_name: Some(observable_tool_name.clone()),
+            call_id: Some(call_id.to_string()),
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Rejected,
+            elapsed_ms: 0,
+        });
+        self.emit_trace(AgentTraceEvent::ToolTerminal {
+            call_id: call_id.to_string(),
+            tool_name: observable_tool_name,
+            tool_round,
+            attempt: 1,
+            status: "rejected".to_string(),
+            elapsed_ms: 0,
+        });
+    }
+
     async fn execute_tool_call(
         &self,
         call_id: &str,
@@ -1764,34 +1797,11 @@ impl SageAgent {
         tool_call: &ToolCall,
     ) -> NativeToolResult {
         let Some(tool) = self.tools.get(&tool_call.name) else {
-            let observable_tool_name = "unrecognized_tool".to_string();
-            self.emit_trace(AgentTraceEvent::ToolAttempted {
-                call_id: call_id.to_string(),
-                tool_name: observable_tool_name.clone(),
-                tool_round,
-                attempt: 1,
-            });
             let result = NativeToolResult::failure(
                 "unknown_tool",
                 "The requested Tool is not enabled for this conversation.",
             );
-            self.emit_trace(AgentTraceEvent::Timing {
-                phase: ConversationTimingPhase::ToolExecution,
-                step: None,
-                tool_name: Some(observable_tool_name.clone()),
-                call_id: Some(call_id.to_string()),
-                attempt: 1,
-                outcome: ConversationTimingOutcome::Rejected,
-                elapsed_ms: 0,
-            });
-            self.emit_trace(AgentTraceEvent::ToolTerminal {
-                call_id: call_id.to_string(),
-                tool_name: observable_tool_name,
-                tool_round,
-                attempt: 1,
-                status: "rejected".to_string(),
-                elapsed_ms: 0,
-            });
+            self.emit_rejected_native_tool_trace(call_id, &tool_call.name, tool_round);
             return result;
         };
 
