@@ -1,10 +1,13 @@
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 
 const MAX_NATIVE_SSE_LINE_BYTES: usize = 1024 * 1024;
+pub const MAX_NATIVE_CONTINUITY_STATE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeToolDefinition {
@@ -24,6 +27,8 @@ pub struct NativeToolCall {
 pub struct NativeAssistantMessage {
     pub content: String,
     pub tool_calls: Vec<NativeToolCall>,
+    /// Provider-supplied opaque continuity state for the current native Tool loop.
+    pub continuity_state: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +85,9 @@ impl NativeChatMessage {
                         ),
                     );
                 }
+                if let Some(continuity_state) = &message.continuity_state {
+                    value.insert("reasoning_content".to_string(), json!(continuity_state));
+                }
                 Value::Object(value)
             }
             Self::ToolResult { call_id, content } => json!({
@@ -100,6 +108,7 @@ pub enum NativeFinishReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeProviderSignal {
     Content(String),
+    Usage(NativeModelUsage),
     Event,
 }
 
@@ -109,7 +118,18 @@ const MAX_NATIVE_TOOL_CALLS: usize = 8;
 pub struct NativeAssistantTurn {
     pub content: String,
     pub tool_calls: Vec<NativeToolCall>,
+    pub continuity_state: Option<String>,
+    pub usage: Option<NativeModelUsage>,
     pub finish_reason: NativeFinishReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeModelUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +142,8 @@ pub struct NativeTurnRequest {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeProviderError {
+    #[error("native provider emitted no stream event before the first-event deadline")]
+    PreResponseStall,
     #[error("native provider transport failed: {0}")]
     Transport(#[from] reqwest::Error),
     #[error("native provider returned HTTP {status}: {body}")]
@@ -138,6 +160,7 @@ pub struct OpenAiNativeClient {
     api_url: String,
     api_key: String,
     temperature: f64,
+    stream_usage_supported: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -150,6 +173,8 @@ struct PartialToolCall {
 #[derive(Default)]
 struct NativeStreamState {
     content: String,
+    continuity_state: String,
+    usage: Option<NativeModelUsage>,
     tool_calls: BTreeMap<u64, PartialToolCall>,
     finish_reason: Option<NativeFinishReason>,
     saw_done: bool,
@@ -157,11 +182,13 @@ struct NativeStreamState {
 
 impl OpenAiNativeClient {
     pub fn new(client: Client, api_url: String, api_key: String, temperature: f64) -> Self {
+        let stream_usage_supported = stream_usage_capability(&api_url);
         Self {
             client,
             api_url,
             api_key,
             temperature,
+            stream_usage_supported,
         }
     }
 
@@ -186,6 +213,9 @@ impl OpenAiNativeClient {
             ("max_tokens".to_string(), json!(request.max_tokens)),
             ("stream".to_string(), json!(true)),
         ]);
+        if self.stream_usage_supported.load(Ordering::Relaxed) {
+            body.insert("stream_options".to_string(), json!({"include_usage": true}));
+        }
         if !request.tools.is_empty() {
             body.insert(
                 "tools".to_string(),
@@ -211,48 +241,96 @@ impl OpenAiNativeClient {
             body.insert("tool_choice".to_string(), json!("none"));
         }
 
-        let response = self
-            .client
+        let mut response = self.send_request(&body).await?;
+        let mut status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && body.contains_key("stream_options")
+                && rejects_stream_usage_options(&error_body)
+            {
+                self.stream_usage_supported.store(false, Ordering::Relaxed);
+                body.remove("stream_options");
+                response = self.send_request(&body).await?;
+                status = response.status();
+                if status.is_success() {
+                    return consume_stream_response(response, signal_sender).await;
+                }
+                let fallback_body = response.text().await.unwrap_or_default();
+                return Err(NativeProviderError::Http {
+                    status,
+                    body: truncate(&fallback_body, 500),
+                });
+            }
+            return Err(NativeProviderError::Http {
+                status,
+                body: truncate(&error_body, 500),
+            });
+        }
+
+        consume_stream_response(response, signal_sender).await
+    }
+
+    async fn send_request(
+        &self,
+        body: &Map<String, Value>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        self.client
             .post(format!(
                 "{}/chat/completions",
                 self.api_url.trim_end_matches('/')
             ))
             .bearer_auth(&self.api_key)
-            .json(&Value::Object(body))
+            .json(&Value::Object(body.clone()))
             .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(NativeProviderError::Http {
-                status,
-                body: truncate(&body, 500),
-            });
-        }
+            .await
+    }
+}
 
-        let mut state = NativeStreamState::default();
-        let mut buffer = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            buffer.extend_from_slice(&chunk?);
-            while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = String::from_utf8_lossy(&buffer[..newline])
-                    .trim_end_matches('\r')
-                    .to_string();
-                buffer.drain(..=newline);
-                consume_sse_line(&line, &mut state, &signal_sender)?;
-            }
-            validate_sse_buffer_len(buffer.len())?;
-        }
-        if !buffer.is_empty() {
-            validate_sse_buffer_len(buffer.len())?;
-            let line = String::from_utf8_lossy(&buffer)
-                .trim_end_matches(['\r', '\n'])
+fn stream_usage_capability(api_url: &str) -> Arc<AtomicBool> {
+    static CAPABILITIES: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+    let key = api_url.trim_end_matches('/').to_string();
+    let mut capabilities = CAPABILITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    capabilities
+        .entry(key)
+        .or_insert_with(|| Arc::new(AtomicBool::new(true)))
+        .clone()
+}
+
+fn rejects_stream_usage_options(body: &str) -> bool {
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("stream_options") || normalized.contains("include_usage")
+}
+
+async fn consume_stream_response(
+    response: reqwest::Response,
+    signal_sender: Option<mpsc::UnboundedSender<NativeProviderSignal>>,
+) -> Result<NativeAssistantTurn, NativeProviderError> {
+    let mut state = NativeStreamState::default();
+    let mut buffer = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        buffer.extend_from_slice(&chunk?);
+        while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line = String::from_utf8_lossy(&buffer[..newline])
+                .trim_end_matches('\r')
                 .to_string();
+            buffer.drain(..=newline);
             consume_sse_line(&line, &mut state, &signal_sender)?;
         }
-        finish_stream(state)
+        validate_sse_buffer_len(buffer.len())?;
     }
+    if !buffer.is_empty() {
+        validate_sse_buffer_len(buffer.len())?;
+        let line = String::from_utf8_lossy(&buffer)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        consume_sse_line(&line, &mut state, &signal_sender)?;
+    }
+    finish_stream(state)
 }
 
 fn validate_sse_buffer_len(buffer_len: usize) -> Result<(), NativeProviderError> {
@@ -282,15 +360,46 @@ fn consume_sse_line(
     let value: Value = serde_json::from_str(data)
         .map_err(|error| NativeProviderError::Protocol(format!("malformed SSE JSON: {error}")))?;
     if let Some(provider_error) = value.get("error") {
+        if let Some(sender) = signal_sender {
+            let _ = sender.send(NativeProviderSignal::Event);
+        }
         return Err(NativeProviderError::Protocol(format!(
             "provider streamed an error: {provider_error}"
         )));
     }
-    let choices = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .ok_or_else(|| NativeProviderError::Protocol("SSE event omitted choices".to_string()))?;
+    let usage_value = value.get("usage").filter(|usage| !usage.is_null());
+    let mut emitted_usage = false;
+    if state.usage.is_none() {
+        if let Some(usage) = usage_value.and_then(parse_usage) {
+            if let Some(sender) = signal_sender {
+                let _ = sender.send(NativeProviderSignal::Usage(usage.clone()));
+            }
+            state.usage = Some(usage);
+            emitted_usage = true;
+        }
+    }
+    let choices = match value.get("choices").and_then(Value::as_array) {
+        Some(choices) => choices,
+        None if usage_value.is_some() => {
+            if !emitted_usage {
+                if let Some(sender) = signal_sender {
+                    let _ = sender.send(NativeProviderSignal::Event);
+                }
+            }
+            return Ok(());
+        }
+        None => {
+            return Err(NativeProviderError::Protocol(
+                "SSE event omitted choices".to_string(),
+            ));
+        }
+    };
     if choices.is_empty() {
+        if !emitted_usage {
+            if let Some(sender) = signal_sender {
+                let _ = sender.send(NativeProviderSignal::Event);
+            }
+        }
         return Ok(());
     }
     if choices.len() != 1 {
@@ -319,8 +428,21 @@ fn consume_sse_line(
             emitted_content = true;
         }
     }
-    for field in ["reasoning", "reasoning_content"] {
-        let _ = optional_string(delta.get(field), field)?;
+    let reasoning_content =
+        optional_string(delta.get("reasoning_content"), "delta.reasoning_content")?;
+    let reasoning = optional_string(delta.get("reasoning"), "delta.reasoning")?;
+    if let Some(continuity_delta) = reasoning_content.or(reasoning) {
+        if state
+            .continuity_state
+            .len()
+            .checked_add(continuity_delta.len())
+            .is_none_or(|size| size > MAX_NATIVE_CONTINUITY_STATE_BYTES)
+        {
+            return Err(NativeProviderError::Protocol(format!(
+                "provider continuity state exceeded {MAX_NATIVE_CONTINUITY_STATE_BYTES} bytes"
+            )));
+        }
+        state.continuity_state.push_str(continuity_delta);
     }
     if let Some(tool_calls) = delta.get("tool_calls") {
         let tool_calls = tool_calls.as_array().ok_or_else(|| {
@@ -387,7 +509,7 @@ fn consume_sse_line(
             ));
         }
     }
-    if !emitted_content && !delta.is_empty() {
+    if !emitted_usage && !emitted_content {
         if let Some(sender) = signal_sender {
             let _ = sender.send(NativeProviderSignal::Event);
         }
@@ -462,7 +584,30 @@ fn finish_stream(state: NativeStreamState) -> Result<NativeAssistantTurn, Native
     Ok(NativeAssistantTurn {
         content: state.content,
         tool_calls,
+        continuity_state: (!state.continuity_state.is_empty()).then_some(state.continuity_state),
+        usage: state.usage,
         finish_reason,
+    })
+}
+
+fn parse_usage(value: &Value) -> Option<NativeModelUsage> {
+    let usage = value.as_object()?;
+    let prompt_details = usage
+        .get("prompt_tokens_details")
+        .and_then(Value::as_object);
+    let completion_details = usage
+        .get("completion_tokens_details")
+        .and_then(Value::as_object);
+    Some(NativeModelUsage {
+        prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
+        completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
+        total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+        cached_tokens: prompt_details
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64),
+        reasoning_tokens: completion_details
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
     })
 }
 
@@ -500,7 +645,7 @@ mod tests {
         consume_sse_line, finish_stream, validate_sse_buffer_len, NativeAssistantMessage,
         NativeChatMessage, NativeFinishReason, NativeProviderSignal, NativeStreamState,
         NativeToolCall, NativeToolDefinition, NativeTurnRequest, OpenAiNativeClient,
-        MAX_NATIVE_SSE_LINE_BYTES,
+        MAX_NATIVE_CONTINUITY_STATE_BYTES, MAX_NATIVE_SSE_LINE_BYTES,
     };
     use axum::{
         extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
@@ -526,14 +671,15 @@ mod tests {
         };
         let stream = if request_index == 1 {
             concat!(
-                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\"}}]},\"finish_reason\":null}]}\n\n",
-                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"freedom guide\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"private continuity \",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"state\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"freedom guide\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                 "data: [DONE]\n\n"
             )
         } else {
             concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded \"},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":41,\"completion_tokens\":17,\"total_tokens\":58,\"prompt_tokens_details\":{\"cached_tokens\":11},\"completion_tokens_details\":{\"reasoning_tokens\":7}}}\n\n",
                 "data: [DONE]\n\n"
             )
         };
@@ -594,6 +740,10 @@ mod tests {
 
         assert_eq!(first.finish_reason, NativeFinishReason::ToolCalls);
         assert_eq!(
+            first.continuity_state.as_deref(),
+            Some("private continuity state")
+        );
+        assert_eq!(
             first.tool_calls,
             vec![NativeToolCall {
                 id: "call-1".to_string(),
@@ -613,6 +763,7 @@ mod tests {
                         NativeChatMessage::Assistant(NativeAssistantMessage {
                             content: first.content,
                             tool_calls: first.tool_calls,
+                            continuity_state: first.continuity_state,
                         }),
                         NativeChatMessage::tool_result("call-1", "The guide recommends safety."),
                     ],
@@ -626,6 +777,13 @@ mod tests {
 
         assert_eq!(second.finish_reason, NativeFinishReason::Stop);
         assert_eq!(second.content, "Grounded answer.");
+        assert_eq!(second.continuity_state, None);
+        let usage = second.usage.expect("terminal usage should be observed");
+        assert_eq!(usage.prompt_tokens, Some(41));
+        assert_eq!(usage.completion_tokens, Some(17));
+        assert_eq!(usage.total_tokens, Some(58));
+        assert_eq!(usage.cached_tokens, Some(11));
+        assert_eq!(usage.reasoning_tokens, Some(7));
         assert_eq!(
             vec![signal_receiver.recv().await, signal_receiver.recv().await,],
             vec![
@@ -646,8 +804,16 @@ mod tests {
         );
         assert_eq!(requests[0].get("tool_choice"), Some(&json!("auto")));
         assert_eq!(
+            requests[0].pointer("/stream_options/include_usage"),
+            Some(&json!(true))
+        );
+        assert_eq!(
             requests[1].pointer("/messages/2/tool_calls/0/id"),
             Some(&json!("call-1"))
+        );
+        assert_eq!(
+            requests[1].pointer("/messages/2/reasoning_content"),
+            Some(&json!("private continuity state"))
         );
         assert_eq!(
             requests[1].pointer("/messages/3/tool_call_id"),
@@ -658,6 +824,82 @@ mod tests {
             Some(&json!("knowledge_search"))
         );
         assert_eq!(requests[1].get("tool_choice"), Some(&json!("auto")));
+    }
+
+    #[tokio::test]
+    async fn unsupported_usage_extension_is_negotiated_once_before_inference() {
+        async fn completion(
+            State(captured): State<CapturedRequests>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            let request_number = {
+                let mut requests = captured.0.lock().unwrap();
+                requests.push(body.clone());
+                requests.len()
+            };
+            if request_number == 1 && body.get("stream_options").is_some() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"message": "Unsupported parameter: stream_options"}})),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Available.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+                .into_response()
+        }
+
+        let captured = CapturedRequests::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(captured.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OpenAiNativeClient::new(
+            reqwest::Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let request = || NativeTurnRequest {
+            model: "compatible-model".to_string(),
+            messages: vec![NativeChatMessage::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+        };
+
+        let first = client
+            .stream_turn(request(), None)
+            .await
+            .expect("unsupported optional usage should fall back before inference");
+        let later_turn_client = OpenAiNativeClient::new(
+            reqwest::Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let second = later_turn_client
+            .stream_turn(request(), None)
+            .await
+            .expect("capability result should be retained for later requests");
+
+        assert_eq!(first.content, "Available.");
+        assert_eq!(second.content, "Available.");
+        let requests = captured.0.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[0].pointer("/stream_options/include_usage"),
+            Some(&json!(true))
+        );
+        assert!(requests[1].get("stream_options").is_none());
+        assert!(requests[2].get("stream_options").is_none());
     }
 
     #[test]
@@ -679,6 +921,149 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_event_still_closes_silent_retry_eligibility() {
+        let mut state = NativeStreamState::default();
+        let (signal_sender, mut signal_receiver) = mpsc::unbounded_channel();
+
+        let error = consume_sse_line(
+            r#"data: {"error":{"message":"upstream stopped"}}"#,
+            &mut state,
+            &Some(signal_sender),
+        )
+        .expect_err("provider error payload should remain a protocol failure");
+
+        assert!(error.to_string().contains("provider streamed an error"));
+        assert_eq!(
+            signal_receiver.try_recv().expect("provider event signal"),
+            NativeProviderSignal::Event
+        );
+    }
+
+    #[test]
+    fn malformed_optional_usage_is_best_effort_and_never_breaks_completion() {
+        let mut state = NativeStreamState::default();
+        let (signal_sender, mut signal_receiver) = mpsc::unbounded_channel();
+
+        consume_sse_line(
+            r#"data: {"usage":{"prompt_tokens":41,"completion_tokens":"unknown","prompt_tokens_details":"unsupported"}}"#,
+            &mut state,
+            &Some(signal_sender),
+        )
+        .expect("optional usage metadata must not fail an otherwise valid stream");
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"content":"Complete."},"finish_reason":"stop"}]}"#,
+            &mut state,
+            &None,
+        )
+        .expect("answer should still parse");
+        consume_sse_line("data: [DONE]", &mut state, &None).expect("DONE should parse");
+
+        assert_eq!(
+            signal_receiver
+                .try_recv()
+                .expect("usage observation signal"),
+            NativeProviderSignal::Usage(super::NativeModelUsage {
+                prompt_tokens: Some(41),
+                completion_tokens: None,
+                total_tokens: None,
+                cached_tokens: None,
+                reasoning_tokens: None,
+            })
+        );
+        let turn = finish_stream(state).expect("usage metadata must not invalidate the answer");
+        assert_eq!(turn.content, "Complete.");
+        assert_eq!(turn.usage.unwrap().prompt_tokens, Some(41));
+    }
+
+    #[test]
+    fn duplicate_usage_observations_keep_the_first_valid_observation() {
+        let mut state = NativeStreamState::default();
+        consume_sse_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":11}}"#,
+            &mut state,
+            &None,
+        )
+        .expect("first usage observation should parse");
+        consume_sse_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":99}}"#,
+            &mut state,
+            &None,
+        )
+        .expect("duplicate optional usage must not fail the stream");
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"content":"Complete."},"finish_reason":"stop"}]}"#,
+            &mut state,
+            &None,
+        )
+        .expect("answer should parse");
+        consume_sse_line("data: [DONE]", &mut state, &None).expect("DONE should parse");
+
+        assert_eq!(
+            finish_stream(state).unwrap().usage.unwrap().prompt_tokens,
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn aggregate_provider_continuity_state_is_bounded() {
+        let mut state = NativeStreamState {
+            continuity_state: "x".repeat(MAX_NATIVE_CONTINUITY_STATE_BYTES),
+            ..NativeStreamState::default()
+        };
+
+        let error = consume_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"y"},"finish_reason":null}]}"#,
+            &mut state,
+            &None,
+        )
+        .expect_err("aggregate continuity state must remain bounded");
+
+        assert!(error.to_string().contains("continuity state exceeded"));
+        assert_eq!(
+            state.continuity_state.len(),
+            MAX_NATIVE_CONTINUITY_STATE_BYTES
+        );
+    }
+
+    #[test]
+    fn each_tool_batch_keeps_only_its_corresponding_continuity_state() {
+        let messages = [
+            NativeChatMessage::Assistant(NativeAssistantMessage {
+                content: String::new(),
+                tool_calls: vec![NativeToolCall {
+                    id: "call-1".to_string(),
+                    name: "knowledge_search".to_string(),
+                    arguments: json!({"query": "first"}),
+                }],
+                continuity_state: Some("first private state".to_string()),
+            }),
+            NativeChatMessage::tool_result("call-1", "first result"),
+            NativeChatMessage::Assistant(NativeAssistantMessage {
+                content: String::new(),
+                tool_calls: vec![NativeToolCall {
+                    id: "call-2".to_string(),
+                    name: "knowledge_search".to_string(),
+                    arguments: json!({"query": "second"}),
+                }],
+                continuity_state: Some("second private state".to_string()),
+            }),
+            NativeChatMessage::tool_result("call-2", "second result"),
+            NativeChatMessage::Assistant(NativeAssistantMessage {
+                content: "final answer".to_string(),
+                tool_calls: Vec::new(),
+                continuity_state: None,
+            }),
+        ]
+        .map(|message| message.to_wire_value());
+
+        assert_eq!(messages[0]["reasoning_content"], "first private state");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(messages[2]["reasoning_content"], "second private state");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call-2");
+        assert!(messages[4].get("reasoning_content").is_none());
+    }
+
+    #[test]
     fn terminal_null_delta_preserves_finish_reason() {
         let mut state = NativeStreamState::default();
         state.content.push_str("Complete answer.");
@@ -694,6 +1079,8 @@ mod tests {
         let turn = finish_stream(state).expect("terminal stream should finish");
         assert_eq!(turn.finish_reason, NativeFinishReason::Stop);
         assert_eq!(turn.content, "Complete answer.");
+        assert_eq!(turn.continuity_state, None);
+        assert_eq!(turn.usage, None);
     }
 
     #[test]

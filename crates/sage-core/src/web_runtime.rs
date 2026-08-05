@@ -41,7 +41,8 @@ use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::openai_native::{
     NativeAssistantMessage, NativeAssistantTurn, NativeChatMessage, NativeFinishReason,
-    NativeProviderError, NativeProviderSignal, NativeTurnRequest, OpenAiNativeClient,
+    NativeModelUsage, NativeProviderError, NativeProviderSignal, NativeTurnRequest,
+    OpenAiNativeClient, MAX_NATIVE_CONTINUITY_STATE_BYTES,
 };
 use crate::sage_agent::{
     tool_parse_arg, tool_string_arg, AgentTraceEvent, ConversationTimingOutcome,
@@ -1795,6 +1796,48 @@ fn log_agent_trace_event(
             reason = %reason,
             outcome = %outcome,
         ),
+        AgentTraceEvent::ModelUsageObservation {
+            step,
+            attempt,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            reasoning_tokens,
+        } => tracing::info!(
+            target: "sage.conversation_timing",
+            event_name = "model_usage_observation",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = ConversationTimingPhase::ModelRequest.as_str(),
+            step = *step,
+            attempt = *attempt,
+            prompt_tokens_observed = prompt_tokens.is_some(),
+            completion_tokens_observed = completion_tokens.is_some(),
+            total_tokens_observed = total_tokens.is_some(),
+            cached_tokens_observed = cached_tokens.is_some(),
+            reasoning_tokens_observed = reasoning_tokens.is_some(),
+        ),
+        AgentTraceEvent::PreResponseProviderStall {
+            step,
+            attempt,
+            threshold_ms,
+            elapsed_ms,
+        } => tracing::info!(
+            target: "sage.model_retry",
+            event_name = "pre_response_provider_stall",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            step = *step,
+            attempt = *attempt,
+            threshold_ms = *threshold_ms as u64,
+            duration_ms = *elapsed_ms as u64,
+            outcome = "timed_out",
+        ),
         AgentTraceEvent::Timing {
             phase,
             step,
@@ -2147,6 +2190,68 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 "attempt": attempt,
                 "reason": reason,
                 "outcome": outcome,
+            }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ModelUsageObservation {
+            step,
+            attempt,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            reasoning_tokens,
+        } => {
+            let mut metadata = json!({
+                "phase": ConversationTimingPhase::ModelRequest.as_str(),
+                "step": step,
+                "attempt": attempt,
+            });
+            for (field, value) in [
+                ("prompt_tokens", prompt_tokens),
+                ("completion_tokens", completion_tokens),
+                ("total_tokens", total_tokens),
+                ("cached_tokens", cached_tokens),
+                ("reasoning_tokens", reasoning_tokens),
+            ] {
+                if let Some(value) = value {
+                    metadata[field] = json!(value);
+                }
+            }
+            ConversationTraceDeltaResponse {
+                id: trace_delta_id("model-usage", &format!("{}-{}", step, attempt)),
+                kind: "timing".to_string(),
+                title: Some("Model usage".to_string()),
+                content: Some("Provider-reported model usage observed.".to_string()),
+                tool_name: None,
+                status: Some("succeeded".to_string()),
+                metadata,
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+            }
+        }
+        AgentTraceEvent::PreResponseProviderStall {
+            step,
+            attempt,
+            threshold_ms,
+            elapsed_ms,
+        } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("provider-stall", &format!("{}-{}", step, attempt)),
+            kind: "timing".to_string(),
+            title: Some("Provider first-event wait".to_string()),
+            content: Some(
+                "Provider produced no event before the first-event deadline.".to_string(),
+            ),
+            tool_name: None,
+            status: Some("timed_out".to_string()),
+            metadata: json!({
+                "phase": ConversationTimingPhase::ProviderFirstEventWait.as_str(),
+                "step": step,
+                "attempt": attempt,
+                "threshold_ms": threshold_ms,
+                "duration_ms": elapsed_ms,
+                "outcome": "timed_out",
+                "provider_wait_proxy": true,
+                "wait_origin": "request_start",
             }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
@@ -7042,6 +7147,25 @@ async fn run_native_turn_with_provider(
     model: &str,
     delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> AppResult<AdapterTurnOutput> {
+    run_native_turn_with_provider_and_first_event_timeout(
+        agent,
+        provider,
+        input,
+        model,
+        delta_sender,
+        CONVERSATION_MODEL_FIRST_EVENT_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_native_turn_with_provider_and_first_event_timeout(
+    agent: &mut SageAgent,
+    provider: &OpenAiNativeClient,
+    input: &str,
+    model: &str,
+    delta_sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    first_event_timeout: Duration,
+) -> AppResult<AdapterTurnOutput> {
     let prompt = agent.native_turn_prompt(input);
     let tools = agent
         .native_tool_definitions()
@@ -7057,23 +7181,26 @@ async fn run_native_turn_with_provider(
     let mut answer = String::new();
     let mut executed_tools = Vec::new();
     let mut completed_tool_rounds = 0;
+    let mut continuity_state_bytes = 0_usize;
 
     loop {
         let step = completed_tool_rounds;
-        let (turn, mut answer_state, selection_attempt) = request_native_turn_with_retry(
-            agent,
-            provider,
-            NativeTurnRequest {
-                model: model.to_string(),
-                messages: messages.clone(),
-                tools: tools.clone(),
-                max_tokens: PLAIN_ANSWER_MAX_TOKENS,
-            },
-            step,
-            &delta_sender,
-        )
-        .await
-        .map_err(|(error, _)| model_provider_error(error))?;
+        let (turn, mut answer_state, selection_attempt) =
+            request_native_turn_with_retry_and_first_event_timeout(
+                agent,
+                provider,
+                NativeTurnRequest {
+                    model: model.to_string(),
+                    messages: messages.clone(),
+                    tools: tools.clone(),
+                    max_tokens: PLAIN_ANSWER_MAX_TOKENS,
+                },
+                step,
+                &delta_sender,
+                first_event_timeout,
+            )
+            .await
+            .map_err(|(error, _)| model_provider_error(error))?;
         let (selected_tools, selection_outcome) =
             native_tool_selection_observation(&enabled_tools, &turn.tool_calls);
         agent.emit_trace_event(AgentTraceEvent::ToolSelectionObservation {
@@ -7099,6 +7226,11 @@ async fn run_native_turn_with_provider(
                 executed_tools,
             });
         }
+        account_native_continuity_state(
+            turn.continuity_state.as_deref(),
+            &mut continuity_state_bytes,
+        )
+        .map_err(model_provider_error)?;
         if completed_tool_rounds == MAX_NATIVE_TOOL_ROUNDS {
             warn!(
                 target: "sage.model_provider",
@@ -7108,6 +7240,7 @@ async fn run_native_turn_with_provider(
             messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
                 content: turn.content,
                 tool_calls: turn.tool_calls.clone(),
+                continuity_state: turn.continuity_state,
             }));
             let rejected_batch = agent.reject_native_tool_calls(
                 completed_tool_rounds + 1,
@@ -7124,7 +7257,7 @@ async fn run_native_turn_with_provider(
 
             let final_step = completed_tool_rounds + 1;
             let (final_turn, mut final_answer_state, final_attempt) =
-                request_native_turn_with_retry(
+                request_native_turn_with_retry_and_first_event_timeout(
                     agent,
                     provider,
                     NativeTurnRequest {
@@ -7135,6 +7268,7 @@ async fn run_native_turn_with_provider(
                     },
                     final_step,
                     &delta_sender,
+                    first_event_timeout,
                 )
                 .await
                 .map_err(|(error, _)| model_provider_error(error))?;
@@ -7165,6 +7299,7 @@ async fn run_native_turn_with_provider(
         messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
             content: turn.content,
             tool_calls: turn.tool_calls.clone(),
+            continuity_state: turn.continuity_state,
         }));
         let batch = agent
             .execute_native_tool_calls(completed_tool_rounds + 1, &turn.tool_calls)
@@ -7181,6 +7316,24 @@ async fn run_native_turn_with_provider(
         executed_tools.extend(batch.executed_tools);
         completed_tool_rounds += 1;
     }
+}
+
+fn account_native_continuity_state(
+    state: Option<&str>,
+    retained_bytes: &mut usize,
+) -> std::result::Result<(), NativeProviderError> {
+    let Some(state) = state else {
+        return Ok(());
+    };
+    *retained_bytes = retained_bytes
+        .checked_add(state.len())
+        .filter(|size| *size <= MAX_NATIVE_CONTINUITY_STATE_BYTES)
+        .ok_or_else(|| {
+            NativeProviderError::Protocol(format!(
+                "provider continuity state exceeded {MAX_NATIVE_CONTINUITY_STATE_BYTES} bytes across the Tool loop"
+            ))
+        })?;
+    Ok(())
 }
 
 fn native_tool_selection_observation(
@@ -7210,12 +7363,13 @@ fn native_tool_selection_observation(
     (selected_tools, outcome.to_string())
 }
 
-async fn request_native_turn_with_retry(
+async fn request_native_turn_with_retry_and_first_event_timeout(
     agent: &SageAgent,
     provider: &OpenAiNativeClient,
     request: NativeTurnRequest,
     step: usize,
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    first_event_timeout: Duration,
 ) -> std::result::Result<
     (NativeAssistantTurn, NativeAnswerStreamState, u32),
     (NativeProviderError, bool),
@@ -7226,15 +7380,18 @@ async fn request_native_turn_with_retry(
         agent,
         provider,
         request.clone(),
-        step,
         &mut answer_state,
         delta_sender,
-        1,
+        NativeModelAttempt {
+            step,
+            attempt: 1,
+            first_event_timeout,
+        },
     )
     .await
     {
         Ok(turn) => Ok((turn, answer_state, 1)),
-        Err(error) if same_model_retry_eligible(&error) && !answer_state.released_any => {
+        Err(error) if same_model_retry_eligible(&error) && !answer_state.saw_provider_event => {
             let reason = same_model_retry_category(&error).unwrap_or("transient_provider_failure");
             warn!("Authoritative model request failed transiently; retrying the same request once");
             agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
@@ -7249,10 +7406,13 @@ async fn request_native_turn_with_retry(
                 agent,
                 provider,
                 request,
-                step,
                 &mut retry_state,
                 delta_sender,
-                2,
+                NativeModelAttempt {
+                    step,
+                    attempt: 2,
+                    first_event_timeout,
+                },
             )
             .await
             {
@@ -7284,12 +7444,20 @@ async fn request_native_turn_with_retry(
     }
 }
 
+#[derive(Clone, Copy)]
+struct NativeModelAttempt {
+    step: usize,
+    attempt: u32,
+    first_event_timeout: Duration,
+}
+
 fn same_model_retry_eligible(error: &NativeProviderError) -> bool {
     same_model_retry_category(error).is_some()
 }
 
 fn same_model_retry_category(error: &NativeProviderError) -> Option<&'static str> {
     match error {
+        NativeProviderError::PreResponseStall => Some("pre_response_stall"),
         NativeProviderError::Protocol(_) => Some("protocol"),
         NativeProviderError::Transport(error) if error.is_timeout() => Some("timeout"),
         NativeProviderError::Transport(error) if error.is_connect() => Some("connection"),
@@ -7314,7 +7482,9 @@ fn safe_protocol_error_detail(error: &NativeProviderError) -> &str {
             "provider_streamed_error"
         }
         NativeProviderError::Protocol(detail) => detail,
-        NativeProviderError::Transport(_) | NativeProviderError::Http { .. } => "",
+        NativeProviderError::PreResponseStall
+        | NativeProviderError::Transport(_)
+        | NativeProviderError::Http { .. } => "",
     }
 }
 
@@ -7322,17 +7492,23 @@ async fn stream_native_turn_attempt(
     agent: &SageAgent,
     provider: &OpenAiNativeClient,
     request: NativeTurnRequest,
-    step: usize,
     answer_state: &mut NativeAnswerStreamState,
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-    attempt: u32,
+    attempt_context: NativeModelAttempt,
 ) -> std::result::Result<NativeAssistantTurn, NativeProviderError> {
+    let NativeModelAttempt {
+        step,
+        attempt,
+        first_event_timeout,
+    } = attempt_context;
     let tools_enabled = !request.tools.is_empty();
     let request_started_at = Instant::now();
     let mut first_provider_event_seen = false;
     let (native_sender, mut native_receiver) = mpsc::unbounded_channel();
     let provider_turn = provider.stream_turn(request, Some(native_sender));
     tokio::pin!(provider_turn);
+    let first_event_deadline = tokio::time::sleep(first_event_timeout);
+    tokio::pin!(first_event_deadline);
 
     let turn_result = loop {
         tokio::select! {
@@ -7377,8 +7553,29 @@ async fn stream_native_turn_attempt(
                     delta_sender,
                 )?;
             }
+            _ = &mut first_event_deadline, if !first_provider_event_seen => {
+                let elapsed_ms = request_started_at.elapsed().as_millis();
+                agent.emit_trace_event(AgentTraceEvent::PreResponseProviderStall {
+                    step,
+                    attempt,
+                    threshold_ms: first_event_timeout.as_millis(),
+                    elapsed_ms,
+                });
+                break Err(NativeProviderError::PreResponseStall);
+            }
         }
     };
+    if let Some(usage) = &answer_state.usage {
+        agent.emit_trace_event(AgentTraceEvent::ModelUsageObservation {
+            step,
+            attempt,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cached_tokens: usage.cached_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+        });
+    }
     let turn_result = match turn_result {
         Ok(turn) if !tools_enabled && turn.finish_reason == NativeFinishReason::ToolCalls => {
             Err(NativeProviderError::Protocol(
@@ -7395,6 +7592,8 @@ async fn stream_native_turn_attempt(
         attempt,
         outcome: if turn_result.is_ok() {
             ConversationTimingOutcome::Succeeded
+        } else if matches!(&turn_result, Err(NativeProviderError::PreResponseStall)) {
+            ConversationTimingOutcome::TimedOut
         } else {
             ConversationTimingOutcome::Failed
         },
@@ -7409,8 +7608,13 @@ fn stage_native_provider_signal(
     answer_state: &mut NativeAnswerStreamState,
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> std::result::Result<(), NativeProviderError> {
+    answer_state.saw_provider_event = true;
     let delta = match signal {
         NativeProviderSignal::Content(delta) => delta,
+        NativeProviderSignal::Usage(usage) => {
+            answer_state.usage = Some(usage);
+            return Ok(());
+        }
         NativeProviderSignal::Event => return Ok(()),
     };
     let released = release_answer_delta(delta.clone(), delta_sender);
@@ -8003,11 +8207,14 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
 const PLAIN_ANSWER_MAX_TOKENS: u32 = 8192;
 const MAX_NATIVE_TOOL_ROUNDS: usize = 6;
 const CONVERSATION_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const CONVERSATION_MODEL_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Default)]
 struct NativeAnswerStreamState {
     answer: String,
     released_any: bool,
+    saw_provider_event: bool,
+    usage: Option<NativeModelUsage>,
 }
 
 impl NativeAnswerStreamState {
@@ -8199,6 +8406,7 @@ fn model_provider_error(error: NativeProviderError) -> AppError {
         )
     } else {
         let (category, status) = match &error {
+            NativeProviderError::PreResponseStall => ("provider_pre_response_stall", 0),
             NativeProviderError::Http { status, .. } => ("provider_rejected", status.as_u16()),
             NativeProviderError::Transport(_) => ("provider_transport", 0),
             NativeProviderError::Protocol(_) => ("provider_protocol", 0),
@@ -8231,6 +8439,7 @@ fn auth_error(error: anyhow::Error) -> AppError {
 mod tests {
     use super::*;
     use flate2::{write::ZlibEncoder, Compression};
+    use futures_util::StreamExt;
     use itsdangerous::{default_builder, timed_serializer_with_signer, TimestampSigner};
     use serde_json::json;
     use std::io::Write;
@@ -9002,6 +9211,7 @@ mod tests {
                 release_completion.notified().await;
                 yield Ok::<_, Infallible>(axum::body::Bytes::from_static(concat!(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"It is now complete.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":23,\"completion_tokens\":9,\"total_tokens\":32}}\n\n",
                     "data: [DONE]\n\n"
                 ).as_bytes()));
             });
@@ -9094,6 +9304,18 @@ mod tests {
                 && selected_tools.is_empty()
                 && outcome == "none"
         )));
+        assert!(trace_events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ModelUsageObservation {
+                step: 0,
+                attempt: 1,
+                prompt_tokens: Some(23),
+                completion_tokens: Some(9),
+                total_tokens: Some(32),
+                cached_tokens: None,
+                reasoning_tokens: None,
+            }
+        )));
         for phase in [
             ConversationTimingPhase::ProviderFirstEventWait,
             ConversationTimingPhase::ModelRequest,
@@ -9107,6 +9329,136 @@ mod tests {
                 } if observed == &phase
             )));
         }
+    }
+
+    #[tokio::test]
+    async fn tool_loop_continuity_is_private_and_does_not_cross_turns() {
+        const PRIVATE_STATE: &str = "private continuity sentinel sk_never_publish_424242";
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            let request_number = {
+                let mut requests = state.0.lock().unwrap();
+                requests.push(body);
+                requests.len()
+            };
+            let stream = match request_number {
+                1 => format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":{private_state},\"tool_calls\":[{{\"index\":0,\"id\":\"call-private\",\"function\":{{\"name\":\"knowledge_search\",\"arguments\":\"{{\\\"query\\\":\\\"guide\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+                    private_state = json!(PRIVATE_STATE),
+                ),
+                2 => concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .to_string(),
+                _ => concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Later turn.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .to_string(),
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                stream,
+            )
+        }
+
+        let provider_state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(provider_state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingReadTool {
+            executions: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let trace_events = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink.lock().unwrap().push(event);
+        }));
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+
+        let first = run_native_turn_with_provider(
+            &mut agent,
+            &provider,
+            "use the guide",
+            "glm-5-2",
+            Some(delta_tx),
+        )
+        .await
+        .expect("Tool-assisted turn should complete");
+        let second = run_native_turn_with_provider(
+            &mut agent,
+            &provider,
+            "new independent turn",
+            "glm-5-2",
+            None,
+        )
+        .await
+        .expect("later turn should complete without prior continuity");
+
+        assert_eq!(first.answer, "Grounded answer.");
+        assert_eq!(second.answer, "Later turn.");
+        assert!(!first.answer.contains(PRIVATE_STATE));
+        while let Ok(signal) = delta_rx.try_recv() {
+            assert!(!format!("{signal:?}").contains(PRIVATE_STATE));
+        }
+        let trace_events = trace_events.lock().unwrap();
+        assert!(!format!("{trace_events:?}").contains(PRIVATE_STATE));
+        let trace = ConversationTraceResponse {
+            visibility: "detailed".to_string(),
+            reasoning: ReasoningTraceResponse {
+                summary: "Sage used enabled tools before answering.".to_string(),
+            },
+            trace_deltas: trace_events
+                .iter()
+                .cloned()
+                .map(agent_trace_event_delta)
+                .collect(),
+            tools: Vec::new(),
+            retrieval: Vec::new(),
+            activity_steps: Vec::new(),
+            suppressed: false,
+        };
+        assert!(!assistant_trace_metadata(&trace)
+            .to_string()
+            .contains(PRIVATE_STATE));
+        drop(trace_events);
+
+        let requests = provider_state.0.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1]["messages"][2]["reasoning_content"],
+            PRIVATE_STATE
+        );
+        assert!(!requests[2].to_string().contains(PRIVATE_STATE));
+    }
+
+    #[test]
+    fn continuity_budget_is_aggregate_across_tool_batches() {
+        let mut retained = MAX_NATIVE_CONTINUITY_STATE_BYTES - 1;
+
+        let error = account_native_continuity_state(Some("ab"), &mut retained)
+            .expect_err("successive Tool batches must share one continuity budget");
+
+        assert!(error.to_string().contains("across the Tool loop"));
+        assert_eq!(retained, MAX_NATIVE_CONTINUITY_STATE_BYTES - 1);
     }
 
     #[test]
@@ -9567,15 +9919,15 @@ mod tests {
             state.0.lock().expect("provider request capture").push(body);
             let stream = match tool_result_count {
                 0 => concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"First lookup. \",\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"First lookup. \",\"reasoning_content\":\"private-state-a\",\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                     "data: [DONE]\n\n"
                 ),
                 1 => concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"Refining. \",\"tool_calls\":[{\"index\":0,\"id\":\"call-b\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Refining. \",\"reasoning_content\":\"private-state-b\",\"tool_calls\":[{\"index\":0,\"id\":\"call-b\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                     "data: [DONE]\n\n"
                 ),
                 2 => concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"Checking one more source. \",\"tool_calls\":[{\"index\":0,\"id\":\"call-c\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"gamma\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Checking one more source. \",\"reasoning_content\":\"private-state-c\",\"tool_calls\":[{\"index\":0,\"id\":\"call-c\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"gamma\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                     "data: [DONE]\n\n"
                 ),
                 _ => concat!(
@@ -9645,6 +9997,31 @@ mod tests {
         assert_eq!(requests[2]["messages"][3]["tool_call_id"], "call-a");
         assert_eq!(requests[2]["messages"][5]["tool_call_id"], "call-b");
         assert_eq!(requests[3]["messages"][7]["tool_call_id"], "call-c");
+        assert_eq!(
+            requests[1]["messages"][2]["reasoning_content"],
+            "private-state-a"
+        );
+        assert_eq!(
+            requests[2]["messages"][2]["reasoning_content"],
+            "private-state-a"
+        );
+        assert_eq!(
+            requests[2]["messages"][4]["reasoning_content"],
+            "private-state-b"
+        );
+        assert_eq!(
+            requests[3]["messages"][2]["reasoning_content"],
+            "private-state-a"
+        );
+        assert_eq!(
+            requests[3]["messages"][4]["reasoning_content"],
+            "private-state-b"
+        );
+        assert_eq!(
+            requests[3]["messages"][6]["reasoning_content"],
+            "private-state-c"
+        );
+        assert!(!format!("{:?}", trace_events.lock().unwrap()).contains("private-state"));
         let attempted_rounds = trace_events
             .lock()
             .expect("native trace events")
@@ -9655,6 +10032,176 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(attempted_rounds, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn public_stream_carries_recovery_usage_and_private_multi_batch_continuity_end_to_end() {
+        const PRIVATE_A: &str = "private-public-stream-state-a";
+        const PRIVATE_B: &str = "private-public-stream-state-b";
+
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            let request_number = {
+                let mut requests = state.0.lock().expect("provider request capture");
+                requests.push(body);
+                requests.len()
+            };
+            match request_number {
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+                        .into_response()
+                }
+                2 => (
+                    [("content-type", "text/event-stream")],
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"First lookup. \",\"reasoning_content\":{},\"tool_calls\":[{{\"index\":0,\"id\":\"call-a\",\"function\":{{\"name\":\"knowledge_search\",\"arguments\":\"{{\\\"query\\\":\\\"alpha\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+                        json!(PRIVATE_A)
+                    ),
+                )
+                    .into_response(),
+                3 => (
+                    [("content-type", "text/event-stream")],
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"Second lookup. \",\"reasoning_content\":{},\"tool_calls\":[{{\"index\":0,\"id\":\"call-b\",\"function\":{{\"name\":\"knowledge_search\",\"arguments\":\"{{\\\"query\\\":\\\"beta\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+                        json!(PRIVATE_B)
+                    ),
+                )
+                    .into_response(),
+                _ => (
+                    [("content-type", "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":89,\"completion_tokens\":21,\"total_tokens\":110}}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+                    .into_response(),
+            }
+        }
+
+        let provider_state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(provider_state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingReadTool {
+            executions: executions.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+        let trace_sink = ConversationTraceDeltaSink::new(Some(stream_tx.clone()));
+        install_conversation_trace_hook(
+            &mut agent,
+            trace_sink.clone(),
+            "conversation-public-acceptance".to_string(),
+            "message-public-acceptance".to_string(),
+            "user".to_string(),
+            7,
+        );
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let turn = run_native_turn_with_provider_and_first_event_timeout(
+            &mut agent,
+            &provider,
+            "use the documents",
+            "glm-5-2",
+            Some(stream_tx),
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("the public streaming path should recover and complete");
+
+        assert_eq!(turn.answer, "First lookup. Second lookup. Grounded answer.");
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        let requests = provider_state.0.lock().expect("captured requests");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[2]["messages"][2]["reasoning_content"], PRIVATE_A);
+        assert_eq!(requests[3]["messages"][2]["reasoning_content"], PRIVATE_A);
+        assert_eq!(requests[3]["messages"][4]["reasoning_content"], PRIVATE_B);
+        drop(requests);
+
+        let message_id = "message-public-acceptance";
+        let session_id = Some("77777777-7777-7777-7777-777777777777".to_string());
+        let mut emission_state = ChatStreamAnswerEmissionState::default();
+        let mut emissions = Vec::new();
+        while let Ok(signal) = stream_rx.try_recv() {
+            emissions.extend(chat_stream_emissions_for_signal(
+                &mut emission_state,
+                signal,
+                message_id,
+                &session_id,
+                Vec::new(),
+                Instant::now(),
+                false,
+            ));
+        }
+        let trace = ConversationTraceResponse {
+            visibility: "detailed".to_string(),
+            reasoning: ReasoningTraceResponse {
+                summary: "Sage answered.".to_string(),
+            },
+            trace_deltas: trace_sink.snapshot(),
+            tools: Vec::new(),
+            retrieval: Vec::new(),
+            activity_steps: Vec::new(),
+            suppressed: false,
+        };
+        emissions.extend(chat_stream_terminal_emissions(
+            message_id,
+            &session_id,
+            "glm-5-2".to_string(),
+            Vec::new(),
+            Some(trace),
+            Vec::new(),
+        ));
+
+        let event_names = emissions
+            .iter()
+            .map(|emission| emission.event)
+            .collect::<Vec<_>>();
+        assert!(event_names.contains(&"answer_delta"));
+        assert!(event_names.contains(&"trace_delta"));
+        assert_eq!(
+            event_names[event_names.len() - 2..],
+            ["trace_final", "done"]
+        );
+        let streamed_answer = emissions
+            .iter()
+            .filter_map(|emission| emission.payload.delta.as_deref())
+            .collect::<String>();
+        assert_eq!(streamed_answer, turn.answer);
+
+        let rendered = emissions
+            .iter()
+            .map(|emission| chat_stream_event_payload_json(&emission.payload))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains(PRIVATE_A));
+        assert!(!rendered.contains(PRIVATE_B));
+        assert!(rendered.contains("provider_first_event_wait"));
+        assert!(rendered.contains("\"threshold_ms\":25"));
+        assert!(rendered.contains("\"prompt_tokens\":89"));
+        assert!(rendered.contains("\"completion_tokens\":21"));
+        assert!(rendered.contains("\"total_tokens\":110"));
     }
 
     #[tokio::test]
@@ -9859,7 +10406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unusable_native_response_gets_one_content_neutral_protocol_retry() {
+    async fn valid_but_unusable_provider_event_is_not_retried() {
         #[derive(Clone, Default)]
         struct ProviderState(Arc<Mutex<Vec<Value>>>);
 
@@ -9911,15 +10458,217 @@ mod tests {
         );
         let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
 
-        let turn =
-            run_native_turn_with_provider(&mut agent, &provider, "hello", "test-model", None)
-                .await
-                .expect("one protocol retry should recover");
+        let result =
+            run_native_turn_with_provider(&mut agent, &provider, "hello", "test-model", None).await;
 
-        assert_eq!(turn.answer, "Recovered answer.");
+        assert!(
+            result.is_err(),
+            "a valid provider event must prevent a second model request"
+        );
+        let requests = provider_state.0.lock().expect("captured provider requests");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_provider_silence_retries_the_identical_request_once() {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            let request_number = {
+                let mut requests = state.0.lock().expect("provider request capture");
+                requests.push(body);
+                requests.len()
+            };
+            if request_number == 1 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered after silence.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }
+
+        let provider_state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(provider_state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider should serve");
+        });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let trace_events = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink.lock().unwrap().push(event);
+        }));
+        let request = NativeTurnRequest {
+            model: "glm-5-2".to_string(),
+            messages: vec![NativeChatMessage::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+        };
+
+        let (turn, _, attempt) = request_native_turn_with_retry_and_first_event_timeout(
+            &agent,
+            &provider,
+            request,
+            0,
+            &None,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("one identical retry should recover from complete provider silence");
+
+        assert_eq!(turn.content, "Recovered after silence.");
+        assert_eq!(attempt, 2);
         let requests = provider_state.0.lock().expect("captured provider requests");
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
+        assert!(trace_events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::PreResponseProviderStall {
+                step: 0,
+                attempt: 1,
+                threshold_ms: 25,
+                elapsed_ms,
+            } if *elapsed_ms >= 25
+        )));
+    }
+
+    #[tokio::test]
+    async fn two_silent_attempts_exhaust_one_logical_request() {
+        #[derive(Clone, Default)]
+        struct RequestCount(Arc<AtomicUsize>);
+
+        async fn completion(State(count): State<RequestCount>) -> impl IntoResponse {
+            count.0.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                "data: [DONE]\n\n",
+            )
+        }
+
+        let count = RequestCount::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(count.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let request = NativeTurnRequest {
+            model: "glm-5-2".to_string(),
+            messages: vec![NativeChatMessage::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+        };
+
+        let error = request_native_turn_with_retry_and_first_event_timeout(
+            &agent,
+            &provider,
+            request,
+            0,
+            &None,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("two silent attempts must exhaust the one-retry ceiling");
+
+        assert!(matches!(error.0, NativeProviderError::PreResponseStall));
+        assert_eq!(count.0.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stall_then_different_failure_does_not_receive_a_third_attempt() {
+        #[derive(Clone, Default)]
+        struct RequestCount(Arc<AtomicUsize>);
+
+        async fn completion(State(count): State<RequestCount>) -> Response {
+            let attempt = count.0.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                return (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    "data: [DONE]\n\n",
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "temporary"})),
+            )
+                .into_response()
+        }
+
+        let count = RequestCount::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(count.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let request = NativeTurnRequest {
+            model: "glm-5-2".to_string(),
+            messages: vec![NativeChatMessage::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+        };
+
+        let error = request_native_turn_with_retry_and_first_event_timeout(
+            &agent,
+            &provider,
+            request,
+            0,
+            &None,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("the retry budget must not reset for a different failure category");
+
+        assert!(matches!(
+            error.0,
+            NativeProviderError::Http {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                ..
+            }
+        ));
+        assert_eq!(count.0.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -10069,6 +10818,87 @@ mod tests {
         assert_eq!(requests[2]["tool_choice"], "auto");
         assert_eq!(requests[1]["messages"], requests[2]["messages"]);
         assert_eq!(requests[1]["tools"], requests[2]["tools"]);
+        assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-once");
+    }
+
+    #[tokio::test]
+    async fn silent_final_model_attempt_reuses_tool_results_without_replaying_tools() {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            let request_number = {
+                let mut requests = state.0.lock().unwrap();
+                requests.push(body);
+                requests.len()
+            };
+            match request_number {
+                1 => (
+                    [("content-type", "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-once\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+                    .into_response(),
+                2 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    (
+                        [("content-type", "text/event-stream")],
+                        "data: [DONE]\n\n",
+                    )
+                        .into_response()
+                }
+                _ => (
+                    [("content-type", "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Final answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+                    .into_response(),
+            }
+        }
+
+        let state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingReadTool {
+            executions: executions.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let turn = run_native_turn_with_provider_and_first_event_timeout(
+            &mut agent,
+            &provider,
+            "use the documents",
+            "glm-5-2",
+            None,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("the silent final attempt should recover without replaying the Tool");
+
+        assert_eq!(turn.answer, "Final answer.");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let requests = state.0.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1], requests[2]);
         assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-once");
     }
 
@@ -10309,10 +11139,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_partial_content_can_retry_but_released_stream_content_cannot() {
+    async fn any_provider_event_prevents_a_second_model_request() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        async fn spawn_provider() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        async fn spawn_provider(
+            private_reasoning_only: bool,
+        ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let accepted = Arc::new(AtomicUsize::new(0));
@@ -10324,7 +11156,11 @@ mod tests {
                     let mut request = [0_u8; 4096];
                     let _ = socket.read(&mut request).await;
                     let body = if attempt == 0 {
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"Private partial. \"},\"finish_reason\":null}]}\n\n"
+                        if private_reasoning_only {
+                            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Private reasoning.\"},\"finish_reason\":null}]}\n\n"
+                        } else {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Released partial. \"},\"finish_reason\":null}]}\n\n"
+                        }
                     } else {
                         concat!(
                             "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered cleanly.\"},\"finish_reason\":\"stop\"}]}\n\n",
@@ -10346,7 +11182,7 @@ mod tests {
             (address, accepted)
         }
 
-        let (nonstream_address, nonstream_accepted) = spawn_provider().await;
+        let (nonstream_address, nonstream_accepted) = spawn_provider(true).await;
         let nonstream_provider = OpenAiNativeClient::new(
             Client::new(),
             format!("http://{nonstream_address}/v1"),
@@ -10355,19 +11191,21 @@ mod tests {
         );
         let mut nonstream_agent =
             SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
-        let turn = run_native_turn_with_provider(
+        let private_reasoning_result = run_native_turn_with_provider(
             &mut nonstream_agent,
             &nonstream_provider,
             "hello",
             "glm-5-2",
             None,
         )
-        .await
-        .expect("private buffered content should not prevent a safe retry");
-        assert_eq!(turn.answer, "Recovered cleanly.");
-        assert_eq!(nonstream_accepted.load(Ordering::SeqCst), 2);
+        .await;
+        assert!(
+            private_reasoning_result.is_err(),
+            "private provider reasoning is progress and must prevent retry"
+        );
+        assert_eq!(nonstream_accepted.load(Ordering::SeqCst), 1);
 
-        let (stream_address, stream_accepted) = spawn_provider().await;
+        let (stream_address, stream_accepted) = spawn_provider(false).await;
         let stream_provider = OpenAiNativeClient::new(
             Client::new(),
             format!("http://{stream_address}/v1"),
@@ -10393,10 +11231,73 @@ mod tests {
         assert_eq!(stream_accepted.load(Ordering::SeqCst), 1);
         match delta_rx.try_recv().unwrap() {
             ConversationStreamSignal::Answer(delta) => {
-                assert_eq!(delta, "Private partial. ")
+                assert_eq!(delta, "Released partial. ")
             }
             ConversationStreamSignal::Trace(_) => panic!("expected the released answer delta"),
         }
+    }
+
+    #[tokio::test]
+    async fn tool_call_event_then_stream_timeout_is_not_retried() {
+        #[derive(Clone, Default)]
+        struct RequestCount(Arc<AtomicUsize>);
+
+        async fn completion(State(count): State<RequestCount>) -> Response {
+            count.0.fetch_add(1, Ordering::SeqCst);
+            let first = futures_util::stream::once(async {
+                Ok::<_, Infallible>(axum::body::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"guide\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                ))
+            });
+            let body = axum::body::Body::from_stream(first.chain(futures_util::stream::pending::<
+                Result<axum::body::Bytes, Infallible>,
+            >()));
+            Response::builder()
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(body)
+                .unwrap()
+        }
+
+        let count = RequestCount::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(count.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            conversation_model_http_client_with_timeout(Duration::from_millis(60)).unwrap();
+        let provider = OpenAiNativeClient::new(
+            client,
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let request = NativeTurnRequest {
+            model: "glm-5-2".to_string(),
+            messages: vec![NativeChatMessage::user("hello")],
+            tools: vec![crate::openai_native::NativeToolDefinition {
+                name: "knowledge_search".to_string(),
+                description: "Search knowledge.".to_string(),
+                parameters: json!({"type": "object"}),
+            }],
+            max_tokens: 64,
+        };
+
+        let error = request_native_turn_with_retry_and_first_event_timeout(
+            &agent,
+            &provider,
+            request,
+            0,
+            &None,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("a later stream timeout must fail without a second request");
+
+        assert!(matches!(error.0, NativeProviderError::Transport(_)));
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -14903,6 +15804,101 @@ mod tests {
         ] {
             assert!(!rendered.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn pre_response_stall_observability_records_threshold_and_elapsed_time() {
+        let event = AgentTraceEvent::PreResponseProviderStall {
+            step: 1,
+            attempt: 2,
+            threshold_ms: 20_000,
+            elapsed_ms: 20_011,
+        };
+        let log = capture_structured_log(event.clone());
+        assert_eq!(log["event_name"], "pre_response_provider_stall");
+        assert_eq!(log["step"], 1);
+        assert_eq!(log["attempt"], 2);
+        assert_eq!(log["threshold_ms"], 20_000);
+        assert_eq!(log["duration_ms"], 20_011);
+        assert_eq!(log["outcome"], "timed_out");
+
+        let delta = agent_trace_event_delta(event);
+        assert_eq!(delta.kind, "timing");
+        assert_eq!(delta.status.as_deref(), Some("timed_out"));
+        assert_eq!(delta.metadata["phase"], "provider_first_event_wait");
+        assert_eq!(delta.metadata["threshold_ms"], 20_000);
+        assert_eq!(delta.metadata["duration_ms"], 20_011);
+        assert!(!format!("{log}{delta:?}").contains("conversation content"));
+    }
+
+    #[test]
+    fn model_usage_observation_preserves_provider_reported_absence() {
+        let event = AgentTraceEvent::ModelUsageObservation {
+            step: 2,
+            attempt: 1,
+            prompt_tokens: Some(101),
+            completion_tokens: Some(29),
+            total_tokens: Some(130),
+            cached_tokens: None,
+            reasoning_tokens: None,
+        };
+        let delta = agent_trace_event_delta(event);
+
+        assert_eq!(delta.kind, "timing");
+        assert_eq!(delta.metadata["phase"], "model_request");
+        assert_eq!(delta.metadata["step"], 2);
+        assert_eq!(delta.metadata["attempt"], 1);
+        assert_eq!(delta.metadata["prompt_tokens"], 101);
+        assert_eq!(delta.metadata["completion_tokens"], 29);
+        assert_eq!(delta.metadata["total_tokens"], 130);
+        assert!(delta.metadata.get("cached_tokens").is_none());
+        assert!(delta.metadata.get("reasoning_tokens").is_none());
+        let rendered = format!("{delta:?}");
+        for forbidden in [
+            "prompt text",
+            "answer text",
+            "tool arguments",
+            "reasoning text",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn model_usage_observation_round_trips_through_persisted_trace_metadata() {
+        let usage_delta = agent_trace_event_delta(AgentTraceEvent::ModelUsageObservation {
+            step: 3,
+            attempt: 2,
+            prompt_tokens: Some(210),
+            completion_tokens: Some(34),
+            total_tokens: Some(244),
+            cached_tokens: Some(80),
+            reasoning_tokens: Some(12),
+        });
+        let trace = ConversationTraceResponse {
+            visibility: "detailed".to_string(),
+            reasoning: ReasoningTraceResponse {
+                summary: "Sage answered.".to_string(),
+            },
+            trace_deltas: vec![usage_delta],
+            tools: Vec::new(),
+            retrieval: Vec::new(),
+            activity_steps: Vec::new(),
+            suppressed: false,
+        };
+
+        let metadata = assistant_trace_metadata(&trace);
+        let hydrated = conversation_trace_from_message_metadata(Some(&metadata))
+            .expect("usage trace should hydrate after ordinary persistence");
+        let observed = &hydrated.trace_deltas[0].metadata;
+
+        assert_eq!(observed["step"], 3);
+        assert_eq!(observed["attempt"], 2);
+        assert_eq!(observed["prompt_tokens"], 210);
+        assert_eq!(observed["completion_tokens"], 34);
+        assert_eq!(observed["total_tokens"], 244);
+        assert_eq!(observed["cached_tokens"], 80);
+        assert_eq!(observed["reasoning_tokens"], 12);
     }
 
     #[test]
