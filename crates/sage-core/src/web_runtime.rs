@@ -7105,10 +7105,61 @@ async fn run_native_turn_with_provider(
                 event_name = "native_tool_round_limit_reached",
                 max_tool_rounds = MAX_NATIVE_TOOL_ROUNDS,
             );
-            return Err(AppError::new(
-                StatusCode::BAD_GATEWAY,
-                "The Conversation reached its Tool execution limit. Please narrow the request and try again.",
-            ));
+            messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
+                content: turn.content,
+                tool_calls: turn.tool_calls.clone(),
+            }));
+            let rejected_batch = agent.reject_native_tool_calls(
+                completed_tool_rounds + 1,
+                &turn.tool_calls,
+                "tool_budget_exhausted",
+                "No more Tool calls can be executed in this Conversation turn.",
+            );
+            let result_contents =
+                bounded_native_tool_result_contents(&rejected_batch.executed_tools);
+            for (call, content) in turn.tool_calls.iter().zip(result_contents) {
+                messages.push(NativeChatMessage::tool_result(&call.id, content));
+            }
+            executed_tools.extend(rejected_batch.executed_tools);
+
+            let final_step = completed_tool_rounds + 1;
+            let (final_turn, mut final_answer_state, final_attempt) =
+                request_native_turn_with_retry(
+                    agent,
+                    provider,
+                    NativeTurnRequest {
+                        model: model.to_string(),
+                        messages,
+                        tools: Vec::new(),
+                        max_tokens: PLAIN_ANSWER_MAX_TOKENS,
+                    },
+                    final_step,
+                    &delta_sender,
+                )
+                .await
+                .map_err(|(error, _)| model_provider_error(error))?;
+            let (selected_tools, selection_outcome) =
+                native_tool_selection_observation(&[], &final_turn.tool_calls);
+            agent.emit_trace_event(AgentTraceEvent::ToolSelectionObservation {
+                step: final_step,
+                attempt: final_attempt,
+                enabled_tools: Vec::new(),
+                selected_tools,
+                outcome: selection_outcome,
+            });
+            if final_answer_state.answer.is_empty() && !final_turn.content.is_empty() {
+                stage_native_provider_signal(
+                    NativeProviderSignal::Content(final_turn.content.clone()),
+                    &mut final_answer_state,
+                    &delta_sender,
+                )
+                .map_err(model_provider_error)?;
+            }
+            answer.push_str(&final_turn.content);
+            return Ok(AdapterTurnOutput {
+                answer,
+                executed_tools,
+            });
         }
 
         messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
@@ -9607,25 +9658,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_tool_round_limit_never_executes_a_batch_past_the_limit() {
+    async fn native_tool_round_limit_rejects_the_batch_and_returns_a_final_answer() {
         #[derive(Clone, Default)]
-        struct ProviderState(Arc<AtomicUsize>);
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
 
         async fn completion(
             State(state): State<ProviderState>,
             Json(body): Json<Value>,
         ) -> impl IntoResponse {
-            state.0.fetch_add(1, Ordering::SeqCst);
+            let tools_disabled = body["tool_choice"] == "none";
+            state
+                .0
+                .lock()
+                .expect("provider request capture")
+                .push(body.clone());
+            if tools_disabled {
+                return (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded final answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .to_string(),
+                );
+            }
             let tool_result_count = body["messages"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter(|message| message["role"] == "tool")
                 .count();
-            let call_id = format!("call-{tool_result_count}");
-            let stream = format!(
-                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"{call_id}\",\"function\":{{\"name\":\"knowledge_search\",\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
-            );
+            let tool_calls = if tool_result_count == 6 {
+                vec![
+                    json!({
+                        "index": 0,
+                        "id": "call-6-a",
+                        "function": {"name": "knowledge_search", "arguments": "{}"},
+                    }),
+                    json!({
+                        "index": 1,
+                        "id": "call-6-b",
+                        "function": {"name": "knowledge_search", "arguments": "{}"},
+                    }),
+                ]
+            } else {
+                vec![json!({
+                    "index": 0,
+                    "id": format!("call-{tool_result_count}"),
+                    "function": {"name": "knowledge_search", "arguments": "{}"},
+                })]
+            };
+            let event = json!({
+                "choices": [{
+                    "delta": {"tool_calls": tool_calls},
+                    "finish_reason": "tool_calls",
+                }],
+            });
+            let stream = format!("data: {event}\n\ndata: [DONE]\n\n");
             (
                 StatusCode::OK,
                 [("content-type", "text/event-stream")],
@@ -9662,26 +9752,47 @@ mod tests {
             0.1,
         );
 
-        let error = match run_native_turn_with_provider(
-            &mut agent,
-            &provider,
-            "keep searching",
-            "glm-5-2",
-            None,
-        )
-        .await
-        {
-            Ok(_) => panic!("a seventh native Tool batch must be rejected"),
-            Err(error) => error,
-        };
+        let turn =
+            run_native_turn_with_provider(&mut agent, &provider, "keep searching", "glm-5-2", None)
+                .await
+                .expect("the model should answer after the over-budget batch is rejected");
 
         assert_eq!(executions.load(Ordering::SeqCst), 6);
-        assert_eq!(provider_state.0.load(Ordering::SeqCst), 7);
-        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(turn.answer, "Grounded final answer.");
+        assert_eq!(turn.executed_tools.len(), 8);
+        assert!(turn.executed_tools[6..].iter().all(|tool| tool.result
+            == NativeToolResult::failure(
+                "tool_budget_exhausted",
+                "No more Tool calls can be executed in this Conversation turn.",
+            )));
+        let requests = provider_state.0.lock().expect("captured requests");
+        assert_eq!(requests.len(), 8);
+        assert!(requests.iter().all(|request| request["model"] == "glm-5-2"));
+        assert!(requests[..7]
+            .iter()
+            .all(|request| request["tool_choice"] == "auto"));
+        assert_eq!(requests[7]["tool_choice"], "none");
+        let final_tool_results = requests[7]["messages"]
+            .as_array()
+            .expect("final request messages")
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect::<Vec<_>>();
+        assert_eq!(final_tool_results.len(), 8);
         assert_eq!(
-            error.message,
-            "The Conversation reached its Tool execution limit. Please narrow the request and try again."
+            final_tool_results
+                .iter()
+                .map(|message| message["tool_call_id"]
+                    .as_str()
+                    .expect("correlated call ID"))
+                .collect::<Vec<_>>(),
+            ["call-0", "call-1", "call-2", "call-3", "call-4", "call-5", "call-6-a", "call-6-b",]
         );
+        assert!(final_tool_results[6..]
+            .iter()
+            .all(|message| message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("tool_budget_exhausted"))));
     }
 
     #[tokio::test]

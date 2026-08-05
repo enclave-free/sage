@@ -73,8 +73,11 @@ configured Conversation model. The model either answers directly or selects
 a bounded Tool batch. After a Tool batch, correlated structured Tool results
 and the same enabled Tool definitions return to the same model. The model may
 continue selecting batches within a six-batch safety ceiling; Sage rejects a
-seventh selected batch before execution. Each batch's Tool results are limited to
-4,000 characters per result and 12,000 characters total.
+seventh selected batch before execution, returns correlated
+`tool_budget_exhausted` failures for those unexecuted calls, and makes one final
+same-model request with Tools disabled so the model can answer from the accumulated
+evidence. Each executed batch's Tool results are limited to 4,000 characters per
+result and 12,000 characters total.
 
 Native assistant content streams in provider order without semantic scanning,
 quarantine, rewriting, or deterministic answer fallback. Provider reasoning is
@@ -132,7 +135,8 @@ Sage owns the bounded native Tool loop for Conversation routes.
 7. if Tools were selected, execute that batch and return its correlated,
    structured results plus the same enabled Tool definitions to the same model
 8. allow model-selected continuation within the six-batch safety ceiling;
-   reject a seventh selected batch before execution
+   reject a seventh selected batch before execution, correlate bounded failures,
+   and request one final same-model answer with Tools disabled
 9. return the assistant message plus Activity/Trace metadata and Tool summaries
 
 Tool Sets:
