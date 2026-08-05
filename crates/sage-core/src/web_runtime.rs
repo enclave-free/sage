@@ -7950,7 +7950,7 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
 }
 
 const PLAIN_ANSWER_MAX_TOKENS: u32 = 8192;
-const MAX_NATIVE_TOOL_ROUNDS: usize = 4;
+const MAX_NATIVE_TOOL_ROUNDS: usize = 6;
 const CONVERSATION_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Default)]
@@ -9608,7 +9608,14 @@ mod tests {
 
     #[tokio::test]
     async fn native_tool_round_limit_never_executes_a_batch_past_the_limit() {
-        async fn completion(Json(body): Json<Value>) -> impl IntoResponse {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<AtomicUsize>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            state.0.fetch_add(1, Ordering::SeqCst);
             let tool_result_count = body["messages"]
                 .as_array()
                 .into_iter()
@@ -9630,10 +9637,14 @@ mod tests {
             .await
             .expect("test provider should bind");
         let address = listener.local_addr().expect("test provider address");
+        let provider_state = ProviderState::default();
+        let provider_state_for_server = provider_state.clone();
         tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/v1/chat/completions", post(completion)),
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(provider_state_for_server),
             )
             .await
             .expect("test provider should serve");
@@ -9660,11 +9671,12 @@ mod tests {
         )
         .await
         {
-            Ok(_) => panic!("a third native Tool batch must be rejected"),
+            Ok(_) => panic!("a seventh native Tool batch must be rejected"),
             Err(error) => error,
         };
 
-        assert_eq!(executions.load(Ordering::SeqCst), MAX_NATIVE_TOOL_ROUNDS);
+        assert_eq!(executions.load(Ordering::SeqCst), 6);
+        assert_eq!(provider_state.0.load(Ordering::SeqCst), 7);
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(
             error.message,
