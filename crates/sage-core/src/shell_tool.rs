@@ -14,7 +14,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::sage_agent::{tool_parse_arg, tool_string_arg, Tool, ToolArgs, ToolResult};
+use crate::sage_agent::{
+    tool_parse_arg, tool_string_arg, LegacyTool, ToolArgs, ToolResult, ToolRetryPolicy,
+};
 
 /// Dangerous command patterns that should be blocked
 const BLOCKED_PATTERNS: &[&str] = &[
@@ -126,7 +128,7 @@ impl ShellTool {
 }
 
 #[async_trait]
-impl Tool for ShellTool {
+impl LegacyTool for ShellTool {
     fn name(&self) -> &str {
         "shell"
     }
@@ -137,6 +139,10 @@ impl Tool for ShellTool {
 
     fn args_schema(&self) -> &str {
         r#"{"command": "shell command to execute (supports pipes, redirects)", "timeout": "optional timeout in seconds (default 60, set appropriately for long-running commands)"}"#
+    }
+
+    fn retry_policy(&self) -> ToolRetryPolicy {
+        ToolRetryPolicy::self_managed_timeout()
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
@@ -160,7 +166,6 @@ impl Tool for ShellTool {
                 output: format!("Command blocked: contains dangerous pattern '{}'", pattern),
                 error: Some("Security violation".to_string()),
                 metadata: serde_json::Value::Null,
-                user_safe_fallback: None,
             });
         }
 
@@ -186,7 +191,6 @@ impl Tool for ShellTool {
                     output: String::new(),
                     error: Some(format!("Failed to execute command: {}", e)),
                     metadata: serde_json::Value::Null,
-                    user_safe_fallback: None,
                 });
             }
         };
@@ -222,7 +226,6 @@ impl Tool for ShellTool {
                         Some(format!("Command exited with code {}", exit_code))
                     },
                     metadata: serde_json::Value::Null,
-                    user_safe_fallback: None,
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
@@ -230,7 +233,6 @@ impl Tool for ShellTool {
                 output: String::new(),
                 error: Some(format!("Failed to wait on command: {}", e)),
                 metadata: serde_json::Value::Null,
-                user_safe_fallback: None,
             }),
             Err(_) => {
                 // Timeout -- kill the entire process group first, then drain
@@ -276,9 +278,38 @@ impl Tool for ShellTool {
                     output: output_str,
                     error: Some(format!("Command timed out after {}s", timeout_secs)),
                     metadata: serde_json::Value::Null,
-                    user_safe_fallback: None,
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn shell_tool_keeps_its_self_managed_timeout_and_cleanup_boundary() {
+        let tool = ShellTool::new(std::env::temp_dir().to_string_lossy());
+
+        assert_eq!(tool.retry_policy(), ToolRetryPolicy::self_managed_timeout());
+    }
+
+    #[tokio::test]
+    async fn shell_accepts_a_configured_timeout_above_the_generic_default() {
+        let tool = ShellTool::new(std::env::temp_dir().to_string_lossy());
+        let args = ToolArgs::from([
+            ("command".to_string(), json!("printf shell-timeout-owned")),
+            ("timeout".to_string(), json!(31)),
+        ]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), tool.execute(&args))
+            .await
+            .expect("Shell Tool must not inherit the generic 30-second timeout")
+            .expect("Shell Tool execution should complete");
+
+        assert!(result.success);
+        assert!(result.output.contains("shell-timeout-owned"));
     }
 }

@@ -4,13 +4,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::sage_agent::{tool_parse_arg, tool_string_arg, Tool, ToolArgs, ToolResult};
+use crate::sage_agent::{tool_parse_arg, tool_string_arg, LegacyTool, ToolArgs, ToolResult};
 
 /// Done tool - signals the agent is finished and doesn't need to send another message
 pub struct DoneTool;
 
 #[async_trait]
-impl Tool for DoneTool {
+impl LegacyTool for DoneTool {
     fn name(&self) -> &str {
         "done"
     }
@@ -42,7 +42,7 @@ impl WebSearchTool {
 }
 
 #[async_trait]
-impl Tool for WebSearchTool {
+impl LegacyTool for WebSearchTool {
     fn name(&self) -> &str {
         "web_search"
     }

@@ -14,7 +14,7 @@ use super::block::BlockManager;
 use super::db::MemoryDb;
 use super::recall_new::RecallManager;
 use super::EmbeddingService;
-use crate::sage_agent::{tool_parse_arg, tool_string_arg, Tool, ToolArgs, ToolResult};
+use crate::sage_agent::{tool_parse_arg, tool_string_arg, LegacyTool, ToolArgs, ToolResult};
 
 // ============================================================================
 // Core Memory Tools
@@ -32,7 +32,7 @@ impl MemoryReplaceTool {
 }
 
 #[async_trait]
-impl Tool for MemoryReplaceTool {
+impl LegacyTool for MemoryReplaceTool {
     fn name(&self) -> &str {
         "memory_replace"
     }
@@ -75,7 +75,7 @@ impl MemoryAppendTool {
 }
 
 #[async_trait]
-impl Tool for MemoryAppendTool {
+impl LegacyTool for MemoryAppendTool {
     fn name(&self) -> &str {
         "memory_append"
     }
@@ -116,7 +116,7 @@ impl MemoryInsertTool {
 }
 
 #[async_trait]
-impl Tool for MemoryInsertTool {
+impl LegacyTool for MemoryInsertTool {
     fn name(&self) -> &str {
         "memory_insert"
     }
@@ -187,7 +187,7 @@ impl ConversationSearchTool {
 }
 
 #[async_trait]
-impl Tool for ConversationSearchTool {
+impl LegacyTool for ConversationSearchTool {
     fn name(&self) -> &str {
         "conversation_search"
     }
@@ -276,7 +276,7 @@ impl ArchivalInsertTool {
 }
 
 #[async_trait]
-impl Tool for ArchivalInsertTool {
+impl LegacyTool for ArchivalInsertTool {
     fn name(&self) -> &str {
         "archival_insert"
     }
@@ -318,7 +318,7 @@ impl ArchivalSearchTool {
 }
 
 #[async_trait]
-impl Tool for ArchivalSearchTool {
+impl LegacyTool for ArchivalSearchTool {
     fn name(&self) -> &str {
         "archival_search"
     }
@@ -374,7 +374,7 @@ impl SetPreferenceTool {
 }
 
 #[async_trait]
-impl Tool for SetPreferenceTool {
+impl LegacyTool for SetPreferenceTool {
     fn name(&self) -> &str {
         "set_preference"
     }

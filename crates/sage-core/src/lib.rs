@@ -7,6 +7,7 @@ pub mod config;
 pub mod marmot;
 pub mod memory;
 pub mod messenger;
+pub mod openai_native;
 pub mod sage_agent;
 pub mod scheduler;
 pub mod scheduler_tools;

@@ -49,8 +49,8 @@ This file contains the branch-specific integration layer:
 - `InternalAgentClient`
 - session ownership checks
 - AI config CRUD and prompt preview
-- current prepared-tool context logic plus the ADR-0023 target Tool Set expansion
-  and model-driven Tool loop execution for Conversation routes
+- current prepared-tool context logic plus Tool Set expansion and the bounded
+  native Tool batch for Conversation routes
 - prompt assembly helpers
 
 ## Public Routes
@@ -58,7 +58,7 @@ This file contains the branch-specific integration layer:
 | Route | Ownership | Notes |
 | --- | --- | --- |
 | `GET /health` | Sage service health | direct Sage runtime health, usually consumed internally |
-| `POST /llm/chat` | Sage | Conversation transport with model-driven Tool loop |
+| `POST /llm/chat` | Sage | Conversation transport with at most one native Tool batch |
 | `POST /query` | Sage | stateful Conversation API compatibility shape |
 | `GET /query/session/{session_id}` | Sage | session inspection |
 | `DELETE /query/session/{session_id}` | Sage | deletes session record |
@@ -66,38 +66,28 @@ This file contains the branch-specific integration layer:
 | `POST /admin/tools/execute` | Sage | public admin route; execution delegated to Python |
 | `/admin/ai-config/*` | Sage | public route family and storage both live in Sage |
 
-### Conversation final-answer safety
+### Native Conversation trust boundary
 
-`POST /llm/chat` plans and runs selected Tools before requesting a separate
-plain final answer. Current-turn Tool results are de-duplicated, limited to
-4,000 characters each and 12,000 characters total, with the newest results
-preferred when the budget is full. The planner's `replan_after_results` field
-is an optional hint; omitting it means no requested replan.
+`POST /llm/chat` sends enabled, authorized native Tool definitions to the one
+configured Conversation model. The model either answers directly or selects
+one bounded Tool batch. After a Tool batch, correlated structured Tool results
+are returned to the same model without Tool definitions, so a second Tool round
+cannot begin. Current-turn Tool results are limited to 4,000 characters each
+and 12,000 characters total.
 
-The final-answer stream briefly holds ambiguous planning/search openings and
-structured Tool-like output. Repeated process narration, Tool intent, provider
-token-limit termination, and unsupported finish reasons fail the answer rather
-than being persisted as success. A quarantined Tool, repetition, or token-limit
-failure may retry once only when no answer text has reached the client.
+Native assistant content streams in provider order without semantic scanning,
+quarantine, rewriting, or deterministic answer fallback. Provider reasoning is
+discarded. Structural protocol failures and eligible connection, timeout, or
+502/503/504 failures may retry the identical request once against the identical
+model. A final-request retry reuses existing Tool-result messages and cannot
+execute Tools again. No other Conversation model is substituted after failure.
 
-One narrow deterministic terminal fallback applies after that retry is
-exhausted: when the turn executed exactly one successful Curated Resources
-inventory lookup and exposed no answer text, Sage may return the Tool adapter's
-separately marked user-safe inventory rendering. Internal Tool output is never
-used for this fallback. Contact lookups, multiple-Tool turns, partial answer
-streams, and ordinary provider or transport failures retain the fail-closed
-behavior above.
-
-Conversation traces time total Tool planning, retrieval, Resource Directory
-lookup, Tool execution, retry delay, final-answer generation, and total turn
-duration separately. Final-answer response-header and first-event waits are
-explicit provider-wait proxies: network transit, provider queueing, and model
-startup may all contribute. The current typed Tool-planning provider contract
-does not expose cluster-scheduling or inference-only timings, so Sage emits
-those two phases as `unavailable` instead of fabricating durations or treating
-the combined planning duration as either metric. This preserves an honest
-correlation between slow planning attempts and omitted/rejected Tool selections
-while making the provider instrumentation gap visible.
+Conversation traces record native model requests, provider first-event wait,
+Retrieval or Resource lookup, Tool execution, retry, and total-turn timing where
+those stages are measurable. Provider first-event wait is a combined proxy:
+network transit, provider queueing, and model startup may all contribute. Sage
+does not emit fabricated `cluster_scheduling` or `inference_only` phases when
+the provider does not supply those measurements.
 
 ## InternalAgentClient Contract
 
@@ -111,8 +101,8 @@ Active calls:
 - `GET /internal/agent/document-access`
 - `GET /internal/agent/user-profile-context/{user_id}`
 - `POST /internal/agent/document-search`
-- `POST /internal/agent/resources/search` — accepts optional `query`, `limit`, and `offset`; returns normalized query plus `total_count`, `returned_count`, `limit`, `offset`, `has_more`, and `next_offset` metadata for ready Curated Resources. Query relevance (exact normalized ID/name/contact, then partial name/contact, then description) precedes existing scope, verification, language, display-order, and name ranking.
-- Explicit contact, Curated Resource inventory, and inventory-continuation requests are validated at the model-planning boundary; ordinary questions about how organizations or the directory work are not inventory requests. Each such user turn requires exactly one successful `find_resources` execution: an initial lookup runs on the current turn, while a continuation can run only on a later user turn using the immediately preceding open page's structured query, region, help type, language, and `next_offset`. Sage does not fetch multiple pages within one turn. Rejected model selections are never executed and do not count toward that one-success limit; Sage retries a plan that omits the required call, changes an explicit inventory/contact query, invents a context-only contact query outside the structured Curated Resources results (with legacy prose grounding only when structured state is unavailable), uses a stale positive offset for a fresh lookup, or changes an exact continuation filter or offset. Redundant `find_resources` calls after a successful turn lookup are removed before execution; selection traces retain both the raw model choice and sanitized executable choice. Rejected selections include their privacy-safe validation reason in structured trace metadata. A missing or zero continuation cursor and bounded planning exhaustion fail closed without an ungrounded answer; an intervening assistant turn expires an older cursor. Conservative pagination reconciles backend counts and cursor state; when more results are reported without a safe cursor, Sage says so instead of inventing one. The Tool’s structured `has_more` result—not rendered prompt text—controls the incomplete-page final-answer guard. For incomplete pages, final-answer text is held until completion and retried before exposure if it falsely claims all, every, or a complete list, while explicit limitations such as “not a complete list” remain valid. The validator never constructs or executes a Tool call itself.
+- `POST /internal/agent/resources/search` — accepts optional generic `query`, `kind`, `tags`, `region`, `language`, and pagination fields. It returns relevance-ranked generic Resources plus `total_count`, `returned_count`, `limit`, `offset`, `has_more`, and `next_offset` metadata. Exact normalized IDs, names, and pointers rank ahead of partial names, pointers, and descriptions.
+- `find_resources` exposes that generic contract directly as a native Tool definition. The Conversation model decides whether to call it and may use the returned pagination metadata on a later turn. Sage validates arguments and backend page consistency, but does not run contact-specific intent classification, force a lookup, rewrite the selected batch, or quarantine final prose for completeness claims.
 - `POST /internal/agent/admin-db-query`
 
 ADR-0023 target calls:
@@ -129,16 +119,19 @@ This is the real integration boundary. If request or response shapes change, bot
 
 ## Conversation Flow Target
 
-Sage owns the model-driven Tool loop for Conversation routes.
+Sage owns the bounded native Tool round for Conversation routes.
 
 1. enforce CSRF for cookie-authenticated unsafe requests
 2. verify auth natively in Sage
 3. hydrate user/admin identity from Python if needed
 4. load effective AI config and request temperature from Sage Postgres
 5. expand enabled Tool Sets into concrete Tool contracts
-6. run the model-driven Tool loop against the configured Model Provider
-7. execute authorized Tool calls, inject results, and continue until answer or Executable Change Set
-8. return the assistant message plus Activity/Trace metadata and Tool summaries
+6. ask the configured Conversation model to answer directly or select at most
+   one bounded batch of authorized Tool calls
+7. if Tools were selected, execute that batch and return its correlated,
+   structured results to the same model without Tool definitions
+8. accept the model's Tool-free final response; no further Tool execution can begin
+9. return the assistant message plus Activity/Trace metadata and Tool summaries
 
 Tool Sets:
 
@@ -146,7 +139,6 @@ Tool Sets:
 - `web-search` exposes `web_search`
 - `admin-config` exposes admin-only configuration read/proposal Tools
 - `db-query` exposes admin-only read-only database inspection Tools
-- `done` or the equivalent final-answer signal completes the loop
 
 The frontend should not pre-run Tools or inject admin configuration snapshots through `tool_context`.
 
@@ -164,7 +156,7 @@ The frontend should not pre-run Tools or inject admin configuration snapshots th
    - persona block from compiled Enclave prompt profile
    - human block from auth + profile context
 8. persist the user turn
-9. run the same model-driven Tool loop with memory enabled
+9. run the same bounded native Tool round with memory enabled
 10. persist the assistant turn
 11. return `session_id`, `sources`, `context_used`, and answer
 
