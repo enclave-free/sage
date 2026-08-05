@@ -1161,6 +1161,15 @@ pub enum AgentTraceEvent {
         reason: String,
         outcome: String,
     },
+    ModelUsageObservation {
+        step: usize,
+        attempt: u32,
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+        cached_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+    },
     CorrectionStarted {
         step: usize,
         attempt: u32,

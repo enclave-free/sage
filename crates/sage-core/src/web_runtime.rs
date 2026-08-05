@@ -41,7 +41,8 @@ use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::openai_native::{
     NativeAssistantMessage, NativeAssistantTurn, NativeChatMessage, NativeFinishReason,
-    NativeProviderError, NativeProviderSignal, NativeTurnRequest, OpenAiNativeClient,
+    NativeModelUsage, NativeProviderError, NativeProviderSignal, NativeTurnRequest,
+    OpenAiNativeClient,
 };
 use crate::sage_agent::{
     tool_parse_arg, tool_string_arg, AgentTraceEvent, ConversationTimingOutcome,
@@ -1795,6 +1796,30 @@ fn log_agent_trace_event(
             reason = %reason,
             outcome = %outcome,
         ),
+        AgentTraceEvent::ModelUsageObservation {
+            step,
+            attempt,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            reasoning_tokens,
+        } => tracing::info!(
+            target: "sage.conversation_timing",
+            event_name = "model_usage_observation",
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            actor_kind = %actor_kind,
+            actor_id,
+            phase = ConversationTimingPhase::ModelRequest.as_str(),
+            step = *step,
+            attempt = *attempt,
+            prompt_tokens_observed = prompt_tokens.is_some(),
+            completion_tokens_observed = completion_tokens.is_some(),
+            total_tokens_observed = total_tokens.is_some(),
+            cached_tokens_observed = cached_tokens.is_some(),
+            reasoning_tokens_observed = reasoning_tokens.is_some(),
+        ),
         AgentTraceEvent::Timing {
             phase,
             step,
@@ -2147,6 +2172,33 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 "attempt": attempt,
                 "reason": reason,
                 "outcome": outcome,
+            }),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        AgentTraceEvent::ModelUsageObservation {
+            step,
+            attempt,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            reasoning_tokens,
+        } => ConversationTraceDeltaResponse {
+            id: trace_delta_id("model-usage", &format!("{}-{}", step, attempt)),
+            kind: "timing".to_string(),
+            title: Some("Model usage".to_string()),
+            content: Some("Provider-reported model usage observed.".to_string()),
+            tool_name: None,
+            status: Some("succeeded".to_string()),
+            metadata: json!({
+                "phase": ConversationTimingPhase::ModelRequest.as_str(),
+                "step": step,
+                "attempt": attempt,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "cached_tokens": cached_tokens,
+                "reasoning_tokens": reasoning_tokens,
             }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
@@ -7108,6 +7160,7 @@ async fn run_native_turn_with_provider(
             messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
                 content: turn.content,
                 tool_calls: turn.tool_calls.clone(),
+                continuity_state: turn.continuity_state,
             }));
             let rejected_batch = agent.reject_native_tool_calls(
                 completed_tool_rounds + 1,
@@ -7165,6 +7218,7 @@ async fn run_native_turn_with_provider(
         messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
             content: turn.content,
             tool_calls: turn.tool_calls.clone(),
+            continuity_state: turn.continuity_state,
         }));
         let batch = agent
             .execute_native_tool_calls(completed_tool_rounds + 1, &turn.tool_calls)
@@ -7220,21 +7274,46 @@ async fn request_native_turn_with_retry(
     (NativeAssistantTurn, NativeAnswerStreamState, u32),
     (NativeProviderError, bool),
 > {
+    request_native_turn_with_retry_and_first_event_timeout(
+        agent,
+        provider,
+        request,
+        step,
+        delta_sender,
+        CONVERSATION_MODEL_FIRST_EVENT_TIMEOUT,
+    )
+    .await
+}
+
+async fn request_native_turn_with_retry_and_first_event_timeout(
+    agent: &SageAgent,
+    provider: &OpenAiNativeClient,
+    request: NativeTurnRequest,
+    step: usize,
+    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+    first_event_timeout: Duration,
+) -> std::result::Result<
+    (NativeAssistantTurn, NativeAnswerStreamState, u32),
+    (NativeProviderError, bool),
+> {
     let model = request.model.clone();
     let mut answer_state = NativeAnswerStreamState::default();
     match stream_native_turn_attempt(
         agent,
         provider,
         request.clone(),
-        step,
         &mut answer_state,
         delta_sender,
-        1,
+        NativeModelAttempt {
+            step,
+            attempt: 1,
+            first_event_timeout,
+        },
     )
     .await
     {
         Ok(turn) => Ok((turn, answer_state, 1)),
-        Err(error) if same_model_retry_eligible(&error) && !answer_state.released_any => {
+        Err(error) if same_model_retry_eligible(&error) && !answer_state.saw_provider_event => {
             let reason = same_model_retry_category(&error).unwrap_or("transient_provider_failure");
             warn!("Authoritative model request failed transiently; retrying the same request once");
             agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
@@ -7249,10 +7328,13 @@ async fn request_native_turn_with_retry(
                 agent,
                 provider,
                 request,
-                step,
                 &mut retry_state,
                 delta_sender,
-                2,
+                NativeModelAttempt {
+                    step,
+                    attempt: 2,
+                    first_event_timeout,
+                },
             )
             .await
             {
@@ -7284,12 +7366,20 @@ async fn request_native_turn_with_retry(
     }
 }
 
+#[derive(Clone, Copy)]
+struct NativeModelAttempt {
+    step: usize,
+    attempt: u32,
+    first_event_timeout: Duration,
+}
+
 fn same_model_retry_eligible(error: &NativeProviderError) -> bool {
     same_model_retry_category(error).is_some()
 }
 
 fn same_model_retry_category(error: &NativeProviderError) -> Option<&'static str> {
     match error {
+        NativeProviderError::PreResponseStall => Some("pre_response_stall"),
         NativeProviderError::Protocol(_) => Some("protocol"),
         NativeProviderError::Transport(error) if error.is_timeout() => Some("timeout"),
         NativeProviderError::Transport(error) if error.is_connect() => Some("connection"),
@@ -7314,7 +7404,9 @@ fn safe_protocol_error_detail(error: &NativeProviderError) -> &str {
             "provider_streamed_error"
         }
         NativeProviderError::Protocol(detail) => detail,
-        NativeProviderError::Transport(_) | NativeProviderError::Http { .. } => "",
+        NativeProviderError::PreResponseStall
+        | NativeProviderError::Transport(_)
+        | NativeProviderError::Http { .. } => "",
     }
 }
 
@@ -7322,17 +7414,23 @@ async fn stream_native_turn_attempt(
     agent: &SageAgent,
     provider: &OpenAiNativeClient,
     request: NativeTurnRequest,
-    step: usize,
     answer_state: &mut NativeAnswerStreamState,
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
-    attempt: u32,
+    attempt_context: NativeModelAttempt,
 ) -> std::result::Result<NativeAssistantTurn, NativeProviderError> {
+    let NativeModelAttempt {
+        step,
+        attempt,
+        first_event_timeout,
+    } = attempt_context;
     let tools_enabled = !request.tools.is_empty();
     let request_started_at = Instant::now();
     let mut first_provider_event_seen = false;
     let (native_sender, mut native_receiver) = mpsc::unbounded_channel();
     let provider_turn = provider.stream_turn(request, Some(native_sender));
     tokio::pin!(provider_turn);
+    let first_event_deadline = tokio::time::sleep(first_event_timeout);
+    tokio::pin!(first_event_deadline);
 
     let turn_result = loop {
         tokio::select! {
@@ -7377,8 +7475,31 @@ async fn stream_native_turn_attempt(
                     delta_sender,
                 )?;
             }
+            _ = &mut first_event_deadline, if !first_provider_event_seen => {
+                agent.emit_trace_event(AgentTraceEvent::Timing {
+                    phase: ConversationTimingPhase::ProviderFirstEventWait,
+                    step: Some(step),
+                    tool_name: None,
+                    call_id: None,
+                    attempt,
+                    outcome: ConversationTimingOutcome::TimedOut,
+                    elapsed_ms: request_started_at.elapsed().as_millis(),
+                });
+                break Err(NativeProviderError::PreResponseStall);
+            }
         }
     };
+    if let Some(usage) = &answer_state.usage {
+        agent.emit_trace_event(AgentTraceEvent::ModelUsageObservation {
+            step,
+            attempt,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cached_tokens: usage.cached_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+        });
+    }
     let turn_result = match turn_result {
         Ok(turn) if !tools_enabled && turn.finish_reason == NativeFinishReason::ToolCalls => {
             Err(NativeProviderError::Protocol(
@@ -7395,6 +7516,8 @@ async fn stream_native_turn_attempt(
         attempt,
         outcome: if turn_result.is_ok() {
             ConversationTimingOutcome::Succeeded
+        } else if matches!(&turn_result, Err(NativeProviderError::PreResponseStall)) {
+            ConversationTimingOutcome::TimedOut
         } else {
             ConversationTimingOutcome::Failed
         },
@@ -7409,8 +7532,13 @@ fn stage_native_provider_signal(
     answer_state: &mut NativeAnswerStreamState,
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 ) -> std::result::Result<(), NativeProviderError> {
+    answer_state.saw_provider_event = true;
     let delta = match signal {
         NativeProviderSignal::Content(delta) => delta,
+        NativeProviderSignal::Usage(usage) => {
+            answer_state.usage = Some(usage);
+            return Ok(());
+        }
         NativeProviderSignal::Event => return Ok(()),
     };
     let released = release_answer_delta(delta.clone(), delta_sender);
@@ -8003,11 +8131,14 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
 const PLAIN_ANSWER_MAX_TOKENS: u32 = 8192;
 const MAX_NATIVE_TOOL_ROUNDS: usize = 6;
 const CONVERSATION_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const CONVERSATION_MODEL_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Default)]
 struct NativeAnswerStreamState {
     answer: String,
     released_any: bool,
+    saw_provider_event: bool,
+    usage: Option<NativeModelUsage>,
 }
 
 impl NativeAnswerStreamState {
@@ -8199,6 +8330,7 @@ fn model_provider_error(error: NativeProviderError) -> AppError {
         )
     } else {
         let (category, status) = match &error {
+            NativeProviderError::PreResponseStall => ("provider_pre_response_stall", 0),
             NativeProviderError::Http { status, .. } => ("provider_rejected", status.as_u16()),
             NativeProviderError::Transport(_) => ("provider_transport", 0),
             NativeProviderError::Protocol(_) => ("provider_protocol", 0),
@@ -9002,6 +9134,7 @@ mod tests {
                 release_completion.notified().await;
                 yield Ok::<_, Infallible>(axum::body::Bytes::from_static(concat!(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"It is now complete.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":23,\"completion_tokens\":9,\"total_tokens\":32}}\n\n",
                     "data: [DONE]\n\n"
                 ).as_bytes()));
             });
@@ -9093,6 +9226,18 @@ mod tests {
             } if enabled_tools == &["knowledge_search"]
                 && selected_tools.is_empty()
                 && outcome == "none"
+        )));
+        assert!(trace_events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::ModelUsageObservation {
+                step: 0,
+                attempt: 1,
+                prompt_tokens: Some(23),
+                completion_tokens: Some(9),
+                total_tokens: Some(32),
+                cached_tokens: None,
+                reasoning_tokens: None,
+            }
         )));
         for phase in [
             ConversationTimingPhase::ProviderFirstEventWait,
@@ -9859,7 +10004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unusable_native_response_gets_one_content_neutral_protocol_retry() {
+    async fn valid_but_unusable_provider_event_is_not_retried() {
         #[derive(Clone, Default)]
         struct ProviderState(Arc<Mutex<Vec<Value>>>);
 
@@ -9911,12 +10056,84 @@ mod tests {
         );
         let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
 
-        let turn =
-            run_native_turn_with_provider(&mut agent, &provider, "hello", "test-model", None)
-                .await
-                .expect("one protocol retry should recover");
+        let result =
+            run_native_turn_with_provider(&mut agent, &provider, "hello", "test-model", None).await;
 
-        assert_eq!(turn.answer, "Recovered answer.");
+        assert!(
+            result.is_err(),
+            "a valid provider event must prevent a second model request"
+        );
+        let requests = provider_state.0.lock().expect("captured provider requests");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_provider_silence_retries_the_identical_request_once() {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            let request_number = {
+                let mut requests = state.0.lock().expect("provider request capture");
+                requests.push(body);
+                requests.len()
+            };
+            if request_number == 1 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered after silence.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }
+
+        let provider_state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(provider_state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider should serve");
+        });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let request = NativeTurnRequest {
+            model: "glm-5-2".to_string(),
+            messages: vec![NativeChatMessage::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+        };
+
+        let (turn, _, attempt) = request_native_turn_with_retry_and_first_event_timeout(
+            &agent,
+            &provider,
+            request,
+            0,
+            &None,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("one identical retry should recover from complete provider silence");
+
+        assert_eq!(turn.content, "Recovered after silence.");
+        assert_eq!(attempt, 2);
         let requests = provider_state.0.lock().expect("captured provider requests");
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
@@ -10309,10 +10526,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_partial_content_can_retry_but_released_stream_content_cannot() {
+    async fn any_provider_event_prevents_a_second_model_request() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        async fn spawn_provider() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        async fn spawn_provider(
+            private_reasoning_only: bool,
+        ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let accepted = Arc::new(AtomicUsize::new(0));
@@ -10324,7 +10543,11 @@ mod tests {
                     let mut request = [0_u8; 4096];
                     let _ = socket.read(&mut request).await;
                     let body = if attempt == 0 {
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"Private partial. \"},\"finish_reason\":null}]}\n\n"
+                        if private_reasoning_only {
+                            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Private reasoning.\"},\"finish_reason\":null}]}\n\n"
+                        } else {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Released partial. \"},\"finish_reason\":null}]}\n\n"
+                        }
                     } else {
                         concat!(
                             "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered cleanly.\"},\"finish_reason\":\"stop\"}]}\n\n",
@@ -10346,7 +10569,7 @@ mod tests {
             (address, accepted)
         }
 
-        let (nonstream_address, nonstream_accepted) = spawn_provider().await;
+        let (nonstream_address, nonstream_accepted) = spawn_provider(true).await;
         let nonstream_provider = OpenAiNativeClient::new(
             Client::new(),
             format!("http://{nonstream_address}/v1"),
@@ -10355,19 +10578,21 @@ mod tests {
         );
         let mut nonstream_agent =
             SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
-        let turn = run_native_turn_with_provider(
+        let private_reasoning_result = run_native_turn_with_provider(
             &mut nonstream_agent,
             &nonstream_provider,
             "hello",
             "glm-5-2",
             None,
         )
-        .await
-        .expect("private buffered content should not prevent a safe retry");
-        assert_eq!(turn.answer, "Recovered cleanly.");
-        assert_eq!(nonstream_accepted.load(Ordering::SeqCst), 2);
+        .await;
+        assert!(
+            private_reasoning_result.is_err(),
+            "private provider reasoning is progress and must prevent retry"
+        );
+        assert_eq!(nonstream_accepted.load(Ordering::SeqCst), 1);
 
-        let (stream_address, stream_accepted) = spawn_provider().await;
+        let (stream_address, stream_accepted) = spawn_provider(false).await;
         let stream_provider = OpenAiNativeClient::new(
             Client::new(),
             format!("http://{stream_address}/v1"),
@@ -10393,7 +10618,7 @@ mod tests {
         assert_eq!(stream_accepted.load(Ordering::SeqCst), 1);
         match delta_rx.try_recv().unwrap() {
             ConversationStreamSignal::Answer(delta) => {
-                assert_eq!(delta, "Private partial. ")
+                assert_eq!(delta, "Released partial. ")
             }
             ConversationStreamSignal::Trace(_) => panic!("expected the released answer delta"),
         }
@@ -14900,6 +15125,39 @@ mod tests {
             "result",
             "reasoning",
             "secret",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn model_usage_observation_preserves_provider_reported_absence() {
+        let event = AgentTraceEvent::ModelUsageObservation {
+            step: 2,
+            attempt: 1,
+            prompt_tokens: Some(101),
+            completion_tokens: Some(29),
+            total_tokens: Some(130),
+            cached_tokens: None,
+            reasoning_tokens: None,
+        };
+        let delta = agent_trace_event_delta(event);
+
+        assert_eq!(delta.kind, "timing");
+        assert_eq!(delta.metadata["phase"], "model_request");
+        assert_eq!(delta.metadata["step"], 2);
+        assert_eq!(delta.metadata["attempt"], 1);
+        assert_eq!(delta.metadata["prompt_tokens"], 101);
+        assert_eq!(delta.metadata["completion_tokens"], 29);
+        assert_eq!(delta.metadata["total_tokens"], 130);
+        assert!(delta.metadata["cached_tokens"].is_null());
+        assert!(delta.metadata["reasoning_tokens"].is_null());
+        let rendered = format!("{delta:?}");
+        for forbidden in [
+            "prompt text",
+            "answer text",
+            "tool arguments",
+            "reasoning text",
         ] {
             assert!(!rendered.contains(forbidden));
         }

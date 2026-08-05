@@ -24,6 +24,8 @@ pub struct NativeToolCall {
 pub struct NativeAssistantMessage {
     pub content: String,
     pub tool_calls: Vec<NativeToolCall>,
+    /// Provider-supplied opaque continuity state for the current native Tool loop.
+    pub continuity_state: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +82,9 @@ impl NativeChatMessage {
                         ),
                     );
                 }
+                if let Some(continuity_state) = &message.continuity_state {
+                    value.insert("reasoning_content".to_string(), json!(continuity_state));
+                }
                 Value::Object(value)
             }
             Self::ToolResult { call_id, content } => json!({
@@ -100,6 +105,7 @@ pub enum NativeFinishReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeProviderSignal {
     Content(String),
+    Usage(NativeModelUsage),
     Event,
 }
 
@@ -109,7 +115,18 @@ const MAX_NATIVE_TOOL_CALLS: usize = 8;
 pub struct NativeAssistantTurn {
     pub content: String,
     pub tool_calls: Vec<NativeToolCall>,
+    pub continuity_state: Option<String>,
+    pub usage: Option<NativeModelUsage>,
     pub finish_reason: NativeFinishReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeModelUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +139,8 @@ pub struct NativeTurnRequest {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeProviderError {
+    #[error("native provider emitted no stream event before the first-event deadline")]
+    PreResponseStall,
     #[error("native provider transport failed: {0}")]
     Transport(#[from] reqwest::Error),
     #[error("native provider returned HTTP {status}: {body}")]
@@ -150,6 +169,8 @@ struct PartialToolCall {
 #[derive(Default)]
 struct NativeStreamState {
     content: String,
+    continuity_state: String,
+    usage: Option<NativeModelUsage>,
     tool_calls: BTreeMap<u64, PartialToolCall>,
     finish_reason: Option<NativeFinishReason>,
     saw_done: bool,
@@ -185,6 +206,7 @@ impl OpenAiNativeClient {
             ("temperature".to_string(), json!(self.temperature)),
             ("max_tokens".to_string(), json!(request.max_tokens)),
             ("stream".to_string(), json!(true)),
+            ("stream_options".to_string(), json!({"include_usage": true})),
         ]);
         if !request.tools.is_empty() {
             body.insert(
@@ -286,11 +308,30 @@ fn consume_sse_line(
             "provider streamed an error: {provider_error}"
         )));
     }
+    let mut observed_usage = false;
+    if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+        if state.usage.is_some() {
+            return Err(NativeProviderError::Protocol(
+                "provider sent multiple usage observations".to_string(),
+            ));
+        }
+        let usage = parse_usage(usage)?;
+        if let Some(sender) = signal_sender {
+            let _ = sender.send(NativeProviderSignal::Usage(usage.clone()));
+        }
+        state.usage = Some(usage);
+        observed_usage = true;
+    }
     let choices = value
         .get("choices")
         .and_then(Value::as_array)
         .ok_or_else(|| NativeProviderError::Protocol("SSE event omitted choices".to_string()))?;
     if choices.is_empty() {
+        if !observed_usage {
+            if let Some(sender) = signal_sender {
+                let _ = sender.send(NativeProviderSignal::Event);
+            }
+        }
         return Ok(());
     }
     if choices.len() != 1 {
@@ -319,8 +360,11 @@ fn consume_sse_line(
             emitted_content = true;
         }
     }
-    for field in ["reasoning", "reasoning_content"] {
-        let _ = optional_string(delta.get(field), field)?;
+    let reasoning_content =
+        optional_string(delta.get("reasoning_content"), "delta.reasoning_content")?;
+    let reasoning = optional_string(delta.get("reasoning"), "delta.reasoning")?;
+    if let Some(continuity_delta) = reasoning_content.or(reasoning) {
+        state.continuity_state.push_str(continuity_delta);
     }
     if let Some(tool_calls) = delta.get("tool_calls") {
         let tool_calls = tool_calls.as_array().ok_or_else(|| {
@@ -387,7 +431,7 @@ fn consume_sse_line(
             ));
         }
     }
-    if !emitted_content && !delta.is_empty() {
+    if !observed_usage && !emitted_content {
         if let Some(sender) = signal_sender {
             let _ = sender.send(NativeProviderSignal::Event);
         }
@@ -462,8 +506,59 @@ fn finish_stream(state: NativeStreamState) -> Result<NativeAssistantTurn, Native
     Ok(NativeAssistantTurn {
         content: state.content,
         tool_calls,
+        continuity_state: (!state.continuity_state.is_empty()).then_some(state.continuity_state),
+        usage: state.usage,
         finish_reason,
     })
+}
+
+fn parse_usage(value: &Value) -> Result<NativeModelUsage, NativeProviderError> {
+    let usage = value.as_object().ok_or_else(|| {
+        NativeProviderError::Protocol("provider usage was not an object".to_string())
+    })?;
+    let prompt_details = optional_object(
+        usage.get("prompt_tokens_details"),
+        "usage.prompt_tokens_details",
+    )?;
+    let completion_details = optional_object(
+        usage.get("completion_tokens_details"),
+        "usage.completion_tokens_details",
+    )?;
+    Ok(NativeModelUsage {
+        prompt_tokens: optional_u64(usage.get("prompt_tokens"), "usage.prompt_tokens")?,
+        completion_tokens: optional_u64(usage.get("completion_tokens"), "usage.completion_tokens")?,
+        total_tokens: optional_u64(usage.get("total_tokens"), "usage.total_tokens")?,
+        cached_tokens: optional_u64(
+            prompt_details.and_then(|details| details.get("cached_tokens")),
+            "usage.prompt_tokens_details.cached_tokens",
+        )?,
+        reasoning_tokens: optional_u64(
+            completion_details.and_then(|details| details.get("reasoning_tokens")),
+            "usage.completion_tokens_details.reasoning_tokens",
+        )?,
+    })
+}
+
+fn optional_object<'a>(
+    value: Option<&'a Value>,
+    field: &str,
+) -> Result<Option<&'a Map<String, Value>>, NativeProviderError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(value)) => Ok(Some(value)),
+        Some(_) => Err(NativeProviderError::Protocol(format!(
+            "{field} was not an object"
+        ))),
+    }
+}
+
+fn optional_u64(value: Option<&Value>, field: &str) -> Result<Option<u64>, NativeProviderError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            NativeProviderError::Protocol(format!("{field} was not a non-negative integer"))
+        }),
+    }
 }
 
 fn optional_string<'a>(
@@ -526,14 +621,15 @@ mod tests {
         };
         let stream = if request_index == 1 {
             concat!(
-                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\"}}]},\"finish_reason\":null}]}\n\n",
-                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"freedom guide\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"private continuity \",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"state\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"freedom guide\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                 "data: [DONE]\n\n"
             )
         } else {
             concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded \"},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":41,\"completion_tokens\":17,\"total_tokens\":58,\"prompt_tokens_details\":{\"cached_tokens\":11},\"completion_tokens_details\":{\"reasoning_tokens\":7}}}\n\n",
                 "data: [DONE]\n\n"
             )
         };
@@ -594,6 +690,10 @@ mod tests {
 
         assert_eq!(first.finish_reason, NativeFinishReason::ToolCalls);
         assert_eq!(
+            first.continuity_state.as_deref(),
+            Some("private continuity state")
+        );
+        assert_eq!(
             first.tool_calls,
             vec![NativeToolCall {
                 id: "call-1".to_string(),
@@ -613,6 +713,7 @@ mod tests {
                         NativeChatMessage::Assistant(NativeAssistantMessage {
                             content: first.content,
                             tool_calls: first.tool_calls,
+                            continuity_state: first.continuity_state,
                         }),
                         NativeChatMessage::tool_result("call-1", "The guide recommends safety."),
                     ],
@@ -626,6 +727,13 @@ mod tests {
 
         assert_eq!(second.finish_reason, NativeFinishReason::Stop);
         assert_eq!(second.content, "Grounded answer.");
+        assert_eq!(second.continuity_state, None);
+        let usage = second.usage.expect("terminal usage should be observed");
+        assert_eq!(usage.prompt_tokens, Some(41));
+        assert_eq!(usage.completion_tokens, Some(17));
+        assert_eq!(usage.total_tokens, Some(58));
+        assert_eq!(usage.cached_tokens, Some(11));
+        assert_eq!(usage.reasoning_tokens, Some(7));
         assert_eq!(
             vec![signal_receiver.recv().await, signal_receiver.recv().await,],
             vec![
@@ -646,8 +754,16 @@ mod tests {
         );
         assert_eq!(requests[0].get("tool_choice"), Some(&json!("auto")));
         assert_eq!(
+            requests[0].pointer("/stream_options/include_usage"),
+            Some(&json!(true))
+        );
+        assert_eq!(
             requests[1].pointer("/messages/2/tool_calls/0/id"),
             Some(&json!("call-1"))
+        );
+        assert_eq!(
+            requests[1].pointer("/messages/2/reasoning_content"),
+            Some(&json!("private continuity state"))
         );
         assert_eq!(
             requests[1].pointer("/messages/3/tool_call_id"),
