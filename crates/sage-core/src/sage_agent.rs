@@ -1170,6 +1170,12 @@ pub enum AgentTraceEvent {
         cached_tokens: Option<u64>,
         reasoning_tokens: Option<u64>,
     },
+    PreResponseProviderStall {
+        step: usize,
+        attempt: u32,
+        threshold_ms: u128,
+        elapsed_ms: u128,
+    },
     CorrectionStarted {
         step: usize,
         attempt: u32,
