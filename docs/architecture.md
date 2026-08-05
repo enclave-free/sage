@@ -49,8 +49,8 @@ This file contains the branch-specific integration layer:
 - `InternalAgentClient`
 - session ownership checks
 - AI config CRUD and prompt preview
-- current prepared-tool context logic plus the ADR-0023 target Tool Set expansion
-  and model-driven Tool loop execution for Conversation routes
+- current prepared-tool context logic plus Tool Set expansion and the bounded
+  native Tool batch for Conversation routes
 - prompt assembly helpers
 
 ## Public Routes
@@ -58,7 +58,7 @@ This file contains the branch-specific integration layer:
 | Route | Ownership | Notes |
 | --- | --- | --- |
 | `GET /health` | Sage service health | direct Sage runtime health, usually consumed internally |
-| `POST /llm/chat` | Sage | Conversation transport with model-driven Tool loop |
+| `POST /llm/chat` | Sage | Conversation transport with at most one native Tool batch |
 | `POST /query` | Sage | stateful Conversation API compatibility shape |
 | `GET /query/session/{session_id}` | Sage | session inspection |
 | `DELETE /query/session/{session_id}` | Sage | deletes session record |
@@ -119,16 +119,19 @@ This is the real integration boundary. If request or response shapes change, bot
 
 ## Conversation Flow Target
 
-Sage owns the model-driven Tool loop for Conversation routes.
+Sage owns the bounded native Tool round for Conversation routes.
 
 1. enforce CSRF for cookie-authenticated unsafe requests
 2. verify auth natively in Sage
 3. hydrate user/admin identity from Python if needed
 4. load effective AI config and request temperature from Sage Postgres
 5. expand enabled Tool Sets into concrete Tool contracts
-6. run the model-driven Tool loop against the configured Model Provider
-7. execute authorized Tool calls, inject results, and continue until answer or Executable Change Set
-8. return the assistant message plus Activity/Trace metadata and Tool summaries
+6. ask the configured Conversation model to answer directly or select at most
+   one bounded batch of authorized Tool calls
+7. if Tools were selected, execute that batch and return its correlated,
+   structured results to the same model without Tool definitions
+8. accept the model's Tool-free final response; no further Tool execution can begin
+9. return the assistant message plus Activity/Trace metadata and Tool summaries
 
 Tool Sets:
 
@@ -136,7 +139,6 @@ Tool Sets:
 - `web-search` exposes `web_search`
 - `admin-config` exposes admin-only configuration read/proposal Tools
 - `db-query` exposes admin-only read-only database inspection Tools
-- `done` or the equivalent final-answer signal completes the loop
 
 The frontend should not pre-run Tools or inject admin configuration snapshots through `tool_context`.
 
@@ -154,7 +156,7 @@ The frontend should not pre-run Tools or inject admin configuration snapshots th
    - persona block from compiled Enclave prompt profile
    - human block from auth + profile context
 8. persist the user turn
-9. run the same model-driven Tool loop with memory enabled
+9. run the same bounded native Tool round with memory enabled
 10. persist the assistant turn
 11. return `session_id`, `sources`, `context_used`, and answer
 
