@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 
 const NATIVE_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const NATIVE_PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_NATIVE_SSE_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeToolDefinition {
@@ -290,8 +291,10 @@ impl OpenAiNativeClient {
                 buffer.drain(..=newline);
                 consume_sse_line(&line, &mut state, &signal_sender)?;
             }
+            validate_sse_buffer_len(buffer.len())?;
         }
         if !buffer.is_empty() {
+            validate_sse_buffer_len(buffer.len())?;
             let line = String::from_utf8_lossy(&buffer)
                 .trim_end_matches(['\r', '\n'])
                 .to_string();
@@ -299,6 +302,15 @@ impl OpenAiNativeClient {
         }
         finish_stream(state)
     }
+}
+
+fn validate_sse_buffer_len(buffer_len: usize) -> Result<(), NativeProviderError> {
+    if buffer_len > MAX_NATIVE_SSE_LINE_BYTES {
+        return Err(NativeProviderError::Protocol(format!(
+            "provider sent an SSE line longer than {MAX_NATIVE_SSE_LINE_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn consume_sse_line(
@@ -449,12 +461,17 @@ fn finish_stream(state: NativeStreamState) -> Result<NativeAssistantTurn, Native
                 "provider returned an incomplete Tool call".to_string(),
             ));
         }
-        let arguments = serde_json::from_str::<Value>(&call.arguments).map_err(|error| {
-            NativeProviderError::Protocol(format!(
-                "Tool '{}' returned malformed arguments: {error}",
-                call.name
-            ))
-        })?;
+        let raw_arguments = call.arguments.trim();
+        let arguments = if raw_arguments.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str::<Value>(raw_arguments).map_err(|error| {
+                NativeProviderError::Protocol(format!(
+                    "Tool '{}' returned malformed arguments: {error}",
+                    call.name
+                ))
+            })?
+        };
         if !arguments.is_object() {
             return Err(NativeProviderError::Protocol(format!(
                 "Tool '{}' arguments were not a JSON object",
@@ -529,9 +546,10 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        consume_sse_line, finish_stream, NativeAssistantMessage, NativeChatMessage,
-        NativeFinishReason, NativeProviderSignal, NativeStreamState, NativeToolCall,
-        NativeToolDefinition, NativeTurnRequest, OpenAiNativeClient,
+        consume_sse_line, finish_stream, validate_sse_buffer_len, NativeAssistantMessage,
+        NativeChatMessage, NativeFinishReason, NativeProviderSignal, NativeStreamState,
+        NativeToolCall, NativeToolDefinition, NativeTurnRequest, OpenAiNativeClient,
+        MAX_NATIVE_SSE_LINE_BYTES,
     };
     use axum::{
         body::{Body, Bytes},
@@ -727,6 +745,30 @@ mod tests {
         let turn = finish_stream(state).expect("terminal stream should finish");
         assert_eq!(turn.finish_reason, NativeFinishReason::Stop);
         assert_eq!(turn.content, "Complete answer.");
+    }
+
+    #[test]
+    fn empty_tool_arguments_become_an_empty_object() {
+        let mut state = NativeStreamState::default();
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_status","arguments":"   "}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut state,
+            &None,
+        )
+        .expect("empty Tool arguments should parse as stream fragments");
+        consume_sse_line("data: [DONE]", &mut state, &None).expect("DONE marker should parse");
+
+        let turn = finish_stream(state).expect("empty arguments should normalize");
+        assert_eq!(turn.tool_calls[0].arguments, json!({}));
+    }
+
+    #[test]
+    fn unterminated_sse_line_is_bounded() {
+        validate_sse_buffer_len(MAX_NATIVE_SSE_LINE_BYTES)
+            .expect("the exact line budget should be accepted");
+        let error = validate_sse_buffer_len(MAX_NATIVE_SSE_LINE_BYTES + 1)
+            .expect_err("an oversized unterminated line must be rejected");
+        assert!(error.to_string().contains("SSE line longer"));
     }
 
     #[tokio::test]

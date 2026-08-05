@@ -825,7 +825,10 @@ impl Tool for ToolDescriptor {
         Ok(self.native_parameters.clone())
     }
     async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
-        unreachable!("ToolDescriptor is description-only and should never be executed")
+        Ok(NativeToolResult::failure(
+            "tool_not_executable",
+            "The requested Tool is not enabled for this conversation.",
+        ))
     }
 }
 
@@ -2148,8 +2151,11 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         tracing::info!("=== LLM REQUEST ===");
         tracing::info!("Tool results in cycle: {}", self.current_tool_results.len());
         tracing::info!("Is first time user: {}", ctx.is_first_time_user);
-        tracing::info!("Input: {}", input_content);
-        tracing::info!("Recent conversation:\n{}", ctx.recent_conversation);
+        tracing::debug!(
+            "LLM request content sizes: input_chars={}, recent_conversation_chars={}",
+            input_content.chars().count(),
+            ctx.recent_conversation.chars().count()
+        );
 
         let available_tools = self.tools.generate_description();
         let input = AgentResponseInput {
@@ -2590,6 +2596,26 @@ mod tests {
         let result = agent.execute_tool_call("native-call", 1, &call).await;
 
         assert_eq!(result.model_value()["path"], "native");
+    }
+
+    #[tokio::test]
+    async fn description_only_tool_returns_a_typed_failure() {
+        let descriptor = ToolDescriptor {
+            name: "described_only".to_string(),
+            description: "description-only test Tool".to_string(),
+            native_parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        };
+
+        let result = descriptor
+            .execute_native(&ToolArgs::new())
+            .await
+            .expect("description-only execution should fail without panicking");
+
+        assert_eq!(result.model_value()["error"]["code"], "tool_not_executable");
     }
 
     #[test]
