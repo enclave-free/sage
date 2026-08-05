@@ -41,8 +41,7 @@ use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::openai_native::{
     NativeAssistantMessage, NativeAssistantTurn, NativeChatMessage, NativeFinishReason,
-    NativeProviderError, NativeProviderSignal, NativeToolChoice, NativeTurnRequest,
-    OpenAiNativeClient,
+    NativeProviderError, NativeProviderSignal, NativeTurnRequest, OpenAiNativeClient,
 };
 use crate::sage_agent::{
     tool_parse_arg, tool_string_arg, AgentTraceEvent, ConversationTimingOutcome,
@@ -7055,86 +7054,82 @@ async fn run_native_turn_with_provider(
         NativeChatMessage::system(prompt.system),
         NativeChatMessage::user(prompt.user),
     ];
-    let initial_tool_choice = if tools.is_empty() {
-        NativeToolChoice::None
-    } else {
-        NativeToolChoice::Auto
-    };
-    let (first_turn, mut first_answer_state, selection_attempt) = request_native_turn_with_retry(
-        agent,
-        provider,
-        NativeTurnRequest {
-            model: model.to_string(),
-            messages: messages.clone(),
-            tools: tools.clone(),
-            tool_choice: initial_tool_choice,
-            max_tokens: PLAIN_ANSWER_MAX_TOKENS,
-        },
-        0,
-        &delta_sender,
-    )
-    .await
-    .map_err(|(error, _)| model_provider_error(error))?;
-    let (selected_tools, selection_outcome) =
-        native_tool_selection_observation(&enabled_tools, &first_turn.tool_calls);
-    agent.emit_trace_event(AgentTraceEvent::ToolSelectionObservation {
-        step: 0,
-        attempt: selection_attempt,
-        enabled_tools,
-        selected_tools: selected_tools.clone(),
-        outcome: selection_outcome,
-    });
+    let mut answer = String::new();
+    let mut executed_tools = Vec::new();
+    let mut completed_tool_rounds = 0;
 
-    let (answer, executed_tools) = match first_turn.finish_reason {
-        NativeFinishReason::Stop => {
-            if first_answer_state.answer.is_empty() {
-                stage_native_provider_signal(
-                    NativeProviderSignal::Content(first_turn.content.clone()),
-                    &mut first_answer_state,
-                    &delta_sender,
-                )
-                .map_err(model_provider_error)?;
-            }
-            (first_turn.content, Vec::new())
-        }
-        NativeFinishReason::ToolCalls => {
-            let preamble = first_turn.content.clone();
-            messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
-                content: first_turn.content,
-                tool_calls: first_turn.tool_calls.clone(),
-            }));
-            let batch = agent
-                .execute_native_tool_calls(&first_turn.tool_calls)
-                .await;
-            let result_contents = bounded_native_tool_result_contents(&batch.executed_tools);
-            for (call, content) in first_turn.tool_calls.iter().zip(result_contents) {
-                messages.push(NativeChatMessage::tool_result(&call.id, content));
-            }
-            let (final_turn, _final_answer_state, _) = request_native_turn_with_retry(
-                agent,
-                provider,
-                NativeTurnRequest {
-                    model: model.to_string(),
-                    messages,
-                    tools,
-                    tool_choice: NativeToolChoice::None,
-                    max_tokens: PLAIN_ANSWER_MAX_TOKENS,
-                },
-                1,
+    loop {
+        let step = completed_tool_rounds;
+        let (turn, mut answer_state, selection_attempt) = request_native_turn_with_retry(
+            agent,
+            provider,
+            NativeTurnRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                tools: tools.clone(),
+                max_tokens: PLAIN_ANSWER_MAX_TOKENS,
+            },
+            step,
+            &delta_sender,
+        )
+        .await
+        .map_err(|(error, _)| model_provider_error(error))?;
+        let (selected_tools, selection_outcome) =
+            native_tool_selection_observation(&enabled_tools, &turn.tool_calls);
+        agent.emit_trace_event(AgentTraceEvent::ToolSelectionObservation {
+            step,
+            attempt: selection_attempt,
+            enabled_tools: enabled_tools.clone(),
+            selected_tools,
+            outcome: selection_outcome,
+        });
+        if answer_state.answer.is_empty() && !turn.content.is_empty() {
+            stage_native_provider_signal(
+                NativeProviderSignal::Content(turn.content.clone()),
+                &mut answer_state,
                 &delta_sender,
             )
-            .await
-            .map_err(|(error, _)| model_provider_error(error))?;
-            (
-                format!("{preamble}{}", final_turn.content),
-                batch.executed_tools,
-            )
+            .map_err(model_provider_error)?;
         }
-    };
-    Ok(AdapterTurnOutput {
-        answer,
-        executed_tools,
-    })
+        answer.push_str(&turn.content);
+
+        if turn.finish_reason == NativeFinishReason::Stop {
+            return Ok(AdapterTurnOutput {
+                answer,
+                executed_tools,
+            });
+        }
+        if completed_tool_rounds == MAX_NATIVE_TOOL_ROUNDS {
+            warn!(
+                target: "sage.model_provider",
+                event_name = "native_tool_round_limit_reached",
+                max_tool_rounds = MAX_NATIVE_TOOL_ROUNDS,
+            );
+            return Err(AppError::new(
+                StatusCode::BAD_GATEWAY,
+                "The Conversation reached its Tool execution limit. Please narrow the request and try again.",
+            ));
+        }
+
+        messages.push(NativeChatMessage::Assistant(NativeAssistantMessage {
+            content: turn.content,
+            tool_calls: turn.tool_calls.clone(),
+        }));
+        let batch = agent
+            .execute_native_tool_calls(completed_tool_rounds + 1, &turn.tool_calls)
+            .await;
+        let result_contents = bounded_native_tool_result_contents(&batch.executed_tools);
+        if result_contents.len() != turn.tool_calls.len() {
+            return Err(AppError::internal(
+                "native Tool execution returned a mismatched result count",
+            ));
+        }
+        for (call, content) in turn.tool_calls.iter().zip(result_contents) {
+            messages.push(NativeChatMessage::tool_result(&call.id, content));
+        }
+        executed_tools.extend(batch.executed_tools);
+        completed_tool_rounds += 1;
+    }
 }
 
 fn native_tool_selection_observation(
@@ -7281,7 +7276,7 @@ async fn stream_native_turn_attempt(
     delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
     attempt: u32,
 ) -> std::result::Result<NativeAssistantTurn, NativeProviderError> {
-    let tools_enabled = request.tool_choice == NativeToolChoice::Auto;
+    let tools_enabled = !request.tools.is_empty();
     let request_started_at = Instant::now();
     let mut first_provider_event_seen = false;
     let (native_sender, mut native_receiver) = mpsc::unbounded_channel();
@@ -7955,6 +7950,7 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
 }
 
 const PLAIN_ANSWER_MAX_TOKENS: u32 = 8192;
+const MAX_NATIVE_TOOL_ROUNDS: usize = 2;
 const CONVERSATION_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Default)]
@@ -9187,10 +9183,13 @@ mod tests {
         agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
 
         let result = agent
-            .execute_native_tool_calls(&[
-                native_test_call("invalid-knowledge", "knowledge_search", ToolArgs::new()),
-                native_test_call("invalid-web", "web_search", ToolArgs::new()),
-            ])
+            .execute_native_tool_calls(
+                1,
+                &[
+                    native_test_call("invalid-knowledge", "knowledge_search", ToolArgs::new()),
+                    native_test_call("invalid-web", "web_search", ToolArgs::new()),
+                ],
+            )
             .await;
 
         assert!(result
@@ -9354,7 +9353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_tool_turn_executes_one_batch_and_disables_final_tool_selection() {
+    async fn native_tool_turn_executes_one_batch_and_returns_correlated_results() {
         #[derive(Clone, Default)]
         struct ProviderState(Arc<Mutex<Vec<Value>>>);
 
@@ -9445,7 +9444,7 @@ mod tests {
         );
         assert_eq!(requests[1]["tools"], requests[0]["tools"]);
         assert_eq!(requests[0]["tool_choice"], "auto");
-        assert_eq!(requests[1]["tool_choice"], "none");
+        assert_eq!(requests[1]["tool_choice"], "auto");
         assert_eq!(requests[1]["messages"][2]["tool_calls"][0]["id"], "call-a");
         assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-a");
         assert_eq!(requests[1]["messages"][4]["tool_call_id"], "call-b");
@@ -9496,6 +9495,172 @@ mod tests {
                 ))
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tool_turn_allows_one_model_selected_follow_up_batch() {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> impl IntoResponse {
+            let tool_result_count = body["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|message| message["role"] == "tool")
+                .count();
+            state.0.lock().expect("provider request capture").push(body);
+            let stream = match tool_result_count {
+                0 => concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"First lookup. \",\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                1 => concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Refining. \",\"tool_calls\":[{\"index\":0,\"id\":\"call-b\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                _ => concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            };
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                stream,
+            )
+        }
+
+        let provider_state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(provider_state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider should serve");
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingReadTool {
+            executions: executions.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let trace_events = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink.lock().expect("native trace sink").push(event);
+        }));
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let turn = run_native_turn_with_provider(
+            &mut agent,
+            &provider,
+            "use the documents",
+            "glm-5-2",
+            None,
+        )
+        .await
+        .expect("the model-selected follow-up Tool batch should complete");
+
+        assert_eq!(turn.answer, "First lookup. Refining. Grounded answer.");
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(turn.executed_tools.len(), 2);
+        let requests = provider_state.0.lock().expect("captured requests");
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|request| request["tool_choice"] == "auto"));
+        assert_eq!(requests[2]["messages"][3]["tool_call_id"], "call-a");
+        assert_eq!(requests[2]["messages"][5]["tool_call_id"], "call-b");
+        let attempted_rounds = trace_events
+            .lock()
+            .expect("native trace events")
+            .iter()
+            .filter_map(|event| match event {
+                AgentTraceEvent::ToolAttempted { tool_round, .. } => Some(*tool_round),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(attempted_rounds, [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn native_tool_round_limit_never_executes_a_third_batch() {
+        async fn completion(Json(body): Json<Value>) -> impl IntoResponse {
+            let tool_result_count = body["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|message| message["role"] == "tool")
+                .count();
+            let call_id = format!("call-{tool_result_count}");
+            let stream = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"{call_id}\",\"function\":{{\"name\":\"knowledge_search\",\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                stream,
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(completion)),
+            )
+            .await
+            .expect("test provider should serve");
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingReadTool {
+            executions: executions.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let error = match run_native_turn_with_provider(
+            &mut agent,
+            &provider,
+            "keep searching",
+            "glm-5-2",
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a third native Tool batch must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(executions.load(Ordering::SeqCst), MAX_NATIVE_TOOL_ROUNDS);
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.message,
+            "The Conversation reached its Tool execution limit. Please narrow the request and try again."
         );
     }
 
@@ -9706,8 +9871,8 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert!(requests.iter().all(|request| request["model"] == "glm-5-2"));
         assert_eq!(requests[1]["tools"], requests[0]["tools"]);
-        assert_eq!(requests[1]["tool_choice"], "none");
-        assert_eq!(requests[2]["tool_choice"], "none");
+        assert_eq!(requests[1]["tool_choice"], "auto");
+        assert_eq!(requests[2]["tool_choice"], "auto");
         assert_eq!(requests[1]["messages"], requests[2]["messages"]);
         assert_eq!(requests[1]["tools"], requests[2]["tools"]);
         assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-once");
@@ -11114,10 +11279,13 @@ mod tests {
                 .push(event);
         }));
         let result = agent
-            .execute_native_tool_calls(&[
-                native_test_call("call-web", "web_search", ToolArgs::new()),
-                native_test_call("call-db", "db_query", ToolArgs::new()),
-            ])
+            .execute_native_tool_calls(
+                1,
+                &[
+                    native_test_call("call-web", "web_search", ToolArgs::new()),
+                    native_test_call("call-db", "db_query", ToolArgs::new()),
+                ],
+            )
             .await;
         assert_eq!(result.executed_tools.len(), 2);
         let events = events.lock().expect("event sink should lock");
@@ -11326,11 +11494,14 @@ mod tests {
                 .push(event);
         }));
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-endpoint",
-                "endpoint_lookup",
-                ToolArgs::new(),
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-endpoint",
+                    "endpoint_lookup",
+                    ToolArgs::new(),
+                )],
+            )
             .await
             .executed_tools
             .into_iter()
@@ -11521,11 +11692,14 @@ mod tests {
         let sink = events.clone();
         agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-write",
-                "write_config",
-                ToolArgs::new(),
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-write",
+                    "write_config",
+                    ToolArgs::new(),
+                )],
+            )
             .await;
         server.abort();
         assert!(!result.executed_tools[0].result.is_success());
@@ -11581,11 +11755,14 @@ mod tests {
         let sink = events.clone();
         agent.set_trace_hook(Arc::new(move |event| sink.lock().unwrap().push(event)));
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-resources",
-                "find_resources",
-                ToolArgs::from([("query".to_string(), json!("aid"))]),
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-resources",
+                    "find_resources",
+                    ToolArgs::from([("query".to_string(), json!("aid"))]),
+                )],
+            )
             .await;
         server.abort();
         assert!(result.executed_tools[0].result.is_success());
@@ -11640,11 +11817,14 @@ mod tests {
         }));
         let mut agent = SageAgent::new_without_memory(registry, "test");
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-empty-resources",
-                "find_resources",
-                ToolArgs::from([("offset".to_string(), json!(12))]),
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-empty-resources",
+                    "find_resources",
+                    ToolArgs::from([("offset".to_string(), json!(12))]),
+                )],
+            )
             .await;
         empty_server.abort();
         assert!(result.executed_tools[0].result.is_success());
@@ -11708,11 +11888,14 @@ mod tests {
         }));
         let mut agent = SageAgent::new_without_memory(registry, "test");
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-knowledge",
-                "knowledge_search",
-                ToolArgs::from([("query".to_string(), json!("handbook"))]),
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-knowledge",
+                    "knowledge_search",
+                    ToolArgs::from([("query".to_string(), json!("handbook"))]),
+                )],
+            )
             .await;
         knowledge_server.abort();
         assert!(result.executed_tools[0].result.is_success());
@@ -12677,11 +12860,14 @@ mod tests {
         let mut agent = SageAgent::new_without_memory(registry, "test");
 
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-db-unauthorized",
-                "db_query",
-                ToolArgs::from([("sql".to_string(), json!("SELECT id FROM users"))]),
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-db-unauthorized",
+                    "db_query",
+                    ToolArgs::from([("sql".to_string(), json!("SELECT id FROM users"))]),
+                )],
+            )
             .await;
         server.abort();
 
@@ -12744,11 +12930,14 @@ mod tests {
             )));
         }));
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-db-guarded",
-                "db_query",
-                ToolArgs::from([("sql".to_string(), json!("DROP TABLE users"))]),
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-db-guarded",
+                    "db_query",
+                    ToolArgs::from([("sql".to_string(), json!("DROP TABLE users"))]),
+                )],
+            )
             .await;
         server.abort();
 
@@ -12790,11 +12979,14 @@ mod tests {
             )));
         }));
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-unknown",
-                "unregistered_tool",
-                ToolArgs::default(),
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-unknown",
+                    "unregistered_tool",
+                    ToolArgs::default(),
+                )],
+            )
             .await;
         let failure = result.executed_tools[0].result.model_value();
         assert_eq!(failure["error"]["code"], "unknown_tool");
@@ -12852,11 +13044,14 @@ mod tests {
         }));
 
         let result = agent
-            .execute_native_tool_calls(&[crate::openai_native::NativeToolCall {
-                id: "call-malformed".to_string(),
-                name: "knowledge_search".to_string(),
-                arguments: json!("not-an-object"),
-            }])
+            .execute_native_tool_calls(
+                1,
+                &[crate::openai_native::NativeToolCall {
+                    id: "call-malformed".to_string(),
+                    name: "knowledge_search".to_string(),
+                    arguments: json!("not-an-object"),
+                }],
+            )
             .await;
 
         let failure = result.executed_tools[0].result.model_value();
@@ -12960,11 +13155,14 @@ mod tests {
         registry.register(Arc::new(tool));
         let mut agent = SageAgent::new_without_memory(registry, "test");
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-admin-approved",
-                "update_deployment_settings",
-                args,
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-admin-approved",
+                    "update_deployment_settings",
+                    args,
+                )],
+            )
             .await;
         server.abort();
 
@@ -13053,14 +13251,17 @@ mod tests {
         registry.register(Arc::new(tool));
         let mut agent = SageAgent::new_without_memory(registry, "test");
         let result = agent
-            .execute_native_tool_calls(&[native_test_call(
-                "call-admin-rejected",
-                "update_instance_settings",
-                ToolArgs::from([(
-                    "settings".to_string(),
-                    json!({"default_language": "English"}),
-                )]),
-            )])
+            .execute_native_tool_calls(
+                1,
+                &[native_test_call(
+                    "call-admin-rejected",
+                    "update_instance_settings",
+                    ToolArgs::from([(
+                        "settings".to_string(),
+                        json!({"default_language": "English"}),
+                    )]),
+                )],
+            )
             .await;
         server.abort();
 

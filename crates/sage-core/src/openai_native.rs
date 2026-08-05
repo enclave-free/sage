@@ -97,12 +97,6 @@ pub enum NativeFinishReason {
     ToolCalls,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NativeToolChoice {
-    Auto,
-    None,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeProviderSignal {
     Content(String),
@@ -123,7 +117,6 @@ pub struct NativeTurnRequest {
     pub model: String,
     pub messages: Vec<NativeChatMessage>,
     pub tools: Vec<NativeToolDefinition>,
-    pub tool_choice: NativeToolChoice,
     pub max_tokens: u32,
 }
 
@@ -213,14 +206,10 @@ impl OpenAiNativeClient {
                         .collect(),
                 ),
             );
+            body.insert("tool_choice".to_string(), json!("auto"));
+        } else {
+            body.insert("tool_choice".to_string(), json!("none"));
         }
-        body.insert(
-            "tool_choice".to_string(),
-            json!(match request.tool_choice {
-                NativeToolChoice::Auto => "auto",
-                NativeToolChoice::None => "none",
-            }),
-        );
 
         let response = self
             .client
@@ -510,8 +499,8 @@ mod tests {
     use super::{
         consume_sse_line, finish_stream, validate_sse_buffer_len, NativeAssistantMessage,
         NativeChatMessage, NativeFinishReason, NativeProviderSignal, NativeStreamState,
-        NativeToolCall, NativeToolChoice, NativeToolDefinition, NativeTurnRequest,
-        OpenAiNativeClient, MAX_NATIVE_SSE_LINE_BYTES,
+        NativeToolCall, NativeToolDefinition, NativeTurnRequest, OpenAiNativeClient,
+        MAX_NATIVE_SSE_LINE_BYTES,
     };
     use axum::{
         extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
@@ -596,7 +585,6 @@ mod tests {
                         NativeChatMessage::user("What does the guide say?"),
                     ],
                     tools: vec![tool.clone()],
-                    tool_choice: NativeToolChoice::Auto,
                     max_tokens: 8192,
                 },
                 None,
@@ -629,7 +617,6 @@ mod tests {
                         NativeChatMessage::tool_result("call-1", "The guide recommends safety."),
                     ],
                     tools: vec![tool],
-                    tool_choice: NativeToolChoice::None,
                     max_tokens: 8192,
                 },
                 Some(signal_sender),
@@ -670,7 +657,7 @@ mod tests {
             requests[1].pointer("/tools/0/function/name"),
             Some(&json!("knowledge_search"))
         );
-        assert_eq!(requests[1].get("tool_choice"), Some(&json!("none")));
+        assert_eq!(requests[1].get("tool_choice"), Some(&json!("auto")));
     }
 
     #[test]
