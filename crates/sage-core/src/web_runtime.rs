@@ -885,7 +885,23 @@ struct InternalAdminConfigToolResponse {
 #[derive(Debug, PartialEq, Eq)]
 enum AdminConfigToolError {
     Unauthorized,
-    Failed(String),
+    Validation(String),
+    Execution(String),
+}
+
+fn admin_config_native_failure(error: AdminConfigToolError) -> NativeToolResult {
+    match error {
+        AdminConfigToolError::Unauthorized => NativeToolResult::failure(
+            "unauthorized",
+            "Admin Config Tools require an approved admin actor.",
+        ),
+        AdminConfigToolError::Validation(message) => {
+            NativeToolResult::failure("validation_failed", message)
+        }
+        AdminConfigToolError::Execution(message) => {
+            NativeToolResult::failure("execution_failed", message)
+        }
+    }
 }
 
 fn admin_config_error_detail(value: &Value, fallback: &str) -> String {
@@ -1249,21 +1265,36 @@ impl InternalAgentClient {
             .json(&InternalAdminConfigToolRequest {
                 actor: actor.clone(),
             });
-        let (status, value) = self
-            .send_value_with_status(request)
-            .await
-            .map_err(|error| AdminConfigToolError::Failed(error.to_string()))?;
-        if status == StatusCode::FORBIDDEN {
+        let (status, value) = self.send_value_with_status(request).await.map_err(|_| {
+            AdminConfigToolError::Execution(
+                "Admin Config control-plane request failed.".to_string(),
+            )
+        })?;
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             return Err(AdminConfigToolError::Unauthorized);
         }
         if !status.is_success() {
-            return Err(AdminConfigToolError::Failed(admin_config_error_detail(
-                &value,
-                "Admin Config tool request failed.",
-            )));
+            let detail = admin_config_error_detail(&value, "Admin Config request failed.");
+            return Err(
+                if matches!(
+                    status,
+                    StatusCode::BAD_REQUEST
+                        | StatusCode::NOT_FOUND
+                        | StatusCode::CONFLICT
+                        | StatusCode::UNPROCESSABLE_ENTITY
+                ) {
+                    AdminConfigToolError::Validation(detail)
+                } else {
+                    AdminConfigToolError::Execution(
+                        "Admin Config control-plane request failed.".to_string(),
+                    )
+                },
+            );
         }
-        serde_json::from_value(value).map_err(|error| {
-            AdminConfigToolError::Failed(format!("Invalid Admin Config tool response: {}", error))
+        serde_json::from_value(value).map_err(|_| {
+            AdminConfigToolError::Execution(
+                "Admin Config returned an invalid structured response.".to_string(),
+            )
         })
     }
 
@@ -1273,9 +1304,9 @@ impl InternalAgentClient {
         actor: &InternalAuthContext,
         conversation_id: &str,
         mut payload: Value,
-    ) -> std::result::Result<Value, AdminConfigToolError> {
+    ) -> std::result::Result<InternalAdminConfigToolResponse, AdminConfigToolError> {
         let Some(object) = payload.as_object_mut() else {
-            return Err(AdminConfigToolError::Failed(
+            return Err(AdminConfigToolError::Validation(
                 "Admin Config Tool payload must be an object.".to_string(),
             ));
         };
@@ -1292,20 +1323,37 @@ impl InternalAgentClient {
             ))
             .header("X-Internal-Agent-Token", &self.internal_agent_token)
             .json(&payload);
-        let (status, value) = self
-            .send_value_with_status(request)
-            .await
-            .map_err(|error| AdminConfigToolError::Failed(error.to_string()))?;
-        if status == StatusCode::FORBIDDEN {
+        let (status, value) = self.send_value_with_status(request).await.map_err(|_| {
+            AdminConfigToolError::Execution(
+                "Admin Config control-plane request failed.".to_string(),
+            )
+        })?;
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             return Err(AdminConfigToolError::Unauthorized);
         }
         if !status.is_success() {
-            return Err(AdminConfigToolError::Failed(admin_config_error_detail(
-                &value,
-                "Admin Config Tool request failed.",
-            )));
+            let detail = admin_config_error_detail(&value, "Admin Config request failed.");
+            return Err(
+                if matches!(
+                    status,
+                    StatusCode::BAD_REQUEST
+                        | StatusCode::NOT_FOUND
+                        | StatusCode::CONFLICT
+                        | StatusCode::UNPROCESSABLE_ENTITY
+                ) {
+                    AdminConfigToolError::Validation(detail)
+                } else {
+                    AdminConfigToolError::Execution(
+                        "Admin Config control-plane request failed.".to_string(),
+                    )
+                },
+            );
         }
-        Ok(value)
+        serde_json::from_value(value).map_err(|_| {
+            AdminConfigToolError::Execution(
+                "Admin Config returned an invalid structured response.".to_string(),
+            )
+        })
     }
 
     async fn send_json<T: for<'de> Deserialize<'de>>(
@@ -2792,24 +2840,14 @@ impl Tool for AdminConfigReadTool {
         Ok(empty_native_parameters())
     }
 
-    async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+    async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
         let response = match self
             .internal
             .admin_config_tool(&self.endpoint, &self.auth)
             .await
         {
             Ok(response) => response,
-            Err(AdminConfigToolError::Unauthorized) => {
-                return Ok(ToolResult::error(
-                    "Admin Config read tools are not authorized for this actor.",
-                ));
-            }
-            Err(AdminConfigToolError::Failed(error)) => {
-                return Ok(ToolResult::error(format!(
-                    "Admin Config read tool failed: {}",
-                    error
-                )));
-            }
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
 
         if let Ok(mut sink) = self.traces.lock() {
@@ -2824,15 +2862,34 @@ impl Tool for AdminConfigReadTool {
             });
         }
 
-        let output = serde_json::to_string_pretty(&json!({
+        Ok(NativeToolResult::success(json!({
             "version": response.version,
             "tool": response.tool,
             "generated_at": response.generated_at,
             "secret_policy": response.secret_policy,
             "warnings": response.warnings,
             "data": response.data,
-        }))?;
-        Ok(ToolResult::success(output))
+        })))
+    }
+
+    async fn execute_native_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+        self.execute_native(args).await.map(|result| {
+            let outcome = if result.is_success() {
+                ConversationTimingOutcome::Succeeded
+            } else {
+                ConversationTimingOutcome::Rejected
+            };
+            (result, outcome)
+        })
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        self.execute_native(args)
+            .await
+            .map(|result| native_result_as_legacy(&result))
     }
 }
 
@@ -2854,34 +2911,34 @@ impl Tool for AdminConfigSetupSummaryTool {
         Ok(empty_native_parameters())
     }
 
-    async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+    async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
         let instance_settings = match self.read_control_plane("instance-settings").await {
             Ok(response) => response,
-            Err(error) => return Ok(ToolResult::error(error)),
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
         let deployment_settings = match self.read_control_plane("deployment-settings").await {
             Ok(response) => response,
-            Err(error) => return Ok(ToolResult::error(error)),
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
         let onboarding_status = match self.read_control_plane("onboarding-status").await {
             Ok(response) => response,
-            Err(error) => return Ok(ToolResult::error(error)),
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
         let user_types = match self.read_control_plane("user-types").await {
             Ok(response) => response,
-            Err(error) => return Ok(ToolResult::error(error)),
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
         let document_access = match self.read_control_plane("document-access").await {
             Ok(response) => response,
-            Err(error) => return Ok(ToolResult::error(error)),
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
         let deployment_readiness = match self.read_control_plane("deployment-readiness").await {
             Ok(response) => response,
-            Err(error) => return Ok(ToolResult::error(error)),
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
         let agent_settings = match self.agent_settings_data(&user_types).await {
             Ok(data) => data,
-            Err(error) => return Ok(ToolResult::error(error)),
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
 
         let data = build_admin_setup_summary_tool_data(
@@ -2925,15 +2982,34 @@ impl Tool for AdminConfigSetupSummaryTool {
             });
         }
 
-        let output = serde_json::to_string_pretty(&json!({
+        Ok(NativeToolResult::success(json!({
             "version": 1,
             "tool": "read_admin_setup_summary",
             "generated_at": chrono::Utc::now().to_rfc3339(),
             "secret_policy": { "mode": "summary_only" },
             "warnings": warnings,
             "data": data,
-        }))?;
-        Ok(ToolResult::success(output))
+        })))
+    }
+
+    async fn execute_native_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+        self.execute_native(args).await.map(|result| {
+            let outcome = if result.is_success() {
+                ConversationTimingOutcome::Succeeded
+            } else {
+                ConversationTimingOutcome::Rejected
+            };
+            (result, outcome)
+        })
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        self.execute_native(args)
+            .await
+            .map(|result| native_result_as_legacy(&result))
     }
 }
 
@@ -2941,24 +3017,14 @@ impl AdminConfigSetupSummaryTool {
     async fn read_control_plane(
         &self,
         endpoint: &str,
-    ) -> std::result::Result<InternalAdminConfigToolResponse, String> {
-        self.internal
-            .admin_config_tool(endpoint, &self.auth)
-            .await
-            .map_err(|error| match error {
-                AdminConfigToolError::Unauthorized => {
-                    "Admin Config setup summary requires an approved admin actor.".to_string()
-                }
-                AdminConfigToolError::Failed(error) => {
-                    format!("Admin Config setup summary failed: {}", error)
-                }
-            })
+    ) -> std::result::Result<InternalAdminConfigToolResponse, AdminConfigToolError> {
+        self.internal.admin_config_tool(endpoint, &self.auth).await
     }
 
     async fn agent_settings_data(
         &self,
         user_types_response: &InternalAdminConfigToolResponse,
-    ) -> std::result::Result<Value, String> {
+    ) -> std::result::Result<Value, AdminConfigToolError> {
         let Some(state) = self.state.as_ref() else {
             return self
                 .read_control_plane("agent-settings")
@@ -2966,7 +3032,8 @@ impl AdminConfigSetupSummaryTool {
                 .map(|response| response.data);
         };
 
-        let global = load_ai_config_response(state).map_err(|error| error.message)?;
+        let global = load_ai_config_response(state)
+            .map_err(|error| AdminConfigToolError::Execution(error.message))?;
         let user_types: Vec<InternalUserTypeResponse> = serde_json::from_value(
             user_types_response
                 .data
@@ -2974,11 +3041,15 @@ impl AdminConfigSetupSummaryTool {
                 .cloned()
                 .unwrap_or_else(|| json!([])),
         )
-        .map_err(|error| format!("invalid user type payload: {}", error))?;
+        .map_err(|_| {
+            AdminConfigToolError::Execution(
+                "Admin Config returned invalid user type data.".to_string(),
+            )
+        })?;
         let mut per_user_type = Vec::new();
         for user_type in user_types {
             let response = load_ai_config_user_type_response(state, &user_type)
-                .map_err(|error| error.message)?;
+                .map_err(|error| AdminConfigToolError::Execution(error.message))?;
             per_user_type.push(response);
         }
 
@@ -3007,14 +3078,11 @@ impl Tool for AdminAgentSettingsReadTool {
         Ok(empty_native_parameters())
     }
 
-    async fn execute(&self, _args: &ToolArgs) -> Result<ToolResult> {
+    async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
         let global = match load_ai_config_response(&self.state) {
             Ok(response) => response,
             Err(error) => {
-                return Ok(ToolResult::error(format!(
-                    "Admin Config read tool failed: {}",
-                    error.message
-                )));
+                return Ok(NativeToolResult::failure("execution_failed", error.message));
             }
         };
         let user_types_response = match self
@@ -3024,17 +3092,7 @@ impl Tool for AdminAgentSettingsReadTool {
             .await
         {
             Ok(response) => response,
-            Err(AdminConfigToolError::Unauthorized) => {
-                return Ok(ToolResult::error(
-                    "Admin Config read tools are not authorized for this actor.",
-                ));
-            }
-            Err(AdminConfigToolError::Failed(error)) => {
-                return Ok(ToolResult::error(format!(
-                    "Admin Config read tool failed: {}",
-                    error
-                )));
-            }
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
         let user_types: Vec<InternalUserTypeResponse> = match serde_json::from_value(
             user_types_response
@@ -3044,11 +3102,11 @@ impl Tool for AdminAgentSettingsReadTool {
                 .unwrap_or_else(|| json!([])),
         ) {
             Ok(user_types) => user_types,
-            Err(error) => {
-                return Ok(ToolResult::error(format!(
-                    "Admin Config read tool failed: invalid user type payload: {}",
-                    error
-                )));
+            Err(_) => {
+                return Ok(NativeToolResult::failure(
+                    "execution_failed",
+                    "Admin Config returned invalid user type data.",
+                ));
             }
         };
         let mut per_user_type = Vec::new();
@@ -3056,10 +3114,7 @@ impl Tool for AdminAgentSettingsReadTool {
             match load_ai_config_user_type_response(&self.state, &user_type) {
                 Ok(response) => per_user_type.push(response),
                 Err(error) => {
-                    return Ok(ToolResult::error(format!(
-                        "Admin Config read tool failed: {}",
-                        error.message
-                    )));
+                    return Ok(NativeToolResult::failure("execution_failed", error.message));
                 }
             }
         }
@@ -3078,15 +3133,34 @@ impl Tool for AdminAgentSettingsReadTool {
             });
         }
 
-        let output = serde_json::to_string_pretty(&json!({
+        Ok(NativeToolResult::success(json!({
             "version": 1,
             "tool": "read_agent_settings",
             "generated_at": chrono::Utc::now().to_rfc3339(),
             "secret_policy": { "mode": "masked" },
             "warnings": warnings,
             "data": data,
-        }))?;
-        Ok(ToolResult::success(output))
+        })))
+    }
+
+    async fn execute_native_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+        self.execute_native(args).await.map(|result| {
+            let outcome = if result.is_success() {
+                ConversationTimingOutcome::Succeeded
+            } else {
+                ConversationTimingOutcome::Rejected
+            };
+            (result, outcome)
+        })
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        self.execute_native(args)
+            .await
+            .map(|result| native_result_as_legacy(&result))
     }
 }
 
@@ -3121,12 +3195,6 @@ fn optional_i64_arg(args: &ToolArgs, key: &str) -> Result<Option<i64>> {
             .as_i64()
             .map(Some)
             .ok_or_else(|| anyhow!("{} must be an integer", key)),
-        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
-        Some(Value::String(value)) => value
-            .trim()
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|_| anyhow!("{} must be an integer", key)),
         Some(_) => Err(anyhow!("{} must be an integer", key)),
     }
 }
@@ -3135,12 +3203,6 @@ fn optional_bool_arg(args: &ToolArgs, key: &str) -> Result<Option<bool>> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
-        Some(Value::String(value)) => value
-            .trim()
-            .parse::<bool>()
-            .map(Some)
-            .map_err(|_| anyhow!("{} must be true or false", key)),
         Some(_) => Err(anyhow!("{} must be true or false", key)),
     }
 }
@@ -3149,9 +3211,14 @@ fn insert_optional_string(
     payload: &mut serde_json::Map<String, Value>,
     args: &ToolArgs,
     key: &str,
-) {
-    if let Some(value) = tool_string_arg(args, key) {
-        payload.insert(key.to_string(), Value::String(value.to_string()));
+) -> Result<()> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(value)) => {
+            payload.insert(key.to_string(), Value::String(value.to_string()));
+            Ok(())
+        }
+        Some(_) => Err(anyhow!("{} must be a string", key)),
     }
 }
 
@@ -3190,7 +3257,7 @@ fn build_admin_config_direct_payload(tool_name: &str, args: &ToolArgs) -> Result
                 payload.insert("display_order".to_string(), Value::from(value));
             }
             for key in ["name", "description", "icon"] {
-                insert_optional_string(&mut payload, args, key);
+                insert_optional_string(&mut payload, args, key)?;
             }
             Ok(Value::Object(payload))
         }
@@ -3211,7 +3278,7 @@ fn build_admin_config_direct_payload(tool_name: &str, args: &ToolArgs) -> Result
                 }
             }
             for key in ["field_name", "field_type", "placeholder"] {
-                insert_optional_string(&mut payload, args, key);
+                insert_optional_string(&mut payload, args, key)?;
             }
             if args.contains_key("options") {
                 payload.insert("options".to_string(), array_arg(args, "options")?);
@@ -3238,55 +3305,139 @@ fn build_admin_config_direct_payload(tool_name: &str, args: &ToolArgs) -> Result
     }
 }
 
+fn instance_settings_native_properties() -> Value {
+    json!({
+        "instance_name": {"type": "string"},
+        "primary_color": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"},
+        "description": {"type": "string"},
+        "public_email_display_name": {"type": "string"},
+        "logo_url": {"type": "string"},
+        "favicon_url": {"type": "string"},
+        "apple_touch_icon_url": {"type": "string"},
+        "icon": {"type": "string"},
+        "assistant_icon": {"type": "string"},
+        "user_icon": {"type": "string"},
+        "assistant_name": {"type": "string"},
+        "user_label": {"type": "string"},
+        "header_layout": {"type": "string"},
+        "header_tagline": {"type": "string"},
+        "chat_bubble_style": {"type": "string"},
+        "chat_bubble_shadow": {"type": "boolean"},
+        "surface_style": {"type": "string"},
+        "status_icon_set": {"type": "string"},
+        "typography_preset": {"type": "string"},
+        "default_language": {
+            "type": "string",
+            "enum": ["en", "es", "pt", "fr", "de", "it", "nl", "ru", "zh-Hans", "zh-Hant", "ja", "ko", "ar", "fa", "hi", "bn", "id", "th", "vi", "tr", "pl", "uk", "sv", "no", "da", "fi", "el", "he", "cs", "ro", "hu"]
+        },
+        "default_theme": {"type": "string", "enum": ["light", "dark", "system"]},
+        "auto_approve_users": {"type": "boolean"},
+        "reachout_enabled": {"type": "boolean"},
+        "reachout_mode": {"type": "string"},
+        "reachout_title": {"type": "string"},
+        "reachout_description": {"type": "string"},
+        "reachout_button_label": {"type": "string"},
+        "reachout_success_message": {"type": "string"},
+        "reachout_to_email": {"type": "string"},
+        "reachout_subject_prefix": {"type": "string"},
+        "reachout_rate_limit_per_hour": {"type": "string"},
+        "reachout_rate_limit_per_day": {"type": "string"},
+        "reachout_include_ip": {"type": "boolean"}
+    })
+}
+
+fn guided_instance_settings_native_properties() -> Value {
+    let all = instance_settings_native_properties();
+    let mut guided = serde_json::Map::new();
+    for key in [
+        "instance_name",
+        "description",
+        "assistant_name",
+        "primary_color",
+        "default_theme",
+        "default_language",
+        "header_tagline",
+        "auto_approve_users",
+    ] {
+        if let Some(value) = all.get(key) {
+            guided.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(guided)
+}
+
 fn admin_config_direct_native_parameters(tool_name: &str) -> Result<Value> {
     let schema = match tool_name {
-        "configure_instance" => json!({
-            "type": "object",
-            "properties": {
-                "settings": {
-                    "type": "object",
-                    "properties": {
-                        "instance_name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "assistant_name": {"type": "string"},
-                        "primary_color": {"type": "string"},
-                        "default_theme": {"type": "string"},
-                        "default_language": {"type": "string"},
-                        "header_tagline": {"type": "string"},
-                        "auto_approve_users": {"type": "boolean"}
+        "configure_instance" => {
+            let settings_properties = guided_instance_settings_native_properties();
+            json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "properties": settings_properties,
+                        "required": ["instance_name", "description", "assistant_name", "primary_color", "default_theme", "default_language", "header_tagline", "auto_approve_users"],
+                        "additionalProperties": false
                     },
-                    "additionalProperties": false
+                    "user_types": {
+                        "type": "array",
+                        "maxItems": 5,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-z0-9][a-z0-9_-]*$"},
+                                "name": {"type": "string", "minLength": 1, "maxLength": 120},
+                                "description": {"type": "string", "maxLength": 1000},
+                                "icon": {"type": "string", "maxLength": 80},
+                                "display_order": {"type": "integer"}
+                            },
+                            "required": ["reference", "name"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "onboarding_questions": {
+                        "type": "array",
+                        "maxItems": 10,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field_name": {"type": "string", "minLength": 1, "maxLength": 120},
+                                "field_type": {"type": "string", "enum": ["text", "textarea", "number", "boolean", "email", "url", "select", "multi_select", "date"]},
+                                "required": {"type": "boolean"},
+                                "display_order": {"type": "integer"},
+                                "user_type_reference": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-z0-9][a-z0-9_-]*$"},
+                                "placeholder": {"type": "string", "maxLength": 240},
+                                "options": {"type": "array", "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
+                                "encryption_enabled": {"type": "boolean"},
+                                "include_in_chat": {"type": "boolean"}
+                            },
+                            "required": ["field_name", "field_type"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "behavior_rules": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}},
+                    "forbidden_topics": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}}
                 },
-                "user_types": {"type": "array", "items": {"type": "object"}},
-                "onboarding_questions": {"type": "array", "items": {"type": "object"}},
-                "behavior_rules": {"type": "array", "items": {"type": "string"}},
-                "forbidden_topics": {"type": "array", "items": {"type": "string"}}
-            },
-            "required": ["settings", "user_types", "onboarding_questions", "behavior_rules", "forbidden_topics"],
-            "additionalProperties": false
-        }),
-        "update_instance_settings" => json!({
-            "type": "object",
-            "properties": {
-                "settings": {
-                    "type": "object",
-                    "properties": {
-                        "instance_name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "assistant_name": {"type": "string"},
-                        "primary_color": {"type": "string"},
-                        "default_theme": {"type": "string"},
-                        "default_language": {"type": "string"},
-                        "header_tagline": {"type": "string"},
-                        "auto_approve_users": {"type": "boolean"}
-                    },
-                    "minProperties": 1,
-                    "additionalProperties": false
-                }
-            },
-            "required": ["settings"],
-            "additionalProperties": false
-        }),
+                "required": ["settings", "user_types", "onboarding_questions", "behavior_rules", "forbidden_topics"],
+                "additionalProperties": false
+            })
+        }
+        "update_instance_settings" => {
+            let settings_properties = instance_settings_native_properties();
+            json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "properties": settings_properties,
+                        "minProperties": 1,
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["settings"],
+                "additionalProperties": false
+            })
+        }
         "update_deployment_settings" => json!({
             "type": "object",
             "properties": {
@@ -3294,7 +3445,7 @@ fn admin_config_direct_native_parameters(tool_name: &str) -> Result<Value> {
                     "type": "object",
                     "description": "Deployment setting names and desired values.",
                     "minProperties": 1,
-                    "additionalProperties": {}
+                    "additionalProperties": {"type": "string"}
                 }
             },
             "required": ["settings"],
@@ -3306,9 +3457,9 @@ fn admin_config_direct_native_parameters(tool_name: &str) -> Result<Value> {
                 "updates": {
                     "type": "object",
                     "description": "Agent setting names and desired values.",
-                    "additionalProperties": {}
+                    "additionalProperties": {"type": "string"}
                 },
-                "user_type_id": {"type": "integer", "description": "Optional User Type id for overrides."},
+                "user_type_id": {"type": "integer", "minimum": 1, "description": "Optional User Type id for overrides."},
                 "revert_keys": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -3322,10 +3473,10 @@ fn admin_config_direct_native_parameters(tool_name: &str) -> Result<Value> {
             "type": "object",
             "properties": {
                 "operation": {"type": "string", "enum": ["create", "update", "delete"]},
-                "user_type_id": {"type": "integer"},
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "icon": {"type": "string"},
+                "user_type_id": {"type": "integer", "minimum": 1},
+                "name": {"type": "string", "minLength": 1, "maxLength": 120},
+                "description": {"type": "string", "maxLength": 1000},
+                "icon": {"type": "string", "maxLength": 80},
                 "display_order": {"type": "integer"}
             },
             "required": ["operation"],
@@ -3335,14 +3486,14 @@ fn admin_config_direct_native_parameters(tool_name: &str) -> Result<Value> {
             "type": "object",
             "properties": {
                 "operation": {"type": "string", "enum": ["create", "update", "delete"]},
-                "question_id": {"type": "integer"},
-                "field_name": {"type": "string"},
-                "field_type": {"type": "string"},
+                "question_id": {"type": "integer", "minimum": 1},
+                "field_name": {"type": "string", "minLength": 1, "maxLength": 120},
+                "field_type": {"type": "string", "enum": ["text", "textarea", "number", "boolean", "email", "url", "select", "multi_select", "date"]},
                 "required": {"type": "boolean"},
                 "display_order": {"type": "integer"},
-                "user_type_id": {"type": "integer"},
-                "placeholder": {"type": "string"},
-                "options": {"type": "array", "items": {"type": "string"}},
+                "user_type_id": {"type": "integer", "minimum": 1},
+                "placeholder": {"type": "string", "maxLength": 240},
+                "options": {"type": "array", "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
                 "encryption_enabled": {"type": "boolean"},
                 "include_in_chat": {"type": "boolean"}
             },
@@ -3352,22 +3503,22 @@ fn admin_config_direct_native_parameters(tool_name: &str) -> Result<Value> {
         "update_document_access" => json!({
             "type": "object",
             "properties": {
-                "user_type_id": {"type": "integer"},
+                "user_type_id": {"type": "integer", "minimum": 1},
                 "updates": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "job_id": {"type": "string"},
-                            "available": {"type": "boolean"},
-                            "is_default": {"type": "boolean"},
+                            "job_id": {"type": "string", "minLength": 1, "maxLength": 255},
+                            "is_available": {"type": "boolean"},
+                            "is_default_active": {"type": "boolean"},
                             "display_order": {"type": "integer"}
                         },
                         "required": ["job_id"],
                         "additionalProperties": false
                     }
                 },
-                "revert_job_ids": {"type": "array", "items": {"type": "string"}}
+                "revert_job_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 255}}
             },
             "anyOf": [{"required": ["updates"]}, {"required": ["revert_job_ids"]}],
             "additionalProperties": false
@@ -3375,7 +3526,7 @@ fn admin_config_direct_native_parameters(tool_name: &str) -> Result<Value> {
         "read_deployment_secret" => json!({
             "type": "object",
             "properties": {
-                "key": {"type": "string", "description": "Secret Deployment Setting name explicitly requested by the Admin."}
+                "key": {"type": "string", "minLength": 1, "maxLength": 255, "description": "Secret Deployment Setting name explicitly requested by the Admin."}
             },
             "required": ["key"],
             "additionalProperties": false
@@ -3403,10 +3554,15 @@ impl Tool for AdminConfigDirectTool {
         admin_config_direct_native_parameters(&self.name)
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+    async fn execute_native(&self, args: &ToolArgs) -> Result<NativeToolResult> {
         let payload = match build_admin_config_direct_payload(&self.name, args) {
             Ok(payload) => payload,
-            Err(error) => return Ok(ToolResult::error(error.to_string())),
+            Err(error) => {
+                return Ok(NativeToolResult::failure(
+                    "invalid_arguments",
+                    error.to_string(),
+                ));
+            }
         };
         let response = match self
             .internal
@@ -3414,20 +3570,10 @@ impl Tool for AdminConfigDirectTool {
             .await
         {
             Ok(response) => response,
-            Err(AdminConfigToolError::Unauthorized) => {
-                return Ok(ToolResult::error(
-                    "Admin Config Tools are not authorized for this actor.",
-                ));
-            }
-            Err(AdminConfigToolError::Failed(error)) => {
-                return Ok(ToolResult::error(format!(
-                    "Admin Config Tool failed: {}",
-                    error
-                )));
-            }
+            Err(error) => return Ok(admin_config_native_failure(error)),
         };
 
-        let data = response.get("data").cloned().unwrap_or_else(|| json!({}));
+        let data = &response.data;
         let changed_names = data
             .get("changed_names")
             .and_then(Value::as_array)
@@ -3466,17 +3612,7 @@ impl Tool for AdminConfigDirectTool {
         } else {
             format!("Changed: {}.", changed_names.join(", "))
         };
-        let warnings = response
-            .get("warnings")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let warnings = response.warnings.clone();
         if let Ok(mut sink) = self.traces.lock() {
             sink.push(ToolCallInfoResponse {
                 tool_id: format!("admin-config:{}", self.name),
@@ -3488,9 +3624,34 @@ impl Tool for AdminConfigDirectTool {
                 guarded: false,
             });
         }
-        Ok(ToolResult::success(serde_json::to_string_pretty(
-            &response,
-        )?))
+        Ok(NativeToolResult::success(json!({
+            "version": response.version,
+            "tool": response.tool,
+            "generated_at": response.generated_at,
+            "secret_policy": response.secret_policy,
+            "warnings": response.warnings,
+            "data": response.data,
+        })))
+    }
+
+    async fn execute_native_with_timing_outcome(
+        &self,
+        args: &ToolArgs,
+    ) -> Result<(NativeToolResult, ConversationTimingOutcome)> {
+        self.execute_native(args).await.map(|result| {
+            let outcome = if result.is_success() {
+                ConversationTimingOutcome::Succeeded
+            } else {
+                ConversationTimingOutcome::Rejected
+            };
+            (result, outcome)
+        })
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResult> {
+        self.execute_native(args)
+            .await
+            .map(|result| native_result_as_legacy(&result))
     }
 }
 
@@ -9303,7 +9464,7 @@ mod tests {
         assert_eq!(deployment["required"], json!(["settings"]));
         assert_eq!(
             deployment["properties"]["settings"]["additionalProperties"],
-            json!({})
+            json!({"type": "string"})
         );
         assert!(
             deployment["properties"]["settings"]["properties"].is_null(),
@@ -9314,12 +9475,30 @@ mod tests {
             .expect("agent settings Tool schema should exist");
         assert_eq!(
             agent["properties"]["updates"]["additionalProperties"],
-            json!({})
+            json!({"type": "string"})
         );
         assert_eq!(
             agent["anyOf"],
             json!([{"required": ["updates"]}, {"required": ["revert_keys"]}])
         );
+
+        let instance = admin_config_direct_native_parameters("update_instance_settings")
+            .expect("instance settings Tool schema should exist");
+        assert!(instance["properties"]["settings"]["properties"]
+            .get("reachout_enabled")
+            .is_some());
+        assert_eq!(
+            instance["properties"]["settings"]["properties"]["default_theme"]["enum"],
+            json!(["light", "dark", "system"])
+        );
+
+        let documents = admin_config_direct_native_parameters("update_document_access")
+            .expect("Document Access Tool schema should exist");
+        let update_fields = &documents["properties"]["updates"]["items"]["properties"];
+        assert!(update_fields.get("is_available").is_some());
+        assert!(update_fields.get("is_default_active").is_some());
+        assert!(update_fields.get("available").is_none());
+        assert!(update_fields.get("is_default").is_none());
     }
 
     struct CountingReadTool {
@@ -12939,14 +13118,25 @@ mod tests {
         };
         let args = ToolArgs::from([("settings".to_string(), json!({"TINFOIL_API_KEY": secret}))]);
 
-        let result = tool
-            .execute(&args)
-            .await
-            .expect("direct Admin Config Tool should execute");
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(tool));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let result = agent
+            .execute_native_tool_calls(&[native_test_call(
+                "call-admin-approved",
+                "update_deployment_settings",
+                args,
+            )])
+            .await;
         server.abort();
 
-        assert!(result.success);
-        assert!(!result.output.contains(secret));
+        assert_eq!(result.executed_tools.len(), 1);
+        let NativeToolResult::Success(data) = &result.executed_tools[0].result else {
+            panic!("expected structured Admin Config success");
+        };
+        assert_eq!(data["tool"], "update_deployment_settings");
+        assert_eq!(data["data"]["outcome"], "succeeded");
+        assert!(!data.to_string().contains(secret));
         let (token, payload) = seen_rx
             .await
             .expect("test backend should record direct Tool request");
@@ -13022,20 +13212,116 @@ mod tests {
             affected_areas: Arc::new(Mutex::new(Vec::new())),
         };
 
-        let result = tool
-            .execute(&ToolArgs::from([(
-                "settings".to_string(),
-                json!({"default_language": "English"}),
-            )]))
-            .await
-            .expect("validation failure should be returned as a Tool result");
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(tool));
+        let mut agent = SageAgent::new_without_memory(registry, "test");
+        let result = agent
+            .execute_native_tool_calls(&[native_test_call(
+                "call-admin-rejected",
+                "update_instance_settings",
+                ToolArgs::from([(
+                    "settings".to_string(),
+                    json!({"default_language": "English"}),
+                )]),
+            )])
+            .await;
         server.abort();
 
-        assert!(!result.success);
-        let error = result.error.expect("validation detail should be preserved");
-        assert!(error.contains("settings.default_language"));
-        assert!(error.contains("Input should be a supported language code"));
-        assert!(!error.contains("Admin Config Tool request failed"));
+        let failure = result.executed_tools[0].result.model_value();
+        assert_eq!(failure["error"]["code"], "validation_failed");
+        assert!(failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("settings.default_language"));
+        assert!(failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Input should be a supported language code"));
+    }
+
+    #[tokio::test]
+    async fn admin_config_native_failures_are_typed_and_sanitized() {
+        let app = Router::new()
+            .route(
+                "/internal/agent/admin-config/instance-settings",
+                post(|| async { (StatusCode::FORBIDDEN, "SENTINEL_AUTH_DETAIL") }),
+            )
+            .route(
+                "/internal/agent/admin-config/update-instance-settings",
+                post(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"detail": "SENTINEL_EXECUTION_DETAIL"})),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend should bind");
+        let addr = listener.local_addr().expect("test backend address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test backend should serve");
+        });
+        let internal = InternalAgentClient::new(
+            Client::new(),
+            format!("http://{addr}"),
+            "test-token".to_string(),
+        );
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let read = AdminConfigReadTool {
+            internal: internal.clone(),
+            auth: auth.clone(),
+            name: "read_instance_settings".to_string(),
+            endpoint: "instance-settings".to_string(),
+            description: "Read instance settings.".to_string(),
+            traces: Arc::new(Mutex::new(Vec::new())),
+        };
+        let write = AdminConfigDirectTool {
+            internal,
+            auth,
+            conversation_id: "conversation-errors".to_string(),
+            name: "update_instance_settings".to_string(),
+            endpoint: "update-instance-settings".to_string(),
+            description: "Update instance settings.".to_string(),
+            args_schema: r#"{"settings":"settings"}"#.to_string(),
+            traces: Arc::new(Mutex::new(Vec::new())),
+            affected_areas: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let unauthorized = read.execute_native(&ToolArgs::new()).await.unwrap();
+        assert_eq!(unauthorized.model_value()["error"]["code"], "unauthorized");
+        assert!(!unauthorized.model_value().to_string().contains("SENTINEL"));
+
+        let invalid = write
+            .execute_native(&ToolArgs::from([(
+                "settings".to_string(),
+                json!("not-an-object"),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(invalid.model_value()["error"]["code"], "invalid_arguments");
+
+        let failed = write
+            .execute_native(&ToolArgs::from([(
+                "settings".to_string(),
+                json!({"instance_name": "Updated"}),
+            )]))
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(failed.model_value()["error"]["code"], "execution_failed");
+        assert!(!failed.model_value().to_string().contains("SENTINEL"));
     }
 
     #[tokio::test]
@@ -13092,7 +13378,7 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::from([(
+            .execute_native(&ToolArgs::from([(
                 "key".to_string(),
                 json!("TINFOIL_API_KEY"),
             )]))
@@ -13100,8 +13386,11 @@ mod tests {
             .expect("secret read Tool should execute");
         server.abort();
 
-        assert!(result.success);
-        assert!(result.output.contains(secret));
+        let NativeToolResult::Success(data) = result else {
+            panic!("explicit secret read should return structured success");
+        };
+        assert_eq!(data["data"]["value"], secret);
+        assert_eq!(data["secret_policy"]["mode"], "explicit_secret");
         let rendered_activity =
             serde_json::to_string(&*traces.lock().expect("trace sink should lock"))
                 .expect("Activity should serialize");
@@ -13109,7 +13398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_config_read_tool_executes_raw_tool_contract() {
+    async fn admin_config_read_tool_returns_structured_native_contract() {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(Option<String>, Value)>();
         let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
         let app = Router::new().route(
@@ -13196,14 +13485,17 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::new())
+            .execute_native(&ToolArgs::new())
             .await
             .expect("Admin Config read tool should execute");
         server.abort();
 
-        assert!(result.success);
-        assert!(result.output.contains("read_deployment_readiness"));
-        assert!(result.output.contains("Sage Runtime Config"));
+        let NativeToolResult::Success(data) = result else {
+            panic!("expected structured Admin Config read");
+        };
+        assert_eq!(data["tool"], "read_deployment_readiness");
+        assert_eq!(data["data"]["items"][0]["label"], "Sage Runtime Config");
+        assert!(data.get("output").is_none());
         let (token, payload) = seen_rx
             .await
             .expect("test backend should record Admin Config request");
@@ -13278,13 +13570,14 @@ mod tests {
         };
 
         let result = tool
-            .execute(&ToolArgs::new())
+            .execute_native(&ToolArgs::new())
             .await
             .expect("Admin Config setup summary tool should execute");
         server.abort();
 
-        assert!(result.success);
-        let output: Value = serde_json::from_str(&result.output).expect("output should be JSON");
+        let NativeToolResult::Success(output) = result else {
+            panic!("expected structured Admin Config summary");
+        };
         assert_eq!(output["tool"], "read_admin_setup_summary");
         assert_eq!(output["secret_policy"]["mode"], "summary_only");
         assert_eq!(output["data"]["status"], "warnings");
