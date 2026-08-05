@@ -10035,6 +10035,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_stream_carries_recovery_usage_and_private_multi_batch_continuity_end_to_end() {
+        const PRIVATE_A: &str = "private-public-stream-state-a";
+        const PRIVATE_B: &str = "private-public-stream-state-b";
+
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            let request_number = {
+                let mut requests = state.0.lock().expect("provider request capture");
+                requests.push(body);
+                requests.len()
+            };
+            match request_number {
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+                        .into_response()
+                }
+                2 => (
+                    [("content-type", "text/event-stream")],
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"First lookup. \",\"reasoning_content\":{},\"tool_calls\":[{{\"index\":0,\"id\":\"call-a\",\"function\":{{\"name\":\"knowledge_search\",\"arguments\":\"{{\\\"query\\\":\\\"alpha\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+                        json!(PRIVATE_A)
+                    ),
+                )
+                    .into_response(),
+                3 => (
+                    [("content-type", "text/event-stream")],
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"Second lookup. \",\"reasoning_content\":{},\"tool_calls\":[{{\"index\":0,\"id\":\"call-b\",\"function\":{{\"name\":\"knowledge_search\",\"arguments\":\"{{\\\"query\\\":\\\"beta\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+                        json!(PRIVATE_B)
+                    ),
+                )
+                    .into_response(),
+                _ => (
+                    [("content-type", "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded answer.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":89,\"completion_tokens\":21,\"total_tokens\":110}}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+                    .into_response(),
+            }
+        }
+
+        let provider_state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider should bind");
+        let address = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(provider_state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingReadTool {
+            executions: executions.clone(),
+        }));
+        let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+        let trace_sink = ConversationTraceDeltaSink::new(Some(stream_tx.clone()));
+        install_conversation_trace_hook(
+            &mut agent,
+            trace_sink.clone(),
+            "conversation-public-acceptance".to_string(),
+            "message-public-acceptance".to_string(),
+            "user".to_string(),
+            7,
+        );
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let turn = run_native_turn_with_provider_and_first_event_timeout(
+            &mut agent,
+            &provider,
+            "use the documents",
+            "glm-5-2",
+            Some(stream_tx),
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("the public streaming path should recover and complete");
+
+        assert_eq!(turn.answer, "First lookup. Second lookup. Grounded answer.");
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        let requests = provider_state.0.lock().expect("captured requests");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[2]["messages"][2]["reasoning_content"], PRIVATE_A);
+        assert_eq!(requests[3]["messages"][2]["reasoning_content"], PRIVATE_A);
+        assert_eq!(requests[3]["messages"][4]["reasoning_content"], PRIVATE_B);
+        drop(requests);
+
+        let message_id = "message-public-acceptance";
+        let session_id = Some("77777777-7777-7777-7777-777777777777".to_string());
+        let mut emission_state = ChatStreamAnswerEmissionState::default();
+        let mut emissions = Vec::new();
+        while let Ok(signal) = stream_rx.try_recv() {
+            emissions.extend(chat_stream_emissions_for_signal(
+                &mut emission_state,
+                signal,
+                message_id,
+                &session_id,
+                Vec::new(),
+                Instant::now(),
+                false,
+            ));
+        }
+        let trace = ConversationTraceResponse {
+            visibility: "detailed".to_string(),
+            reasoning: ReasoningTraceResponse {
+                summary: "Sage answered.".to_string(),
+            },
+            trace_deltas: trace_sink.snapshot(),
+            tools: Vec::new(),
+            retrieval: Vec::new(),
+            activity_steps: Vec::new(),
+            suppressed: false,
+        };
+        emissions.extend(chat_stream_terminal_emissions(
+            message_id,
+            &session_id,
+            "glm-5-2".to_string(),
+            Vec::new(),
+            Some(trace),
+            Vec::new(),
+        ));
+
+        let event_names = emissions
+            .iter()
+            .map(|emission| emission.event)
+            .collect::<Vec<_>>();
+        assert!(event_names.contains(&"answer_delta"));
+        assert!(event_names.contains(&"trace_delta"));
+        assert_eq!(
+            event_names[event_names.len() - 2..],
+            ["trace_final", "done"]
+        );
+        let streamed_answer = emissions
+            .iter()
+            .filter_map(|emission| emission.payload.delta.as_deref())
+            .collect::<String>();
+        assert_eq!(streamed_answer, turn.answer);
+
+        let rendered = emissions
+            .iter()
+            .map(|emission| chat_stream_event_payload_json(&emission.payload))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains(PRIVATE_A));
+        assert!(!rendered.contains(PRIVATE_B));
+        assert!(rendered.contains("provider_first_event_wait"));
+        assert!(rendered.contains("\"threshold_ms\":25"));
+        assert!(rendered.contains("\"prompt_tokens\":89"));
+        assert!(rendered.contains("\"completion_tokens\":21"));
+        assert!(rendered.contains("\"total_tokens\":110"));
+    }
+
+    #[tokio::test]
     async fn native_tool_round_limit_rejects_the_batch_and_returns_a_final_answer() {
         #[derive(Clone, Default)]
         struct ProviderState(Arc<Mutex<Vec<Value>>>);
