@@ -9699,7 +9699,7 @@ mod tests {
                     json!({
                         "index": 1,
                         "id": "call-6-b",
-                        "function": {"name": "knowledge_search", "arguments": "{}"},
+                        "function": {"name": "unregistered_tool", "arguments": "{}"},
                     }),
                 ]
             } else {
@@ -9745,6 +9745,11 @@ mod tests {
             executions: executions.clone(),
         }));
         let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
+        let trace_events = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink.lock().expect("native trace sink").push(event);
+        }));
         let provider = OpenAiNativeClient::new(
             Client::new(),
             format!("http://{address}/v1"),
@@ -9793,6 +9798,64 @@ mod tests {
             .all(|message| message["content"]
                 .as_str()
                 .is_some_and(|content| content.contains("tool_budget_exhausted"))));
+        let trace_events = trace_events.lock().expect("captured trace events");
+        for (call_id, tool_name) in [
+            ("call-6-a", "knowledge_search"),
+            ("call-6-b", "unrecognized_tool"),
+        ] {
+            assert_eq!(
+                trace_events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        AgentTraceEvent::ToolAttempted {
+                            call_id: observed_call_id,
+                            tool_name: observed_tool_name,
+                            tool_round: 7,
+                            attempt: 1,
+                        } if observed_call_id == call_id && observed_tool_name == tool_name
+                    ))
+                    .count(),
+                1,
+            );
+            assert_eq!(
+                trace_events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        AgentTraceEvent::Timing {
+                            phase: ConversationTimingPhase::ToolExecution,
+                            tool_name: Some(observed_tool_name),
+                            call_id: Some(observed_call_id),
+                            attempt: 1,
+                            outcome: ConversationTimingOutcome::Rejected,
+                            elapsed_ms: 0,
+                            ..
+                        } if observed_call_id == call_id && observed_tool_name == tool_name
+                    ))
+                    .count(),
+                1,
+            );
+            assert_eq!(
+                trace_events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        AgentTraceEvent::ToolTerminal {
+                            call_id: observed_call_id,
+                            tool_name: observed_tool_name,
+                            tool_round: 7,
+                            attempt: 1,
+                            status,
+                            elapsed_ms: 0,
+                        } if observed_call_id == call_id
+                            && observed_tool_name == tool_name
+                            && status == "rejected"
+                    ))
+                    .count(),
+                1,
+            );
+        }
     }
 
     #[tokio::test]
