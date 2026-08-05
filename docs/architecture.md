@@ -58,7 +58,7 @@ This file contains the branch-specific integration layer:
 | Route | Ownership | Notes |
 | --- | --- | --- |
 | `GET /health` | Sage service health | direct Sage runtime health, usually consumed internally |
-| `POST /llm/chat` | Sage | Conversation transport with at most four native Tool batches |
+| `POST /llm/chat` | Sage | Conversation transport with at most six native Tool batches |
 | `POST /query` | Sage | stateful Conversation API compatibility shape |
 | `GET /query/session/{session_id}` | Sage | session inspection |
 | `DELETE /query/session/{session_id}` | Sage | deletes session record |
@@ -72,8 +72,8 @@ This file contains the branch-specific integration layer:
 configured Conversation model. The model either answers directly or selects
 a bounded Tool batch. After a Tool batch, correlated structured Tool results
 and the same enabled Tool definitions return to the same model. The model may
-continue selecting batches within a four-batch safety ceiling; Sage rejects a
-fifth selected batch before execution. Each batch's Tool results are limited to
+continue selecting batches within a six-batch safety ceiling; Sage rejects a
+seventh selected batch before execution. Each batch's Tool results are limited to
 4,000 characters per result and 12,000 characters total.
 
 Native assistant content streams in provider order without semantic scanning,
@@ -131,8 +131,8 @@ Sage owns the bounded native Tool loop for Conversation routes.
    batch of authorized Tool calls
 7. if Tools were selected, execute that batch and return its correlated,
    structured results plus the same enabled Tool definitions to the same model
-8. allow model-selected continuation within the four-batch safety ceiling;
-   reject a fifth selected batch before execution
+8. allow model-selected continuation within the six-batch safety ceiling;
+   reject a seventh selected batch before execution
 9. return the assistant message plus Activity/Trace metadata and Tool summaries
 
 Tool Sets:
