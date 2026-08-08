@@ -81,12 +81,13 @@ result and 12,000 characters total.
 
 Native assistant content streams in provider order without semantic scanning,
 quarantine, rewriting, or deterministic answer fallback. Provider reasoning is
-discarded. Structural protocol failures and eligible connection, timeout, or
-502/503/504 failures share a bounded recovery budget of three identical attempts
-against the identical model. Complete provider silence for 30 seconds is also
-eligible within that same budget. A final-request retry reuses existing Tool-result
-messages and cannot execute Tools again. No other Conversation model is substituted
-after failure.
+discarded. Before the first provider event, structural protocol failures and
+eligible connection, timeout, or 502/503/504 failures share a bounded recovery
+budget of three identical attempts against the identical model. Complete provider
+silence for 30 seconds is also eligible within that same budget. Once content,
+reasoning, or Tool-call data has arrived, a later failure does not retry. A
+final-request retry reuses existing Tool-result messages and cannot execute Tools
+again. No other Conversation model is substituted after failure.
 
 Conversation traces record each native loop step, provider first-event wait,
 Retrieval or Resource lookup, Tool execution, retry, and total-turn timing where
