@@ -7376,73 +7376,75 @@ async fn request_native_turn_with_retry_and_first_event_timeout(
     (NativeProviderError, bool),
 > {
     let model = request.model.clone();
-    let mut answer_state = NativeAnswerStreamState::default();
-    match stream_native_turn_attempt(
-        agent,
-        provider,
-        request.clone(),
-        &mut answer_state,
-        delta_sender,
-        NativeModelAttempt {
-            step,
-            attempt: 1,
-            first_event_timeout,
-        },
-    )
-    .await
-    {
-        Ok(turn) => Ok((turn, answer_state, 1)),
-        Err(error) if same_model_retry_eligible(&error) && !answer_state.saw_provider_event => {
-            let reason = same_model_retry_category(&error).unwrap_or("transient_provider_failure");
-            warn!("Authoritative model request failed transiently; retrying the same request once");
-            agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
-                model: model.clone(),
+    let mut scheduled_reason = None;
+
+    for attempt in 1..=CONVERSATION_MODEL_MAX_ATTEMPTS {
+        let mut answer_state = NativeAnswerStreamState::default();
+        match stream_native_turn_attempt(
+            agent,
+            provider,
+            request.clone(),
+            &mut answer_state,
+            delta_sender,
+            NativeModelAttempt {
                 step,
-                attempt: 2,
-                reason: reason.to_string(),
-                outcome: "scheduled".to_string(),
-            });
-            let mut retry_state = NativeAnswerStreamState::default();
-            match stream_native_turn_attempt(
-                agent,
-                provider,
-                request,
-                &mut retry_state,
-                delta_sender,
-                NativeModelAttempt {
-                    step,
-                    attempt: 2,
-                    first_event_timeout,
-                },
-            )
-            .await
-            {
-                Ok(turn) => {
+                attempt,
+                first_event_timeout,
+            },
+        )
+        .await
+        {
+            Ok(turn) => {
+                if let Some(reason) = scheduled_reason {
                     agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
                         model,
                         step,
-                        attempt: 2,
-                        reason: reason.to_string(),
+                        attempt,
+                        reason,
                         outcome: "recovered".to_string(),
                     });
-                    Ok((turn, retry_state, 2))
                 }
-                Err(error) => {
+                return Ok((turn, answer_state, attempt));
+            }
+            Err(error) => {
+                let retry_reason = same_model_retry_category(&error);
+                let retry_eligible = retry_reason.is_some() && !answer_state.saw_provider_event;
+                if retry_eligible && attempt < CONVERSATION_MODEL_MAX_ATTEMPTS {
+                    let next_attempt = attempt + 1;
+                    let reason = retry_reason
+                        .unwrap_or("transient_provider_failure")
+                        .to_string();
+                    warn!(
+                        attempt,
+                        next_attempt,
+                        max_attempts = CONVERSATION_MODEL_MAX_ATTEMPTS,
+                        "Authoritative model request failed transiently; retrying the same request"
+                    );
+                    agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
+                        model: model.clone(),
+                        step,
+                        attempt: next_attempt,
+                        reason: reason.clone(),
+                        outcome: "scheduled".to_string(),
+                    });
+                    scheduled_reason = Some(reason);
+                    continue;
+                }
+                if attempt > 1 {
                     agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
                         model,
                         step,
-                        attempt: 2,
-                        reason: same_model_retry_category(&error)
-                            .unwrap_or("retry_failed")
-                            .to_string(),
+                        attempt,
+                        reason: retry_reason.unwrap_or("retry_failed").to_string(),
                         outcome: "exhausted".to_string(),
                     });
-                    Err((error, retry_state.released_any))
                 }
+                return Err((error, answer_state.released_any));
             }
         }
-        Err(error) => Err((error, answer_state.released_any)),
     }
+
+    unreachable!("the bounded model-attempt loop always returns")
 }
 
 #[derive(Clone, Copy)]
@@ -8209,7 +8211,8 @@ fn value_as_bool(value: Option<&Value>, default: bool) -> bool {
 const PLAIN_ANSWER_MAX_TOKENS: u32 = 8192;
 const MAX_NATIVE_TOOL_ROUNDS: usize = 6;
 const CONVERSATION_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
-const CONVERSATION_MODEL_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(20);
+const CONVERSATION_MODEL_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+const CONVERSATION_MODEL_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Default)]
 struct NativeAnswerStreamState {
@@ -10056,12 +10059,12 @@ mod tests {
                 requests.len()
             };
             match request_number {
-                1 => {
+                1 | 2 => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
                         .into_response()
                 }
-                2 => (
+                3 => (
                     [("content-type", "text/event-stream")],
                     format!(
                         "data: {{\"choices\":[{{\"delta\":{{\"content\":\"First lookup. \",\"reasoning_content\":{},\"tool_calls\":[{{\"index\":0,\"id\":\"call-a\",\"function\":{{\"name\":\"knowledge_search\",\"arguments\":\"{{\\\"query\\\":\\\"alpha\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
@@ -10069,7 +10072,7 @@ mod tests {
                     ),
                 )
                     .into_response(),
-                3 => (
+                4 => (
                     [("content-type", "text/event-stream")],
                     format!(
                         "data: {{\"choices\":[{{\"delta\":{{\"content\":\"Second lookup. \",\"reasoning_content\":{},\"tool_calls\":[{{\"index\":0,\"id\":\"call-b\",\"function\":{{\"name\":\"knowledge_search\",\"arguments\":\"{{\\\"query\\\":\\\"beta\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
@@ -10136,11 +10139,12 @@ mod tests {
         assert_eq!(turn.answer, "First lookup. Second lookup. Grounded answer.");
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         let requests = provider_state.0.lock().expect("captured requests");
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
         assert_eq!(requests[0], requests[1]);
-        assert_eq!(requests[2]["messages"][2]["reasoning_content"], PRIVATE_A);
+        assert_eq!(requests[1], requests[2]);
         assert_eq!(requests[3]["messages"][2]["reasoning_content"], PRIVATE_A);
-        assert_eq!(requests[3]["messages"][4]["reasoning_content"], PRIVATE_B);
+        assert_eq!(requests[4]["messages"][2]["reasoning_content"], PRIVATE_A);
+        assert_eq!(requests[4]["messages"][4]["reasoning_content"], PRIVATE_B);
         drop(requests);
 
         let message_id = "message-public-acceptance";
@@ -10474,7 +10478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_provider_silence_retries_the_identical_request_once() {
+    async fn two_silent_attempts_retry_the_identical_request_and_recover_on_the_third() {
         #[derive(Clone, Default)]
         struct ProviderState(Arc<Mutex<Vec<Value>>>);
 
@@ -10487,7 +10491,7 @@ mod tests {
                 requests.push(body);
                 requests.len()
             };
-            if request_number == 1 {
+            if request_number <= 2 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             (
@@ -10541,13 +10545,14 @@ mod tests {
             Duration::from_millis(25),
         )
         .await
-        .expect("one identical retry should recover from complete provider silence");
+        .expect("two identical retries should recover from complete provider silence");
 
         assert_eq!(turn.content, "Recovered after silence.");
-        assert_eq!(attempt, 2);
+        assert_eq!(attempt, 3);
         let requests = provider_state.0.lock().expect("captured provider requests");
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[1], requests[2]);
         assert!(trace_events.lock().unwrap().iter().any(|event| matches!(
             event,
             AgentTraceEvent::PreResponseProviderStall {
@@ -10560,7 +10565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_silent_attempts_exhaust_one_logical_request() {
+    async fn three_silent_attempts_exhaust_one_logical_request() {
         #[derive(Clone, Default)]
         struct RequestCount(Arc<AtomicUsize>);
 
@@ -10604,14 +10609,14 @@ mod tests {
             Duration::from_millis(25),
         )
         .await
-        .expect_err("two silent attempts must exhaust the one-retry ceiling");
+        .expect_err("three silent attempts must exhaust the two-retry ceiling");
 
         assert!(matches!(error.0, NativeProviderError::PreResponseStall));
-        assert_eq!(count.0.load(Ordering::SeqCst), 2);
+        assert_eq!(count.0.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
-    async fn stall_then_different_failure_does_not_receive_a_third_attempt() {
+    async fn mixed_retryable_failures_share_one_three_attempt_ceiling() {
         #[derive(Clone, Default)]
         struct RequestCount(Arc<AtomicUsize>);
 
@@ -10672,18 +10677,18 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(count.0.load(Ordering::SeqCst), 2);
+        assert_eq!(count.0.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
-    async fn transient_failure_retries_the_same_authoritative_model_once() {
+    async fn two_transient_failures_retry_the_same_authoritative_model_twice() {
         async fn completion(
             State(requested_models): State<Arc<Mutex<Vec<String>>>>,
             Json(body): Json<Value>,
         ) -> Response {
             let model = body["model"].as_str().unwrap_or_default().to_string();
             requested_models.lock().unwrap().push(model.clone());
-            if requested_models.lock().unwrap().len() == 1 {
+            if requested_models.lock().unwrap().len() <= 2 {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({ "error": "503 Service Unavailable" })),
@@ -10733,7 +10738,7 @@ mod tests {
         assert_eq!(answer, "recovered answer");
         assert_eq!(
             requested_models.lock().unwrap().as_slice(),
-            ["glm-5-2", "glm-5-2"]
+            ["glm-5-2", "glm-5-2", "glm-5-2"]
         );
     }
 
@@ -10849,7 +10854,7 @@ mod tests {
                     ),
                 )
                     .into_response(),
-                2 => {
+                2 | 3 => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     (
                         [("content-type", "text/event-stream")],
@@ -10902,8 +10907,9 @@ mod tests {
         assert_eq!(turn.answer, "Final answer.");
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         let requests = state.0.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert_eq!(requests[1], requests[2]);
+        assert_eq!(requests[2], requests[3]);
         assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-once");
     }
 
@@ -10945,7 +10951,7 @@ mod tests {
 
         let error = run_agent_turn(&mut agent, "hello", None, &settings, None)
             .await
-            .expect_err("two transient failures should end the turn");
+            .expect_err("three transient failures should end the turn");
 
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -10954,12 +10960,12 @@ mod tests {
         );
         assert_eq!(
             requested_models.lock().unwrap().as_slice(),
-            ["glm-5-2", "glm-5-2"]
+            ["glm-5-2", "glm-5-2", "glm-5-2"]
         );
     }
 
     #[tokio::test]
-    async fn connection_and_timeout_failures_each_receive_one_same_model_retry() {
+    async fn connection_and_timeout_failures_each_receive_two_same_model_retries() {
         let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let closed_address = closed_listener.local_addr().unwrap();
         drop(closed_listener);
@@ -11003,7 +11009,7 @@ mod tests {
                     }
                 ))
                 .count(),
-            2
+            3
         );
 
         #[derive(Clone)]
@@ -11055,7 +11061,7 @@ mod tests {
             timeout_result.is_err(),
             "the configured HTTP timeout should bound a stalled response body and exhaust the retry"
         );
-        assert_eq!(timeout_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(timeout_requests.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
