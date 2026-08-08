@@ -2174,7 +2174,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             kind: "retry".to_string(),
             title: Some("Model retry".to_string()),
             content: Some(match outcome.as_str() {
-                "scheduled" => "Retrying the authoritative model once.".to_string(),
+                "scheduled" => "Retrying the authoritative model.".to_string(),
                 "recovered" => "The authoritative model retry recovered.".to_string(),
                 _ => "The authoritative model retry was exhausted.".to_string(),
             }),
