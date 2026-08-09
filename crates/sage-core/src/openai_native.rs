@@ -483,10 +483,14 @@ fn consume_sse_line(
             ));
         }
     };
+    let delta_selects_tools = delta
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|tool_calls| !tool_calls.is_empty());
     let mut emitted_content = false;
     if let Some(content) = optional_string(delta.get("content"), "delta.content")? {
         state.content.push_str(content);
-        if !content.is_empty() {
+        if !content.is_empty() && !delta_selects_tools {
             if let Some(sender) = signal_sender {
                 let _ = sender.send(NativeProviderSignal::Content(content.to_string()));
             }
@@ -986,6 +990,26 @@ mod tests {
             signal_receiver.try_recv().expect("provider event signal"),
             NativeProviderSignal::Event
         );
+    }
+
+    #[test]
+    fn mixed_content_and_tool_call_delta_keeps_content_provider_private() {
+        let mut state = NativeStreamState::default();
+        let (signal_sender, mut signal_receiver) = mpsc::unbounded_channel();
+
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"content":"I will search.","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"knowledge_search","arguments":"{\"query\":\"guide\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut state,
+            &Some(signal_sender),
+        )
+        .expect("mixed Tool-selection event should parse");
+
+        assert_eq!(state.content, "I will search.");
+        assert_eq!(
+            signal_receiver.try_recv().expect("provider event signal"),
+            NativeProviderSignal::Event
+        );
+        assert!(signal_receiver.try_recv().is_err());
     }
 
     #[test]

@@ -109,7 +109,7 @@ Active calls:
 - `GET /internal/agent/user-profile-context/{user_id}`
 - `POST /internal/agent/document-search`
 - `POST /internal/agent/resources/search` — accepts optional generic `query`, `kind`, `tags`, `region`, `language`, and pagination fields. It returns relevance-ranked generic Resources plus `total_count`, `returned_count`, `limit`, `offset`, `has_more`, and `next_offset` metadata. Exact normalized IDs, names, and pointers rank ahead of partial names, pointers, and descriptions.
-- `find_resources` exposes that generic contract directly as a native Tool definition. The Conversation model decides whether to call it and may use the returned pagination metadata on a later turn. Sage validates arguments and backend page consistency, but does not run contact-specific intent classification, force a lookup, rewrite the selected batch, or quarantine final prose for completeness claims.
+- `find_resources` exposes a smaller model-facing contract: optional `exact_resource`, `region`, `language`, and continuation `offset`. Sage maps `exact_resource` to the private endpoint's `query` field and leaves private `kind` and `tags` unset, removing guess-prone facets from the model without adding a classifier or forced lookup. The Conversation model decides whether to call the Tool and may use returned pagination metadata on a later turn. Sage validates arguments and backend page consistency, but does not force a lookup, rewrite the selected batch, or quarantine final prose for completeness claims.
 - `POST /internal/agent/admin-db-query`
 
 ADR-0023 target calls:
@@ -140,16 +140,35 @@ Sage owns the bounded native Tool loop for Conversation routes.
 8. allow model-selected continuation within the six-batch safety ceiling;
    reject a seventh selected batch before execution, correlate bounded failures,
    and request one final same-model answer with Tools disabled
-9. return the assistant message plus Activity/Trace metadata and Tool summaries
+9. return the assistant message plus Activity/Trace metadata and Tool summaries;
+   separate prose from distinct model requests when their boundary contains no
+   whitespace
 
 Tool Sets:
 
 - `knowledge-search` exposes `knowledge_search` with Document Access and selected Document constraints
+- `curated-resources` exposes `find_resources` for relevance-ranked, operator-curated referrals and exact pointers
 - `web-search` exposes `web_search`
 - `admin-config` exposes admin-only configuration read/proposal Tools
 - `db-query` exposes admin-only read-only database inspection Tools
 
 The frontend should not pre-run Tools or inject admin configuration snapshots through `tool_context`.
+
+The shared Conversation instruction leaves judgment with the model while
+requiring it to preserve explicit consent and personal autonomy without indirect
+or observer-record workarounds, default the complete User turn to one current
+action in no more than three short paragraphs without headings or lists, emit a
+Tool call without preparatory prose, and stop selecting Tools once the evidence
+is enough. Broad Curated Resource discovery sends only region and language when
+applicable. The optional model-facing `exact_resource` field is reserved for a
+Resource name or pointer the User is asking for directly, not a place or subject
+mentioned as context. Private directory query, kind, and tag facets remain
+outside the native Conversation Tool schema.
+The configurable Agent Settings profile is assembled before these immutable
+runtime requirements in the same system instruction, so personalization remains
+available without becoming a later override of the platform contract.
+Sage does not implement those behaviors with an intent classifier, semantic
+answer rewrite, or hard output truncation.
 
 ## Stateful Conversation Compatibility
 
