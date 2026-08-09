@@ -8462,6 +8462,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn model_request_boundary_inserts_exactly_one_paragraph_separator() {
+        let mut answer = "First response.".to_string();
+
+        append_model_turn_content(&mut answer, "Second response.");
+
+        assert_eq!(answer, "First response.\n\nSecond response.");
+    }
+
+    #[test]
+    fn model_request_boundary_preserves_empty_and_whitespace_boundaries() {
+        let mut empty_previous = String::new();
+        append_model_turn_content(&mut empty_previous, "Second response.");
+        assert_eq!(empty_previous, "Second response.");
+
+        let mut empty_next = "First response.".to_string();
+        append_model_turn_content(&mut empty_next, "");
+        assert_eq!(empty_next, "First response.");
+
+        let mut previous_has_whitespace = "First response. ".to_string();
+        append_model_turn_content(&mut previous_has_whitespace, "Second response.");
+        assert_eq!(previous_has_whitespace, "First response. Second response.");
+
+        let mut next_has_whitespace = "First response.".to_string();
+        append_model_turn_content(&mut next_has_whitespace, " Second response.");
+        assert_eq!(next_has_whitespace, "First response. Second response.");
+    }
+
+    #[test]
+    fn provider_chunks_within_one_model_request_are_not_separated() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let mut answer_state = NativeAnswerStreamState::default();
+
+        stage_native_provider_signal(
+            NativeProviderSignal::Content("First.".to_string()),
+            &mut answer_state,
+            &Some(delta_tx.clone()),
+        )
+        .expect("first provider chunk should stage");
+        stage_native_provider_signal(
+            NativeProviderSignal::Content("Second.".to_string()),
+            &mut answer_state,
+            &Some(delta_tx),
+        )
+        .expect("second provider chunk should stage");
+
+        assert_eq!(answer_state.answer, "First.Second.");
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().expect("first answer delta")),
+            "First."
+        );
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().expect("second answer delta")),
+            "Second."
+        );
+        assert!(delta_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn streamed_model_request_boundary_emits_separator_before_content() {
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let mut answer_state = NativeAnswerStreamState::with_leading_separator(true);
+
+        stage_native_provider_signal(
+            NativeProviderSignal::Content("Second response.".to_string()),
+            &mut answer_state,
+            &Some(delta_tx),
+        )
+        .expect("cross-request provider chunk should stage");
+
+        assert_eq!(answer_state.answer, "\n\nSecond response.");
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().expect("separator delta")),
+            "\n\n"
+        );
+        assert_eq!(
+            answer_signal(delta_rx.try_recv().expect("answer delta")),
+            "Second response."
+        );
+        assert!(delta_rx.try_recv().is_err());
+    }
+
     fn native_test_call(
         id: &str,
         name: &str,
