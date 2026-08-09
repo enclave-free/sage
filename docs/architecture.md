@@ -80,8 +80,12 @@ evidence. Each executed batch's Tool results are limited to 4,000 characters per
 result and 12,000 characters total.
 
 Native assistant content streams in provider order without semantic scanning,
-quarantine, rewriting, or deterministic answer fallback. Provider reasoning is
-discarded. Before the first provider event, structural protocol failures and
+rewriting, or deterministic answer fallback. When a model request has Tools
+available, Sage buffers that request's visible content until the provider has
+finished Tool selection: content from a Tool-selection turn remains private,
+while a direct answer is released intact. Requests with no Tools available keep
+incremental answer streaming. Provider reasoning is discarded. Before the first
+provider event, structural protocol failures and
 eligible connection, timeout, or 502/503/504 failures share a bounded recovery
 budget of three identical attempts against the identical model. Complete provider
 silence for 30 seconds is also eligible within that same budget. Once any provider
