@@ -7167,11 +7167,12 @@ async fn run_native_turn_with_provider_and_first_event_timeout(
             stage_native_provider_signal(
                 NativeProviderSignal::Content(turn.content.clone()),
                 &mut answer_state,
-                &delta_sender,
+                &None,
             )
             .map_err(model_provider_error)?;
         }
         if !tool_turn {
+            release_buffered_native_answer(&mut answer_state, &delta_sender);
             append_model_turn_content(&mut answer, &turn.content);
         }
 
@@ -7241,10 +7242,11 @@ async fn run_native_turn_with_provider_and_first_event_timeout(
                 stage_native_provider_signal(
                     NativeProviderSignal::Content(final_turn.content.clone()),
                     &mut final_answer_state,
-                    &delta_sender,
+                    &None,
                 )
                 .map_err(model_provider_error)?;
             }
+            release_buffered_native_answer(&mut final_answer_state, &delta_sender);
             append_model_turn_content(&mut answer, &final_turn.content);
             return Ok(AdapterTurnOutput {
                 answer,
@@ -7464,6 +7466,11 @@ async fn stream_native_turn_attempt(
     let tools_enabled = !request.tools.is_empty();
     let request_started_at = Instant::now();
     let mut first_provider_event_seen = false;
+    let provider_delta_sender = if tools_enabled {
+        None
+    } else {
+        delta_sender.clone()
+    };
     let (native_sender, mut native_receiver) = mpsc::unbounded_channel();
     let provider_turn = provider.stream_turn(request, Some(native_sender));
     tokio::pin!(provider_turn);
@@ -7489,7 +7496,7 @@ async fn stream_native_turn_attempt(
                     stage_native_provider_signal(
                         signal,
                         answer_state,
-                        delta_sender,
+                        &provider_delta_sender,
                     )?;
                 }
                 break result;
@@ -7510,7 +7517,7 @@ async fn stream_native_turn_attempt(
                 stage_native_provider_signal(
                     signal,
                     answer_state,
-                    delta_sender,
+                    &provider_delta_sender,
                 )?;
             }
             _ = &mut first_event_deadline, if !first_provider_event_seen => {
@@ -8241,6 +8248,16 @@ fn release_answer_delta(
         return false;
     };
     sender.send(ConversationStreamSignal::Answer(delta)).is_ok()
+}
+
+fn release_buffered_native_answer(
+    answer_state: &mut NativeAnswerStreamState,
+    delta_sender: &Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
+) {
+    if answer_state.answer.is_empty() || answer_state.released_any {
+        return;
+    }
+    answer_state.released_any = release_answer_delta(answer_state.answer.clone(), delta_sender);
 }
 
 fn conversation_model_http_client() -> std::result::Result<Client, reqwest::Error> {
@@ -9279,7 +9296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_tool_free_turn_uses_one_model_request_and_streams_the_answer() {
+    async fn native_tool_capable_direct_answer_waits_for_tool_selection_to_finish() {
         #[derive(Clone)]
         struct StreamingProviderState {
             requests: Arc<AtomicUsize>,
@@ -9357,10 +9374,12 @@ mod tests {
             .await
         });
 
-        let first_delta = tokio::time::timeout(Duration::from_secs(1), delta_rx.recv())
-            .await
-            .expect("first answer delta should arrive before provider completion")
-            .expect("answer stream should remain open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), delta_rx.recv())
+                .await
+                .is_err(),
+            "Tool-capable model content must remain private until the request proves it did not select a Tool"
+        );
         assert!(!turn_task.is_finished());
         release_completion.notify_one();
         let turn = turn_task
@@ -9373,10 +9392,11 @@ mod tests {
             turn.answer,
             "Let me explain this directly. It is now complete."
         );
-        let mut deltas = vec![answer_signal(first_delta)];
+        let mut deltas = Vec::new();
         while let Ok(signal) = delta_rx.try_recv() {
             deltas.push(answer_signal(signal));
         }
+        assert_eq!(deltas.len(), 1);
         assert_eq!(deltas.concat(), turn.answer);
         let trace_events = trace_events.lock().expect("native trace events");
         let serialized_trace = format!("{trace_events:?}");
@@ -9861,7 +9881,8 @@ mod tests {
             };
             let stream = if request_number == 1 {
                 concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"I found something. \",\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}},{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"I found something. \"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"alpha\\\"}\"}},{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"knowledge_search\",\"arguments\":\"{\\\"query\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
                     "data: [DONE]\n\n"
                 )
             } else {
@@ -9926,7 +9947,7 @@ mod tests {
                 answer_deltas.push(delta);
             }
         }
-        assert_eq!(answer_deltas.concat(), turn.answer);
+        assert_eq!(answer_deltas, ["Grounded answer."]);
         assert_eq!(turn.executed_tools.len(), 2);
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         let requests = provider_state.0.lock().expect("captured provider requests");
@@ -9939,6 +9960,7 @@ mod tests {
         assert_eq!(requests[0]["tool_choice"], "auto");
         assert_eq!(requests[1]["tool_choice"], "auto");
         assert_eq!(requests[1]["messages"][2]["tool_calls"][0]["id"], "call-a");
+        assert_eq!(requests[1]["messages"][2]["content"], "I found something. ");
         assert_eq!(requests[1]["messages"][3]["tool_call_id"], "call-a");
         assert_eq!(requests[1]["messages"][4]["tool_call_id"], "call-b");
         let trace_events = trace_events.lock().expect("native trace events");
