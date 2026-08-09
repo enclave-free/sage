@@ -9300,6 +9300,7 @@ mod tests {
         #[derive(Clone)]
         struct StreamingProviderState {
             requests: Arc<AtomicUsize>,
+            first_content_sent: Arc<tokio::sync::Notify>,
             release_completion: Arc<tokio::sync::Notify>,
         }
 
@@ -9309,12 +9310,14 @@ mod tests {
         ) -> Response {
             state.requests.fetch_add(1, Ordering::SeqCst);
             assert_eq!(body["tools"][0]["function"]["name"], "knowledge_search");
+            let first_content_sent = state.first_content_sent.clone();
             let release_completion = state.release_completion.clone();
             let body = axum::body::Body::from_stream(async_stream::stream! {
                 yield Ok::<_, Infallible>(axum::body::Bytes::from_static(concat!(
                     "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hidden credential sk_test_never_stream and private value 8675309\"},\"finish_reason\":null}]}\n\n",
                     "data: {\"choices\":[{\"delta\":{\"content\":\"Let me explain this directly. \"},\"finish_reason\":null}]}\n\n"
                 ).as_bytes()));
+                first_content_sent.notify_one();
                 release_completion.notified().await;
                 yield Ok::<_, Infallible>(axum::body::Bytes::from_static(concat!(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"It is now complete.\"},\"finish_reason\":\"stop\"}]}\n\n",
@@ -9329,6 +9332,7 @@ mod tests {
         }
 
         let requests = Arc::new(AtomicUsize::new(0));
+        let first_content_sent = Arc::new(tokio::sync::Notify::new());
         let release_completion = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -9338,6 +9342,7 @@ mod tests {
             .route("/v1/chat/completions", post(completion))
             .with_state(StreamingProviderState {
                 requests: requests.clone(),
+                first_content_sent: first_content_sent.clone(),
                 release_completion: release_completion.clone(),
             });
         tokio::spawn(async move {
@@ -9374,6 +9379,9 @@ mod tests {
             .await
         });
 
+        tokio::time::timeout(Duration::from_secs(1), first_content_sent.notified())
+            .await
+            .expect("provider should deliver its first content chunk");
         assert!(
             tokio::time::timeout(Duration::from_millis(100), delta_rx.recv())
                 .await
