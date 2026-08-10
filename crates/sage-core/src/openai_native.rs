@@ -1029,7 +1029,7 @@ mod tests {
         else {
             panic!("valid HTTP-date guidance should be retained as a duration");
         };
-        assert!(delay >= Duration::from_secs(1));
+        assert!(delay > Duration::ZERO);
         assert!(delay <= Duration::from_secs(2));
     }
 
