@@ -1617,6 +1617,11 @@ struct ConversationTraceDeltaSink {
     sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>,
 }
 
+enum TraceDeltaSnapshotWrite {
+    Append,
+    ReplaceById,
+}
+
 impl ConversationTraceDeltaSink {
     fn new(sender: Option<mpsc::UnboundedSender<ConversationStreamSignal>>) -> Self {
         Self {
@@ -1626,9 +1631,30 @@ impl ConversationTraceDeltaSink {
     }
 
     fn emit(&self, delta: ConversationTraceDeltaResponse) {
+        self.emit_with_snapshot_write(delta, TraceDeltaSnapshotWrite::Append);
+    }
+
+    fn emit_replacing(&self, delta: ConversationTraceDeltaResponse) {
+        self.emit_with_snapshot_write(delta, TraceDeltaSnapshotWrite::ReplaceById);
+    }
+
+    fn emit_with_snapshot_write(
+        &self,
+        delta: ConversationTraceDeltaResponse,
+        snapshot_write: TraceDeltaSnapshotWrite,
+    ) {
         let guarded = guard_trace_delta(delta);
         if let Ok(mut deltas) = self.deltas.lock() {
-            deltas.push(guarded.clone());
+            match snapshot_write {
+                TraceDeltaSnapshotWrite::Append => deltas.push(guarded.clone()),
+                TraceDeltaSnapshotWrite::ReplaceById => {
+                    if let Some(existing) = deltas.iter_mut().find(|delta| delta.id == guarded.id) {
+                        *existing = guarded.clone();
+                    } else {
+                        deltas.push(guarded.clone());
+                    }
+                }
+            }
         }
         if let Some(sender) = &self.sender {
             let _ = sender.send(ConversationStreamSignal::Trace(Box::new(guarded)));
@@ -1642,6 +1668,8 @@ impl ConversationTraceDeltaSink {
             .unwrap_or_default()
     }
 }
+
+const NATIVE_MODEL_RETRY_DELTA_ID_PREFIX: &str = "native-model-retry-step-";
 
 #[derive(Clone)]
 struct ConversationToolLoopSinks {
@@ -1879,7 +1907,13 @@ fn install_conversation_trace_hook(
 ) {
     agent.set_trace_hook(Arc::new(move |event| {
         log_agent_trace_event(&event, &conversation_id, &message_id, &actor_kind, actor_id);
-        trace_sink.emit(agent_trace_event_delta(event));
+        let replace_snapshot = matches!(&event, AgentTraceEvent::NativeModelRetry { .. });
+        let delta = agent_trace_event_delta(event);
+        if replace_snapshot {
+            trace_sink.emit_replacing(delta);
+        } else {
+            trace_sink.emit(delta);
+        }
     }));
 }
 
@@ -2170,10 +2204,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             reason,
             outcome,
         } => ConversationTraceDeltaResponse {
-            id: trace_delta_id(
-                "native-model-retry",
-                &format!("{}-{}-{}", step, attempt, outcome),
-            ),
+            id: format!("{NATIVE_MODEL_RETRY_DELTA_ID_PREFIX}{step}"),
             kind: "retry".to_string(),
             title: Some("Model retry".to_string()),
             content: Some(match outcome.as_str() {
@@ -7373,10 +7404,12 @@ async fn request_native_turn_with_retry_and_first_event_timeout(
                     let reason = retry_reason
                         .unwrap_or("transient_provider_failure")
                         .to_string();
+                    let retry_delay = native_model_retry_delay(&error, attempt);
                     warn!(
                         attempt,
                         next_attempt,
                         max_attempts = CONVERSATION_MODEL_MAX_ATTEMPTS,
+                        retry_delay_ms = retry_delay.as_millis() as u64,
                         "Authoritative model request failed transiently; retrying the same request"
                     );
                     agent.emit_trace_event(AgentTraceEvent::NativeModelRetry {
@@ -7387,6 +7420,17 @@ async fn request_native_turn_with_retry_and_first_event_timeout(
                         outcome: "scheduled".to_string(),
                     });
                     scheduled_reason = Some(reason);
+                    let retry_delay_started_at = Instant::now();
+                    tokio::time::sleep(retry_delay).await;
+                    agent.emit_trace_event(AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::RetryDelay,
+                        step: Some(step),
+                        tool_name: None,
+                        call_id: None,
+                        attempt,
+                        outcome: ConversationTimingOutcome::Succeeded,
+                        elapsed_ms: retry_delay_started_at.elapsed().as_millis(),
+                    });
                     continue;
                 }
                 if attempt > 1 {
@@ -7427,6 +7471,7 @@ fn same_model_retry_category(error: &NativeProviderError) -> Option<&'static str
             Some("response_stream")
         }
         NativeProviderError::Http { status, .. } => match *status {
+            reqwest::StatusCode::TOO_MANY_REQUESTS => Some("http_429"),
             reqwest::StatusCode::BAD_GATEWAY => Some("http_502"),
             reqwest::StatusCode::SERVICE_UNAVAILABLE => Some("http_503"),
             reqwest::StatusCode::GATEWAY_TIMEOUT => Some("http_504"),
@@ -7434,6 +7479,34 @@ fn same_model_retry_category(error: &NativeProviderError) -> Option<&'static str
         },
         NativeProviderError::Transport(_) => None,
     }
+}
+
+fn native_model_retry_delay(error: &NativeProviderError, failed_attempt: u32) -> Duration {
+    if let NativeProviderError::Http {
+        retry_after: Some(retry_after),
+        ..
+    } = error
+    {
+        return (*retry_after).min(CONVERSATION_MODEL_RETRY_MAX_DELAY);
+    }
+
+    let exponent = failed_attempt.saturating_sub(1).min(8);
+    let base_delay = CONVERSATION_MODEL_RETRY_BASE_DELAY
+        .saturating_mul(1_u32 << exponent)
+        .min(CONVERSATION_MODEL_RETRY_MAX_DELAY);
+    let jitter_ceiling = base_delay / 4;
+    let jitter_nanos = if jitter_ceiling.is_zero() {
+        0
+    } else {
+        let nanos_since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u128;
+        nanos_since_epoch % (jitter_ceiling.as_nanos() + 1)
+    };
+    base_delay
+        .saturating_add(Duration::from_nanos(jitter_nanos as u64))
+        .min(CONVERSATION_MODEL_RETRY_MAX_DELAY)
 }
 
 fn safe_protocol_error_detail(error: &NativeProviderError) -> &str {
@@ -8185,6 +8258,8 @@ const MAX_NATIVE_TOOL_ROUNDS: usize = 6;
 const CONVERSATION_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const CONVERSATION_MODEL_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONVERSATION_MODEL_MAX_ATTEMPTS: u32 = 3;
+const CONVERSATION_MODEL_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const CONVERSATION_MODEL_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 struct NativeAnswerStreamState {
@@ -10676,6 +10751,273 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_output_rate_limit_retries_the_identical_request_and_recovers() {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            let request_number = {
+                let mut requests = state.0.lock().expect("provider request capture");
+                requests.push(body);
+                requests.len()
+            };
+            if request_number == 1 {
+                return Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("retry-after", "0")
+                    .body(axum::body::Body::from(
+                        r#"{"error":"private upstream detail"}"#,
+                    ))
+                    .expect("rate-limit response should build");
+            }
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered after rate limit.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+                .into_response()
+        }
+
+        let state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let trace_events = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink.lock().expect("native trace sink").push(event);
+        }));
+        let request = NativeTurnRequest {
+            model: "glm-5-2".to_string(),
+            messages: vec![NativeChatMessage::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+        };
+
+        let (turn, _, attempt) = request_native_turn_with_retry_and_first_event_timeout(
+            &agent,
+            &provider,
+            request,
+            0,
+            &None,
+            Duration::from_millis(25),
+            false,
+        )
+        .await
+        .expect("a pre-output rate limit should recover within the shared attempt budget");
+
+        assert_eq!(turn.content, "Recovered after rate limit.");
+        assert_eq!(attempt, 2);
+        let requests = state.0.lock().expect("captured provider requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        drop(requests);
+        let trace_events = trace_events.lock().expect("captured trace events");
+        assert!(trace_events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::Timing {
+                phase: ConversationTimingPhase::RetryDelay,
+                step: Some(0),
+                attempt: 1,
+                outcome: ConversationTimingOutcome::Succeeded,
+                ..
+            }
+        )));
+        assert!(trace_events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::NativeModelRetry {
+                step: 0,
+                attempt: 2,
+                reason,
+                outcome,
+                ..
+            } if reason == "http_429" && outcome == "recovered"
+        )));
+        assert!(!format!("{trace_events:?}").contains("private upstream detail"));
+    }
+
+    #[tokio::test]
+    async fn provider_stall_then_rate_limit_recovers_on_the_final_shared_attempt() {
+        #[derive(Clone, Default)]
+        struct ProviderState(Arc<Mutex<Vec<Value>>>);
+
+        async fn completion(
+            State(state): State<ProviderState>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            let request_number = {
+                let mut requests = state.0.lock().expect("provider request capture");
+                requests.push(body);
+                requests.len()
+            };
+            match request_number {
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    ([(("content-type"), "text/event-stream")], "data: [DONE]\n\n")
+                        .into_response()
+                }
+                2 => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error": "private upstream detail"})),
+                )
+                    .into_response(),
+                _ => (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered on final attempt.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+                    .into_response(),
+            }
+        }
+
+        let state = ProviderState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let request = NativeTurnRequest {
+            model: "glm-5-2".to_string(),
+            messages: vec![NativeChatMessage::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+        };
+
+        let (turn, _, attempt) = request_native_turn_with_retry_and_first_event_timeout(
+            &agent,
+            &provider,
+            request,
+            0,
+            &None,
+            Duration::from_millis(25),
+            false,
+        )
+        .await
+        .expect("stall and rate limit should share the same bounded recovery budget");
+
+        assert_eq!(turn.content, "Recovered on final attempt.");
+        assert_eq!(attempt, 3);
+        let requests = state.0.lock().expect("captured provider requests");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[1], requests[2]);
+    }
+
+    #[tokio::test]
+    async fn three_pre_output_rate_limits_exhaust_without_a_fourth_request() {
+        #[derive(Clone, Default)]
+        struct RequestCount(Arc<AtomicUsize>);
+
+        async fn completion(State(count): State<RequestCount>) -> Response {
+            count.0.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "0")],
+                Json(json!({"error": "private upstream detail"})),
+            )
+                .into_response()
+        }
+
+        let count = RequestCount::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion))
+            .with_state(count.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = OpenAiNativeClient::new(
+            Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+        let mut agent = SageAgent::new_without_memory(ToolRegistry::new(), "Answer accurately.");
+        let trace_events = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = trace_events.clone();
+        agent.set_trace_hook(Arc::new(move |event| {
+            trace_sink.lock().expect("native trace sink").push(event);
+        }));
+        let request = NativeTurnRequest {
+            model: "glm-5-2".to_string(),
+            messages: vec![NativeChatMessage::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+        };
+
+        let error = request_native_turn_with_retry_and_first_event_timeout(
+            &agent,
+            &provider,
+            request,
+            0,
+            &None,
+            Duration::from_millis(25),
+            false,
+        )
+        .await
+        .expect_err("the shared recovery budget must stop after three rate limits");
+
+        assert!(matches!(
+            error.0,
+            NativeProviderError::Http {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                ..
+            }
+        ));
+        assert_eq!(count.0.load(Ordering::SeqCst), 3);
+        let trace_events = trace_events.lock().expect("captured trace events");
+        assert_eq!(
+            trace_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentTraceEvent::Timing {
+                        phase: ConversationTimingPhase::RetryDelay,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert!(trace_events.iter().any(|event| matches!(
+            event,
+            AgentTraceEvent::NativeModelRetry {
+                attempt: 3,
+                reason,
+                outcome,
+                ..
+            } if reason == "http_429" && outcome == "exhausted"
+        )));
+        assert!(!format!("{trace_events:?}").contains("private upstream detail"));
+    }
+
+    #[tokio::test]
     async fn three_silent_attempts_exhaust_one_logical_request() {
         #[derive(Clone, Default)]
         struct RequestCount(Arc<AtomicUsize>);
@@ -10728,7 +11070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_retryable_failures_share_one_three_attempt_ceiling() {
+    async fn stall_and_rate_limits_share_one_three_attempt_ceiling() {
         #[derive(Clone, Default)]
         struct RequestCount(Arc<AtomicUsize>);
 
@@ -10744,8 +11086,9 @@ mod tests {
                     .into_response();
             }
             (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "temporary"})),
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "0")],
+                Json(json!({"error": "private upstream detail"})),
             )
                 .into_response()
         }
@@ -10786,7 +11129,7 @@ mod tests {
         assert!(matches!(
             error.0,
             NativeProviderError::Http {
-                status: StatusCode::SERVICE_UNAVAILABLE,
+                status: StatusCode::TOO_MANY_REQUESTS,
                 ..
             }
         ));
@@ -10856,7 +11199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_model_retry_reuses_tool_results_without_replaying_tools() {
+    async fn post_tool_rate_limit_reuses_results_without_replaying_tools() {
         #[derive(Clone, Default)]
         struct ProviderState(Arc<Mutex<Vec<Value>>>);
 
@@ -10879,8 +11222,9 @@ mod tests {
                 )
                     .into_response(),
                 2 => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"error": "temporary"})),
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "0")],
+                    Json(json!({"error": "private upstream detail"})),
                 )
                     .into_response(),
                 _ => (
@@ -15848,6 +16192,7 @@ mod tests {
             "malformed response".to_string()
         )));
         for status in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
             reqwest::StatusCode::BAD_GATEWAY,
             reqwest::StatusCode::SERVICE_UNAVAILABLE,
             reqwest::StatusCode::GATEWAY_TIMEOUT,
@@ -15855,16 +16200,53 @@ mod tests {
             assert!(same_model_retry_eligible(&NativeProviderError::Http {
                 status,
                 body: "temporary".to_string(),
+                retry_after: None,
             }));
         }
         assert!(!same_model_retry_eligible(&NativeProviderError::Http {
             status: reqwest::StatusCode::UNAUTHORIZED,
             body: "invalid key".to_string(),
+            retry_after: None,
         }));
         assert!(!same_model_retry_eligible(&NativeProviderError::Http {
             status: reqwest::StatusCode::BAD_REQUEST,
             body: "invalid request".to_string(),
+            retry_after: None,
         }));
+    }
+
+    #[test]
+    fn model_retry_delays_fall_back_with_jitter_and_cap_provider_guidance() {
+        let fallback = native_model_retry_delay(
+            &NativeProviderError::Http {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body: "private upstream body".to_string(),
+                retry_after: None,
+            },
+            1,
+        );
+        assert!(fallback >= CONVERSATION_MODEL_RETRY_BASE_DELAY);
+        assert!(fallback <= CONVERSATION_MODEL_RETRY_BASE_DELAY.saturating_mul(5) / 4);
+
+        let guided = native_model_retry_delay(
+            &NativeProviderError::Http {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body: "private upstream body".to_string(),
+                retry_after: Some(Duration::from_secs(1)),
+            },
+            1,
+        );
+        assert_eq!(guided, Duration::from_secs(1));
+
+        let capped = native_model_retry_delay(
+            &NativeProviderError::Http {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body: "private upstream body".to_string(),
+                retry_after: Some(Duration::from_secs(60)),
+            },
+            1,
+        );
+        assert_eq!(capped, CONVERSATION_MODEL_RETRY_MAX_DELAY);
     }
 
     #[test]
@@ -15885,6 +16267,7 @@ mod tests {
             safe_protocol_error_detail(&NativeProviderError::Http {
                 status: reqwest::StatusCode::BAD_GATEWAY,
                 body: "private upstream body".to_string(),
+                retry_after: None,
             }),
             ""
         );
@@ -15896,6 +16279,7 @@ mod tests {
         let error = model_provider_error(NativeProviderError::Http {
             status: reqwest::StatusCode::UNAUTHORIZED,
             body: format!("Authorization failed for {secret}"),
+            retry_after: None,
         });
 
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
@@ -15940,6 +16324,104 @@ mod tests {
         ] {
             assert!(!rendered.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn native_model_retry_trace_updates_one_logical_row_through_recovery() {
+        let scheduled_second = agent_trace_event_delta(AgentTraceEvent::NativeModelRetry {
+            model: "glm-5-2".to_string(),
+            step: 1,
+            attempt: 2,
+            reason: "pre_response_stall".to_string(),
+            outcome: "scheduled".to_string(),
+        });
+        let scheduled_third = agent_trace_event_delta(AgentTraceEvent::NativeModelRetry {
+            model: "glm-5-2".to_string(),
+            step: 1,
+            attempt: 3,
+            reason: "http_429".to_string(),
+            outcome: "scheduled".to_string(),
+        });
+        let recovered = agent_trace_event_delta(AgentTraceEvent::NativeModelRetry {
+            model: "glm-5-2".to_string(),
+            step: 1,
+            attempt: 3,
+            reason: "http_429".to_string(),
+            outcome: "recovered".to_string(),
+        });
+
+        assert_eq!(scheduled_second.id, scheduled_third.id);
+        assert_eq!(scheduled_third.id, recovered.id);
+        assert_eq!(scheduled_second.status.as_deref(), Some("running"));
+        assert_eq!(scheduled_third.status.as_deref(), Some("running"));
+        assert_eq!(recovered.status.as_deref(), Some("succeeded"));
+    }
+
+    #[test]
+    fn native_model_retry_trace_updates_one_logical_row_through_exhaustion() {
+        let scheduled_second = agent_trace_event_delta(AgentTraceEvent::NativeModelRetry {
+            model: "glm-5-2".to_string(),
+            step: 2,
+            attempt: 2,
+            reason: "http_429".to_string(),
+            outcome: "scheduled".to_string(),
+        });
+        let scheduled_third = agent_trace_event_delta(AgentTraceEvent::NativeModelRetry {
+            model: "glm-5-2".to_string(),
+            step: 2,
+            attempt: 3,
+            reason: "http_429".to_string(),
+            outcome: "scheduled".to_string(),
+        });
+        let exhausted = agent_trace_event_delta(AgentTraceEvent::NativeModelRetry {
+            model: "glm-5-2".to_string(),
+            step: 2,
+            attempt: 3,
+            reason: "http_429".to_string(),
+            outcome: "exhausted".to_string(),
+        });
+
+        assert_eq!(scheduled_second.id, scheduled_third.id);
+        assert_eq!(scheduled_third.id, exhausted.id);
+        assert_eq!(scheduled_second.status.as_deref(), Some("running"));
+        assert_eq!(scheduled_third.status.as_deref(), Some("running"));
+        assert_eq!(exhausted.status.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn native_model_retry_trace_snapshot_replaces_running_state() {
+        let sink = ConversationTraceDeltaSink::new(None);
+        for event in [
+            AgentTraceEvent::NativeModelRetry {
+                model: "glm-5-2".to_string(),
+                step: 3,
+                attempt: 2,
+                reason: "pre_response_stall".to_string(),
+                outcome: "scheduled".to_string(),
+            },
+            AgentTraceEvent::NativeModelRetry {
+                model: "glm-5-2".to_string(),
+                step: 3,
+                attempt: 3,
+                reason: "http_429".to_string(),
+                outcome: "scheduled".to_string(),
+            },
+            AgentTraceEvent::NativeModelRetry {
+                model: "glm-5-2".to_string(),
+                step: 3,
+                attempt: 3,
+                reason: "http_429".to_string(),
+                outcome: "recovered".to_string(),
+            },
+        ] {
+            sink.emit_replacing(agent_trace_event_delta(event));
+        }
+
+        let snapshot = sink.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].status.as_deref(), Some("succeeded"));
+        assert_eq!(snapshot[0].metadata["attempt"], 3);
+        assert_eq!(snapshot[0].metadata["outcome"], "recovered");
     }
 
     #[test]

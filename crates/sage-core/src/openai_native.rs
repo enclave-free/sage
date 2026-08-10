@@ -6,6 +6,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 const MAX_NATIVE_SSE_LINE_BYTES: usize = 1024 * 1024;
@@ -204,6 +205,7 @@ pub enum NativeProviderError {
     Http {
         status: reqwest::StatusCode,
         body: String,
+        retry_after: Option<Duration>,
     },
     #[error("native provider protocol error: {0}")]
     Protocol(String),
@@ -309,6 +311,7 @@ impl OpenAiNativeClient {
         let mut response = self.send_request(&body).await?;
         let mut status = response.status();
         if !status.is_success() {
+            let retry_after = retry_after_from_headers(response.headers());
             let error_body = response.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::BAD_REQUEST
                 && body.contains_key("stream_options")
@@ -321,15 +324,18 @@ impl OpenAiNativeClient {
                 if status.is_success() {
                     return consume_stream_response(response, signal_sender).await;
                 }
+                let retry_after = retry_after_from_headers(response.headers());
                 let fallback_body = response.text().await.unwrap_or_default();
                 return Err(NativeProviderError::Http {
                     status,
                     body: truncate(&fallback_body, 500),
+                    retry_after,
                 });
             }
             return Err(NativeProviderError::Http {
                 status,
                 body: truncate(&error_body, 500),
+                retry_after,
             });
         }
 
@@ -350,6 +356,25 @@ impl OpenAiNativeClient {
             .send()
             .await
     }
+}
+
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    Some(
+        (retry_at - chrono::Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 fn stream_usage_capability(api_url: &str) -> Arc<AtomicBool> {
@@ -712,15 +737,23 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         consume_sse_line, finish_stream, validate_sse_buffer_len, NativeAssistantMessage,
-        NativeChatMessage, NativeFinishReason, NativeProviderSignal, NativeReasoningEffort,
-        NativeStreamState, NativeToolCall, NativeToolDefinition, NativeTurnRequest,
-        OpenAiNativeClient, MAX_NATIVE_CONTINUITY_STATE_BYTES, MAX_NATIVE_SSE_LINE_BYTES,
+        NativeChatMessage, NativeFinishReason, NativeProviderError, NativeProviderSignal,
+        NativeReasoningEffort, NativeStreamState, NativeToolCall, NativeToolDefinition,
+        NativeTurnRequest, OpenAiNativeClient, MAX_NATIVE_CONTINUITY_STATE_BYTES,
+        MAX_NATIVE_SSE_LINE_BYTES,
     };
     use axum::{
-        extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
+        extract::State,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::post,
+        Json, Router,
     };
     use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
     use tokio::sync::mpsc;
 
     #[derive(Clone, Default)]
@@ -896,6 +929,160 @@ mod tests {
         );
         assert_eq!(requests[1].get("tool_choice"), Some(&json!("auto")));
         assert_eq!(requests[1].get("reasoning_effort"), Some(&json!("high")));
+    }
+
+    #[tokio::test]
+    async fn provider_rejection_carries_sanitized_retry_after_guidance() {
+        async fn completion() -> impl IntoResponse {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "2")],
+                Json(json!({"error": "private upstream detail"})),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(completion)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = OpenAiNativeClient::new(
+            reqwest::Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let error = client
+            .stream_turn(
+                NativeTurnRequest {
+                    model: "glm-5-2".to_string(),
+                    messages: vec![NativeChatMessage::user("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 64,
+                },
+                None,
+            )
+            .await
+            .expect_err("the provider should reject the request");
+
+        assert!(matches!(
+            error,
+            NativeProviderError::Http {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                retry_after: Some(delay),
+                ..
+            } if delay == Duration::from_secs(2)
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_rejection_accepts_http_date_retry_after_guidance() {
+        async fn completion() -> axum::response::Response {
+            let retry_at = (chrono::Utc::now() + chrono::Duration::seconds(2))
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string();
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("retry-after", retry_at)
+                .body(axum::body::Body::from("rejected"))
+                .unwrap()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(completion)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = OpenAiNativeClient::new(
+            reqwest::Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let error = client
+            .stream_turn(
+                NativeTurnRequest {
+                    model: "glm-5-2".to_string(),
+                    messages: vec![NativeChatMessage::user("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 64,
+                },
+                None,
+            )
+            .await
+            .expect_err("the provider should reject the request");
+
+        let NativeProviderError::Http {
+            retry_after: Some(delay),
+            ..
+        } = error
+        else {
+            panic!("valid HTTP-date guidance should be retained as a duration");
+        };
+        assert!(delay >= Duration::from_secs(1));
+        assert!(delay <= Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn malformed_retry_after_guidance_is_not_retained() {
+        async fn completion() -> axum::response::Response {
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("retry-after", "not-a-delay")
+                .body(axum::body::Body::from("rejected"))
+                .unwrap()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(completion)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = OpenAiNativeClient::new(
+            reqwest::Client::new(),
+            format!("http://{address}/v1"),
+            "test-key".to_string(),
+            0.1,
+        );
+
+        let error = client
+            .stream_turn(
+                NativeTurnRequest {
+                    model: "glm-5-2".to_string(),
+                    messages: vec![NativeChatMessage::user("hello")],
+                    tools: Vec::new(),
+                    max_tokens: 64,
+                },
+                None,
+            )
+            .await
+            .expect_err("the provider should reject the request");
+
+        assert!(matches!(
+            error,
+            NativeProviderError::Http {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                retry_after: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

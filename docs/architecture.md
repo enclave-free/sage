@@ -85,20 +85,25 @@ available, Sage buffers that request's visible content until the provider has
 finished Tool selection: content from a Tool-selection turn remains private,
 while a direct answer is released intact. Requests with no Tools available keep
 incremental answer streaming. Provider reasoning is discarded. Before the first
-provider event, structural protocol failures and
-eligible connection, timeout, or 502/503/504 failures share a bounded recovery
-budget of three identical attempts against the identical model. Complete provider
-silence for 30 seconds is also eligible within that same budget. Once any provider
-stream event has arrived, a later failure does not retry. A final-request retry
-reuses existing Tool-result messages and cannot execute Tools again. No other
-Conversation model is substituted after failure.
+provider event, structural protocol failures and eligible connection, timeout,
+429, or 502/503/504 failures share a bounded recovery budget of three identical
+attempts against the identical model. Complete provider silence for 30 seconds is
+also eligible within that same budget. Eligible retries wait through a short
+capped exponential delay with jitter; valid `Retry-After` guidance is honored up
+to the same internal cap. Once any provider stream event has arrived, a later
+failure does not retry. A final-request retry reuses existing Tool-result messages
+and cannot execute Tools again. No other Conversation model is substituted after
+failure.
 
 Conversation traces record each native loop step, provider first-event wait,
-Retrieval or Resource lookup, Tool execution, retry, and total-turn timing where
-those stages are measurable. Provider first-event wait is a combined proxy:
+Retrieval or Resource lookup, Tool execution, content-free retry delay, retry
+outcome, and total-turn timing where those stages are measurable. Provider
+first-event wait is a combined proxy:
 network transit, provider queueing, and model startup may all contribute. Sage
 does not emit fabricated `cluster_scheduling` or `inference_only` phases when
-the provider does not supply those measurements.
+the provider does not supply those measurements. A model retry keeps one stable
+per-step Trace identity so scheduled state is replaced by recovered or exhausted
+state instead of leaving a completed retry visibly running.
 
 ## InternalAgentClient Contract
 
