@@ -367,12 +367,10 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Dura
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
-    let retry_at = chrono::DateTime::parse_from_rfc2822(value)
-        .ok()?
-        .with_timezone(&chrono::Utc);
+    let retry_at = httpdate::parse_http_date(value).ok()?;
     Some(
-        (retry_at - chrono::Utc::now())
-            .to_std()
+        retry_at
+            .duration_since(std::time::SystemTime::now())
             .unwrap_or(Duration::ZERO),
     )
 }
@@ -736,11 +734,11 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        consume_sse_line, finish_stream, validate_sse_buffer_len, NativeAssistantMessage,
-        NativeChatMessage, NativeFinishReason, NativeProviderError, NativeProviderSignal,
-        NativeReasoningEffort, NativeStreamState, NativeToolCall, NativeToolDefinition,
-        NativeTurnRequest, OpenAiNativeClient, MAX_NATIVE_CONTINUITY_STATE_BYTES,
-        MAX_NATIVE_SSE_LINE_BYTES,
+        consume_sse_line, finish_stream, retry_after_from_headers, validate_sse_buffer_len,
+        NativeAssistantMessage, NativeChatMessage, NativeFinishReason, NativeProviderError,
+        NativeProviderSignal, NativeReasoningEffort, NativeStreamState, NativeToolCall,
+        NativeToolDefinition, NativeTurnRequest, OpenAiNativeClient,
+        MAX_NATIVE_CONTINUITY_STATE_BYTES, MAX_NATIVE_SSE_LINE_BYTES,
     };
     use axum::{
         extract::State,
@@ -1033,6 +1031,21 @@ mod tests {
         };
         assert!(delay >= Duration::from_secs(1));
         assert!(delay <= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retry_after_accepts_obsolete_http_date_formats() {
+        for value in ["Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994"] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                value
+                    .parse()
+                    .expect("fixture should be a valid header value"),
+            );
+
+            assert_eq!(retry_after_from_headers(&headers), Some(Duration::ZERO));
+        }
     }
 
     #[tokio::test]

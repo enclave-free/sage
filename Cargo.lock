@@ -3464,6 +3464,7 @@ dependencies = [
  "dspy-rs",
  "flate2",
  "futures-util",
+ "httpdate",
  "isocountry",
  "itsdangerous",
  "libc",
