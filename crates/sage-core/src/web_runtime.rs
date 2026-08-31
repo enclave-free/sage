@@ -1496,20 +1496,23 @@ impl KnowledgeSearchTool {
         }
         if let Ok(mut sink) = self.traces.lock() {
             let mut warnings = Vec::new();
-            let output_summary =
-                if response.sources.is_empty() && response.context.trim().is_empty() {
-                    warnings.push("no_relevant_uploaded_document_context".to_string());
-                    "No relevant uploaded-document passages were found.".to_string()
-                } else {
-                    "Retrieved uploaded-document passages for the answer.".to_string()
-                };
+            let has_context = !response.context.trim().is_empty();
+            let output_summary = if response.sources.is_empty() && !has_context {
+                warnings.push("no_relevant_uploaded_document_context".to_string());
+                "No relevant uploaded-document passages were found.".to_string()
+            } else {
+                "Retrieved uploaded-document passages for the answer.".to_string()
+            };
             sink.push(ToolCallInfoResponse {
                 tool_id: "knowledge-search".to_string(),
                 tool_name: "Knowledge Search".to_string(),
                 query: Some("uploaded-document search".to_string()),
                 output_summary: Some(output_summary),
                 warnings,
-                metadata: json!({}),
+                metadata: json!({
+                    "returned_count": response.sources.len(),
+                    "has_context": has_context,
+                }),
                 guarded: false,
             });
         }
@@ -1589,7 +1592,9 @@ impl SearxWebSearchTool {
                     "Web search results were prepared for the answer.".to_string(),
                 ),
                 warnings: Vec::new(),
-                metadata: json!({}),
+                metadata: json!({
+                    "returned_count": results.len(),
+                }),
                 guarded: false,
             });
         }
@@ -2137,7 +2142,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 kind: "timing".to_string(),
                 title: Some(title),
                 content: Some(summary),
-                tool_name: tool_name.map(|name| tool_trace_title(&name)),
+                tool_name,
                 status: Some(outcome.as_str().to_string()),
                 metadata,
                 created_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -2154,14 +2159,6 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 outcome.as_str(),
                 "rejected" | "partially_rejected" | "failed"
             );
-            let display_enabled_tools = enabled_tools
-                .iter()
-                .map(|tool_name| tool_trace_title(tool_name))
-                .collect::<Vec<_>>();
-            let display_selected_tools = selected_tools
-                .iter()
-                .map(|tool_name| tool_trace_title(tool_name))
-                .collect::<Vec<_>>();
             let summary = if outcome == "partially_rejected" {
                 "Some of the model's Tool selections were rejected."
             } else if selection_rejected {
@@ -2185,8 +2182,8 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 metadata: json!({
                     "step": step,
                     "attempt": attempt,
-                    "enabled_tools": display_enabled_tools,
-                    "selected_tools": display_selected_tools,
+                    "enabled_tools": enabled_tools,
+                    "selected_tools": selected_tools,
                     "selection_count": selected_tools.len(),
                     "outcome": outcome,
                 }),
@@ -2203,9 +2200,9 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             kind: "tool_call".to_string(),
             title: Some(tool_trace_title(&tool_name)),
             content: Some(format!("{} call attempted.", tool_trace_title(&tool_name))),
-            tool_name: Some(tool_trace_title(&tool_name)),
+            tool_name: Some(tool_name),
             status: Some("running".to_string()),
-            metadata: json!({ "phase": "attempted", "call_id": call_id, "tool_round": tool_round, "attempt": attempt }),
+            metadata: json!({ "phase": "attempted", "call_id": call_id, "tool_round": tool_round, "attempt": attempt, "static_message": true }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
         AgentTraceEvent::ToolTerminal {
@@ -2229,9 +2226,9 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 }
                 .to_string(),
             ),
-            tool_name: Some(tool_trace_title(&tool_name)),
+            tool_name: Some(tool_name),
             status: Some(status),
-            metadata: json!({ "phase": "terminal", "call_id": call_id, "tool_round": tool_round, "attempt": attempt, "duration_ms": elapsed_ms }),
+            metadata: json!({ "phase": "terminal", "call_id": call_id, "tool_round": tool_round, "attempt": attempt, "duration_ms": elapsed_ms, "static_message": true }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
         AgentTraceEvent::ToolRetryScheduled {
@@ -2249,7 +2246,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 tool_trace_title(&tool_name),
                 attempt
             )),
-            tool_name: Some(tool_trace_title(&tool_name)),
+            tool_name: Some(tool_name),
             status: Some("running".to_string()),
             metadata: json!({
                 "phase": "retry",
@@ -2257,6 +2254,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 "tool_round": tool_round,
                 "attempt": attempt,
                 "reason": reason,
+                "static_message": true,
             }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
@@ -2271,7 +2269,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             kind: "timeout".to_string(),
             title: Some(tool_trace_title(&tool_name)),
             content: Some(format!("{} timed out.", tool_trace_title(&tool_name))),
-            tool_name: Some(tool_trace_title(&tool_name)),
+            tool_name: Some(tool_name),
             status: Some("timed_out".to_string()),
             metadata: json!({
                 "phase": "timeout",
@@ -2279,6 +2277,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 "tool_round": tool_round,
                 "attempt": attempt,
                 "duration_ms": elapsed_ms,
+                "static_message": true,
             }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
         },
@@ -2998,7 +2997,9 @@ impl Tool for AdminConfigReadTool {
                 query: Some(self.name.clone()),
                 output_summary: Some(format!("Read {}.", self.name)),
                 warnings: response.warnings.clone(),
-                metadata: json!({}),
+                metadata: json!({
+                    "admin_config_tool": self.name,
+                }),
                 guarded: false,
             });
         }
@@ -3094,7 +3095,11 @@ impl Tool for AdminConfigSetupSummaryTool {
                     status, missing_count
                 )),
                 warnings: warnings.clone(),
-                metadata: json!({}),
+                metadata: json!({
+                    "admin_config_setup": true,
+                    "outcome": status,
+                    "missing_count": missing_count,
+                }),
                 guarded: false,
             });
         }
@@ -3221,7 +3226,9 @@ impl Tool for AdminAgentSettingsReadTool {
                 query: Some("read_agent_settings".to_string()),
                 output_summary: Some("Read read_agent_settings.".to_string()),
                 warnings: warnings.clone(),
-                metadata: json!({}),
+                metadata: json!({
+                    "admin_config_tool": "read_agent_settings",
+                }),
                 guarded: false,
             });
         }
@@ -3689,7 +3696,11 @@ impl Tool for AdminConfigDirectTool {
                 query: Some(self.name.clone()),
                 output_summary: Some(format!("{}: {} {}", self.name, outcome, changed_summary)),
                 warnings,
-                metadata: json!({}),
+                metadata: json!({
+                    "admin_config_direct": true,
+                    "outcome": outcome,
+                    "changed_settings": changed_names,
+                }),
                 guarded: false,
             });
         }
@@ -3770,7 +3781,7 @@ impl AdminDbQueryTool {
                         "Database Query was rejected by the safe SQL executor.".to_string(),
                     ),
                     warnings: vec!["db_query_rejected".to_string()],
-                    metadata: json!({}),
+                    metadata: json!({ "db_query_rejected": true }),
                     guarded: true,
                 });
             }
@@ -3787,7 +3798,7 @@ impl AdminDbQueryTool {
                 query: Some("read-only database query".to_string()),
                 output_summary: Some("Database results were redacted from the trace.".to_string()),
                 warnings: vec!["raw_results_redacted".to_string()],
-                metadata: json!({}),
+                metadata: json!({ "db_results_redacted": true }),
                 guarded: false,
             });
         }
@@ -8115,9 +8126,27 @@ fn build_conversation_trace(
                     tool_warnings
                 },
                 metadata: if is_guarded {
-                    json!({ "guarded": true, "executed": false })
+                    let mut metadata = json!({ "guarded": true, "executed": false });
+                    if tool
+                        .metadata
+                        .get("db_query_rejected")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        metadata["db_query_rejected"] = json!(true);
+                    }
+                    metadata
                 } else if is_db_query {
-                    json!({ "redacted": true })
+                    let mut metadata = json!({ "redacted": true });
+                    if tool
+                        .metadata
+                        .get("db_results_redacted")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        metadata["db_results_redacted"] = json!(true);
+                    }
+                    metadata
                 } else {
                     tool.metadata
                 },
@@ -8223,38 +8252,84 @@ fn activity_status_key(status: &str) -> Option<String> {
     .then(|| format!("chat.activity.status.{status}"))
 }
 
-fn static_tool_summary_key(
-    tool_name: &str,
-    status: &str,
-    summary: Option<&str>,
-) -> Option<&'static str> {
-    // A key is valid only for an exact backend-owned message. In particular,
-    // never let this override a tool-provided output summary.
-    let key = if is_db_query_tool(tool_name)
-        && summary == Some("Database results were redacted from the trace.")
-    {
-        "chat.activity.databaseResultsRedacted"
-    } else if is_db_query_tool(tool_name)
-        && status == "guarded"
-        && summary == Some("Database Query was rejected by the safe SQL executor.")
-    {
-        "chat.activity.databaseQuery.rejected"
-    } else if status == "succeeded" && summary == Some("Tool completed.") {
-        "chat.activity.tool.completed"
-    } else if status == "guarded" && summary == Some("Tool was guarded.") {
-        "chat.activity.tool.guarded"
-    } else {
-        return None;
-    };
-    Some(key)
-}
-
 fn is_db_query_tool(tool_name: &str) -> bool {
     matches!(tool_name, "db_query" | "db-query" | "Database Query")
 }
 
-fn activity_tool_values(tool_name: &str, metadata: &Value) -> Value {
-    let mut values = json!({ "toolName": tool_trace_title(tool_name) });
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityToolKind {
+    KnowledgeSearch,
+    WebSearch,
+    CuratedResources,
+    AdminConfig,
+    DatabaseQuery,
+    Dynamic,
+}
+
+#[derive(Clone, Debug)]
+struct LocalizedMessageDescriptor {
+    key: &'static str,
+    values: Value,
+}
+
+impl LocalizedMessageDescriptor {
+    fn new(key: &'static str, values: Value) -> Self {
+        debug_assert!(values.is_object());
+        Self { key, values }
+    }
+}
+
+fn activity_tool_kind(tool_id: &str, tool_name: &str) -> ActivityToolKind {
+    if matches!(tool_id, "knowledge-search" | "knowledge_search") || tool_name == "Knowledge Search"
+    {
+        ActivityToolKind::KnowledgeSearch
+    } else if matches!(tool_id, "web-search" | "web_search") || tool_name == "Web Search" {
+        ActivityToolKind::WebSearch
+    } else if matches!(
+        tool_id,
+        "curated-resources" | "curated_resources" | "find-resources" | "find_resources"
+    ) || tool_name == "Curated Resources"
+    {
+        ActivityToolKind::CuratedResources
+    } else if tool_id == "admin-config"
+        || tool_id.starts_with("admin-config:")
+        || tool_name == "Admin Config"
+        || is_admin_config_tool_name(tool_id)
+    {
+        ActivityToolKind::AdminConfig
+    } else if is_db_query_tool(tool_id) || is_db_query_tool(tool_name) {
+        ActivityToolKind::DatabaseQuery
+    } else {
+        ActivityToolKind::Dynamic
+    }
+}
+
+fn activity_tool_title_descriptor(tool_id: &str, tool_name: &str) -> LocalizedMessageDescriptor {
+    let (key, values) = match activity_tool_kind(tool_id, tool_name) {
+        ActivityToolKind::KnowledgeSearch => {
+            ("chat.activity.tool.knowledgeSearch.title", json!({}))
+        }
+        ActivityToolKind::WebSearch => ("chat.activity.tool.webSearch.title", json!({})),
+        ActivityToolKind::CuratedResources => {
+            ("chat.activity.tool.curatedResources.title", json!({}))
+        }
+        ActivityToolKind::AdminConfig => ("chat.activity.tool.adminConfig.title", json!({})),
+        ActivityToolKind::DatabaseQuery => ("chat.activity.tool.databaseQuery.title", json!({})),
+        ActivityToolKind::Dynamic => (
+            "chat.activity.tool.title",
+            json!({ "toolName": tool_trace_title(tool_name) }),
+        ),
+    };
+    LocalizedMessageDescriptor::new(key, values)
+}
+
+fn activity_tool_values(tool_id: &str, tool_name: &str, metadata: &Value) -> Value {
+    let kind = activity_tool_kind(tool_id, tool_name);
+    let mut values = if kind == ActivityToolKind::Dynamic {
+        json!({ "toolName": tool_trace_title(tool_name) })
+    } else {
+        json!({ "toolId": tool_id })
+    };
     for (source, target) in [
         ("returned_count", "count"),
         ("total_count", "totalCount"),
@@ -8270,39 +8345,148 @@ fn activity_tool_values(tool_name: &str, metadata: &Value) -> Value {
     values
 }
 
+fn activity_summary_descriptor(
+    tool_id: &str,
+    tool_name: &str,
+    status: &str,
+    metadata: &Value,
+    generated_summary: bool,
+) -> Option<LocalizedMessageDescriptor> {
+    let kind = activity_tool_kind(tool_id, tool_name);
+    let count = || metadata.get("returned_count").and_then(Value::as_u64);
+    let descriptor = match kind {
+        ActivityToolKind::KnowledgeSearch => {
+            let count = count()?;
+            let has_context = metadata
+                .get("has_context")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if count == 0 && !has_context {
+                LocalizedMessageDescriptor::new(
+                    "chat.activity.knowledgeSearch.noResults",
+                    json!({ "count": count }),
+                )
+            } else {
+                LocalizedMessageDescriptor::new(
+                    "chat.activity.knowledgeSearch.retrieved",
+                    json!({ "count": count }),
+                )
+            }
+        }
+        ActivityToolKind::WebSearch => LocalizedMessageDescriptor::new(
+            "chat.activity.webSearch.prepared",
+            json!({ "count": count()? }),
+        ),
+        ActivityToolKind::CuratedResources => {
+            let count = count()?;
+            let total_count = metadata
+                .get("total_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(count);
+            let truncated = metadata
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let key = if count == 0 && total_count > 0 {
+                "chat.activity.curatedResources.noAdditional"
+            } else if count == 0 {
+                "chat.activity.curatedResources.noMatches"
+            } else {
+                "chat.activity.curatedResources.returned"
+            };
+            LocalizedMessageDescriptor::new(
+                key,
+                json!({
+                    "count": count,
+                    "totalCount": total_count,
+                    "truncated": truncated,
+                }),
+            )
+        }
+        ActivityToolKind::AdminConfig => {
+            let outcome = metadata
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("succeeded");
+            let changed_settings = metadata
+                .get("changed_settings")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let missing_count = metadata
+                .get("missing_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0));
+            LocalizedMessageDescriptor::new(
+                "chat.activity.adminConfig.completed",
+                json!({
+                    "toolId": tool_id,
+                    "outcome": outcome,
+                    "changedSettings": changed_settings,
+                    "missingCount": missing_count,
+                }),
+            )
+        }
+        ActivityToolKind::DatabaseQuery if status == "succeeded" => {
+            LocalizedMessageDescriptor::new(
+                "chat.activity.databaseResultsRedacted",
+                json!({ "toolId": tool_id }),
+            )
+        }
+        ActivityToolKind::DatabaseQuery
+            if status == "guarded"
+                && metadata.get("db_query_rejected").and_then(Value::as_bool) == Some(true) =>
+        {
+            LocalizedMessageDescriptor::new(
+                "chat.activity.databaseQuery.rejected",
+                json!({ "toolId": tool_id }),
+            )
+        }
+        ActivityToolKind::Dynamic if generated_summary => {
+            let key = match status {
+                "succeeded" => "chat.activity.tool.completed",
+                "guarded" => "chat.activity.tool.guarded",
+                "failed" => "chat.activity.tool.failed",
+                "rejected" => "chat.activity.tool.rejected",
+                "timed_out" => "chat.activity.tool.timedOut",
+                _ => return None,
+            };
+            LocalizedMessageDescriptor::new(key, activity_tool_values(tool_id, tool_name, metadata))
+        }
+        _ => return None,
+    };
+    Some(descriptor)
+}
+
+fn generic_tool_summary(status: &str) -> &'static str {
+    match status {
+        "guarded" => "Tool was guarded.",
+        "failed" => "Tool failed.",
+        "rejected" => "Tool call was rejected.",
+        "timed_out" => "Tool timed out.",
+        _ => "Tool completed.",
+    }
+}
+
+fn selected_tool_value(tool_id: &str) -> Value {
+    let kind = activity_tool_kind(tool_id, tool_id);
+    match kind {
+        ActivityToolKind::Dynamic => {
+            json!({ "id": tool_id, "displayName": tool_trace_title(tool_id) })
+        }
+        _ => json!({
+            "id": tool_id,
+            "titleKey": activity_tool_title_descriptor(tool_id, tool_id).key,
+        }),
+    }
+}
+
 fn tool_delta_message(
     kind: &str,
     tool_name: &str,
     status: &str,
     metadata: &Value,
-    content: Option<&str>,
-) -> Option<(&'static str, Value)> {
-    let expected = match kind {
-        "tool_call" => Some(format!("{} call attempted.", tool_trace_title(tool_name))),
-        "tool_result" => Some(
-            match status {
-                "succeeded" => "Tool completed.",
-                "guarded" => "Tool was guarded.",
-                "timed_out" => "Tool timed out.",
-                "rejected" => "Tool call was rejected.",
-                _ => "Tool failed.",
-            }
-            .to_string(),
-        ),
-        "timeout" => Some(format!("{} timed out.", tool_trace_title(tool_name))),
-        "tool_retry" => metadata
-            .get("attempt")
-            .and_then(Value::as_u64)
-            .map(|attempt| {
-                format!(
-                    "Retrying {} after attempt {}.",
-                    tool_trace_title(tool_name),
-                    attempt
-                )
-            }),
-        _ => None,
-    };
-    if expected.as_deref() != content {
+) -> Option<LocalizedMessageDescriptor> {
+    if metadata.get("static_message").and_then(Value::as_bool) != Some(true) {
         return None;
     }
     let key = match (kind, status, is_db_query_tool(tool_name)) {
@@ -8317,7 +8501,10 @@ fn tool_delta_message(
         (_, "running", _) => "chat.activity.tool.running",
         _ => return None,
     };
-    Some((key, activity_tool_values(tool_name, metadata)))
+    Some(LocalizedMessageDescriptor::new(
+        key,
+        activity_tool_values(tool_name, tool_name, metadata),
+    ))
 }
 
 fn conversation_activity_steps_from_trace_deltas(
@@ -8392,6 +8579,7 @@ fn conversation_activity_steps_from_trace_deltas(
             ) {
                 let raw_tool_name = delta.tool_name.as_deref().unwrap_or("Tool");
                 let tool_name = tool_trace_title(raw_tool_name);
+                let title_message = activity_tool_title_descriptor(raw_tool_name, &tool_name);
                 let title = delta
                     .title
                     .as_deref()
@@ -8406,17 +8594,16 @@ fn conversation_activity_steps_from_trace_deltas(
                     raw_tool_name,
                     &status,
                     &delta.metadata,
-                    delta.content.as_deref(),
                 );
                 let (summary_key, summary_values) = summary_message
-                    .map(|(key, values)| (Some(key.to_string()), values))
+                    .map(|message| (Some(message.key.to_string()), message.values))
                     .unwrap_or_else(|| (None, json!({})));
                 return ConversationActivityStepResponse {
                     id: format!("activity-{}", delta.id),
                     kind: "tool".to_string(),
                     title: title.clone(),
-                    title_key: Some("chat.activity.tool.title".to_string()),
-                    title_values: json!({ "toolName": tool_name }),
+                    title_key: Some(title_message.key.to_string()),
+                    title_values: title_message.values,
                     status: status.clone(),
                     status_key: activity_status_key(&status),
                     status_values: json!({}),
@@ -8426,18 +8613,16 @@ fn conversation_activity_steps_from_trace_deltas(
                     warnings: Vec::new(),
                 };
             }
-            let selected = delta
+            let selected_ids = delta
                 .metadata
                 .get("selected_tools")
                 .and_then(Value::as_array)
-                .map(|tools| {
-                    tools
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(tool_trace_title)
-                        .collect::<Vec<_>>()
-                })
+                .map(|tools| tools.iter().filter_map(Value::as_str).collect::<Vec<_>>())
                 .unwrap_or_default();
+            let selected_names = selected_ids
+                .iter()
+                .map(|tool_id| tool_trace_title(tool_id))
+                .collect::<Vec<_>>();
             let selection_outcome = delta
                 .metadata
                 .get("outcome")
@@ -8447,10 +8632,10 @@ fn conversation_activity_steps_from_trace_deltas(
                 "Tool selection failed before a usable selection was recorded.".to_string()
             } else if selection_outcome == "partially_rejected" {
                 "Some of the model's Tool selections were rejected.".to_string()
-            } else if selected.is_empty() {
+            } else if selected_names.is_empty() {
                 "No Tools were selected.".to_string()
             } else {
-                format!("Selected: {}.", selected.join(", "))
+                format!("Selected: {}.", selected_names.join(", "))
             };
             let trace_summary_is_known = matches!(
                 delta.content.as_deref(),
@@ -8468,7 +8653,7 @@ fn conversation_activity_steps_from_trace_deltas(
             };
             let summary_key = if matches!(selection_outcome, "failed" | "rejected") {
                 "chat.activity.toolSelection.failed"
-            } else if selected.is_empty() {
+            } else if selected_names.is_empty() {
                 "chat.activity.toolSelection.noneSelected"
             } else if selection_outcome == "partially_rejected" {
                 "chat.activity.toolSelection.partialFailure"
@@ -8492,8 +8677,11 @@ fn conversation_activity_steps_from_trace_deltas(
                 summary: Some(summary),
                 summary_key: summary_key.map(str::to_string),
                 summary_values: json!({
-                    "selectedTools": selected,
-                    "selectionCount": selected.len(),
+                    "selectedTools": selected_ids
+                        .iter()
+                        .map(|tool_id| selected_tool_value(tool_id))
+                        .collect::<Vec<_>>(),
+                    "selectionCount": selected_ids.len(),
                     "outcome": selection_outcome,
                 }),
                 warnings: Vec::new(),
@@ -8510,26 +8698,38 @@ fn conversation_activity_step_from_tool(
     let is_db_query = is_db_query_tool(&tool.tool_id) || is_db_query_tool(&tool.tool_name);
     let status = if tool.guarded { "guarded" } else { "succeeded" };
     let title = tool_trace_title(&tool.tool_name);
+    let title_message = activity_tool_title_descriptor(&tool.tool_id, &tool.tool_name);
+    let summary_generated = summary.is_none() && tool.output_summary.is_none();
     let summary = summary.or_else(|| tool.output_summary.clone()).or_else(|| {
         if is_db_query {
             Some("Database results were redacted from the trace.".to_string())
         } else {
-            Some("Tool completed.".to_string())
+            Some(generic_tool_summary(status).to_string())
         }
     });
-    let summary_key = static_tool_summary_key(&tool.tool_name, status, summary.as_deref());
+    let summary_message = activity_summary_descriptor(
+        &tool.tool_id,
+        &tool.tool_name,
+        status,
+        &tool.metadata,
+        summary_generated,
+    );
     ConversationActivityStepResponse {
         id: format!("tool-{}", tool.tool_id),
         kind: "tool".to_string(),
         title: title.clone(),
-        title_key: Some("chat.activity.tool.title".to_string()),
-        title_values: json!({ "toolName": title }),
+        title_key: Some(title_message.key.to_string()),
+        title_values: title_message.values,
         status: status.to_string(),
         status_key: activity_status_key(status),
         status_values: json!({}),
         summary,
-        summary_key: summary_key.map(str::to_string),
-        summary_values: activity_tool_values(&tool.tool_name, &tool.metadata),
+        summary_key: summary_message
+            .as_ref()
+            .map(|message| message.key.to_string()),
+        summary_values: summary_message
+            .map(|message| message.values)
+            .unwrap_or_else(|| json!({})),
         warnings: if warnings.is_empty() {
             tool.warnings.clone()
         } else {
@@ -8547,23 +8747,35 @@ fn conversation_activity_step_from_tool_trace(
         tool.status.clone()
     };
     let title = tool_trace_title(&tool.name);
+    let title_message = activity_tool_title_descriptor(&tool.id, &tool.name);
+    let summary_generated = tool.output_summary.is_none();
     let summary = tool
         .output_summary
         .clone()
-        .or_else(|| Some("Tool completed.".to_string()));
-    let summary_key = static_tool_summary_key(&tool.name, &status, summary.as_deref());
+        .or_else(|| Some(generic_tool_summary(&status).to_string()));
+    let summary_message = activity_summary_descriptor(
+        &tool.id,
+        &tool.name,
+        &status,
+        &tool.metadata,
+        summary_generated,
+    );
     ConversationActivityStepResponse {
         id: format!("tool-{}", tool.id),
         kind: "tool".to_string(),
         title: title.clone(),
-        title_key: Some("chat.activity.tool.title".to_string()),
-        title_values: json!({ "toolName": title }),
+        title_key: Some(title_message.key.to_string()),
+        title_values: title_message.values,
         status_key: activity_status_key(&status),
         status_values: json!({}),
         status,
         summary,
-        summary_key: summary_key.map(str::to_string),
-        summary_values: activity_tool_values(&tool.name, &tool.metadata),
+        summary_key: summary_message
+            .as_ref()
+            .map(|message| message.key.to_string()),
+        summary_values: summary_message
+            .map(|message| message.values)
+            .unwrap_or_else(|| json!({})),
         warnings: tool.warnings.clone(),
     }
 }
@@ -14129,8 +14341,10 @@ mod tests {
             elapsed_ms: 3,
         });
         assert_eq!(attempted.kind, "tool_call");
+        assert_eq!(attempted.tool_name.as_deref(), Some("unknown_tool"));
         assert_eq!(attempted.metadata["phase"], json!("attempted"));
         assert_eq!(terminal.kind, "tool_result");
+        assert_eq!(terminal.tool_name.as_deref(), Some("unknown_tool"));
         assert_eq!(terminal.status.as_deref(), Some("rejected"));
 
         let retry = agent_trace_event_delta(AgentTraceEvent::ToolRetryScheduled {
@@ -14183,9 +14397,45 @@ mod tests {
         );
         assert_eq!(
             activity[0].summary_values["selectedTools"],
-            json!(["Curated Resources"])
+            json!([{
+                "id": "find_resources",
+                "titleKey": "chat.activity.tool.curatedResources.title"
+            }])
         );
         assert_eq!(activity[0].summary_values["selectionCount"], json!(1));
+
+        let mixed = conversation_activity_steps_from_trace_deltas(&[agent_trace_event_delta(
+            AgentTraceEvent::ToolSelectionObservation {
+                step: 0,
+                attempt: 1,
+                enabled_tools: vec![
+                    "find_resources".to_string(),
+                    "provider_custom_tool".to_string(),
+                ],
+                selected_tools: vec![
+                    "find_resources".to_string(),
+                    "provider_custom_tool".to_string(),
+                ],
+                outcome: "selected".to_string(),
+            },
+        )]);
+        assert_eq!(
+            mixed[0].summary_values["selectedTools"],
+            json!([
+                {
+                    "id": "find_resources",
+                    "titleKey": "chat.activity.tool.curatedResources.title"
+                },
+                {
+                    "id": "provider_custom_tool",
+                    "displayName": "Provider Custom Tool"
+                }
+            ])
+        );
+        assert!(!mixed[0]
+            .summary_values
+            .to_string()
+            .contains("Curated Resources"));
 
         let no_tools = conversation_activity_steps_from_trace_deltas(&[agent_trace_event_delta(
             AgentTraceEvent::ToolSelectionObservation {
@@ -14399,7 +14649,7 @@ mod tests {
             db.summary_key.as_deref(),
             Some("chat.activity.databaseResultsRedacted")
         );
-        assert_eq!(db.summary_values, json!({ "toolName": "Database Query" }));
+        assert_eq!(db.summary_values, json!({ "toolId": "db-query" }));
         assert!(!serde_json::to_string(&db)
             .unwrap()
             .contains("SELECT secret"));
@@ -14431,7 +14681,7 @@ mod tests {
                     "Database Query was rejected by the safe SQL executor.".to_string(),
                 ),
                 warnings: vec!["db_query_rejected".to_string()],
-                metadata: json!({}),
+                metadata: json!({ "db_query_rejected": true }),
                 guarded: true,
             },
             None,
@@ -14462,8 +14712,14 @@ mod tests {
                 Vec::new(),
             );
             assert_eq!(activity.title, expected_display);
-            assert_eq!(activity.title_values["toolName"], expected_display);
-            assert_eq!(activity.summary_values["toolName"], expected_display);
+            if tool_name == "provider_custom_tool" {
+                assert_eq!(activity.title_values["toolName"], "Provider Custom Tool");
+                assert!(activity.summary_key.is_none());
+                assert!(activity.summary_values.as_object().unwrap().is_empty());
+            } else {
+                assert!(activity.title_values.as_object().unwrap().is_empty());
+                assert_eq!(activity.summary_values["toolId"], tool_name);
+            }
         }
 
         for unsafe_name in [
@@ -14487,7 +14743,8 @@ mod tests {
             );
             assert_eq!(activity.title, "Tool");
             assert_eq!(activity.title_values["toolName"], "Tool");
-            assert_eq!(activity.summary_values["toolName"], "Tool");
+            assert!(activity.summary_key.is_none());
+            assert!(activity.summary_values.as_object().unwrap().is_empty());
 
             let delta = agent_trace_event_delta(AgentTraceEvent::ToolAttempted {
                 call_id: "call-unsafe".to_string(),
@@ -14496,8 +14753,7 @@ mod tests {
                 attempt: 1,
             });
             assert_eq!(delta.title.as_deref(), Some("Tool"));
-            assert_eq!(delta.tool_name.as_deref(), Some("Tool"));
-            assert!(!serde_json::to_string(&delta).unwrap().contains(unsafe_name));
+            assert_eq!(delta.tool_name.as_deref(), Some(unsafe_name));
         }
 
         for tool_name in ["db_query", "db-query", "Database Query"] {
@@ -14531,6 +14787,108 @@ mod tests {
         assert_eq!(
             dynamic_activity[0].summary.as_deref(),
             Some("Found a user-provided result.")
+        );
+
+        let static_producers = [
+            (
+                "knowledge-search",
+                "Knowledge Search",
+                json!({ "returned_count": 0 }),
+                "chat.activity.knowledgeSearch.noResults",
+            ),
+            (
+                "knowledge-search",
+                "Knowledge Search",
+                json!({ "returned_count": 3 }),
+                "chat.activity.knowledgeSearch.retrieved",
+            ),
+            (
+                "web-search",
+                "Web Search",
+                json!({ "returned_count": 2 }),
+                "chat.activity.webSearch.prepared",
+            ),
+            (
+                "curated-resources",
+                "Curated Resources",
+                json!({ "returned_count": 0, "total_count": 0, "has_more": false }),
+                "chat.activity.curatedResources.noMatches",
+            ),
+            (
+                "curated-resources",
+                "Curated Resources",
+                json!({ "returned_count": 0, "total_count": 4, "has_more": false }),
+                "chat.activity.curatedResources.noAdditional",
+            ),
+            (
+                "curated-resources",
+                "Curated Resources",
+                json!({ "returned_count": 2, "total_count": 4, "has_more": true }),
+                "chat.activity.curatedResources.returned",
+            ),
+        ];
+        for (tool_id, tool_name, metadata, expected_key) in static_producers {
+            let activity = conversation_activity_step_from_tool(
+                &ToolCallInfoResponse {
+                    tool_id: tool_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    query: None,
+                    output_summary: Some("backend-authored summary".to_string()),
+                    warnings: Vec::new(),
+                    metadata,
+                    guarded: false,
+                },
+                None,
+                Vec::new(),
+            );
+            assert_eq!(activity.summary_key.as_deref(), Some(expected_key));
+            assert!(activity.summary_values.is_object());
+            assert!(activity.title_values.as_object().unwrap().is_empty());
+        }
+
+        let admin = conversation_activity_step_from_tool(
+            &ToolCallInfoResponse {
+                tool_id: "admin-config:update_instance_settings".to_string(),
+                tool_name: "Admin Config".to_string(),
+                query: None,
+                output_summary: Some("backend-authored summary".to_string()),
+                warnings: Vec::new(),
+                metadata: json!({
+                    "admin_config_direct": true,
+                    "outcome": "updated",
+                    "changed_settings": ["header_tagline"],
+                }),
+                guarded: false,
+            },
+            None,
+            Vec::new(),
+        );
+        assert_eq!(
+            admin.summary_key.as_deref(),
+            Some("chat.activity.adminConfig.completed")
+        );
+        assert_eq!(admin.summary_values["outcome"], "updated");
+        assert_eq!(
+            admin.summary_values["changedSettings"],
+            json!(["header_tagline"])
+        );
+
+        let generated = conversation_activity_step_from_tool(
+            &ToolCallInfoResponse {
+                tool_id: "provider_custom_tool".to_string(),
+                tool_name: "provider_custom_tool".to_string(),
+                query: None,
+                output_summary: None,
+                warnings: Vec::new(),
+                metadata: json!({}),
+                guarded: false,
+            },
+            None,
+            Vec::new(),
+        );
+        assert_eq!(
+            generated.summary_key.as_deref(),
+            Some("chat.activity.tool.completed")
         );
     }
 
