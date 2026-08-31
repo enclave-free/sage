@@ -1949,10 +1949,10 @@ fn install_conversation_trace_hook(
 
 fn tool_trace_title(tool_name: &str) -> String {
     match tool_name {
-        "knowledge_search" => "Knowledge Search",
-        "web_search" => "Web Search",
-        "find_resources" => "Curated Resources",
-        "db_query" => "Database Query",
+        "knowledge_search" => "Knowledge Search".to_string(),
+        "web_search" => "Web Search".to_string(),
+        "find_resources" => "Curated Resources".to_string(),
+        "db_query" | "db-query" | "Database Query" => "Database Query".to_string(),
         "read_admin_setup_summary"
         | "read_instance_settings"
         | "read_deployment_settings"
@@ -1968,23 +1968,131 @@ fn tool_trace_title(tool_name: &str) -> String {
         | "manage_user_types"
         | "manage_onboarding_questions"
         | "update_document_access"
-        | "read_deployment_secret" => "Admin Config",
-        other => other,
+        | "read_deployment_secret" => "Admin Config".to_string(),
+        other => sanitize_tool_display_name(other),
     }
-    .to_string()
 }
 
-fn timing_phase_title(phase: ConversationTimingPhase) -> String {
-    match phase {
-        ConversationTimingPhase::ModelRequest => "Model request",
-        ConversationTimingPhase::ProviderFirstEventWait => "Provider first-event wait",
-        ConversationTimingPhase::ToolExecution => "Tool execution",
-        ConversationTimingPhase::ResourceDirectoryLookup => "Resource Directory lookup",
-        ConversationTimingPhase::Retrieval => "Retrieval",
-        ConversationTimingPhase::RetryDelay => "Retry delay",
-        ConversationTimingPhase::TotalTurn => "Total turn",
+fn sanitize_tool_display_name(tool_name: &str) -> String {
+    let normalized = tool_name.trim().to_ascii_lowercase();
+    let unsafe_marker = [
+        "api_token",
+        "api-token",
+        "api key",
+        "api_key",
+        "authorization",
+        "bearer",
+        "credential",
+        "developer instruction",
+        "developer_instruction",
+        "hidden instruction",
+        "hidden_instruction",
+        "internal instruction",
+        "internal_instruction",
+        "password",
+        "private key",
+        "private_key",
+        "prompt injection",
+        "prompt_injection",
+        "system prompt",
+        "system_prompt",
+        "token",
+    ];
+    if normalized.is_empty()
+        || trace_content_needs_redaction(&normalized)
+        || unsafe_marker
+            .iter()
+            .any(|marker| normalized.contains(marker))
+    {
+        return "Tool".to_string();
     }
-    .to_string()
+
+    let mut display = String::new();
+    for word in tool_name
+        .trim()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+    {
+        if !display.is_empty() {
+            display.push(' ');
+        }
+        let mut characters = word.chars();
+        if let Some(first) = characters.next() {
+            display.extend(first.to_uppercase());
+            display.extend(characters);
+        }
+    }
+    if display.is_empty() {
+        "Tool".to_string()
+    } else {
+        display
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TimingActivityMessage {
+    title_key: &'static str,
+    summary_key: &'static str,
+    title_fallback: &'static str,
+}
+
+fn timing_activity_message_from_token(token: &str) -> Option<TimingActivityMessage> {
+    Some(match token {
+        "model_request" => TimingActivityMessage {
+            title_key: "chat.activity.timing.modelRequest.title",
+            summary_key: "chat.activity.timing.modelRequest.summary",
+            title_fallback: "Model request",
+        },
+        "provider_first_event_wait" => TimingActivityMessage {
+            title_key: "chat.activity.timing.providerFirstEventWait.title",
+            summary_key: "chat.activity.timing.providerFirstEventWait.summary",
+            title_fallback: "Provider first-event wait",
+        },
+        "tool_execution" => TimingActivityMessage {
+            title_key: "chat.activity.timing.toolExecution.title",
+            summary_key: "chat.activity.timing.toolExecution.summary",
+            title_fallback: "Tool execution",
+        },
+        "resource_directory_lookup" => TimingActivityMessage {
+            title_key: "chat.activity.timing.resourceDirectoryLookup.title",
+            summary_key: "chat.activity.timing.resourceDirectoryLookup.summary",
+            title_fallback: "Resource Directory lookup",
+        },
+        "retrieval" => TimingActivityMessage {
+            title_key: "chat.activity.timing.retrieval.title",
+            summary_key: "chat.activity.timing.retrieval.summary",
+            title_fallback: "Retrieval",
+        },
+        "retry_delay" => TimingActivityMessage {
+            title_key: "chat.activity.timing.retryDelay.title",
+            summary_key: "chat.activity.timing.retryDelay.summary",
+            title_fallback: "Retry delay",
+        },
+        "total_turn" => TimingActivityMessage {
+            title_key: "chat.activity.timing.totalTurn.title",
+            summary_key: "chat.activity.timing.totalTurn.summary",
+            title_fallback: "Total turn",
+        },
+        _ => return None,
+    })
+}
+
+fn timing_activity_message(phase: ConversationTimingPhase) -> TimingActivityMessage {
+    timing_activity_message_from_token(phase.as_str())
+        .expect("every ConversationTimingPhase has an activity message")
+}
+
+fn timing_summary(message: TimingActivityMessage, elapsed_ms: u128, proxy: bool) -> String {
+    format!(
+        "{}: {} ms{}.",
+        message.title_fallback,
+        elapsed_ms,
+        if proxy {
+            " (combined provider wait)"
+        } else {
+            ""
+        }
+    )
 }
 
 fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResponse {
@@ -1998,14 +2106,10 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             outcome,
             elapsed_ms,
         } => {
-            let title = timing_phase_title(phase);
+            let message = timing_activity_message(phase);
+            let title = message.title_fallback.to_string();
             let proxy = phase.is_provider_wait_proxy();
-            let proxy_suffix = if proxy {
-                " (combined provider wait)"
-            } else {
-                ""
-            };
-            let summary = format!("{}: {} ms{}.", title, elapsed_ms, proxy_suffix);
+            let summary = timing_summary(message, elapsed_ms, proxy);
             let mut metadata = json!({
                 "phase": phase.as_str(),
                 "step": step,
@@ -2033,7 +2137,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 kind: "timing".to_string(),
                 title: Some(title),
                 content: Some(summary),
-                tool_name,
+                tool_name: tool_name.map(|name| tool_trace_title(&name)),
                 status: Some(outcome.as_str().to_string()),
                 metadata,
                 created_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -2050,6 +2154,14 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 outcome.as_str(),
                 "rejected" | "partially_rejected" | "failed"
             );
+            let display_enabled_tools = enabled_tools
+                .iter()
+                .map(|tool_name| tool_trace_title(tool_name))
+                .collect::<Vec<_>>();
+            let display_selected_tools = selected_tools
+                .iter()
+                .map(|tool_name| tool_trace_title(tool_name))
+                .collect::<Vec<_>>();
             let summary = if outcome == "partially_rejected" {
                 "Some of the model's Tool selections were rejected."
             } else if selection_rejected {
@@ -2073,8 +2185,8 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 metadata: json!({
                     "step": step,
                     "attempt": attempt,
-                    "enabled_tools": enabled_tools,
-                    "selected_tools": selected_tools,
+                    "enabled_tools": display_enabled_tools,
+                    "selected_tools": display_selected_tools,
                     "selection_count": selected_tools.len(),
                     "outcome": outcome,
                 }),
@@ -2091,7 +2203,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             kind: "tool_call".to_string(),
             title: Some(tool_trace_title(&tool_name)),
             content: Some(format!("{} call attempted.", tool_trace_title(&tool_name))),
-            tool_name: Some(tool_name),
+            tool_name: Some(tool_trace_title(&tool_name)),
             status: Some("running".to_string()),
             metadata: json!({ "phase": "attempted", "call_id": call_id, "tool_round": tool_round, "attempt": attempt }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -2117,7 +2229,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 }
                 .to_string(),
             ),
-            tool_name: Some(tool_name),
+            tool_name: Some(tool_trace_title(&tool_name)),
             status: Some(status),
             metadata: json!({ "phase": "terminal", "call_id": call_id, "tool_round": tool_round, "attempt": attempt, "duration_ms": elapsed_ms }),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -2137,7 +2249,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
                 tool_trace_title(&tool_name),
                 attempt
             )),
-            tool_name: Some(tool_name),
+            tool_name: Some(tool_trace_title(&tool_name)),
             status: Some("running".to_string()),
             metadata: json!({
                 "phase": "retry",
@@ -2159,7 +2271,7 @@ fn agent_trace_event_delta(event: AgentTraceEvent) -> ConversationTraceDeltaResp
             kind: "timeout".to_string(),
             title: Some(tool_trace_title(&tool_name)),
             content: Some(format!("{} timed out.", tool_trace_title(&tool_name))),
-            tool_name: Some(tool_name),
+            tool_name: Some(tool_trace_title(&tool_name)),
             status: Some("timed_out".to_string()),
             metadata: json!({
                 "phase": "timeout",
@@ -8111,20 +8223,6 @@ fn activity_status_key(status: &str) -> Option<String> {
     .then(|| format!("chat.activity.status.{status}"))
 }
 
-fn timing_phase_title_from_token(token: &str) -> String {
-    match token {
-        "model_request" => "Model request",
-        "provider_first_event_wait" => "Provider first-event wait",
-        "tool_execution" => "Tool execution",
-        "resource_directory_lookup" => "Resource Directory lookup",
-        "retrieval" => "Retrieval",
-        "retry_delay" => "Retry delay",
-        "total_turn" => "Total turn",
-        _ => "Timing",
-    }
-    .to_string()
-}
-
 fn static_tool_summary_key(
     tool_name: &str,
     status: &str,
@@ -8136,6 +8234,11 @@ fn static_tool_summary_key(
         && summary == Some("Database results were redacted from the trace.")
     {
         "chat.activity.databaseResultsRedacted"
+    } else if is_db_query_tool(tool_name)
+        && status == "guarded"
+        && summary == Some("Database Query was rejected by the safe SQL executor.")
+    {
+        "chat.activity.databaseQuery.rejected"
     } else if status == "succeeded" && summary == Some("Tool completed.") {
         "chat.activity.tool.completed"
     } else if status == "guarded" && summary == Some("Tool was guarded.") {
@@ -8151,7 +8254,7 @@ fn is_db_query_tool(tool_name: &str) -> bool {
 }
 
 fn activity_tool_values(tool_name: &str, metadata: &Value) -> Value {
-    let mut values = json!({ "toolName": tool_name });
+    let mut values = json!({ "toolName": tool_trace_title(tool_name) });
     for (source, target) in [
         ("returned_count", "count"),
         ("total_count", "totalCount"),
@@ -8240,17 +8343,17 @@ fn conversation_activity_steps_from_trace_deltas(
                     .get("phase")
                     .and_then(Value::as_str)
                     .unwrap_or("total_turn");
+                let timing_message = timing_activity_message_from_token(phase_token);
                 let elapsed_ms = delta
                     .metadata
                     .get("duration_ms")
                     .cloned()
                     .unwrap_or_else(|| json!(0));
-                let title = delta.title.clone().unwrap_or_else(|| "Timing".to_string());
-                let phase = if title == "Timing" {
-                    timing_phase_title_from_token(phase_token)
-                } else {
-                    title.clone()
-                };
+                let title = delta.title.clone().unwrap_or_else(|| {
+                    timing_message
+                        .map(|message| message.title_fallback.to_string())
+                        .unwrap_or_else(|| "Timing".to_string())
+                });
                 let status = delta
                     .status
                     .clone()
@@ -8260,32 +8363,23 @@ fn conversation_activity_steps_from_trace_deltas(
                     .get("provider_wait_proxy")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let static_summary = elapsed_ms.as_u64().map(|elapsed_ms| {
-                    format!(
-                        "{}: {} ms{}.",
-                        title,
-                        elapsed_ms,
-                        if proxy {
-                            " (combined provider wait)"
-                        } else {
-                            ""
-                        }
-                    )
+                let static_summary = elapsed_ms.as_u64().and_then(|elapsed_ms| {
+                    timing_message.map(|message| timing_summary(message, elapsed_ms as u128, proxy))
                 });
                 return ConversationActivityStepResponse {
                     id: format!("activity-{}", delta.id),
                     kind: "timing".to_string(),
                     title: title.clone(),
-                    title_key: Some("chat.activity.timing.title".to_string()),
-                    title_values: json!({ "phase": phase }),
+                    title_key: timing_message.map(|message| message.title_key.to_string()),
+                    title_values: json!({}),
                     status: status.clone(),
                     status_key: activity_status_key(&status),
                     status_values: json!({}),
                     summary: delta.content.clone(),
                     summary_key: (delta.content.as_deref() == static_summary.as_deref())
-                        .then(|| "chat.activity.timing.summary".to_string()),
+                        .then(|| timing_message.map(|message| message.summary_key.to_string()))
+                        .flatten(),
                     summary_values: json!({
-                        "phase": phase,
                         "elapsedMs": elapsed_ms,
                         "providerWaitProxy": proxy,
                     }),
@@ -8296,15 +8390,20 @@ fn conversation_activity_steps_from_trace_deltas(
                 delta.kind.as_str(),
                 "tool_call" | "tool_result" | "tool_retry" | "timeout"
             ) {
-                let title = delta.title.clone().unwrap_or_else(|| "Tool".to_string());
+                let raw_tool_name = delta.tool_name.as_deref().unwrap_or("Tool");
+                let tool_name = tool_trace_title(raw_tool_name);
+                let title = delta
+                    .title
+                    .as_deref()
+                    .map(tool_trace_title)
+                    .unwrap_or_else(|| tool_name.clone());
                 let status = delta
                     .status
                     .clone()
                     .unwrap_or_else(|| "running".to_string());
-                let tool_name = delta.tool_name.clone().unwrap_or_else(|| title.clone());
                 let summary_message = tool_delta_message(
                     delta.kind.as_str(),
-                    &tool_name,
+                    raw_tool_name,
                     &status,
                     &delta.metadata,
                     delta.content.as_deref(),
@@ -8410,7 +8509,7 @@ fn conversation_activity_step_from_tool(
 ) -> ConversationActivityStepResponse {
     let is_db_query = is_db_query_tool(&tool.tool_id) || is_db_query_tool(&tool.tool_name);
     let status = if tool.guarded { "guarded" } else { "succeeded" };
-    let title = tool.tool_name.clone();
+    let title = tool_trace_title(&tool.tool_name);
     let summary = summary.or_else(|| tool.output_summary.clone()).or_else(|| {
         if is_db_query {
             Some("Database results were redacted from the trace.".to_string())
@@ -8447,7 +8546,7 @@ fn conversation_activity_step_from_tool_trace(
     } else {
         tool.status.clone()
     };
-    let title = tool.name.clone();
+    let title = tool_trace_title(&tool.name);
     let summary = tool
         .output_summary
         .clone()
@@ -14210,13 +14309,14 @@ mod tests {
         )]);
         assert_eq!(
             timing[0].title_key.as_deref(),
-            Some("chat.activity.timing.title")
+            Some("chat.activity.timing.toolExecution.title")
         );
         assert_eq!(
             timing[0].summary_key.as_deref(),
-            Some("chat.activity.timing.summary")
+            Some("chat.activity.timing.toolExecution.summary")
         );
-        assert_eq!(timing[0].summary_values["phase"], json!("Tool execution"));
+        assert!(timing[0].title_values.as_object().unwrap().is_empty());
+        assert!(timing[0].summary_values.get("phase").is_none());
         assert_eq!(timing[0].summary_values["elapsedMs"], json!(42));
         assert!(!timing[0]
             .title_key
@@ -14224,6 +14324,63 @@ mod tests {
             .unwrap()
             .contains("secret-call-id"));
         assert!(!timing[0].summary_key.as_deref().unwrap().contains("42 ms"));
+
+        let phases = [
+            (
+                ConversationTimingPhase::ModelRequest,
+                "chat.activity.timing.modelRequest.title",
+                "chat.activity.timing.modelRequest.summary",
+            ),
+            (
+                ConversationTimingPhase::ProviderFirstEventWait,
+                "chat.activity.timing.providerFirstEventWait.title",
+                "chat.activity.timing.providerFirstEventWait.summary",
+            ),
+            (
+                ConversationTimingPhase::ToolExecution,
+                "chat.activity.timing.toolExecution.title",
+                "chat.activity.timing.toolExecution.summary",
+            ),
+            (
+                ConversationTimingPhase::ResourceDirectoryLookup,
+                "chat.activity.timing.resourceDirectoryLookup.title",
+                "chat.activity.timing.resourceDirectoryLookup.summary",
+            ),
+            (
+                ConversationTimingPhase::Retrieval,
+                "chat.activity.timing.retrieval.title",
+                "chat.activity.timing.retrieval.summary",
+            ),
+            (
+                ConversationTimingPhase::RetryDelay,
+                "chat.activity.timing.retryDelay.title",
+                "chat.activity.timing.retryDelay.summary",
+            ),
+            (
+                ConversationTimingPhase::TotalTurn,
+                "chat.activity.timing.totalTurn.title",
+                "chat.activity.timing.totalTurn.summary",
+            ),
+        ];
+        for (phase, title_key, summary_key) in phases {
+            let activity =
+                conversation_activity_steps_from_trace_deltas(&[agent_trace_event_delta(
+                    AgentTraceEvent::Timing {
+                        phase,
+                        step: None,
+                        tool_name: None,
+                        call_id: None,
+                        attempt: 1,
+                        outcome: ConversationTimingOutcome::Succeeded,
+                        elapsed_ms: 7,
+                    },
+                )])[0]
+                    .clone();
+            assert_eq!(activity.title_key.as_deref(), Some(title_key));
+            assert_eq!(activity.summary_key.as_deref(), Some(summary_key));
+            assert!(activity.title_values.as_object().unwrap().is_empty());
+            assert!(activity.summary_values.get("phase").is_none());
+        }
 
         let db = conversation_activity_step_from_tool(
             &ToolCallInfoResponse {
@@ -14264,6 +14421,84 @@ mod tests {
             db_id_alias.summary_key.as_deref(),
             Some("chat.activity.databaseResultsRedacted")
         );
+
+        let guarded_db = conversation_activity_step_from_tool(
+            &ToolCallInfoResponse {
+                tool_id: "db-query".to_string(),
+                tool_name: "Database Query".to_string(),
+                query: None,
+                output_summary: Some(
+                    "Database Query was rejected by the safe SQL executor.".to_string(),
+                ),
+                warnings: vec!["db_query_rejected".to_string()],
+                metadata: json!({}),
+                guarded: true,
+            },
+            None,
+            Vec::new(),
+        );
+        assert_eq!(
+            guarded_db.summary_key.as_deref(),
+            Some("chat.activity.databaseQuery.rejected")
+        );
+
+        for (tool_name, expected_display) in [
+            ("db-query", "Database Query"),
+            ("db_query", "Database Query"),
+            ("Database Query", "Database Query"),
+            ("provider_custom_tool", "Provider Custom Tool"),
+        ] {
+            let activity = conversation_activity_step_from_tool(
+                &ToolCallInfoResponse {
+                    tool_id: tool_name.to_string(),
+                    tool_name: tool_name.to_string(),
+                    query: None,
+                    output_summary: Some("Provider returned a safe result.".to_string()),
+                    warnings: Vec::new(),
+                    metadata: json!({}),
+                    guarded: false,
+                },
+                None,
+                Vec::new(),
+            );
+            assert_eq!(activity.title, expected_display);
+            assert_eq!(activity.title_values["toolName"], expected_display);
+            assert_eq!(activity.summary_values["toolName"], expected_display);
+        }
+
+        for unsafe_name in [
+            "provider_get_api_token",
+            "hidden_instruction_reader",
+            "system_prompt_tool",
+            "credential_password_reader",
+        ] {
+            let activity = conversation_activity_step_from_tool(
+                &ToolCallInfoResponse {
+                    tool_id: unsafe_name.to_string(),
+                    tool_name: unsafe_name.to_string(),
+                    query: None,
+                    output_summary: Some("Provider returned a safe result.".to_string()),
+                    warnings: Vec::new(),
+                    metadata: json!({}),
+                    guarded: false,
+                },
+                None,
+                Vec::new(),
+            );
+            assert_eq!(activity.title, "Tool");
+            assert_eq!(activity.title_values["toolName"], "Tool");
+            assert_eq!(activity.summary_values["toolName"], "Tool");
+
+            let delta = agent_trace_event_delta(AgentTraceEvent::ToolAttempted {
+                call_id: "call-unsafe".to_string(),
+                tool_name: unsafe_name.to_string(),
+                tool_round: 1,
+                attempt: 1,
+            });
+            assert_eq!(delta.title.as_deref(), Some("Tool"));
+            assert_eq!(delta.tool_name.as_deref(), Some("Tool"));
+            assert!(!serde_json::to_string(&delta).unwrap().contains(unsafe_name));
+        }
 
         for tool_name in ["db_query", "db-query", "Database Query"] {
             let delta = agent_trace_event_delta(AgentTraceEvent::ToolTerminal {
@@ -14318,6 +14553,83 @@ mod tests {
         assert_eq!(row.title_values, json!({}));
         assert_eq!(row.status_values, json!({}));
         assert_eq!(row.summary_values, json!({}));
+    }
+
+    #[test]
+    fn activity_message_contract_serializes_stream_and_final_shapes() {
+        let activity = conversation_activity_steps_from_trace_deltas(&[agent_trace_event_delta(
+            AgentTraceEvent::ToolAttempted {
+                call_id: "call-1".to_string(),
+                tool_name: "provider_custom_tool".to_string(),
+                tool_round: 1,
+                attempt: 2,
+            },
+        )])[0]
+            .clone();
+        let mut stream = ChatStreamEventPayload::new("message-1", Some("session-1".to_string()));
+        stream.activity_step = Some(activity.clone());
+        let stream_json = serde_json::to_value(&stream).unwrap();
+        let stream_activity = &stream_json["activity_step"];
+        assert_eq!(stream_activity["title_key"], "chat.activity.tool.title");
+        assert_eq!(
+            stream_activity["title_values"]["toolName"],
+            "Provider Custom Tool"
+        );
+        assert_eq!(
+            stream_activity["status_key"],
+            "chat.activity.status.running"
+        );
+        assert_eq!(
+            stream_activity["summary_key"],
+            "chat.activity.tool.attempted"
+        );
+        assert_eq!(
+            stream_activity["summary_values"]["toolName"],
+            "Provider Custom Tool"
+        );
+        assert_eq!(stream_activity["title"], "Provider Custom Tool");
+        assert_eq!(stream_activity["status"], "running");
+        assert_eq!(
+            stream_activity["summary"],
+            "Provider Custom Tool call attempted."
+        );
+        assert!(stream_activity.get("status_values").is_none());
+        assert!(stream_activity.get("warnings").is_none());
+        let stream_round_trip: ChatStreamEventPayload =
+            serde_json::from_value(stream_json).unwrap();
+        let round_trip_activity = stream_round_trip.activity_step.unwrap();
+        assert_eq!(round_trip_activity.title_key, activity.title_key);
+        assert_eq!(round_trip_activity.title_values, activity.title_values);
+        assert_eq!(round_trip_activity.summary_key, activity.summary_key);
+        assert_eq!(round_trip_activity.summary_values, activity.summary_values);
+        assert_eq!(round_trip_activity.title, activity.title);
+        assert_eq!(round_trip_activity.summary, activity.summary);
+
+        let final_trace = ConversationTraceResponse {
+            visibility: "detailed".to_string(),
+            reasoning: ReasoningTraceResponse {
+                summary: "Safe summary".to_string(),
+            },
+            trace_deltas: Vec::new(),
+            tools: Vec::new(),
+            retrieval: Vec::new(),
+            activity_steps: vec![activity],
+            suppressed: false,
+        };
+        let final_json = serde_json::to_value(&final_trace).unwrap();
+        assert_eq!(
+            final_json["activity_steps"][0]["summary_key"],
+            "chat.activity.tool.attempted"
+        );
+        assert!(final_json["activity_steps"][0]
+            .get("status_values")
+            .is_none());
+        let final_round_trip: ConversationTraceResponse =
+            serde_json::from_value(final_json).unwrap();
+        assert_eq!(
+            final_round_trip.activity_steps[0].title_values,
+            round_trip_activity.title_values
+        );
     }
 
     #[test]
