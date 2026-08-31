@@ -8610,7 +8610,9 @@ fn conversation_activity_steps_from_trace_deltas(
                     id: format!("activity-{}", delta.id),
                     kind: "timing".to_string(),
                     title: title.clone(),
-                    title_key: timing_message.map(|message| message.title_key.to_string()),
+                    title_key: timing_message
+                        .filter(|message| title == message.title_fallback)
+                        .map(|message| message.title_key.to_string()),
                     title_values: json!({}),
                     status: status.clone(),
                     status_key: activity_status_key(&status),
@@ -9407,6 +9409,50 @@ mod tests {
         assert_eq!(rows[0].title, "Retry delay");
         assert!(rows[0].summary.as_deref().unwrap().contains("101 ms"));
         assert!(!rows[0].summary.as_deref().unwrap().contains("call-1"));
+    }
+
+    #[test]
+    fn canonical_timing_activity_title_remains_keyed_through_serialization() {
+        let canonical = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ToolExecution,
+            step: None,
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 101,
+        });
+        let canonical_row = conversation_activity_steps_from_trace_deltas(&[canonical])[0].clone();
+        assert_eq!(canonical_row.title, "Tool execution");
+        assert_eq!(
+            canonical_row.title_key.as_deref(),
+            Some("chat.activity.timing.toolExecution.title")
+        );
+        let canonical_json = serde_json::to_value(&canonical_row).unwrap();
+        assert_eq!(
+            canonical_json["title_key"],
+            "chat.activity.timing.toolExecution.title"
+        );
+    }
+
+    #[test]
+    fn custom_timing_activity_title_is_preserved_and_unkeyed_through_serialization() {
+        let mut custom = agent_trace_event_delta(AgentTraceEvent::Timing {
+            phase: ConversationTimingPhase::ToolExecution,
+            step: None,
+            tool_name: None,
+            call_id: None,
+            attempt: 1,
+            outcome: ConversationTimingOutcome::Succeeded,
+            elapsed_ms: 101,
+        });
+        custom.title = Some("Custom timing title".to_string());
+        let custom_row = conversation_activity_steps_from_trace_deltas(&[custom])[0].clone();
+        assert_eq!(custom_row.title, "Custom timing title");
+        assert!(custom_row.title_key.is_none());
+        let custom_json = serde_json::to_value(&custom_row).unwrap();
+        assert_eq!(custom_json["title"], "Custom timing title");
+        assert!(custom_json.get("title_key").is_none());
     }
 
     #[test]
