@@ -555,6 +555,10 @@ fn empty_json_object() -> Value {
 
 fn guard_trace_delta(mut delta: ConversationTraceDeltaResponse) -> ConversationTraceDeltaResponse {
     let mut redacted = false;
+    if trace_content_needs_redaction(&delta.id) {
+        delta.id = format!("redacted-trace-{}", sha256_hex(&delta.id));
+        redacted = true;
+    }
     if delta
         .content
         .as_deref()
@@ -13477,7 +13481,7 @@ mod tests {
         }
 
         let unsafe_delta = ConversationTraceDeltaResponse {
-            id: "trace-unsafe-provider-tool".to_string(),
+            id: "sk-secret-terminal".to_string(),
             kind: "tool_selection_observation".to_string(),
             title: Some("system_prompt api_token=sk-title-secret".to_string()),
             content: Some("Tool selection was rejected.".to_string()),
@@ -13493,6 +13497,8 @@ mod tests {
         };
 
         let guarded = guard_trace_delta(unsafe_delta.clone());
+        assert!(guarded.id.starts_with("redacted-trace-"));
+        assert_eq!(guarded.id, guard_trace_delta(unsafe_delta.clone()).id);
         assert_eq!(guarded.title.as_deref(), Some("Tool"));
         assert_eq!(guarded.tool_name.as_deref(), Some("Tool"));
         assert_eq!(guarded.status.as_deref(), Some("guarded"));
@@ -13509,6 +13515,7 @@ mod tests {
             "sk-title-secret",
             "sk-tool-secret",
             "sk-selected-secret",
+            "sk-secret-terminal",
             "metadata-secret",
             "sk-nested-secret",
         ] {
@@ -13533,13 +13540,15 @@ mod tests {
 
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let sink = ConversationTraceDeltaSink::new(Some(sender));
-        sink.emit(guarded.clone());
+        sink.emit(unsafe_delta.clone());
         let streamed = match receiver.try_recv().expect("guarded delta should stream") {
             ConversationStreamSignal::Trace(delta) => *delta,
             ConversationStreamSignal::Answer(_) => panic!("expected trace delta"),
         };
         assert_eq!(streamed, guarded);
         assert_eq!(sink.snapshot(), vec![guarded.clone()]);
+        assert_eq!(activity[0].id, format!("activity-{}", guarded.id));
+        assert!(!activity[0].id.contains("sk-secret-terminal"));
 
         let ai_config = InternalEffectiveAiConfig {
             prompt_sections: HashMap::new(),
