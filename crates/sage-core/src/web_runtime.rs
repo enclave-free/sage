@@ -2040,42 +2040,13 @@ fn tool_trace_title(tool_name: &str) -> String {
 }
 
 fn sanitize_tool_display_name(tool_name: &str) -> String {
-    let normalized = tool_name.trim().to_ascii_lowercase();
-    let unsafe_marker = [
-        "api_token",
-        "api-token",
-        "api key",
-        "api_key",
-        "authorization",
-        "bearer",
-        "credential",
-        "developer instruction",
-        "developer_instruction",
-        "hidden instruction",
-        "hidden_instruction",
-        "internal instruction",
-        "internal_instruction",
-        "password",
-        "private key",
-        "private_key",
-        "prompt injection",
-        "prompt_injection",
-        "system prompt",
-        "system_prompt",
-        "token",
-    ];
-    if normalized.is_empty()
-        || trace_content_needs_redaction(&normalized)
-        || unsafe_marker
-            .iter()
-            .any(|marker| normalized.contains(marker))
-    {
+    let trimmed = tool_name.trim();
+    if trimmed.is_empty() || trace_content_needs_redaction(trimmed) {
         return "Tool".to_string();
     }
 
     let mut display = String::new();
-    for word in tool_name
-        .trim()
+    for word in trimmed
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
     {
@@ -2103,49 +2074,57 @@ struct TimingActivityMessage {
 }
 
 fn timing_activity_message_from_token(token: &str) -> Option<TimingActivityMessage> {
-    Some(match token {
-        "model_request" => TimingActivityMessage {
+    let phase = match token {
+        "model_request" => ConversationTimingPhase::ModelRequest,
+        "provider_first_event_wait" => ConversationTimingPhase::ProviderFirstEventWait,
+        "tool_execution" => ConversationTimingPhase::ToolExecution,
+        "resource_directory_lookup" => ConversationTimingPhase::ResourceDirectoryLookup,
+        "retrieval" => ConversationTimingPhase::Retrieval,
+        "retry_delay" => ConversationTimingPhase::RetryDelay,
+        "total_turn" => ConversationTimingPhase::TotalTurn,
+        _ => return None,
+    };
+    Some(timing_activity_message(phase))
+}
+
+fn timing_activity_message(phase: ConversationTimingPhase) -> TimingActivityMessage {
+    match phase {
+        ConversationTimingPhase::ModelRequest => TimingActivityMessage {
             title_key: "chat.activity.timing.modelRequest.title",
             summary_key: "chat.activity.timing.modelRequest.summary",
             title_fallback: "Model request",
         },
-        "provider_first_event_wait" => TimingActivityMessage {
+        ConversationTimingPhase::ProviderFirstEventWait => TimingActivityMessage {
             title_key: "chat.activity.timing.providerFirstEventWait.title",
             summary_key: "chat.activity.timing.providerFirstEventWait.summary",
             title_fallback: "Provider first-event wait",
         },
-        "tool_execution" => TimingActivityMessage {
+        ConversationTimingPhase::ToolExecution => TimingActivityMessage {
             title_key: "chat.activity.timing.toolExecution.title",
             summary_key: "chat.activity.timing.toolExecution.summary",
             title_fallback: "Tool execution",
         },
-        "resource_directory_lookup" => TimingActivityMessage {
+        ConversationTimingPhase::ResourceDirectoryLookup => TimingActivityMessage {
             title_key: "chat.activity.timing.resourceDirectoryLookup.title",
             summary_key: "chat.activity.timing.resourceDirectoryLookup.summary",
             title_fallback: "Resource Directory lookup",
         },
-        "retrieval" => TimingActivityMessage {
+        ConversationTimingPhase::Retrieval => TimingActivityMessage {
             title_key: "chat.activity.timing.retrieval.title",
             summary_key: "chat.activity.timing.retrieval.summary",
             title_fallback: "Retrieval",
         },
-        "retry_delay" => TimingActivityMessage {
+        ConversationTimingPhase::RetryDelay => TimingActivityMessage {
             title_key: "chat.activity.timing.retryDelay.title",
             summary_key: "chat.activity.timing.retryDelay.summary",
             title_fallback: "Retry delay",
         },
-        "total_turn" => TimingActivityMessage {
+        ConversationTimingPhase::TotalTurn => TimingActivityMessage {
             title_key: "chat.activity.timing.totalTurn.title",
             summary_key: "chat.activity.timing.totalTurn.summary",
             title_fallback: "Total turn",
         },
-        _ => return None,
-    })
-}
-
-fn timing_activity_message(phase: ConversationTimingPhase) -> TimingActivityMessage {
-    timing_activity_message_from_token(phase.as_str())
-        .expect("every ConversationTimingPhase has an activity message")
+    }
 }
 
 fn timing_summary(message: TimingActivityMessage, elapsed_ms: u128, proxy: bool) -> String {
@@ -8720,10 +8699,10 @@ fn conversation_activity_steps_from_trace_deltas(
             };
             let summary_key = if matches!(selection_outcome, "failed" | "rejected") {
                 "chat.activity.toolSelection.failed"
-            } else if selected_names.is_empty() {
-                "chat.activity.toolSelection.noneSelected"
             } else if selection_outcome == "partially_rejected" {
                 "chat.activity.toolSelection.partialFailure"
+            } else if selected_names.is_empty() {
+                "chat.activity.toolSelection.noneSelected"
             } else {
                 "chat.activity.toolSelection.selected"
             };
@@ -14639,6 +14618,29 @@ mod tests {
             Some("chat.activity.toolSelection.noneSelected")
         );
         assert_eq!(no_tools[0].summary_values["selectionCount"], json!(0));
+
+        let partial_without_selected_tools =
+            conversation_activity_steps_from_trace_deltas(&[ConversationTraceDeltaResponse {
+                id: "tool-selection-partial-empty".to_string(),
+                kind: "tool_selection_observation".to_string(),
+                title: Some("Tool Selection".to_string()),
+                content: Some("Some of the model's Tool selections were rejected.".to_string()),
+                tool_name: None,
+                status: Some("failed".to_string()),
+                metadata: json!({
+                    "selected_tools": [],
+                    "outcome": "partially_rejected",
+                }),
+                created_at: None,
+            }]);
+        assert_eq!(
+            partial_without_selected_tools[0].summary_key.as_deref(),
+            Some("chat.activity.toolSelection.partialFailure")
+        );
+        assert_eq!(
+            partial_without_selected_tools[0].summary.as_deref(),
+            Some("Some of the model's Tool selections were rejected.")
+        );
 
         let failed = conversation_activity_steps_from_trace_deltas(&[agent_trace_event_delta(
             AgentTraceEvent::ToolSelectionObservation {
