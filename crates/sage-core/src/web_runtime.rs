@@ -554,12 +554,28 @@ fn empty_json_object() -> Value {
 }
 
 fn guard_trace_delta(mut delta: ConversationTraceDeltaResponse) -> ConversationTraceDeltaResponse {
+    let mut redacted = false;
     if delta
         .content
         .as_deref()
         .is_some_and(trace_content_needs_redaction)
     {
         delta.content = Some("[redacted]".to_string());
+        redacted = true;
+    }
+    for identifier in [&mut delta.title, &mut delta.tool_name] {
+        if identifier
+            .as_deref()
+            .is_some_and(trace_content_needs_redaction)
+        {
+            *identifier = Some("Tool".to_string());
+            redacted = true;
+        }
+    }
+    if sanitize_trace_metadata(&mut delta.metadata) {
+        redacted = true;
+    }
+    if redacted {
         delta.status = Some("guarded".to_string());
     }
     delta
@@ -569,19 +585,60 @@ fn trace_content_needs_redaction(content: &str) -> bool {
     let normalized = content.to_ascii_lowercase();
     [
         "api_token",
+        "api-token",
         "api key",
         "api_key",
-        "authorization:",
-        "bearer ",
-        "private key",
-        "system prompt",
+        "authorization",
+        "bearer",
+        "credential",
         "developer instruction",
+        "developer_instruction",
+        "hidden instruction",
+        "hidden_instruction",
+        "internal instruction",
+        "internal_instruction",
+        "password",
+        "private key",
+        "private_key",
+        "prompt injection",
+        "prompt_injection",
+        "system prompt",
+        "system_prompt",
         "developer message",
         "secret",
         "sk-",
+        "token",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+}
+
+fn sanitize_trace_metadata(value: &mut Value) -> bool {
+    match value {
+        Value::String(string) if trace_content_needs_redaction(string) => {
+            *string = "Tool".to_string();
+            true
+        }
+        Value::Array(values) => {
+            let mut redacted = false;
+            for value in values {
+                if sanitize_trace_metadata(value) {
+                    redacted = true;
+                }
+            }
+            redacted
+        }
+        Value::Object(object) => {
+            let mut redacted = false;
+            for value in object.values_mut() {
+                if sanitize_trace_metadata(value) {
+                    redacted = true;
+                }
+            }
+            redacted
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -8090,6 +8147,12 @@ fn build_conversation_trace(
     retrieval_sources: Vec<QuerySource>,
     trace_deltas: Vec<ConversationTraceDeltaResponse>,
 ) -> Option<ConversationTraceResponse> {
+    // Keep the guard at the persistence/export boundary as a defense in depth
+    // for callers that did not originate their deltas from the live sink.
+    let trace_deltas = trace_deltas
+        .into_iter()
+        .map(guard_trace_delta)
+        .collect::<Vec<_>>();
     let detailed_tools = tools
         .into_iter()
         .map(|tool| {
@@ -13389,6 +13452,122 @@ mod tests {
         assert!(rendered.contains(r#""content":"[redacted]""#));
         assert!(rendered.contains(r#""status":"guarded""#));
         assert!(!rendered.contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn trace_guard_preserves_safe_ids_and_redacts_unsafe_identifiers_at_the_boundary() {
+        let safe_deltas = ["web_search", "db_query", "provider_custom_tool"]
+            .into_iter()
+            .map(|tool_name| ConversationTraceDeltaResponse {
+                id: format!("trace-{tool_name}"),
+                kind: "tool_result".to_string(),
+                title: Some(tool_name.to_string()),
+                content: Some("Tool completed.".to_string()),
+                tool_name: Some(tool_name.to_string()),
+                status: Some("succeeded".to_string()),
+                metadata: json!({
+                    "selected_tools": [tool_name],
+                    "tool_name": tool_name,
+                }),
+                created_at: None,
+            })
+            .collect::<Vec<_>>();
+        for safe in safe_deltas {
+            assert_eq!(guard_trace_delta(safe.clone()), safe);
+        }
+
+        let unsafe_delta = ConversationTraceDeltaResponse {
+            id: "trace-unsafe-provider-tool".to_string(),
+            kind: "tool_selection_observation".to_string(),
+            title: Some("system_prompt api_token=sk-title-secret".to_string()),
+            content: Some("Tool selection was rejected.".to_string()),
+            tool_name: Some("provider_api_token_sk-tool-secret".to_string()),
+            status: Some("failed".to_string()),
+            metadata: json!({
+                "selected_tools": ["web_search", "sk-selected-secret"],
+                "enabled_tools": ["provider_custom_tool", "system_prompt_tool"],
+                "tool_name": "authorization: Bearer metadata-secret",
+                "nested": {"identifier": "api_token=sk-nested-secret"},
+            }),
+            created_at: None,
+        };
+
+        let guarded = guard_trace_delta(unsafe_delta.clone());
+        assert_eq!(guarded.title.as_deref(), Some("Tool"));
+        assert_eq!(guarded.tool_name.as_deref(), Some("Tool"));
+        assert_eq!(guarded.status.as_deref(), Some("guarded"));
+        assert_eq!(guarded.metadata["selected_tools"][0], "web_search");
+        assert_eq!(guarded.metadata["selected_tools"][1], "Tool");
+        assert_eq!(guarded.metadata["enabled_tools"][1], "Tool");
+        assert_eq!(guarded.metadata["tool_name"], "Tool");
+        assert_eq!(guarded.metadata["nested"]["identifier"], "Tool");
+
+        let serialized = serde_json::to_string(&guarded).unwrap();
+        for secret in [
+            "system_prompt",
+            "api_token",
+            "sk-title-secret",
+            "sk-tool-secret",
+            "sk-selected-secret",
+            "metadata-secret",
+            "sk-nested-secret",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "leaked {secret}: {serialized}"
+            );
+        }
+
+        let activity =
+            conversation_activity_steps_from_trace_deltas(std::slice::from_ref(&guarded));
+        assert_eq!(activity[0].title, "Tool Selection");
+        assert_eq!(
+            activity[0].summary_values["selectedTools"][0]["id"],
+            "web_search"
+        );
+        assert_eq!(
+            activity[0].summary_values["selectedTools"][1]["displayName"],
+            "Tool"
+        );
+        assert!(!serde_json::to_string(&activity).unwrap().contains("secret"));
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink = ConversationTraceDeltaSink::new(Some(sender));
+        sink.emit(guarded.clone());
+        let streamed = match receiver.try_recv().expect("guarded delta should stream") {
+            ConversationStreamSignal::Trace(delta) => *delta,
+            ConversationStreamSignal::Answer(_) => panic!("expected trace delta"),
+        };
+        assert_eq!(streamed, guarded);
+        assert_eq!(sink.snapshot(), vec![guarded.clone()]);
+
+        let ai_config = InternalEffectiveAiConfig {
+            prompt_sections: HashMap::new(),
+            parameters: HashMap::new(),
+            defaults: HashMap::new(),
+            compiled_prompt: "Safe prompt".to_string(),
+        };
+        let auth = InternalAuthContext {
+            id: 1,
+            kind: "admin".to_string(),
+            approved: true,
+            pubkey: Some("admin-pubkey".to_string()),
+            email: None,
+            name: None,
+            user_type_id: None,
+            dev_mode: false,
+        };
+        let persisted = build_conversation_trace(
+            &ai_config,
+            &auth,
+            Vec::new(),
+            Vec::new(),
+            vec![unsafe_delta],
+        )
+        .expect("trace should remain exportable after identifier redaction");
+        assert_eq!(persisted.trace_deltas, vec![guarded]);
+        let persisted_json = assistant_trace_metadata(&persisted).to_string();
+        assert!(!persisted_json.contains("secret"));
     }
 
     struct TestTraceTool {
