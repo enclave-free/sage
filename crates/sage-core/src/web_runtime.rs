@@ -8288,14 +8288,21 @@ fn conversation_activity_steps_from_tool_traces(
         .collect()
 }
 
+const ACTIVITY_STATUS_KEYS: &[(&str, &str)] = &[
+    ("running", "chat.activity.status.running"),
+    ("succeeded", "chat.activity.status.succeeded"),
+    ("failed", "chat.activity.status.failed"),
+    ("guarded", "chat.activity.status.guarded"),
+    ("timed_out", "chat.activity.status.timed_out"),
+    ("rejected", "chat.activity.status.rejected"),
+];
+
 fn activity_status_key(status: &str) -> Option<String> {
     // Keep unknown/status extensions on the English compatibility fallback;
     // only backend-owned product statuses may select a locale key.
-    matches!(
-        status,
-        "running" | "succeeded" | "failed" | "guarded" | "timed_out" | "rejected"
-    )
-    .then(|| format!("chat.activity.status.{status}"))
+    ACTIVITY_STATUS_KEYS
+        .iter()
+        .find_map(|(token, key)| (*token == status).then(|| (*key).to_string()))
 }
 
 fn is_db_query_tool(tool_name: &str) -> bool {
@@ -14670,27 +14677,20 @@ mod tests {
             Some("chat.activity.toolSelection.failed")
         );
 
-        for status in [
-            "running",
-            "succeeded",
-            "failed",
-            "guarded",
-            "timed_out",
-            "rejected",
-        ] {
+        for (status, expected_key) in ACTIVITY_STATUS_KEYS {
             let activity = conversation_activity_step_from_tool_trace(&ToolTraceResponse {
                 id: "tool-1".to_string(),
                 name: "Web Search".to_string(),
-                status: status.to_string(),
+                status: (*status).to_string(),
                 execution: "server".to_string(),
                 input_summary: None,
                 output_summary: None,
                 warnings: Vec::new(),
                 metadata: json!({}),
             });
-            let expected_key = format!("chat.activity.status.{status}");
-            assert_eq!(activity.status_key.as_deref(), Some(expected_key.as_str()));
+            assert_eq!(activity.status_key.as_deref(), Some(*expected_key));
         }
+        assert_eq!(activity_status_key("future_status"), None);
 
         let dynamic = conversation_activity_step_from_tool(
             &ToolCallInfoResponse {
