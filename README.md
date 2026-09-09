@@ -98,8 +98,8 @@ Useful env for the web runtime path:
 DATABASE_URL=postgres://sage:sage@localhost:5432/sage
 TINFOIL_API_URL=http://localhost:8089/v1
 TINFOIL_API_KEY=your-key
-TINFOIL_MODEL=glm-5-2
-TINFOIL_REASONING_EFFORT=none
+TINFOIL_MODEL=glm-5-3-flash
+TINFOIL_REASONING_EFFORT=low
 TINFOIL_EMBEDDING_MODEL=nomic-embed-text
 ENCLAVE_WEB_PORT=3000
 ENCLAVE_BACKEND_URL=http://core-backend:8000

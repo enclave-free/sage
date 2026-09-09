@@ -44,7 +44,8 @@ KEEP_IMAGE="${KEEP_IMAGE:-0}"
 KEEP_STACK_ON_FAILURE="${KEEP_STACK_ON_FAILURE:-0}"
 
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-sage-smoke}"
-export TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-2}"
+export TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-3-flash}"
+export TINFOIL_REASONING_EFFORT="${TINFOIL_REASONING_EFFORT:-low}"
 export TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}"
 export TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-qwen3-vl-30b}"
 export TINFOIL_ROUTER_HOST="${TINFOIL_ROUTER_HOST:-inference.tinfoil.sh}"
@@ -135,6 +136,7 @@ run_in_runner() {
         -e TINFOIL_API_URL="http://tinfoil-proxy:${TINFOIL_PROXY_PORT}/v1" \
         -e TINFOIL_API_KEY \
         -e TINFOIL_MODEL \
+        -e TINFOIL_REASONING_EFFORT \
         -e TINFOIL_EMBEDDING_MODEL \
         -e TINFOIL_VISION_MODEL \
         -v "${CARGO_HOME_VOLUME}:/cargo-home" \
@@ -172,7 +174,8 @@ def post(path: str, payload: dict):
 chat_payload = {
     "model": chat_model,
     "messages": [{"role": "user", "content": "Reply with OK."}],
-    "max_tokens": 8,
+    "reasoning_effort": os.environ["TINFOIL_REASONING_EFFORT"],
+    "max_tokens": 1024,
 }
 
 last_error = None

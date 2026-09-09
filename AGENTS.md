@@ -77,8 +77,8 @@ If not using Nix, install at least:
 DATABASE_URL=postgres://sage:sage@localhost:5434/sage
 TINFOIL_API_URL=http://localhost:8089/v1
 TINFOIL_API_KEY=your-api-key
-TINFOIL_MODEL=glm-5-2
-TINFOIL_REASONING_EFFORT=none
+TINFOIL_MODEL=glm-5-3-flash
+TINFOIL_REASONING_EFFORT=low
 TINFOIL_EMBEDDING_MODEL=nomic-embed-text
 TINFOIL_VISION_MODEL=kimi-k2-5
 ENCLAVE_WEB_PORT=3000
