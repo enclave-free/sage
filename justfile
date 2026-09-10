@@ -376,8 +376,8 @@ ci-check:
     cargo test --all-features
 
 # Run the isolated Tinfoil + pgvector smoke gate without Signal or Marmot
-smoke-tinfoil:
-    ./scripts/smoke_tinfoil.sh
+smoke-tinfoil mode="full":
+    ./scripts/smoke_tinfoil.sh --mode {{quote(mode)}}
 
 # =============================================================================
 # GEPA Prompt Optimization

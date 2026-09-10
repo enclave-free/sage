@@ -30,6 +30,15 @@ detect_engine() {
     fail "Neither docker nor podman is available"
 }
 
+# Full Sage verification remains the default for existing callers.
+export SAGE_SMOKE_MODE=full
+case "$#:${1:-}:${2:-}" in
+    0::) ;;
+    2:--mode:full|2:--mode:enclave) SAGE_SMOKE_MODE="$2" ;;
+    1:--help:) printf 'Usage: %s [--mode full|enclave]\nEnclave mode excludes vision; all workspace and database checks still run.\n' "$0"; exit 0 ;;
+    *) fail "Usage: $0 [--mode full|enclave]" ;;
+esac
+
 ENGINE="${CONTAINER_ENGINE:-$(detect_engine)}"
 require_command "$ENGINE"
 
@@ -139,6 +148,7 @@ run_in_runner() {
         -e TINFOIL_REASONING_EFFORT \
         -e TINFOIL_EMBEDDING_MODEL \
         -e TINFOIL_VISION_MODEL \
+        -e SAGE_SMOKE_MODE \
         -v "${CARGO_HOME_VOLUME}:/cargo-home" \
         -v "${ROOT_DIR}:/repo" \
         -w /repo \
@@ -146,7 +156,7 @@ run_in_runner() {
 }
 
 run_proxy_checks() {
-    log "Running chat, embeddings, and vision smoke checks"
+    log "Running provider checks (mode: ${SAGE_SMOKE_MODE})"
 
     run_in_runner python3 - <<'PY'
 import base64
@@ -225,47 +235,50 @@ if not all(isinstance(value, (int, float)) for value in embedding):
     raise SystemExit("FAIL embeddings contain non-numeric values")
 print("PASS embeddings shape")
 
-subprocess.run(["mkdir", "-p", "/tmp/sage-smoke"], check=True)
-subprocess.run(
-    ["convert", "-size", "64x64", "xc:red", "/tmp/sage-smoke/red.png"],
-    check=True,
-)
-with open("/tmp/sage-smoke/red.png", "rb") as handle:
-    image_b64 = base64.b64encode(handle.read()).decode("ascii")
-
-vision_response = post(
-    "/chat/completions",
-    {
-        "model": vision_model,
-        "messages": [
-            {"role": "system", "content": "Describe the user image in one sentence."},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": "Describe this image in one sentence.",
-                    },
-                ],
-            },
-        ],
-        "max_tokens": 64,
-    },
-)
-if vision_response.status_code != 200:
-    raise SystemExit(
-        f"FAIL vision status {vision_response.status_code}: {vision_response.text}"
+if os.environ["SAGE_SMOKE_MODE"] == "full":
+    subprocess.run(["mkdir", "-p", "/tmp/sage-smoke"], check=True)
+    subprocess.run(
+        ["convert", "-size", "64x64", "xc:red", "/tmp/sage-smoke/red.png"],
+        check=True,
     )
+    with open("/tmp/sage-smoke/red.png", "rb") as handle:
+        image_b64 = base64.b64encode(handle.read()).decode("ascii")
 
-vision_content = vision_response.json()["choices"][0]["message"]["content"]
-vision_lower = vision_content.lower()
-if not vision_content or not any(token in vision_lower for token in ("red", "square", "solid", "color")):
-    raise SystemExit(f"FAIL vision content: {vision_content!r}")
-print("PASS vision completion")
+    vision_response = post(
+        "/chat/completions",
+        {
+            "model": vision_model,
+            "messages": [
+                {"role": "system", "content": "Describe the user image in one sentence."},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in one sentence.",
+                        },
+                    ],
+                },
+            ],
+            "max_tokens": 64,
+        },
+    )
+    if vision_response.status_code != 200:
+        raise SystemExit(
+            f"FAIL vision status {vision_response.status_code}: {vision_response.text}"
+        )
+
+    vision_content = vision_response.json()["choices"][0]["message"]["content"]
+    vision_lower = vision_content.lower()
+    if not vision_content or not any(token in vision_lower for token in ("red", "square", "solid", "color")):
+        raise SystemExit(f"FAIL vision content: {vision_content!r}")
+    print("PASS vision completion")
+else:
+    print("NOT TESTED vision: not used by the Enclave Deployment")
 
 invalid_model_response = post(
     "/chat/completions",
@@ -440,4 +453,4 @@ run_in_runner cargo clippy --workspace --all-targets --all-features -- -D warnin
 
 run_memory_harness
 
-log "Smoke test passed"
+log "Smoke test passed (mode: ${SAGE_SMOKE_MODE})"
