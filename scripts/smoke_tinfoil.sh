@@ -128,7 +128,7 @@ apply_migrations() {
 }
 
 run_in_runner() {
-    run_engine run --rm \
+    run_engine run --rm -i \
         --network "$NETWORK_NAME" \
         --user root \
         -e CARGO_HOME=/cargo-home \
@@ -197,7 +197,10 @@ if response_model != chat_model:
     raise SystemExit(
         f"FAIL chat model mismatch: requested {chat_model!r}, received {response_model!r}"
     )
-chat_content = chat_json["choices"][0]["message"]["content"]
+chat_choice = chat_json["choices"][0]
+if chat_choice.get("finish_reason") != "stop":
+    raise SystemExit(f"FAIL chat finish reason: {chat_choice.get('finish_reason')!r}")
+chat_content = chat_choice["message"]["content"]
 if not chat_content or "ok" not in chat_content.lower():
     raise SystemExit(f"FAIL chat content: {chat_content!r}")
 print("PASS chat completion")
@@ -427,12 +430,13 @@ apply_migrations
 log "Building smoke runner image"
 run_engine build --target smoke-runner -t "$RUNNER_IMAGE" "$ROOT_DIR"
 
+run_proxy_checks
+
 log "Running containerized workspace checks"
 run_in_runner cargo check --workspace
 run_in_runner cargo test --workspace
 run_in_runner cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-run_proxy_checks
 run_memory_harness
 
 log "Smoke test passed"
