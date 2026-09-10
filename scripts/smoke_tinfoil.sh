@@ -192,6 +192,11 @@ else:
     raise SystemExit(f"FAIL chat readiness: {last_error}")
 
 chat_json = response.json()
+response_model = chat_json.get("model")
+if response_model != chat_model:
+    raise SystemExit(
+        f"FAIL chat model mismatch: requested {chat_model!r}, received {response_model!r}"
+    )
 chat_content = chat_json["choices"][0]["message"]["content"]
 if not chat_content or "ok" not in chat_content.lower():
     raise SystemExit(f"FAIL chat content: {chat_content!r}")
