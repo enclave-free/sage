@@ -420,8 +420,9 @@ run_engine run -d \
     --network "$NETWORK_NAME" \
     --network-alias tinfoil-proxy \
     -e TINFOIL_API_KEY \
-    ghcr.io/tinfoilsh/tinfoil-cli:latest \
-    proxy -e "$TINFOIL_ROUTER_HOST" -r "$TINFOIL_ROUTER_REPO" -p "$TINFOIL_PROXY_PORT" -b 0.0.0.0 >/dev/null
+    ghcr.io/tinfoilsh/tinfoil-proxy:0.1.6 \
+    -e "$TINFOIL_ROUTER_HOST" -r "$TINFOIL_ROUTER_REPO" -p "$TINFOIL_PROXY_PORT" -b 0.0.0.0 \
+    --allowed-host tinfoil-proxy >/dev/null
 
 log "Waiting for postgres readiness"
 wait_for_postgres
