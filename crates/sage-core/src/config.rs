@@ -14,6 +14,8 @@ pub enum MessengerType {
 pub struct Config {
     pub tinfoil_api_url: String,
     pub tinfoil_api_key: Option<String>,
+    pub maple_api_url: String,
+    pub maple_api_key: Option<String>,
     pub tinfoil_model: String,
     pub tinfoil_reasoning_effort: NativeReasoningEffort,
     pub tinfoil_embedding_model: String,
@@ -74,6 +76,9 @@ impl Config {
             tinfoil_api_url: std::env::var("TINFOIL_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8089/v1".to_string()),
             tinfoil_api_key: std::env::var("TINFOIL_API_KEY").ok(),
+            maple_api_url: std::env::var("MAPLE_API_URL")
+                .unwrap_or_else(|_| "http://maple-proxy:8080/v1".to_string()),
+            maple_api_key: std::env::var("MAPLE_API_KEY").ok(),
             tinfoil_model,
             tinfoil_reasoning_effort,
             tinfoil_embedding_model: std::env::var("TINFOIL_EMBEDDING_MODEL")
