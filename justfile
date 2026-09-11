@@ -369,8 +369,9 @@ setup-hooks:
     git config core.hooksPath .githooks
     @echo "✅ Git hooks configured. Pre-commit will run fmt, clippy, and tests."
 
-# Run all CI checks (same as pre-commit hook)
+# Run local Rust and smoke-contract checks
 ci-check:
+    python3 -m unittest discover -s scripts -p test_smoke_tinfoil.py
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-features
