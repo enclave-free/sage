@@ -75,10 +75,9 @@ services:
 
   # Verified local proxy for Tinfoil's hosted router
   tinfoil-proxy:
-    image: ghcr.io/tinfoilsh/tinfoil-cli:latest
+    image: ghcr.io/tinfoilsh/tinfoil-proxy:0.1.6
     container_name: sage-tinfoil-proxy
     command:
-      - proxy
       - -e
       - ${TINFOIL_ROUTER_HOST:-inference.tinfoil.sh}
       - -r
@@ -87,6 +86,8 @@ services:
       - "${TINFOIL_PROXY_PORT:-8089}"
       - -b
       - 0.0.0.0
+      - --allowed-host
+      - tinfoil-proxy
     ports:
       - "${TINFOIL_PROXY_PORT:-8089}:${TINFOIL_PROXY_PORT:-8089}"
     environment:
@@ -126,8 +127,8 @@ services:
       # LLM Backend (Tinfoil via verified local proxy)
       - TINFOIL_API_URL=http://tinfoil-proxy:${TINFOIL_PROXY_PORT:-8089}/v1
       - TINFOIL_API_KEY=${TINFOIL_API_KEY}
-      - TINFOIL_MODEL=${TINFOIL_MODEL:-glm-5-2}
-      - TINFOIL_REASONING_EFFORT=${TINFOIL_REASONING_EFFORT:-none}
+      - TINFOIL_MODEL=${TINFOIL_MODEL:-glm-5-3-flash}
+      - TINFOIL_REASONING_EFFORT=${TINFOIL_REASONING_EFFORT:-low}
       - TINFOIL_EMBEDDING_MODEL=${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}
       - TINFOIL_VISION_MODEL=${TINFOIL_VISION_MODEL:-qwen3-vl-30b}
       

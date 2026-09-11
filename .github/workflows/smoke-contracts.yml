@@ -1,0 +1,13 @@
+name: Smoke contracts
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s scripts -p test_smoke_tinfoil.py

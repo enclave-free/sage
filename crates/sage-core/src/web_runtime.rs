@@ -12914,6 +12914,7 @@ mod tests {
     }
 
     struct EndpointLookupTool {
+        client: reqwest::Client,
         url: String,
         policy: ToolRetryPolicy,
     }
@@ -12937,21 +12938,17 @@ mod tests {
         }
 
         async fn execute_native(&self, _args: &ToolArgs) -> Result<NativeToolResult> {
-            let response = reqwest::Client::new()
-                .get(&self.url)
-                .send()
-                .await
-                .map_err(|error| {
-                    if error.is_connect() {
-                        anyhow::Error::new(ToolExecutionError::Connection)
-                    } else if error.is_timeout() {
-                        anyhow::Error::new(ToolExecutionError::Timeout)
-                    } else {
-                        anyhow::Error::new(ToolExecutionError::Other(
-                            "endpoint request failed".to_string(),
-                        ))
-                    }
-                })?;
+            let response = self.client.get(&self.url).send().await.map_err(|error| {
+                if error.is_connect() {
+                    anyhow::Error::new(ToolExecutionError::Connection)
+                } else if error.is_timeout() {
+                    anyhow::Error::new(ToolExecutionError::Timeout)
+                } else {
+                    anyhow::Error::new(ToolExecutionError::Other(
+                        "endpoint request failed".to_string(),
+                    ))
+                }
+            })?;
             let status = response.status();
             if !status.is_success() {
                 return Err(anyhow::Error::new(ToolExecutionError::HttpStatus(
@@ -13056,6 +13053,8 @@ mod tests {
         });
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EndpointLookupTool {
+            // Client setup is outside the request deadline, as in production.
+            client: reqwest::Client::new(),
             url: format!("http://{address}/"),
             policy,
         }));

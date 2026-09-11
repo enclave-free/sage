@@ -48,16 +48,34 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let tinfoil_model =
+            std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "glm-5-3-flash".to_string());
+        let tinfoil_reasoning_effort = std::env::var("TINFOIL_REASONING_EFFORT")
+            .unwrap_or_else(|_| "low".to_string())
+            .parse()
+            .map_err(anyhow::Error::msg)
+            .context("TINFOIL_REASONING_EFFORT must be a supported reasoning effort")?;
+
+        if tinfoil_model == "glm-5-3-flash"
+            && !matches!(
+                tinfoil_reasoning_effort,
+                NativeReasoningEffort::Low
+                    | NativeReasoningEffort::High
+                    | NativeReasoningEffort::Max
+            )
+        {
+            anyhow::bail!(
+                "TINFOIL_REASONING_EFFORT={} is unsupported for glm-5-3-flash; expected low, high, or max",
+                tinfoil_reasoning_effort
+            );
+        }
+
         Ok(Self {
             tinfoil_api_url: std::env::var("TINFOIL_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8089/v1".to_string()),
             tinfoil_api_key: std::env::var("TINFOIL_API_KEY").ok(),
-            tinfoil_model: std::env::var("TINFOIL_MODEL").unwrap_or_else(|_| "glm-5-2".to_string()),
-            tinfoil_reasoning_effort: std::env::var("TINFOIL_REASONING_EFFORT")
-                .unwrap_or_else(|_| NativeReasoningEffort::default().to_string())
-                .parse()
-                .map_err(anyhow::Error::msg)
-                .context("TINFOIL_REASONING_EFFORT must be a supported reasoning effort")?,
+            tinfoil_model,
+            tinfoil_reasoning_effort,
             tinfoil_embedding_model: std::env::var("TINFOIL_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string()),
             tinfoil_vision_model: std::env::var("TINFOIL_VISION_MODEL")
@@ -203,10 +221,26 @@ mod tests {
         let defaulted_vision = Config::from_env().unwrap();
         assert_eq!(defaulted_vision.tinfoil_vision_model, "qwen3-vl-30b");
 
+        std::env::remove_var("TINFOIL_MODEL");
         std::env::remove_var("TINFOIL_REASONING_EFFORT");
         let defaulted_reasoning = Config::from_env().unwrap();
+        assert_eq!(defaulted_reasoning.tinfoil_model, "glm-5-3-flash");
         assert_eq!(
             defaulted_reasoning.tinfoil_reasoning_effort,
+            NativeReasoningEffort::Low
+        );
+
+        std::env::set_var("TINFOIL_REASONING_EFFORT", "none");
+        let unsupported_flash_effort = Config::from_env().unwrap_err();
+        assert!(unsupported_flash_effort
+            .to_string()
+            .contains("unsupported for glm-5-3-flash"));
+
+        std::env::set_var("TINFOIL_MODEL", "custom-model");
+        let custom_model = Config::from_env().unwrap();
+        assert_eq!(custom_model.tinfoil_model, "custom-model");
+        assert_eq!(
+            custom_model.tinfoil_reasoning_effort,
             NativeReasoningEffort::None
         );
 

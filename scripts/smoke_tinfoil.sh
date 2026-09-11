@@ -30,6 +30,15 @@ detect_engine() {
     fail "Neither docker nor podman is available"
 }
 
+# Full Sage verification remains the default for existing callers.
+export SAGE_SMOKE_MODE=full
+case "$#:${1:-}:${2:-}" in
+    0::) ;;
+    2:--mode:full|2:--mode:enclave) SAGE_SMOKE_MODE="$2" ;;
+    1:--help:) printf 'Usage: %s [--mode full|enclave]\nEnclave mode excludes vision; all workspace and database checks still run.\n' "$0"; exit 0 ;;
+    *) fail "Usage: $0 [--mode full|enclave]" ;;
+esac
+
 ENGINE="${CONTAINER_ENGINE:-$(detect_engine)}"
 require_command "$ENGINE"
 
@@ -44,7 +53,8 @@ KEEP_IMAGE="${KEEP_IMAGE:-0}"
 KEEP_STACK_ON_FAILURE="${KEEP_STACK_ON_FAILURE:-0}"
 
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-sage-smoke}"
-export TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-2}"
+export TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-3-flash}"
+export TINFOIL_REASONING_EFFORT="${TINFOIL_REASONING_EFFORT:-low}"
 export TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}"
 export TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-qwen3-vl-30b}"
 export TINFOIL_ROUTER_HOST="${TINFOIL_ROUTER_HOST:-inference.tinfoil.sh}"
@@ -127,7 +137,7 @@ apply_migrations() {
 }
 
 run_in_runner() {
-    run_engine run --rm \
+    run_engine run --rm -i \
         --network "$NETWORK_NAME" \
         --user root \
         -e CARGO_HOME=/cargo-home \
@@ -135,8 +145,10 @@ run_in_runner() {
         -e TINFOIL_API_URL="http://tinfoil-proxy:${TINFOIL_PROXY_PORT}/v1" \
         -e TINFOIL_API_KEY \
         -e TINFOIL_MODEL \
+        -e TINFOIL_REASONING_EFFORT \
         -e TINFOIL_EMBEDDING_MODEL \
         -e TINFOIL_VISION_MODEL \
+        -e SAGE_SMOKE_MODE \
         -v "${CARGO_HOME_VOLUME}:/cargo-home" \
         -v "${ROOT_DIR}:/repo" \
         -w /repo \
@@ -144,7 +156,7 @@ run_in_runner() {
 }
 
 run_proxy_checks() {
-    log "Running chat, embeddings, and vision smoke checks"
+    log "Running provider checks (mode: ${SAGE_SMOKE_MODE})"
 
     run_in_runner python3 - <<'PY'
 import base64
@@ -172,7 +184,8 @@ def post(path: str, payload: dict):
 chat_payload = {
     "model": chat_model,
     "messages": [{"role": "user", "content": "Reply with OK."}],
-    "max_tokens": 8,
+    "reasoning_effort": os.environ["TINFOIL_REASONING_EFFORT"],
+    "max_tokens": 1024,
 }
 
 last_error = None
@@ -189,7 +202,15 @@ else:
     raise SystemExit(f"FAIL chat readiness: {last_error}")
 
 chat_json = response.json()
-chat_content = chat_json["choices"][0]["message"]["content"]
+response_model = chat_json.get("model")
+if response_model != chat_model:
+    raise SystemExit(
+        f"FAIL chat model mismatch: requested {chat_model!r}, received {response_model!r}"
+    )
+chat_choice = chat_json["choices"][0]
+if chat_choice.get("finish_reason") != "stop":
+    raise SystemExit(f"FAIL chat finish reason: {chat_choice.get('finish_reason')!r}")
+chat_content = chat_choice["message"]["content"]
 if not chat_content or "ok" not in chat_content.lower():
     raise SystemExit(f"FAIL chat content: {chat_content!r}")
 print("PASS chat completion")
@@ -214,47 +235,50 @@ if not all(isinstance(value, (int, float)) for value in embedding):
     raise SystemExit("FAIL embeddings contain non-numeric values")
 print("PASS embeddings shape")
 
-subprocess.run(["mkdir", "-p", "/tmp/sage-smoke"], check=True)
-subprocess.run(
-    ["convert", "-size", "64x64", "xc:red", "/tmp/sage-smoke/red.png"],
-    check=True,
-)
-with open("/tmp/sage-smoke/red.png", "rb") as handle:
-    image_b64 = base64.b64encode(handle.read()).decode("ascii")
-
-vision_response = post(
-    "/chat/completions",
-    {
-        "model": vision_model,
-        "messages": [
-            {"role": "system", "content": "Describe the user image in one sentence."},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": "Describe this image in one sentence.",
-                    },
-                ],
-            },
-        ],
-        "max_tokens": 64,
-    },
-)
-if vision_response.status_code != 200:
-    raise SystemExit(
-        f"FAIL vision status {vision_response.status_code}: {vision_response.text}"
+if os.environ["SAGE_SMOKE_MODE"] == "full":
+    subprocess.run(["mkdir", "-p", "/tmp/sage-smoke"], check=True)
+    subprocess.run(
+        ["convert", "-size", "64x64", "xc:red", "/tmp/sage-smoke/red.png"],
+        check=True,
     )
+    with open("/tmp/sage-smoke/red.png", "rb") as handle:
+        image_b64 = base64.b64encode(handle.read()).decode("ascii")
 
-vision_content = vision_response.json()["choices"][0]["message"]["content"]
-vision_lower = vision_content.lower()
-if not vision_content or not any(token in vision_lower for token in ("red", "square", "solid", "color")):
-    raise SystemExit(f"FAIL vision content: {vision_content!r}")
-print("PASS vision completion")
+    vision_response = post(
+        "/chat/completions",
+        {
+            "model": vision_model,
+            "messages": [
+                {"role": "system", "content": "Describe the user image in one sentence."},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in one sentence.",
+                        },
+                    ],
+                },
+            ],
+            "max_tokens": 64,
+        },
+    )
+    if vision_response.status_code != 200:
+        raise SystemExit(
+            f"FAIL vision status {vision_response.status_code}: {vision_response.text}"
+        )
+
+    vision_content = vision_response.json()["choices"][0]["message"]["content"]
+    vision_lower = vision_content.lower()
+    if not vision_content or not any(token in vision_lower for token in ("red", "square", "solid", "color")):
+        raise SystemExit(f"FAIL vision content: {vision_content!r}")
+    print("PASS vision completion")
+else:
+    print("NOT TESTED vision: not used by the Enclave Deployment")
 
 invalid_model_response = post(
     "/chat/completions",
@@ -409,8 +433,9 @@ run_engine run -d \
     --network "$NETWORK_NAME" \
     --network-alias tinfoil-proxy \
     -e TINFOIL_API_KEY \
-    ghcr.io/tinfoilsh/tinfoil-cli:latest \
-    proxy -e "$TINFOIL_ROUTER_HOST" -r "$TINFOIL_ROUTER_REPO" -p "$TINFOIL_PROXY_PORT" -b 0.0.0.0 >/dev/null
+    ghcr.io/tinfoilsh/tinfoil-proxy:0.1.6 \
+    -e "$TINFOIL_ROUTER_HOST" -r "$TINFOIL_ROUTER_REPO" -p "$TINFOIL_PROXY_PORT" -b 0.0.0.0 \
+    --allowed-host tinfoil-proxy >/dev/null
 
 log "Waiting for postgres readiness"
 wait_for_postgres
@@ -419,12 +444,13 @@ apply_migrations
 log "Building smoke runner image"
 run_engine build --target smoke-runner -t "$RUNNER_IMAGE" "$ROOT_DIR"
 
+run_proxy_checks
+
 log "Running containerized workspace checks"
 run_in_runner cargo check --workspace
 run_in_runner cargo test --workspace
 run_in_runner cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-run_proxy_checks
 run_memory_harness
 
-log "Smoke test passed"
+log "Smoke test passed (mode: ${SAGE_SMOKE_MODE})"

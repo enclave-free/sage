@@ -92,14 +92,24 @@ just test-chat-stream
 
 The helper exports `LIBRARY_PATH="$(brew --prefix libpq)/lib:${LIBRARY_PATH:-}"` before running `cargo test -p sage-core chat_stream` on macOS.
 
+Run isolated provider and database verification with `just smoke-tinfoil enclave`
+(or `./scripts/smoke_tinfoil.sh --mode enclave`). This mode checks chat,
+embeddings, invalid-model rejection, migrations, and recall/archival storage,
+and runs all workspace checks, tests, and Clippy. It reports vision as **NOT
+TESTED** because the Enclave Deployment does not use Sage's messenger image path.
+This does not verify the full authenticated web Conversation flow.
+
+`just smoke-tinfoil` retains full Sage verification, including vision. A missing
+vision model fails full mode; it is never counted as a pass in Enclave mode.
+
 Useful env for the web runtime path:
 
 ```bash
 DATABASE_URL=postgres://sage:sage@localhost:5432/sage
 TINFOIL_API_URL=http://localhost:8089/v1
 TINFOIL_API_KEY=your-key
-TINFOIL_MODEL=glm-5-2
-TINFOIL_REASONING_EFFORT=none
+TINFOIL_MODEL=glm-5-3-flash
+TINFOIL_REASONING_EFFORT=low
 TINFOIL_EMBEDDING_MODEL=nomic-embed-text
 ENCLAVE_WEB_PORT=3000
 ENCLAVE_BACKEND_URL=http://core-backend:8000

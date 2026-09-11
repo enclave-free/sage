@@ -113,8 +113,8 @@ start:
         -e DATABASE_URL=postgres://sage:sage@localhost:5434/sage \
         -e TINFOIL_API_URL="${TINFOIL_API_URL:-http://localhost:${TINFOIL_PROXY_PORT}/v1}" \
         -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
-        -e TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-2}" \
-        -e TINFOIL_REASONING_EFFORT="${TINFOIL_REASONING_EFFORT:-none}" \
+        -e TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-3-flash}" \
+        -e TINFOIL_REASONING_EFFORT="${TINFOIL_REASONING_EFFORT:-low}" \
         -e TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}" \
         -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-qwen3-vl-30b}" \
         $MESSENGER_ENV \
@@ -210,8 +210,8 @@ restart:
         -e DATABASE_URL=postgres://sage:sage@localhost:5434/sage \
         -e TINFOIL_API_URL="${TINFOIL_API_URL:-http://localhost:${TINFOIL_PROXY_PORT}/v1}" \
         -e TINFOIL_API_KEY="$TINFOIL_API_KEY" \
-        -e TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-2}" \
-        -e TINFOIL_REASONING_EFFORT="${TINFOIL_REASONING_EFFORT:-none}" \
+        -e TINFOIL_MODEL="${TINFOIL_MODEL:-glm-5-3-flash}" \
+        -e TINFOIL_REASONING_EFFORT="${TINFOIL_REASONING_EFFORT:-low}" \
         -e TINFOIL_EMBEDDING_MODEL="${TINFOIL_EMBEDDING_MODEL:-nomic-embed-text}" \
         -e TINFOIL_VISION_MODEL="${TINFOIL_VISION_MODEL:-qwen3-vl-30b}" \
         $MESSENGER_ENV \
@@ -369,15 +369,16 @@ setup-hooks:
     git config core.hooksPath .githooks
     @echo "✅ Git hooks configured. Pre-commit will run fmt, clippy, and tests."
 
-# Run all CI checks (same as pre-commit hook)
+# Run local Rust and smoke-contract checks
 ci-check:
+    python3 -m unittest discover -s scripts -p test_smoke_tinfoil.py
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-features
 
 # Run the isolated Tinfoil + pgvector smoke gate without Signal or Marmot
-smoke-tinfoil:
-    ./scripts/smoke_tinfoil.sh
+smoke-tinfoil mode="full":
+    ./scripts/smoke_tinfoil.sh --mode {{quote(mode)}}
 
 # =============================================================================
 # GEPA Prompt Optimization
