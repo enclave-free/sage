@@ -218,6 +218,7 @@ pub struct OpenAiNativeClient {
     temperature: f64,
     reasoning_effort: NativeReasoningEffort,
     stream_usage_supported: Arc<AtomicBool>,
+    auth_fallback: Option<(String, String)>,
 }
 
 #[derive(Default)]
@@ -247,6 +248,7 @@ impl OpenAiNativeClient {
             temperature,
             reasoning_effort: NativeReasoningEffort::default(),
             stream_usage_supported,
+            auth_fallback: None,
         }
     }
 
@@ -255,7 +257,48 @@ impl OpenAiNativeClient {
         self
     }
 
+    /// Retry rejected credentials once through an explicitly configured proxy.
+    pub fn with_auth_fallback(mut self, api_url: String, api_key: Option<String>) -> Self {
+        self.auth_fallback = api_key
+            .filter(|key| !key.trim().is_empty())
+            .map(|key| (api_url, key));
+        self
+    }
+
     pub async fn stream_turn(
+        &self,
+        request: NativeTurnRequest,
+        signal_sender: Option<mpsc::UnboundedSender<NativeProviderSignal>>,
+    ) -> Result<NativeAssistantTurn, NativeProviderError> {
+        let result = self
+            .stream_turn_once(request.clone(), signal_sender.clone())
+            .await;
+        if let Err(NativeProviderError::Http { status, .. }) = &result {
+            if matches!(
+                *status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                if let Some((api_url, api_key)) = &self.auth_fallback {
+                    tracing::warn!(
+                        status = status.as_u16(),
+                        "Primary model credentials rejected; retrying through Maple"
+                    );
+                    return Self::new(
+                        self.client.clone(),
+                        api_url.clone(),
+                        api_key.clone(),
+                        self.temperature,
+                    )
+                    .with_reasoning_effort(self.reasoning_effort)
+                    .stream_turn_once(request, signal_sender)
+                    .await;
+                }
+            }
+        }
+        result
+    }
+
+    async fn stream_turn_once(
         &self,
         request: NativeTurnRequest,
         signal_sender: Option<mpsc::UnboundedSender<NativeProviderSignal>>,
@@ -788,6 +831,99 @@ mod tests {
             [("content-type", "text/event-stream")],
             stream,
         )
+    }
+
+    #[tokio::test]
+    async fn auth_fallback_is_bounded_and_preserves_the_request() {
+        const SUCCESS: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"42\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        const BROKEN_STREAM: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"code\":401,\"message\":\"rejected\"}}\n\n";
+        for (primary_status, primary_body, fallback_status, key, use_fallback) in [
+            (200, SUCCESS, 200, Some("maple-key"), false),
+            (401, SUCCESS, 200, Some("maple-key"), true),
+            (403, SUCCESS, 200, Some("maple-key"), true),
+            (401, SUCCESS, 401, Some("maple-key"), true),
+            (429, SUCCESS, 200, Some("maple-key"), false),
+            (500, SUCCESS, 200, Some("maple-key"), false),
+            (401, SUCCESS, 200, None, false),
+            (403, SUCCESS, 200, Some("  "), false),
+            (200, BROKEN_STREAM, 200, Some("maple-key"), false),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut urls = Vec::new();
+            let mut servers = Vec::new();
+            for (name, status, response_body) in [
+                ("primary", primary_status, primary_body),
+                ("fallback", fallback_status, SUCCESS),
+            ] {
+                let calls = calls.clone();
+                let app = Router::new().route(
+                    "/v1/chat/completions",
+                    post(
+                        move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                            let calls = calls.clone();
+                            async move {
+                                calls.lock().unwrap().push((
+                                    name,
+                                    headers["authorization"].to_str().unwrap().to_string(),
+                                    body,
+                                ));
+                                (StatusCode::from_u16(status).unwrap(), response_body)
+                            }
+                        },
+                    ),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                urls.push(format!("http://{}/v1", listener.local_addr().unwrap()));
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap()
+                }));
+            }
+            let client = OpenAiNativeClient::new(
+                reqwest::Client::new(),
+                urls[0].clone(),
+                "tinfoil-key".to_string(),
+                0.3,
+            )
+            .with_reasoning_effort(NativeReasoningEffort::Low)
+            .with_auth_fallback(urls[1].clone(), key.map(str::to_string));
+            let result = client
+                .stream_turn(
+                    NativeTurnRequest {
+                        model: "glm-5-3-flash".to_string(),
+                        messages: vec![NativeChatMessage::user("Compute 17 + 25.")],
+                        tools: vec![],
+                        max_tokens: 32,
+                    },
+                    None,
+                )
+                .await;
+            let expected_status = if use_fallback {
+                fallback_status
+            } else {
+                primary_status
+            };
+            if primary_body == BROKEN_STREAM {
+                assert!(matches!(result, Err(NativeProviderError::Protocol(_))));
+            } else if expected_status == 200 {
+                assert_eq!(result.unwrap().content, "42");
+            } else {
+                assert!(
+                    matches!(result, Err(NativeProviderError::Http { status, .. }) if status.as_u16() == expected_status)
+                );
+            }
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), if use_fallback { 2 } else { 1 });
+            assert_eq!(calls[0].0, "primary");
+            assert_eq!(calls[0].1, "Bearer tinfoil-key");
+            if use_fallback {
+                assert_eq!(calls[1].0, "fallback");
+                assert_eq!(calls[1].1, "Bearer maple-key");
+                assert_eq!(calls[1].2, calls[0].2);
+            }
+            for server in servers {
+                server.abort();
+            }
+        }
     }
 
     #[tokio::test]
