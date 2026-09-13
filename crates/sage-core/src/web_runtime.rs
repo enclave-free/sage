@@ -7780,7 +7780,8 @@ async fn run_agent_steps(
         lm.api_key.clone(),
         lm.temperature,
     )
-    .with_reasoning_effort(lm.reasoning_effort);
+    .with_reasoning_effort(lm.reasoning_effort)
+    .with_auth_fallback(lm.maple_api_url.clone(), lm.maple_api_key.clone());
     let turn = run_native_turn_with_provider(agent, &provider, input, model, delta_sender).await?;
     persist_successful_admin_config_tools(agent, memory_user_id, &turn.executed_tools).await;
     Ok(turn.answer)
@@ -8347,6 +8348,8 @@ fn conversation_model_http_client_with_timeout(
 
 /// Per-request configuration for the one authoritative Conversation model.
 struct RequestLmSettings {
+    maple_api_url: String,
+    maple_api_key: Option<String>,
     api_url: String,
     api_key: String,
     model: String,
@@ -8362,6 +8365,8 @@ impl RequestLmSettings {
             .ok_or_else(|| AppError::internal("TINFOIL_API_KEY not configured"))?;
 
         Ok(Self {
+            maple_api_url: config.maple_api_url.clone(),
+            maple_api_key: config.maple_api_key.clone(),
             api_url: config.tinfoil_api_url.clone(),
             api_key: api_key.to_string(),
             model: config.tinfoil_model.clone(),
@@ -11180,6 +11185,8 @@ mod tests {
         registry.register(Arc::new(crate::tools::DoneTool));
         let mut agent = SageAgent::new_without_memory(registry, "Answer accurately.");
         let settings = RequestLmSettings {
+            maple_api_url: String::new(),
+            maple_api_key: None,
             api_url: format!("http://{address}/v1"),
             api_key: "test-key".to_string(),
             model: "glm-5-2".to_string(),
@@ -11398,6 +11405,8 @@ mod tests {
             .unwrap();
         });
         let settings = RequestLmSettings {
+            maple_api_url: String::new(),
+            maple_api_key: None,
             api_url: format!("http://{address}/v1"),
             api_key: "test-key".to_string(),
             model: "glm-5-2".to_string(),
@@ -16734,6 +16743,8 @@ mod tests {
 
     fn test_config_with_tinfoil_key(secret: &str) -> Config {
         Config {
+            maple_api_url: "http://maple-proxy:8080/v1".to_string(),
+            maple_api_key: None,
             tinfoil_api_url: "http://tinfoil-proxy:8089/v1".to_string(),
             tinfoil_api_key: Some(secret.to_string()),
             tinfoil_model: "glm-5-2".to_string(),

@@ -14,6 +14,8 @@ pub enum MessengerType {
 pub struct Config {
     pub tinfoil_api_url: String,
     pub tinfoil_api_key: Option<String>,
+    pub maple_api_url: String,
+    pub maple_api_key: Option<String>,
     pub tinfoil_model: String,
     pub tinfoil_reasoning_effort: NativeReasoningEffort,
     pub tinfoil_embedding_model: String,
@@ -74,6 +76,9 @@ impl Config {
             tinfoil_api_url: std::env::var("TINFOIL_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8089/v1".to_string()),
             tinfoil_api_key: std::env::var("TINFOIL_API_KEY").ok(),
+            maple_api_url: std::env::var("MAPLE_API_URL")
+                .unwrap_or_else(|_| "http://maple-proxy:8080/v1".to_string()),
+            maple_api_key: std::env::var("MAPLE_API_KEY").ok(),
             tinfoil_model,
             tinfoil_reasoning_effort,
             tinfoil_embedding_model: std::env::var("TINFOIL_EMBEDDING_MODEL")
@@ -178,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reads_tinfoil_env_only() {
+    fn config_reads_tinfoil_and_optional_maple_fallback() {
         let _guard = env_lock().lock().unwrap();
 
         let previous_database = std::env::var("DATABASE_URL").ok();
@@ -202,8 +207,8 @@ mod tests {
         std::env::set_var("TINFOIL_EMBEDDING_MODEL", "nomic-embed-text");
         std::env::set_var("TINFOIL_VISION_MODEL", "qwen3-vl-30b");
 
-        std::env::set_var("MAPLE_API_URL", "http://legacy.invalid/v1");
-        std::env::set_var("MAPLE_API_KEY", "legacy-key");
+        std::env::set_var("MAPLE_API_URL", "http://maple.invalid/v1");
+        std::env::set_var("MAPLE_API_KEY", "maple-key");
         std::env::set_var("MAPLE_MODEL", "legacy-model");
         std::env::set_var("MAPLE_EMBEDDING_MODEL", "legacy-embed");
         std::env::set_var("MAPLE_VISION_MODEL", "legacy-vision");
@@ -216,10 +221,16 @@ mod tests {
         assert_eq!(config.tinfoil_reasoning_effort, NativeReasoningEffort::High);
         assert_eq!(config.tinfoil_embedding_model, "nomic-embed-text");
         assert_eq!(config.tinfoil_vision_model, "qwen3-vl-30b");
+        assert_eq!(config.maple_api_url, "http://maple.invalid/v1");
+        assert_eq!(config.maple_api_key.as_deref(), Some("maple-key"));
 
+        std::env::remove_var("MAPLE_API_URL");
+        std::env::remove_var("MAPLE_API_KEY");
         std::env::remove_var("TINFOIL_VISION_MODEL");
         let defaulted_vision = Config::from_env().unwrap();
         assert_eq!(defaulted_vision.tinfoil_vision_model, "qwen3-vl-30b");
+        assert_eq!(defaulted_vision.maple_api_url, "http://maple-proxy:8080/v1");
+        assert_eq!(defaulted_vision.maple_api_key, None);
 
         std::env::remove_var("TINFOIL_MODEL");
         std::env::remove_var("TINFOIL_REASONING_EFFORT");
