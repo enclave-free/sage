@@ -270,37 +270,35 @@ impl OpenAiNativeClient {
         request: NativeTurnRequest,
         signal_sender: Option<mpsc::UnboundedSender<NativeProviderSignal>>,
     ) -> Result<NativeAssistantTurn, NativeProviderError> {
-        let result = self
-            .stream_turn_once(request.clone(), signal_sender.clone())
-            .await;
-        if let Err(NativeProviderError::Http { status, .. }) = &result {
-            if matches!(
-                *status,
-                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-            ) {
-                if let Some((api_url, api_key)) = &self.auth_fallback {
-                    tracing::warn!(
-                        status = status.as_u16(),
-                        "Primary model credentials rejected; retrying through Maple"
-                    );
-                    return Self::new(
-                        self.client.clone(),
-                        api_url.clone(),
-                        api_key.clone(),
-                        self.temperature,
-                    )
-                    .with_reasoning_effort(self.reasoning_effort)
-                    .stream_turn_once(request, signal_sender)
-                    .await;
-                }
+        let result = self.stream_turn_once(&request, signal_sender.clone()).await;
+        match (&result, &self.auth_fallback) {
+            (Err(NativeProviderError::Http { status, .. }), Some((api_url, api_key)))
+                if matches!(
+                    *status,
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                ) =>
+            {
+                tracing::warn!(
+                    status = status.as_u16(),
+                    "Primary model credentials rejected; retrying through Maple"
+                );
+                Self::new(
+                    self.client.clone(),
+                    api_url.clone(),
+                    api_key.clone(),
+                    self.temperature,
+                )
+                .with_reasoning_effort(self.reasoning_effort)
+                .stream_turn_once(&request, signal_sender)
+                .await
             }
+            _ => result,
         }
-        result
     }
 
     async fn stream_turn_once(
         &self,
-        request: NativeTurnRequest,
+        request: &NativeTurnRequest,
         signal_sender: Option<mpsc::UnboundedSender<NativeProviderSignal>>,
     ) -> Result<NativeAssistantTurn, NativeProviderError> {
         let mut body = Map::from_iter([
