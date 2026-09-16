@@ -7781,7 +7781,7 @@ async fn run_agent_steps(
         lm.temperature,
     )
     .with_reasoning_effort(lm.reasoning_effort)
-    .with_auth_fallback(lm.maple_api_url.clone(), lm.maple_api_key.clone());
+    .with_provider_fallback(lm.maple_api_url.clone(), lm.maple_api_key.clone());
     let turn = run_native_turn_with_provider(agent, &provider, input, model, delta_sender).await?;
     persist_successful_admin_config_tools(agent, memory_user_id, &turn.executed_tools).await;
     Ok(turn.answer)

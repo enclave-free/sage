@@ -95,6 +95,12 @@ failure does not retry. A final-request retry reuses existing Tool-result messag
 and cannot execute Tools again. No other Conversation model is substituted after
 failure.
 
+When Maple credentials are configured, each native provider attempt rejected
+with HTTP 401, 403, or 429 tries Maple once before returning to that recovery
+budget. Maple receives the same model, messages, Tools, and request settings.
+A Maple failure cannot recursively trigger another provider fallback, and a
+failure after streaming begins never triggers provider fallback.
+
 Conversation traces record each native loop step, provider first-event wait,
 Retrieval or Resource lookup, Tool execution, content-free retry delay, retry
 outcome, and total-turn timing where those stages are measurable. Provider
