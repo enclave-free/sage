@@ -218,7 +218,7 @@ pub struct OpenAiNativeClient {
     temperature: f64,
     reasoning_effort: NativeReasoningEffort,
     stream_usage_supported: Arc<AtomicBool>,
-    auth_fallback: Option<(String, String)>,
+    provider_fallback: Option<(String, String)>,
 }
 
 #[derive(Default)]
@@ -248,7 +248,7 @@ impl OpenAiNativeClient {
             temperature,
             reasoning_effort: NativeReasoningEffort::default(),
             stream_usage_supported,
-            auth_fallback: None,
+            provider_fallback: None,
         }
     }
 
@@ -257,9 +257,9 @@ impl OpenAiNativeClient {
         self
     }
 
-    /// Retry rejected credentials once through an explicitly configured proxy.
-    pub fn with_auth_fallback(mut self, api_url: String, api_key: Option<String>) -> Self {
-        self.auth_fallback = api_key
+    /// Retry authentication or rate-limit rejection once through a configured proxy.
+    pub fn with_provider_fallback(mut self, api_url: String, api_key: Option<String>) -> Self {
+        self.provider_fallback = api_key
             .filter(|key| !key.trim().is_empty())
             .map(|key| (api_url, key));
         self
@@ -271,16 +271,18 @@ impl OpenAiNativeClient {
         signal_sender: Option<mpsc::UnboundedSender<NativeProviderSignal>>,
     ) -> Result<NativeAssistantTurn, NativeProviderError> {
         let result = self.stream_turn_once(&request, signal_sender.clone()).await;
-        match (&result, &self.auth_fallback) {
+        match (&result, &self.provider_fallback) {
             (Err(NativeProviderError::Http { status, .. }), Some((api_url, api_key)))
                 if matches!(
                     *status,
-                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                    reqwest::StatusCode::UNAUTHORIZED
+                        | reqwest::StatusCode::FORBIDDEN
+                        | reqwest::StatusCode::TOO_MANY_REQUESTS
                 ) =>
             {
                 tracing::warn!(
                     status = status.as_u16(),
-                    "Primary model credentials rejected; retrying through Maple"
+                    "Primary model request rejected; retrying through Maple"
                 );
                 Self::new(
                     self.client.clone(),
@@ -832,7 +834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_fallback_is_bounded_and_preserves_the_request() {
+    async fn provider_fallback_is_bounded_and_preserves_the_request() {
         const SUCCESS: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"42\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         const BROKEN_STREAM: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"code\":401,\"message\":\"rejected\"}}\n\n";
         for (primary_status, primary_body, fallback_status, key, use_fallback) in [
@@ -840,7 +842,11 @@ mod tests {
             (401, SUCCESS, 200, Some("maple-key"), true),
             (403, SUCCESS, 200, Some("maple-key"), true),
             (401, SUCCESS, 401, Some("maple-key"), true),
-            (429, SUCCESS, 200, Some("maple-key"), false),
+            (429, SUCCESS, 200, Some("maple-key"), true),
+            (429, SUCCESS, 429, Some("maple-key"), true),
+            (429, SUCCESS, 401, Some("maple-key"), true),
+            (429, SUCCESS, 200, None, false),
+            (429, SUCCESS, 200, Some("  "), false),
             (500, SUCCESS, 200, Some("maple-key"), false),
             (401, SUCCESS, 200, None, false),
             (403, SUCCESS, 200, Some("  "), false),
@@ -883,7 +889,7 @@ mod tests {
                 0.3,
             )
             .with_reasoning_effort(NativeReasoningEffort::Low)
-            .with_auth_fallback(urls[1].clone(), key.map(str::to_string));
+            .with_provider_fallback(urls[1].clone(), key.map(str::to_string));
             let result = client
                 .stream_turn(
                     NativeTurnRequest {
